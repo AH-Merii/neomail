@@ -123,6 +123,32 @@ each section is not required — keep related decisions together.
   - Results start streaming within a frame of typing, even at 100k+ messages per account.
   - Matching is incremental and multi-threaded, and never blocks the UI. Study how Helix's nucleo matcher achieves this.
 
+## Images and attachments
+
+- **Images in messages render in the terminal.** Embedded images (logos, screenshots, inline `cid:` parts) are shown inline.
+  - They use the terminal's graphics protocol (kitty graphics, Sixel, iTerm2), falling back to coloured half-blocks.
+  - Decoding uses memory-safe decoders with size limits, never blocks the UI, and can be switched off.
+  - *Provisional (Claude's default, owner to confirm):* on by default.
+- **Remote images are blocked by default.** This is for privacy: tracking pixels, read receipts and IP leaks.
+  - One key loads them for this message, or always for this sender.
+  - The daemon fetches them without cookies or referrer, with size and time limits. Known tracking pixels are never loaded.
+- **Open the full message in a browser** when a newsletter needs it. The browser gets a sanitised copy, with remote content still blocked unless allowed.
+- **Attachments:**
+  - Each is listed with its name, its real type and its size. The type is detected from the content, with a warning if it doesn't match the extension.
+  - Attachments download on demand and are cached.
+  - Save one or all, to the downloads folder (configurable) or a chosen path.
+  - Open with the system's default app. This never happens automatically, and executables and scripts get a warning.
+  - Preview in the terminal where possible: images, text, PDF text.
+  - Filenames are sanitised: no path traversal, and no control or bidirectional characters. Saved files are never executable, and macOS quarantine flags are kept.
+- **Attachments are searchable.**
+  - An attachments picker searches all accounts by name, type, sender and date.
+  - The CLI and agents get the same commands (`nmail attachment list|save|open --json`). Agents read attachment text as data, never as instructions.
+- **Drafting with files and images:**
+  - Attach with `:attach` and a fuzzy file picker, by pasting or dropping a file path, or by pasting an image from the clipboard.
+  - Markdown images (`![alt](path)`) are sent as inline images. Per-identity signatures can include a logo. The composer previews images inline.
+  - Before sending, neomail warns about a forgotten attachment (the draft says "attached" but has none) and about provider size limits.
+  - Large files use the provider's upload sessions.
+
 ## CLI, scripting, agents, extensibility
 
 - **The CLI can do everything the TUI can**, modelled on Superlogical's Rex
