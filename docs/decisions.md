@@ -94,6 +94,34 @@ each section is not required — keep related decisions together.
   animation that shows each message being sorted into its group. On by default; can be turned off
   in the configuration. It must degrade gracefully (reduced motion, slow terminals or SSH, small
   windows) and never delay the actual sorting.
+- **Drafting feels like Neovim.**
+  - Full modal editing with motions, counts and text objects.
+  - Absolute, relative and hybrid line numbers (`number` / `relativenumber`), so jumps like `5j`, `12k` and `3dd` are quick.
+  - `$EDITOR` remains an option.
+- **Markdown drafts:**
+  - Write in Markdown with live, incremental syntax highlighting. Quotes, signatures, links and addresses are highlighted too.
+  - Drafts are sent as `multipart/alternative`: the rendered HTML, plus the Markdown source as the plain-text part.
+  - A per-message toggle sends plain text only.
+- **Spelling and grammar checks, fully offline:**
+  - Dictionary spellcheck for any language, plus English grammar hints. Nothing leaves the machine.
+  - Problems appear as diagnostics, with an underline and a sign. Navigate them like Neovim: `]s` / `[s` to jump, `z=` for suggestions, `zg` to add a word.
+  - A floating window explains the problem under the cursor. Completion popups (addresses, words) and hover info use the same floating-window mechanism.
+
+## Search and pickers
+
+- **Fuzzy search is a core, extensible building block**, inspired by snacks.nvim's picker, Telescope and Helix.
+  - A picker is a *source* (what to list), a *scope* (where to look), a fast matcher, a preview and actions.
+  - New pickers are added by registering a source, from Rust or Lua. Agents and the CLI can query the same sources.
+  - This mirrors how Neovim extends search to files, grep, keymaps, diagnostics and more.
+- **Scopes, like buffer vs project in Neovim:** the current draft or message, then the thread, the folder or group, one account (e.g. only Outlook), and everything. You can switch scope inside the picker without retyping the query.
+- **First pickers:**
+  - search inside the draft being written;
+  - live text search over all mail, returning the matching emails;
+  - senders, ranked by frecency.
+- **Next pickers:** subjects, folders/labels/groups, accounts, keymaps, actions/commands, errors/log, themes, drafts and attachments.
+- **Very fast:**
+  - Results start streaming within a frame of typing, even at 100k+ messages per account.
+  - Matching is incremental and multi-threaded, and never blocks the UI. Study how Helix's nucleo matcher achieves this.
 
 ## CLI, scripting, agents, extensibility
 
@@ -109,6 +137,16 @@ each section is not required — keep related decisions together.
   to drive (machine-readable output, self-describing schema, agent skill/docs, MCP).
 - **Extension language: Lua** (embedded, Neovim/Rex style) for custom actions, hooks and UI.
   Plain settings live in a TOML config file.
+- **Building blocks first (the owner's design principle).** Design neomail the way Neovim and Helix are designed: a small set of fast, general primitives, with every feature built from them. The primitives:
+  - **buffers:** every view is a buffer (message list, message, thread, draft, picker, help, log);
+  - **windows**, including floating windows;
+  - **decorations:** highlights, virtual text, signs;
+  - **events** (autocommands);
+  - **the action registry**;
+  - **keymaps** per mode and per buffer;
+  - **pluggable providers:** picker sources, completion sources, diagnostics, previewers, animation styles.
+
+  Extensions use exactly the same primitives as built-in features. The performance of these primitives is a hard requirement; everything else follows from them.
 
 ## Platforms
 
