@@ -1,0 +1,6 @@
+████████▄▄
+███▀▀▀▀▀███
+███      ███   neomail
+███      ▄▄▄   vim-style terminal mail, sorted by AI
+███      ███
+███      ███
