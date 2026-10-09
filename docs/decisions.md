@@ -103,6 +103,12 @@ each section is not required — keep related decisions together.
   customize neomail themselves (extensions, docs written for agents, hot reload).
 - **Ask an agent about your email / have an agent act on it:** the CLI/API must be easy for AI agents
   to drive (machine-readable output, self-describing schema, agent skill/docs, MCP).
+- **Extension language: Lua** (embedded, Neovim/Rex style) for custom actions, hooks and UI.
+  Plain settings live in a TOML config file.
+
+## Platforms
+
+- **First release: Linux and macOS** (CI, prebuilt binaries, OS keyring on both). Windows later.
 
 ## Project and delivery
 
