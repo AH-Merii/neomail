@@ -108,7 +108,13 @@ each section is not required — keep related decisions together.
 
 ## Platforms
 
-- **First release: Linux and macOS** (CI, prebuilt binaries, OS keyring on both). Windows later.
+- **First release: Linux, macOS, and WSL (WSL2)** — CI, prebuilt binaries, OS keyring on Linux and
+  macOS. Native Windows later.
+- **WSL specifics are first-class:** detect WSL (`WSL_DISTRO_NAME` / WSLInterop) and handle it —
+  secrets fall back when no Secret Service is available (password command such as `pass`, Windows
+  Credential Manager via interop, or an encrypted file store), OAuth opens the Windows browser
+  (`wslview` / `explorer.exe`) while the loopback redirect still works via WSL2 localhost
+  forwarding, and clipboard/notifications go through Windows interop (or OSC 52).
 
 ## Project and delivery
 
