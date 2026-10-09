@@ -90,6 +90,10 @@ each section is not required — keep related decisions together.
 - **Keybindings are configurable and easy to learn**, with a quick way to look them up and change
   them.
 - **Theming.**
+- **Live sorting animation:** when jev sorts/tags mail in real time, the TUI plays a really cool
+  animation that shows each message being sorted into its group. On by default; can be turned off
+  in the configuration. It must degrade gracefully (reduced motion, slow terminals or SSH, small
+  windows) and never delay the actual sorting.
 
 ## CLI, scripting, agents, extensibility
 
