@@ -94,6 +94,12 @@ each section is not required — keep related decisions together.
   animation that shows each message being sorted into its group. On by default; can be turned off
   in the configuration. It must degrade gracefully (reduced motion, slow terminals or SSH, small
   windows) and never delay the actual sorting.
+  - **Chosen style (owner, 2026-10-10):** *Decode*, combined with *Scan & stamp*'s confidence bar.
+    - While jev works, the message decodes: a short scramble sweeps the subject.
+    - The group tag then resolves left to right in the group's colour.
+    - The confidence bar fills in alongside it.
+  - The other prototyped concepts (Sorting machine, Scan & stamp) are not required for v1. The
+    animation-style seam keeps them possible later. Prototypes: PR #1, `prototypes/sort-animation`.
 - **Drafting feels like Neovim.**
   - Full modal editing with motions, counts and text objects.
   - Absolute, relative and hybrid line numbers (`number` / `relativenumber`), so jumps like `5j`, `12k` and `3dd` are quick.
