@@ -227,6 +227,9 @@ the old one, and the bullet above it is updated to link the new entry. The proce
 - **Design consistency** ([DEC-2026-10-11-consistency-process](#dec-2026-10-11-consistency-process)):
   the process in [process/consistency/process.md](process/consistency/process.md) binds every
   workflow, agent and CI job that writes `docs/` or code.
+- **Benchmarks** ([DEC-2026-10-11-bench-sample](#dec-2026-10-11-bench-sample)): a benchmark runs
+  on a representative sample, just large enough to measure the metrics, never on whole datasets.
+  The choice weighs speed against accuracy.
 
 ## Decision log
 
@@ -378,3 +381,13 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   - Edge installs as `nmail-edge`, with its own data directory and keyring namespace, and can
     update itself. Tagged releases do not update themselves.
 - **Refines:** D1 in the brief, which had stewards re-wire the roots at each phase.
+
+### <a id="dec-2026-10-11-bench-sample"></a>DEC-2026-10-11-bench-sample: benchmarks decide on a representative sample
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Context:** the PII benchmark had run every detector over the whole corpus (8,629 documents) for
+  hours. The owner stopped it.
+- **Owner's words:** "forget it, stop the tests for pii, you didn't have to run it on the entire
+  dataset, we just needed a representitive set to get an idea and measure the metrics and compare
+  speed vs accuracy metrics and decide base on the tradeoffs..."
+- **Ruling:** the "Benchmarks" bullet under [Project and delivery](#project-and-delivery).
