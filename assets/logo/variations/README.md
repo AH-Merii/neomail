@@ -1,5 +1,7 @@
 # neomail logo variations
 
+> **Chosen: 05, "Split and statusline".** [DEC-2026-10-11-logo](../../../docs/decisions.md#dec-2026-10-11-logo) adopted it as the main logo, and it now lives in [`assets/logo/`](../README.md), rebuilt by `python3 assets/logo/src/build.py`. The folder `05-split-statusline/` keeps the draft as reviewed. The original "cursor n" set, with its `src/`, moved to [`00-cursor-n/`](00-cursor-n/README.md). Below this note, the text predates the decision: "current" means cursor n, and `../` and `../src/` now mean the 05 set, so read them as `00-cursor-n/` and `00-cursor-n/src/`. The same applies to `build_sheet.py`, whose "Cursor n (current)" entry reads `../`. Run as is, it would show the 05 set in that slot, so the committed sheets are the record.
+
 Six alternatives to the current "cursor n" mark (`../neomail-mark.svg`, PR #2), shown side by side with it.
 
 | Sheet | What it shows |

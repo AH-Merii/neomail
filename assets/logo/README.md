@@ -1,58 +1,84 @@
 # neomail logo
 
-The mark is a geometric lowercase **n** whose right leg is a **terminal cursor**: a 12×20 block, the proportions of a terminal cell. It sits on a 64-unit grid with a 12-unit stroke. The flat top runs into a quarter-circle shoulder (outer radius 24, inner radius 12). A 4-unit gap separates the cursor from the shoulder. The cursor is the only accent in the whole brand.
+**Split and statusline**, adopted by [DEC-2026-10-11-logo](../../docs/decisions.md#dec-2026-10-11-logo). It was variation 05; the drafts are in [`variations/`](variations/) and the retired cursor-n set is in [`variations/00-cursor-n/`](variations/00-cursor-n/).
+
+## The idea
+
+The envelope is a Neovim window. A V seam from the two top corners forms the flap. A `:vsplit` separator drops from the flap's left arm at one third of the width, so the mail list and the reader are the two panes. Under the window sits a statusline whose left end is a powerline-shaped mode chip, the NORMAL block. The chip is the only colour in the mark.
+
+- **Neovim:** panes, a vertical split, and a statusline with a coloured mode block and a powerline arrow, the shape lualine and airline users know. No part of the Neovim logo is used: no prisms, no slanted N, no green or blue.
+- **Mail:** a solid envelope with a V flap, split where a mail client splits: a narrow list on the left, a wide reader on the right. The chip's arrow points right, like "send".
+- **Not other mail icons:** no M (Gmail), no padlock or purple (Proton), no "O" tile (Outlook), no bird (Thunderbird), no blue gradient tile (Apple Mail).
 
 ## Files
 
 | File | Use |
 | --- | --- |
-| `neomail-mark.svg` | Mark for light backgrounds (ink n, teal cursor) |
-| `neomail-mark-dark.svg` | Mark for dark backgrounds (off-white n, teal cursor) |
-| `neomail-mark-mono.svg` | Single-colour mark, one path (recolour freely) |
+| `neomail-mark.svg` | Mark for light backgrounds (ink window, dark-amber chip) |
+| `neomail-mark-dark.svg` | Mark for dark backgrounds (off-white window, amber chip) |
+| `neomail-mark-mono.svg` | Single-colour mark, one `currentColor` path. The chip stays its own shape, cut off by the notch. |
 | `neomail-logo-light.svg` | Mark and wordmark for light backgrounds |
 | `neomail-logo-dark.svg` | Mark and wordmark for dark backgrounds |
-| `neomail-logo-mono.svg` | Single-colour lockup |
-| `favicon.svg` | App icon and favicon (ink tile, drawn separately for 16 px) |
-| `icon-mono.svg` | Single-colour app icon (n and cursor cut out of the tile) |
-| `favicon-32.png`, `icon-192.png`, `icon-512.png` | Raster app icons rendered from `favicon.svg` |
-| `social-preview.png` (`.svg`) | 1280×640 repository and social card |
-| `logo.txt` | Plain Unicode half-block lockup for the README and TUI splash (6 lines) |
-| `logo.ans` | The same lockup with a 24-bit ANSI teal cursor (`cat logo.ans`) |
-| `src/` | Build scripts that generate everything above |
+| `neomail-logo-mono.svg` | Single-colour lockup, `currentColor` |
+| `favicon.svg` | Favicon: 16 px pixel art of the same layout on an ink tile with a 1 px paper keyline |
+| `icon.svg` | App icon for 48 px and above: the master mark at 75 % on the ink tile with a paper keyline |
+| `icon-mono.svg` | Single-colour app icon: the favicon drawing cut out of the tile, `currentColor` |
+| `favicon-32.png` | Rendered from `favicon.svg` (each drawing pixel becomes 2 × 2) |
+| `icon-192.png`, `icon-512.png` | Rendered from `icon.svg`, where the 16 px pixel steps would look wrong |
+| `social-preview.svg`, `social-preview.png` | 1280 × 640 repository and social card: lockup, tagline, and a statusline along the bottom |
+| `logo.txt` | Plain Unicode lockup for the README and the TUI splash: the half-block mark (21 columns × 8 rows) with `neomail` and the tagline beside it, 59 columns wide |
+| `logo.ans` | The same in 24-bit ANSI (`cat logo.ans`). The window uses the terminal's own foreground (`ESC[39m`), so it works on light and dark themes. The chip prints `NORMAL` in ink on amber; the wordmark is bold and the tagline dim. |
+| `src/` | The generator: `brand.py` (palette and geometry), `build.py` (writes every file above), `text.py` (HarfBuzz and fontTools outlines), `review.py` (review sheets) |
 
-All SVGs are hand-built paths with a `viewBox`. They contain no `<text>` and no raster images.
+All SVGs are filled paths with a `viewBox`. They contain no `<text>`, no raster images, no filters and no gradients. The mono files use `currentColor`, which is black in an `<img>` and inherits the text colour when inlined.
 
 ## Palette
 
-| Role | Hex | Notes |
-| --- | --- | --- |
-| Ink | `#0D1117` | Dark background, light-theme foreground, icon tile |
-| Paper | `#F6F8FA` | Light background (ink on paper 17.8:1) |
-| Off-white | `#E8EEF3` | Dark-theme foreground (16.2:1 on ink) |
-| Teal | `#48DCC1` | Accent on dark and on the ink tile (11.1:1 on ink) |
-| Teal (light) | `#008F7A` | Accent graphics on light backgrounds (3.79:1 on paper) |
-| Teal text (light) | `#037A69` | Accent **text** on light backgrounds (4.94:1, WCAG AA) |
-| Muted | `#8B98A5` | Secondary text on dark, for example the tagline (6.4:1 on ink) |
+WCAG 2 contrast ratios (sRGB relative luminance), computed by `brand.contrast()` in `src/brand.py`.
 
-Do not use `#48DCC1` on light backgrounds (1.6:1). Do not use `#008F7A` for small text. The retired concept colours `#3DDC97` and `#0A9963` are too close to Android, Nuxt and Supabase green.
+| Role | Hex | Contrast |
+| --- | --- | --- |
+| Ink: dark background, window on light, icon tile, chip label | `#0D1117` | 17.78:1 on paper |
+| Paper: light background, icon keyline | `#F6F8FA` | |
+| Off-white: window on dark | `#E8EEF3` | 16.18:1 on ink |
+| Amber: mode chip on dark and on the ink tile | `#FFB238` | 10.52:1 on ink; ink label on amber 10.52:1 |
+| Dark amber: mode chip on light | `#B86E00` | 3.74:1 on paper (graphics only, never text) |
+| Muted: secondary text on dark (card tagline) | `#8B98A5` | 6.43:1 on ink, 5.17:1 on the card's bar |
+| Bar: the card's statusline | `#21262D` | decorative; amber on it 8.46:1 |
+
+Amber was chosen because no mail client and no Neovim mark uses it, and it reads as "status" without suggesting an error. Never use `#FFB238` on light backgrounds (1.69:1 on paper); use `#B86E00` there.
 
 ## Wordmark
 
-- Font: Adwaita Sans (SIL OFL; derived from Inter), instanced at `wght 640, opsz 32` (Inter Display style). The text is outlined, so the font is not needed at runtime.
-- Always set the wordmark in lowercase, `neomail`, in one colour: ink on light, off-white on dark, black or white in mono. Never split it into neo|mail colours or add accent letters.
-- Tracking is 0 with no pair adjustments. The font applies no kerning to this string.
-- Use `nmail` only for the binary name in code or commands, never as a logo.
+- Adwaita Sans (SIL OFL), instanced at `wght 600, opsz 32`, outlined by `src/text.py`, so the font is not needed at runtime.
+- Always lowercase, `neomail`, in one colour: ink on light, off-white on dark, `currentColor` in mono. Never colour part of the word or give it the accent.
+- Tracking 0, the font's own spacing.
+- `nmail` is the binary name in code and commands, never a logo.
 
-## Lockup geometry (64 units tall)
+## Geometry (64-unit grid, `MASTER` in `src/brand.py`)
 
-- The mark's bottom sits on the baseline (y 56). Its top lines up with the top of the "l" (y 8). Word scale: 0.03221 per font unit, giving an x-height of 34 units.
-- The gap between mark and word is 24 units, measured from the cursor's right edge (x 56) to the ink of the "n".
-- **Clear space:** 24 units (half the mark height) on all sides.
-- **Minimum size:** the lockup at 20 px tall; the mark alone at 16 px. Below 20 px, use the mark alone.
+- Every horizontal and vertical edge is on a multiple of 4 units, so it lands on whole pixels at 16, 32 and 64 px. All corners are square, like terminal cells; only the app-icon tile is rounded.
+- Window x 4–60, y 8–40. Flap: a 4-unit V seam from the top corners to the apex (32, 24). Split: x 20–24, from the flap's left arm to the bottom edge, 8 units clear of the apex, so the seams never form a Y.
+- Statusline y 44–56. The chip runs x 4–16 with a 45° point to x 22 (the split's centre line); a 6-unit notch separates it from the bar.
+- **Lockup:** the "l" runs from the window top (y 8) to the statusline bottom (y 56), so the baseline is the statusline's bottom edge. The word scale is 0.03221 per font unit. The gap from the mark (x 60) to the ink of the "n" is 20 units. The lockup is 317 × 64 units.
 
-## Usage rules
+## Clear space
 
-- Use the dark variants on dark backgrounds and the light variants on light backgrounds. On photos or busy backgrounds, use mono or the app icon.
+Keep 16 units (a quarter of the mark's 64-unit height) clear on every side of the mark's or lockup's `viewBox`. The `viewBox` already holds 4 units of margin at the sides and 8 at the top and bottom.
+
+## Minimum sizes
+
+| Asset | Minimum | Below that |
+| --- | --- | --- |
+| Mark (`neomail-mark*.svg`) | 24 px | `favicon.svg`. At 16 px the master's flap diagonals blur to grey. |
+| Lockup (`neomail-logo-*.svg`) | 32 px tall | The mark alone |
+| `favicon.svg`, `icon-mono.svg` | 16 px | Drawn for 16 px; crisp at every whole multiple (32, 64…) |
+| `icon.svg` | 48 px | `favicon.svg`. It is crisp at 64, 192 and 512 px, and soft at 16. |
+| `logo.txt` / `logo.ans` | 59 columns | The mark alone: the first 21 columns of each line |
+
+## Usage
+
+- Dark variants on dark backgrounds, light variants on light ones. On photos or busy backgrounds use mono or the app icon.
 - On GitHub, switch with `<picture>`:
 
   ```html
@@ -62,32 +88,38 @@ Do not use `#48DCC1` on light backgrounds (1.6:1). Do not use `#008F7A` for smal
   </picture>
   ```
 
-- Use the tile (`favicon.svg`) only as an app-icon or favicon container. The main mark is the freestanding n.
-- For the favicon and sizes of 32 px or less, use `favicon.svg` or the PNGs. Scaling the master mark blurs it at 16 px; the icon is drawn on its own grid (stem 3 px, counter 4 px, cursor 3×4 px at 16 px).
-- Never put the n on a solid teal square or any other bright square. That is npm's territory.
-- Don't stretch, rotate, outline, add shadows or gradients, recolour the n with the accent, or close the gap between the cursor and the shoulder.
-- Don't move the cursor to the left leg or make it blink in static assets. Animating the cursor block is fine in the TUI and in motion work.
-- Keep the sorting chevrons and lanes for the AI-sorting animation, not for the logo.
+- Use the tile only as an app-icon or favicon container. The main mark stands free.
 
-## Terminal rendition
+## Don'ts
 
-At 16 px, the mark maps exactly onto half-block characters: each terminal cell is two pixels tall, so the mark is 12 columns by 6 rows. `logo.txt` and `logo.ans` can be printed in the splash screen or by `nmail --version`.
+- Don't stretch, rotate, outline, shadow, or add gradients or rounded corners to the mark.
+- Don't colour the window or the bar with the accent, or the chip with anything but amber (dark amber on light, or the mono colour).
+- Don't move the split to the centre: the seams would meet in a Y, and the list | reader reading is lost.
+- Don't close the notch between the chip and the bar, or turn the chip's point into a round end.
+- Don't put the chip's label `NORMAL` into the SVG mark; it belongs to the terminal logo and the card.
+- Don't print `logo.ans` with reverse video for the label: on light themes that gives paper on amber, 1.69:1.
+- Don't use `#FFB238` on light backgrounds or `#B86E00` for text.
+
+## Terminal logo
 
 ```
-████████▄▄
-███▀▀▀▀▀███
-███      ███   neomail
-███      ▄▄▄   vim-style terminal mail, sorted by AI
-███      ███
-███      ███
+▄▄▀▀█████████████▀▀▄▄
+████▄▄▀▀█████▀▀▄▄████
+██████ █▄▄▀▄▄████████
+██████ ██████████████   neomail
+██████ ██████████████   a fast, modal terminal email client
+██████ ██████████████
+▀▀▀▀▀▀ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+NORMAL ██████████████
 ```
+
+The mark is pixel art (`TERM` in `src/brand.py`), 21 × 16 px printed as 8 rows of half blocks. The split is column 6, and the statusline's one-cell notch is the same column. The bottom row prints `NORMAL` in the chip's six cells, in `logo.txt` too, so the chip still reads without colour; in `logo.ans` the SGR resets before the notch, so the notch takes the terminal's own background. The wordmark sits beside the window's middle rows, 3 columns from the mark, which keeps the whole lockup at 59 columns.
 
 ## Rebuilding
 
 ```sh
-cd assets/logo/src
-uv run --with fonttools --with uharfbuzz python build.py   # SVG masters
-uv run --with pillow python render.py /tmp/neomail-logo-review   # PNGs, logo.txt/.ans, review sheets
+python3 assets/logo/src/build.py                            # every file above
+python3 assets/logo/src/review.py /tmp/neomail-logo-review  # review-dark.png, review-light.png
 ```
 
-This needs `rsvg-convert`, `magick` and Adwaita Sans at `/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf`.
+This needs `rsvg-convert`, `magick`, Adwaita Sans in `/usr/share/fonts/Adwaita/` and, for the review sheets, Noto Sans Mono in `/usr/share/fonts/noto/`. If Pillow, uharfbuzz or fontTools are missing, the scripts re-run themselves under `uv run --with pillow --with uharfbuzz --with fonttools`. A re-run gives byte-identical files.
