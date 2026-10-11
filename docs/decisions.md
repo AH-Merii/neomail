@@ -82,6 +82,9 @@ the old one, and the bullet above it is updated to link the new entry. The proce
   automatically, newest first, without asking, capped at the newest 1,000 emails. It then shows an
   estimate of what classifying all the remaining emails would cost (count, requests, time, money),
   and the user can start that with one action. The window and the cap are configurable.
+- **Redaction uses our own rules** ([DEC-2026-10-11-pii-rules](#dec-2026-10-11-pii-rules)): the PII
+  redaction that runs before text goes to jev is neomail's own rule redactor. No model is part of
+  the default.
 
 ## Data and storage
 
@@ -422,3 +425,30 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   it comes to coupling or contradictory design?", then, after the answer: "okay make note of this
   retro so you can avoide that and refer to this down the line."
 - **Ruling:** the "Architecture rules" bullet under [Project and delivery](#project-and-delivery).
+
+### <a id="dec-2026-10-11-pii-rules"></a>DEC-2026-10-11-pii-rules: redaction uses our own rules
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Context:** on the PII benchmark's email excerpts (the first 1,500 characters, as jev receives
+  them), the rules caught 99–100% of email addresses, 96% of phone numbers, all links and 67% of
+  other IDs, at about 0.04 ms per email and 55 MB. They caught at most 29% of people's names. The
+  detectors that catch names took 1.7–1.8 s per email, which would hold up the jev sorter, or had
+  no speed measurement yet.
+- **Owner's words:** "okay so ai say we go with our own rules for pii then, seems to be the most
+  pragmatic thing to do agree or no?"
+- **Settles:** the detector default that
+  [DEC-2026-10-11-redaction-default](#dec-2026-10-11-redaction-default) left to the benchmark.
+- **Ruling:** the "Redaction uses our own rules" bullet under [Classification](#classification-jev).
+
+### <a id="dec-2026-10-11-redaction-gaps"></a>DEC-2026-10-11-redaction-gaps: close the rules' gaps without a model
+
+- **Status:** proposed by Claude on 2026-10-11.
+- **Proposal:**
+  - Mask the names the daemon already knows, as whole words: the display names in From, To and Cc,
+    the owner's contacts and the owner's own name.
+  - Add patterns for the identifier formats the rules miss (they caught 67% of IDs).
+  - Say plainly at consent that, at `standard`, other people's and organisations' names in the
+    body still go to jev.
+  - Keep models out of the default. A model detector may come later as an opt-in level, if its
+    speed keeps up with the sorter.
+- **Builds on:** [DEC-2026-10-11-pii-rules](#dec-2026-10-11-pii-rules).
