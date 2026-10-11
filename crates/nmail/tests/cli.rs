@@ -1,0 +1,222 @@
+//! `nmail list`, `show` and the offline failure paths of `sync`, against a temporary data
+//! directory. No network.
+#![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
+
+use std::path::Path;
+use std::process::{Command, Output};
+
+use chrono::DateTime;
+use nm_core::{Cache, FetchedMessage, Flags, Uid, UidValidity};
+use serde_json::Value;
+
+const LONG_SUBJECT: &str =
+    "A rather long subject line that will certainly not fit in eighty columns at all";
+
+fn message(uid: u32, received: i64, from: &str, subject: &str, seen: bool) -> FetchedMessage {
+    let raw = format!(
+        "From: {from}\r\nTo: me@mail.example\r\nSubject: {subject}\r\n\
+         Date: Sat, 10 Oct 2026 09:30:00 +0000\r\n\r\nHello from {uid}.\r\n"
+    );
+    FetchedMessage {
+        uid: Uid::new(uid).unwrap(),
+        flags: Flags::new(if seen { vec![Flags::SEEN] } else { vec![] }),
+        received: DateTime::from_timestamp(received, 0),
+        raw: raw.into_bytes(),
+    }
+}
+
+/// A data directory with three messages in "work" and one in "home".
+fn seeded() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache = Cache::open(&dir.path().join("cache.sqlite3")).unwrap();
+    let work = cache
+        .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
+        .unwrap();
+    cache
+        .insert_messages(
+            work.id,
+            &[
+                message(1, 100, "Ada Lovelace <ada@mail.example>", "Oldest", true),
+                message(2, 300, "bob@mail.example", LONG_SUBJECT, false),
+                message(
+                    3,
+                    200,
+                    "Carol <carol@mail.example>",
+                    "Escape \x1b[31m here",
+                    false,
+                ),
+            ],
+        )
+        .unwrap();
+    let home = cache
+        .reset_mailbox("home", "INBOX", UidValidity::new(9).unwrap())
+        .unwrap();
+    cache
+        .insert_messages(home.id, &[message(5, 50, "dan@mail.example", "Home", true)])
+        .unwrap();
+    dir
+}
+
+fn nmail(data: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_nmail"))
+        .args(args)
+        .env("NMAIL_DATA_DIR", data)
+        .env("NMAIL_CONFIG", data.join("config.toml"))
+        .env("HOME", data)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .unwrap()
+}
+
+fn stdout(o: &Output) -> String {
+    String::from_utf8(o.stdout.clone()).unwrap()
+}
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8(o.stderr.clone()).unwrap()
+}
+
+fn json(o: &Output) -> Value {
+    assert!(o.status.success(), "{}", stderr(o));
+    serde_json::from_slice(&o.stdout).unwrap()
+}
+
+#[test]
+fn list_prints_newest_first_within_80_columns() {
+    let dir = seeded();
+    let o = nmail(dir.path(), &["list"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = stdout(&o);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 4, "{out}");
+    assert!(
+        lines[0].contains("bob@mail.example") && lines[0].contains('…'),
+        "{out}"
+    );
+    assert!(
+        lines[1].contains("Carol") && !lines[1].contains('\x1b'),
+        "{out}"
+    );
+    assert!(
+        lines[2].contains("Ada Lovelace") && lines[2].contains("Oldest"),
+        "{out}"
+    );
+    assert!(lines[3].contains("Home"), "{out}");
+    for line in &lines {
+        assert!(line.chars().count() <= 80, "too wide: {line:?}");
+    }
+    // Unread mark after the id.
+    assert_eq!(lines[0].split_whitespace().nth(1), Some("*"));
+    assert_ne!(lines[2].split_whitespace().nth(1), Some("*"));
+
+    let o = nmail(dir.path(), &["list", "--account", "work", "--limit", "2"]);
+    assert_eq!(stdout(&o).lines().count(), 2);
+}
+
+#[test]
+fn list_json_shape() {
+    let dir = seeded();
+    let v = json(&nmail(dir.path(), &["list", "--json", "--account", "work"]));
+    let items = v.as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    let first = &items[0];
+    assert_eq!(first["account"], "work");
+    assert_eq!(first["uid"], 2);
+    assert_eq!(first["unread"], true);
+    assert_eq!(first["subject"], LONG_SUBJECT);
+    assert_eq!(first["from"]["address"], "bob@mail.example");
+    assert_eq!(first["from"]["name"], Value::Null);
+    assert_eq!(first["date"], "2026-10-10T09:30:00Z");
+    assert_eq!(items[2]["flags"], serde_json::json!(["\\Seen"]));
+    assert!(first["id"].is_i64());
+}
+
+#[test]
+fn show_human_json_and_raw() {
+    let dir = seeded();
+    let id = json(&nmail(dir.path(), &["list", "--json"]))[2]["id"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+
+    let o = nmail(dir.path(), &["show", &id]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("From:    Ada Lovelace <ada@mail.example>"),
+        "{out}"
+    );
+    assert!(out.contains("To:      me@mail.example"), "{out}");
+    assert!(out.contains("Subject: Oldest"), "{out}");
+    assert!(out.contains("Hello from 1."), "{out}");
+
+    let v = json(&nmail(dir.path(), &["show", &id, "--json"]));
+    assert_eq!(v["body_type"], "text/plain");
+    assert_eq!(v["from"][0]["name"], "Ada Lovelace");
+    assert_eq!(v["attachments"], serde_json::json!([]));
+    assert_eq!(v["unread"], false);
+
+    let o = nmail(dir.path(), &["show", &id, "--raw"]);
+    assert!(o.stdout.starts_with(b"From: Ada Lovelace"));
+}
+
+#[test]
+fn failures_are_clear_and_non_zero() {
+    let dir = seeded();
+    let o = nmail(dir.path(), &["show", "999"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).contains("no cached message with id 999"),
+        "{}",
+        stderr(&o)
+    );
+
+    assert_eq!(nmail(dir.path(), &["show", "abc"]).status.code(), Some(2));
+    assert_eq!(
+        nmail(dir.path(), &["list", "--limit", "0"]).status.code(),
+        Some(2)
+    );
+
+    let o = nmail(dir.path(), &["list", "--account", "nope"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("home, work"), "{}", stderr(&o));
+
+    let o = nmail(dir.path(), &["sync"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("no config file"), "{}", stderr(&o));
+}
+
+#[test]
+fn empty_data_dir_lists_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = nmail(dir.path(), &["list"]);
+    assert!(o.status.success());
+    assert!(stdout(&o).is_empty());
+    assert!(stderr(&o).contains("nmail sync"));
+    assert_eq!(
+        json(&nmail(dir.path(), &["list", "--json"])),
+        serde_json::json!([])
+    );
+    assert_eq!(nmail(dir.path(), &["show", "1"]).status.code(), Some(1));
+    assert!(
+        !dir.path().join("cache.sqlite3").exists(),
+        "list must not create the cache"
+    );
+}
+
+#[test]
+fn password_command_output_never_appears_in_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[[accounts]]\nname = \"work\"\nusername = \"user@mail.example\"\n\
+         password_command = \"echo hunter2; exit 1\"\nimap = { host = \"imap.mail.example\" }\n",
+    )
+    .unwrap();
+    let o = nmail(dir.path(), &["sync"]);
+    assert_eq!(o.status.code(), Some(1));
+    let all = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(all.contains("password_command failed"), "{all}");
+    assert!(!all.contains("hunter2"), "{all}");
+}

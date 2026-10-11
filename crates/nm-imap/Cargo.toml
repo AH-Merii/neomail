@@ -1,0 +1,24 @@
+[package]
+name = "nm-imap"
+description = "neomail's IMAP MailSource: TLS, STARTTLS, certificate pinning and IMAP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+nm-core.workspace = true
+async-imap.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+
+[lints]
+workspace = true

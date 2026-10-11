@@ -1,0 +1,170 @@
+//! One-shot, read-only sync of an account's INBOX into the cache.
+
+use std::collections::BTreeMap;
+use std::num::NonZeroU32;
+
+use crate::cache::{Cache, CacheError};
+use crate::source::MailSource;
+use crate::types::{Flags, ListedMessage, Uid, UidFlags};
+
+/// The only mailbox slice 1 syncs.
+pub const INBOX: &str = "INBOX";
+
+/// How many of the newest messages the first sync takes, unless told otherwise.
+pub const DEFAULT_LIMIT: NonZeroU32 = NonZeroU32::MIN.saturating_add(499);
+
+/// Messages fetched per request.
+const FETCH_BATCH: usize = 50;
+
+/// What one sync changed in the cache.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SyncReport {
+    /// Messages fetched and added.
+    pub new: usize,
+    /// Cached messages whose flags changed on the server.
+    pub updated: usize,
+    /// Cached messages dropped: expunged on the server, or all of them on a UIDVALIDITY change.
+    pub removed: usize,
+    /// The server's UIDVALIDITY changed, so the cache was rebuilt.
+    pub reset: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError<E: std::error::Error + 'static> {
+    #[error("the mail server request failed")]
+    Source(#[source] E),
+    #[error(transparent)]
+    Cache(#[from] CacheError),
+}
+
+/// Brings the cached INBOX of `account` up to date with `source`.
+///
+/// - A changed UIDVALIDITY drops the mailbox's cache and starts again.
+/// - The first sync lists every message and fetches the `limit` that arrived last (by
+///   INTERNALDATE, not UID: some servers number old mail highest). Its watermark is the highest
+///   UID on the server, set only once the first sync completes; an interrupted first sync is
+///   simply run again.
+/// - Later syncs fetch every UID above the watermark, with no cap, so no new mail is skipped.
+/// - Cached messages get their flags refreshed, and the ones gone from the server are dropped.
+/// - New messages are fetched oldest UID first, and each batch of a later sync raises the
+///   watermark, so an interrupted sync resumes where it stopped.
+pub async fn sync_inbox<S: MailSource>(
+    source: &mut S,
+    cache: &mut Cache,
+    account: &str,
+    limit: NonZeroU32,
+) -> Result<SyncReport, SyncError<S::Error>> {
+    let status = source.examine_inbox().await.map_err(SyncError::Source)?;
+    let mut report = SyncReport::default();
+
+    let mailbox = match cache.mailbox(account, INBOX)? {
+        Some(m) if m.uid_validity == status.uid_validity => m,
+        previous => {
+            if let Some(old) = previous {
+                report.reset = true;
+                report.removed = cache.cached_flags(old.id)?.len();
+            }
+            cache.reset_mailbox(account, INBOX, status.uid_validity)?
+        }
+    };
+
+    let cached = cache.cached_flags(mailbox.id)?;
+    let (server, new, watermark): (BTreeMap<Uid, Flags>, Vec<Uid>, Option<Uid>) =
+        match mailbox.highest_uid {
+            None => {
+                let listing = if status.exists == 0 {
+                    Vec::new()
+                } else {
+                    source.list_all().await.map_err(SyncError::Source)?
+                };
+                let (server, watermark) = newest_arrivals(listing, limit);
+                let new = server
+                    .keys()
+                    .copied()
+                    .filter(|uid| cached.binary_search_by_key(uid, |c| c.uid).is_err())
+                    .collect();
+                (server, new, watermark)
+            }
+            Some(highest) => {
+                // The listing must cover the oldest cached message, else the first UID after the
+                // highest one seen.
+                let from = match cached.first() {
+                    Some(first) => first.uid,
+                    None => match highest.get().checked_add(1).and_then(Uid::new) {
+                        Some(next) => next,
+                        None => return Ok(report), // UID space exhausted: nothing can be new.
+                    },
+                };
+                let listing = if status.exists == 0 {
+                    Vec::new()
+                } else {
+                    source.flags_from(from).await.map_err(SyncError::Source)?
+                };
+                let server: BTreeMap<Uid, Flags> = listing
+                    .into_iter()
+                    .filter(|m| m.uid >= from)
+                    .map(|m| (m.uid, m.flags))
+                    .collect();
+                let new = server
+                    .keys()
+                    .copied()
+                    .filter(|uid| *uid > highest)
+                    .collect();
+                (server, new, None)
+            }
+        };
+
+    let mut updates = Vec::new();
+    let mut removed = Vec::new();
+    for c in &cached {
+        match server.get(&c.uid) {
+            Some(flags) if *flags != c.flags => updates.push(UidFlags {
+                uid: c.uid,
+                flags: flags.clone(),
+            }),
+            Some(_) => {}
+            None => removed.push(c.uid),
+        }
+    }
+    cache.apply_changes(mailbox.id, &updates, &removed)?;
+    report.updated = updates.len();
+    report.removed += removed.len();
+
+    let first_sync = mailbox.highest_uid.is_none();
+    for batch in new.chunks(FETCH_BATCH) {
+        let mut fetched = source.fetch(batch).await.map_err(SyncError::Source)?;
+        fetched.retain(|m| batch.binary_search(&m.uid).is_ok());
+        fetched.sort_by_key(|m| m.uid);
+        fetched.dedup_by_key(|m| m.uid);
+        if first_sync {
+            cache.store_messages(mailbox.id, &fetched)?;
+        } else {
+            cache.insert_messages(mailbox.id, &fetched)?;
+        }
+        report.new += fetched.len();
+    }
+    if let Some(watermark) = watermark {
+        cache.raise_highest_uid(mailbox.id, watermark)?;
+    }
+    Ok(report)
+}
+
+/// Picks the `limit` messages that arrived last (ties and unknown dates by UID, highest first),
+/// keyed by UID, and returns them with the highest UID in the whole listing.
+fn newest_arrivals(
+    mut listing: Vec<ListedMessage>,
+    limit: NonZeroU32,
+) -> (BTreeMap<Uid, Flags>, Option<Uid>) {
+    let watermark = listing.iter().map(|m| m.uid).max();
+    listing.sort_by_key(|m| m.uid);
+    listing.dedup_by_key(|m| m.uid);
+    // `None` sorts before any date, so messages without one count as the oldest.
+    listing.sort_by_key(|m| std::cmp::Reverse((m.received, m.uid)));
+    let cap = usize::try_from(limit.get()).unwrap_or(usize::MAX);
+    let chosen = listing
+        .into_iter()
+        .take(cap)
+        .map(|m| (m.uid, m.flags))
+        .collect();
+    (chosen, watermark)
+}
