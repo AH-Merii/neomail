@@ -27,8 +27,8 @@ const CACHE_FILE: &str = "cache.sqlite3";
     about = "neomail: a terminal email client (read-only INBOX for now)"
 )]
 struct Cli {
-    /// Config file [default: $XDG_CONFIG_HOME/neomail/config.toml]
-    #[arg(long, global = true, env = "NMAIL_CONFIG", value_name = "PATH")]
+    /// Config file [env: NMAIL_CONFIG] [default: $XDG_CONFIG_HOME/neomail/config.toml]
+    #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
@@ -177,8 +177,39 @@ fn open_cache(create: bool) -> Result<Option<Cache>> {
         return Ok(None);
     }
     create_private_dir(&dir)?;
+    #[cfg(unix)]
+    restrict_cache_files(&path)?;
     let cache = Cache::open(&path).with_context(|| format!("cannot open {}", path.display()))?;
     Ok(Some(cache))
+}
+
+/// Makes the cache file and SQLite's `-wal` and `-shm` files readable only by the user, even in
+/// a data directory that already existed with looser modes. A missing cache file is created
+/// empty with mode 0600 first; SQLite gives the `-wal` and `-shm` files it creates later the
+/// same mode.
+#[cfg(unix)]
+fn restrict_cache_files(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        let file = Path::new(&file);
+        let Ok(meta) = std::fs::metadata(file) else {
+            continue; // Not there (yet).
+        };
+        if meta.permissions().mode() & 0o777 != 0o600 {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("cannot make {} private", file.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Creates the data directory readable only by the user: it holds mail.
@@ -219,8 +250,13 @@ async fn sync_account(account: &Account, cache: &mut Cache, limit: NonZeroU32) -
     } else {
         ""
     };
+    let missing = if r.missing > 0 {
+        format!(", {} without a body (retried next sync)", r.missing)
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "{}: {} new, {} updated, {} removed{reset}",
+        "{}: {} new, {} updated, {} removed{missing}{reset}",
         account.name, r.new, r.updated, r.removed
     ))
 }

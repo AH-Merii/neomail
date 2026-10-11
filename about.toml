@@ -1,0 +1,7 @@
+# cargo-about: the THIRD-PARTY-LICENSES file shipped in each edge tarball (.github/workflows/ci.yml).
+# `accepted` lists the licences the dependency tree uses today, checked with `cargo about generate`;
+# a new dependency under another licence fails the edge build until it is reviewed and added.
+accepted = ["Apache-2.0", "MIT", "ISC", "BSD-3-Clause", "Zlib", "Unicode-3.0"]
+targets = ["x86_64-unknown-linux-musl", "aarch64-apple-darwin"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

@@ -1,6 +1,8 @@
 //! The IMAP [`MailSource`]: TLS or STARTTLS over rustls, then read-only IMAP on INBOX.
 
 mod tls;
+#[cfg(test)]
+mod wire_tests;
 
 use std::future::Future;
 use std::io;
@@ -85,9 +87,20 @@ pub enum ImapError {
 
 type Stream = TlsStream<TcpStream>;
 
+/// What an IMAP session can run over: TLS in production, an in-memory pipe in the tests.
+pub trait Transport:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send
+{
+}
+
+impl<T> Transport for T where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send
+{
+}
+
 /// A logged-in IMAP session that implements [`MailSource`].
-pub struct ImapSource {
-    session: Session<Stream>,
+pub struct ImapSource<T: Transport = Stream> {
+    session: Session<T>,
     /// Message count from the last EXAMINE; zero means there is nothing to list.
     exists: u32,
 }
@@ -139,7 +152,9 @@ impl ImapSource {
             })?;
         Ok(Self { session, exists: 0 })
     }
+}
 
+impl<T: Transport> ImapSource<T> {
     /// Ends the session politely. Errors are ignored: the work is already done.
     pub async fn logout(mut self) {
         let _ = step("logout", self.session.logout()).await;
@@ -207,7 +222,7 @@ enum Cmd<'a> {
     Uid(&'a str),
 }
 
-impl MailSource for ImapSource {
+impl<T: Transport> MailSource for ImapSource<T> {
     type Error = ImapError;
 
     async fn examine_inbox(&mut self) -> Result<MailboxStatus, ImapError> {
@@ -284,10 +299,7 @@ impl MailSource for ImapSource {
 }
 
 /// Reads the server greeting, which must come before any command.
-async fn greeting<T>(client: &mut Client<T>) -> Result<(), ImapError>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
-{
+async fn greeting<T: Transport>(client: &mut Client<T>) -> Result<(), ImapError> {
     match step("the greeting", client.read_response()).await? {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(ImapError::NoGreeting),

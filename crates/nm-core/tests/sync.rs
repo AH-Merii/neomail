@@ -18,6 +18,8 @@ struct FakeSource {
     /// INTERNALDATEs by UID; a message without one has no date.
     dates: BTreeMap<u32, DateTime<Utc>>,
     fetched: Vec<u32>,
+    /// UIDs whose FETCH reply comes back without a body.
+    bodiless: Vec<u32>,
 }
 
 impl FakeSource {
@@ -27,6 +29,7 @@ impl FakeSource {
             messages: uids.into_iter().map(|u| (u, Flags::default())).collect(),
             dates: BTreeMap::new(),
             fetched: Vec::new(),
+            bodiless: Vec::new(),
         }
     }
 
@@ -78,6 +81,9 @@ impl MailSource for FakeSource {
     async fn fetch(&mut self, uids: &[Uid]) -> Result<Vec<FetchedMessage>, Infallible> {
         let mut out = Vec::new();
         for uid in uids {
+            if self.bodiless.contains(&uid.get()) {
+                continue;
+            }
             if let Some(flags) = self.messages.get(&uid.get()) {
                 self.fetched.push(uid.get());
                 out.push(FetchedMessage {
@@ -116,6 +122,7 @@ fn report(new: usize, updated: usize, removed: usize, reset: bool) -> SyncReport
         new,
         updated,
         removed,
+        missing: 0,
         reset,
     }
 }
@@ -278,7 +285,7 @@ async fn interrupted_first_sync_is_completed_by_the_next() {
         .reset_mailbox("work", "INBOX", UidValidity::new(7).unwrap())
         .unwrap();
     let partial = source.fetch(&[Uid::new(4).unwrap()]).await.unwrap();
-    cache.store_messages(mailbox.id, &partial).unwrap();
+    cache.store_messages(mailbox.id, &partial, None).unwrap();
     source.fetched.clear();
 
     let r = sync_inbox(&mut source, &mut cache, "work", LIMIT)
@@ -287,4 +294,81 @@ async fn interrupted_first_sync_is_completed_by_the_next() {
     assert_eq!(r, report(2, 0, 0, false));
     assert_eq!(source.fetched, vec![3, 5]);
     assert_eq!(cached_uids(&cache), vec![3, 4, 5]);
+}
+
+#[tokio::test]
+async fn a_message_without_a_body_is_asked_for_again() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let mut source = FakeSource::new(7, 1..=2);
+    sync(&mut source, &mut cache).await;
+
+    // 4 comes back without a body: 3 is stored and the watermark stops below 4, so 5 is stored
+    // but 4 is not skipped.
+    source
+        .messages
+        .extend((3..=5).map(|u| (u, Flags::default())));
+    source.bodiless.push(4);
+    let r = sync(&mut source, &mut cache).await;
+    assert_eq!((r.new, r.missing), (2, 1));
+    assert_eq!(cached_uids(&cache), vec![1, 2, 3, 5]);
+    let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
+    assert_eq!(mailbox.highest_uid, Uid::new(3));
+
+    // Once the server sends it, the next sync fetches 4 alone.
+    source.bodiless.clear();
+    let r = sync_inbox(&mut source, &mut cache, "work", LIMIT)
+        .await
+        .unwrap();
+    assert_eq!((r.new, r.missing), (1, 0));
+    assert_eq!(source.fetched, vec![4]);
+    assert_eq!(cached_uids(&cache), vec![1, 2, 3, 4, 5]);
+    let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
+    assert_eq!(mailbox.highest_uid, Uid::new(4));
+}
+
+#[tokio::test]
+async fn a_first_sync_missing_a_body_sets_no_watermark() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let mut source = FakeSource::new(7, 1..=3);
+    source.bodiless.push(2);
+    let r = sync(&mut source, &mut cache).await;
+    assert_eq!((r.new, r.missing), (2, 1));
+    let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
+    assert_eq!(mailbox.highest_uid, None);
+
+    source.bodiless.clear();
+    let r = sync_inbox(&mut source, &mut cache, "work", LIMIT)
+        .await
+        .unwrap();
+    assert_eq!((r.new, r.missing), (1, 0));
+    assert_eq!(source.fetched, vec![2]);
+    let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
+    assert_eq!(mailbox.highest_uid, Uid::new(3));
+}
+
+#[tokio::test]
+async fn a_first_sync_run_again_keeps_what_it_cached() {
+    // 3 never comes back with a body, so every sync is a first sync again.
+    let mut cache = Cache::open_in_memory().unwrap();
+    let mut source = FakeSource::new(7, 1..=3);
+    source.bodiless.push(3);
+    let r = sync(&mut source, &mut cache).await;
+    assert_eq!((r.new, r.missing), (2, 1));
+
+    // New mail pushes 1 out of the newest three, but 1 is still on the server, so it stays.
+    source.messages.insert(4, Flags::default());
+    let r = sync_inbox(&mut source, &mut cache, "work", LIMIT)
+        .await
+        .unwrap();
+    assert_eq!((r.new, r.removed, r.missing), (1, 0, 1));
+    assert_eq!(source.fetched, vec![4]);
+    assert_eq!(cached_uids(&cache), vec![1, 2, 4]);
+    let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
+    assert_eq!(mailbox.highest_uid, None);
+
+    // Once 3 is expunged, the first sync completes and sets the watermark.
+    source.messages.remove(&3);
+    assert_eq!(sync(&mut source, &mut cache).await, report(0, 0, 0, false));
+    let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
+    assert_eq!(mailbox.highest_uid, Uid::new(4));
 }

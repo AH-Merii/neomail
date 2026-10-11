@@ -20,5 +20,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util"] }
+
 [lints]
 workspace = true

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::parse::{self, EmailAddress};
 use crate::types::{FetchedMessage, Flags, MessageId, Uid, UidFlags, UidValidity};
@@ -100,20 +100,24 @@ impl Cache {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        match version {
-            0 => {
-                conn.execute_batch(SCHEMA)?;
-                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        if schema_version(&conn)? == 0 {
+            // One write transaction that reads the version again: two first opens at once cannot
+            // both create the schema, and a crash cannot leave half of it.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if schema_version(&tx)? == 0 {
+                tx.execute_batch(SCHEMA)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
-            SCHEMA_VERSION => {}
-            found => return Err(CacheError::TooNew { found }),
+            tx.commit()?;
         }
-        Ok(Self { conn })
+        match schema_version(&conn)? {
+            SCHEMA_VERSION => Ok(Self { conn }),
+            found => Err(CacheError::TooNew { found }),
+        }
     }
 
     pub fn mailbox(&self, account: &str, name: &str) -> Result<Option<MailboxRecord>> {
@@ -207,13 +211,8 @@ impl Cache {
 
     /// Stores fetched messages and raises the mailbox's highest UID to theirs, in one transaction.
     pub fn insert_messages(&mut self, mailbox_id: i64, messages: &[FetchedMessage]) -> Result<()> {
-        self.store(mailbox_id, messages, true)
-    }
-
-    /// Stores fetched messages without touching the mailbox's highest UID. A first sync uses
-    /// this, because the messages it picks need not be the highest UIDs on the server.
-    pub fn store_messages(&mut self, mailbox_id: i64, messages: &[FetchedMessage]) -> Result<()> {
-        self.store(mailbox_id, messages, false)
+        let highest = messages.iter().map(|m| m.uid).max();
+        self.store_messages(mailbox_id, messages, highest)
     }
 
     /// Raises the mailbox's highest UID to `uid` (never lowers it): UIDs up to it are not new.
@@ -225,7 +224,15 @@ impl Cache {
         Ok(())
     }
 
-    fn store(&mut self, mailbox_id: i64, messages: &[FetchedMessage], raise: bool) -> Result<()> {
+    /// Stores fetched messages and, when `raise_to` is given, raises the mailbox's highest UID to
+    /// it (never lowers it), in one transaction. A first sync passes `None`, because the messages
+    /// it picks need not be the highest UIDs on the server.
+    pub fn store_messages(
+        &mut self,
+        mailbox_id: i64,
+        messages: &[FetchedMessage],
+        raise_to: Option<Uid>,
+    ) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
             let mut insert = tx.prepare(
@@ -255,7 +262,7 @@ impl Cache {
                     m.raw,
                 ])?;
             }
-            if let Some(max) = messages.iter().map(|m| m.uid).max().filter(|_| raise) {
+            if let Some(max) = raise_to {
                 tx.execute(
                     "UPDATE mailbox SET highest_uid = MAX(highest_uid, ?2) WHERE id = ?1",
                     params![mailbox_id, max.get()],
@@ -344,6 +351,10 @@ impl Cache {
         })
         .transpose()
     }
+}
+
+fn schema_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
 }
 
 fn uid_from_db(value: i64) -> Result<Uid> {
@@ -458,7 +469,9 @@ mod tests {
         let before = ids(&cache);
 
         // Storing a cached message again keeps its id.
-        cache.store_messages(mb.id, &[msg(11, 2, "b2")]).unwrap();
+        cache
+            .store_messages(mb.id, &[msg(11, 2, "b2")], None)
+            .unwrap();
         assert_eq!(ids(&cache), before);
 
         // Expunge the newest-inserted row, then add new mail: the new id is a fresh one.

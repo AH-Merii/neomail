@@ -8,10 +8,15 @@ use anyhow::{Context, Result, bail};
 use nm_imap::{CertPin, ImapConfig, Security};
 use serde::Deserialize;
 
-/// Where the config file is: `--config` or `NMAIL_CONFIG` (both handled by clap) win, then
-/// `$XDG_CONFIG_HOME/neomail/config.toml`, then `~/.config/neomail/config.toml`.
+/// Where the config file is: `--config`, then `NMAIL_CONFIG`, then
+/// `$XDG_CONFIG_HOME/neomail/config.toml`, then `~/.config/neomail/config.toml`. An empty
+/// `NMAIL_CONFIG` counts as unset, like an empty `NMAIL_DATA_DIR`.
 pub fn config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    match explicit {
+    match explicit.or_else(|| {
+        env::var_os("NMAIL_CONFIG")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }) {
         Some(p) => Ok(p),
         None => Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?.join("neomail/config.toml")),
     }
@@ -23,6 +28,21 @@ pub fn data_dir() -> Result<PathBuf> {
     match env::var_os("NMAIL_DATA_DIR").filter(|v| !v.is_empty()) {
         Some(dir) => Ok(PathBuf::from(dir)),
         None => Ok(xdg_dir("XDG_DATA_HOME", ".local/share")?.join("neomail")),
+    }
+}
+
+/// A TOML error as its message and position only. toml's own `Display` quotes the offending
+/// line, which could echo a secret pasted into the config.
+fn syntax_error(text: &str, e: &toml::de::Error) -> anyhow::Error {
+    let message = e.message().trim_end();
+    match e.span() {
+        Some(span) => {
+            let before = text.get(..span.start).unwrap_or(text);
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            anyhow::anyhow!("line {line}, column {column}: {message}")
+        }
+        None => anyhow::anyhow!("{message}"),
     }
 }
 
@@ -103,7 +123,7 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let raw: RawConfig = toml::from_str(text)?;
+        let raw: RawConfig = toml::from_str(text).map_err(|e| syntax_error(text, &e))?;
         let mut seen = HashSet::new();
         let mut accounts = Vec::with_capacity(raw.accounts.len());
         for a in raw.accounts {
@@ -226,5 +246,14 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             assert!(Config::parse(&bad).is_err(), "{bad}");
         }
         assert!(Config::parse("").unwrap().select(None).is_err());
+    }
+
+    #[test]
+    fn syntax_errors_name_the_place_but_never_quote_the_file() {
+        let secret = "hunter2-not-a-real-secret";
+        let text = format!("[[accounts]]\nname = \"a\"\npassword = {secret}\n");
+        let message = format!("{:#}", Config::parse(&text).unwrap_err());
+        assert!(!message.contains(secret), "{message}");
+        assert!(message.starts_with("line 3, column "), "{message}");
     }
 }

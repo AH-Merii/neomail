@@ -35,14 +35,27 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  # The oldest Rust that Cargo.toml's rust-version claims. Keep the two in step.
+  msrv:
+    name: Check on Rust 1.88
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+
   build-edge:
     name: Build edge (${{ matrix.target }})
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: check
+    needs: [check, msrv]
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          # musl: a static binary that runs on any x86_64 Linux, whatever its glibc.
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
@@ -55,12 +68,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Install the musl C toolchain (ring and the bundled SQLite are C)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }} -p nmail
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      # The licence notices of the statically linked crates; about.toml lists the accepted ones.
+      - run: cargo about generate --locked --fail -c about.toml -m crates/nmail/Cargo.toml -o THIRD-PARTY-LICENSES about.hbs
+      # The musl target also links musl libc statically (MIT, some files BSD, ISC or public domain);
+      # cargo-about only sees crates. The Ubuntu musl package that musl-tools installs carries
+      # musl's full notice; `test -s` fails the build if it ever goes missing.
+      - name: Add the musl libc notice
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          test -s /usr/share/doc/musl/copyright
+          sep='================================================================================'
+          dash='--------------------------------------------------------------------------------'
+          {
+            printf '\n%s\nmusl libc (MIT; some files under other permissive terms, listed below)\n' "$sep"
+            printf 'Used by: the Linux (musl) build, statically linked\n%s\n\n' "$dash"
+            cat /usr/share/doc/musl/copyright
+          } >> THIRD-PARTY-LICENSES
       - name: Package
         run: |
           name="nmail-${{ matrix.target }}"
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/nmail" README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          cp "target/${{ matrix.target }}/release/nmail" README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES "$name/"
           tar -czf "$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v7
         with:
@@ -86,16 +121,27 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Move the edge tag to this commit
-        run: |
-          git tag -f edge "$GITHUB_SHA"
-          git push -f origin refs/tags/edge
-      - name: Create or update the edge pre-release
+      # A newer push can cancel this job at any step. Once the release exists the tag moves
+      # last, so a cancelled run never leaves edge pointing at a commit whose assets were not
+      # uploaded: at worst the assets and notes are newer than the tag, and the next run sets
+      # all three. The first publish must push the tag before creating the release; if it is
+      # cancelled, the next run takes whichever branch applies and finishes the job.
+      - name: Publish the edge pre-release
         run: |
           notes="Rolling build of main at ${GITHUB_SHA} ($(date -u +%Y-%m-%dT%H:%MZ)). Replaced on every push to main; expect breaking changes."
           if gh release view edge >/dev/null 2>&1; then
+            gh release upload edge dist/*.tar.gz --clobber
+            # --clobber only replaces assets of the same name, so drop any this build did not
+            # produce (such as a renamed target), or they would linger frozen at an old commit.
+            gh release view edge --json assets --jq '.assets[].name' | while read -r asset; do
+              [ -e "dist/$asset" ] || gh release delete-asset edge "$asset" --yes
+            done
             gh release edit edge --prerelease --title "edge" --notes "$notes"
+            git tag -f edge "$GITHUB_SHA"
+            git push -f origin refs/tags/edge
           else
+            git tag -f edge "$GITHUB_SHA"
+            git push -f origin refs/tags/edge
             gh release create edge --prerelease --title "edge" --notes "$notes" --verify-tag
+            gh release upload edge dist/*.tar.gz --clobber
           fi
-          gh release upload edge dist/*.tar.gz --clobber

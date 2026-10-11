@@ -65,7 +65,9 @@ One object.
 
 - `date` is the Date header; `received` is when the server got the message.
 - `body_type` is `"text/plain"` (the plain part), `"text/html"` (the HTML part converted to
-  text) or `"none"` (no text body; `body` is `""`).
+  text) or `"none"` (no text body; `body` is `""`). HTML larger than 1 MiB or nested more than
+  100 levels deep is not laid out: its tags are stripped, and `body` starts with a line
+  beginning `[nmail: this HTML is too large or too deeply nested`.
 - `attachments` are listed, not saved. `size` is the decoded size in bytes; `name` may be `null`.
 
 ## Exit codes
@@ -76,4 +78,6 @@ One object.
 | 1 | Failure: no config, a bad config, an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. |
 | 2 | Bad usage: an unknown option or an invalid value. |
 
-Errors go to standard error as one line starting with `nmail:`.
+Errors go to standard error. A failure (exit 1) prints one line starting with `nmail:`. A usage
+error (exit 2) comes from the argument parser: it starts with `error:` and may be followed by a
+usage hint on further lines.
