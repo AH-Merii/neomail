@@ -228,6 +228,16 @@ the old one, and the bullet above it is updated to link the new entry. The proce
 - **Design consistency** ([DEC-2026-10-11-consistency-process](#dec-2026-10-11-consistency-process)):
   the process in [process/consistency/process.md](process/consistency/process.md) binds every
   workflow, agent and CI job that writes `docs/` or code.
+- **Architecture rules** ([DEC-2026-10-11-architecture-retro](#dec-2026-10-11-architecture-retro)):
+  - a seams inventory comes first;
+  - a capability with two or more consumers, or a realistic alternative, gets a port with a contract
+    and a conformance suite;
+  - each cross-cutting concern has one owner section, which others link to and never redefine;
+  - the architecture is machine-checkable: a manifest, generated tables and a docs lint;
+  - invariants live in types, not comments;
+  - adversarial review runs until a round finds nothing new;
+  - when requirements change, the affected sections are re-derived, not patched;
+  - a walking skeleton comes early.
 - **Benchmarks** ([DEC-2026-10-11-bench-sample](#dec-2026-10-11-bench-sample)): a benchmark runs
   on a representative sample, just large enough to measure the metrics, never on whole datasets.
   The choice weighs speed against accuracy.
@@ -401,3 +411,14 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Owner's words:** "i like the split and status line logo"
 - **Ruling:** the "A neomail logo" bullet under [Project and delivery](#project-and-delivery):
   variation 05 replaces the original mark in `assets/logo/`.
+
+### <a id="dec-2026-10-11-architecture-retro"></a>DEC-2026-10-11-architecture-retro: rules against coupling and contradictions
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Context:** the architecture had buried PII redaction inside `nm-classify` while MCP claimed to
+  reuse it. Asked how to avoid such coupling and contradictions, Claude wrote a retro with seven
+  rules, and the owner asked to keep them.
+- **Owner's words:** "looking back in retrospective how would you avoid the "mistakes" you made when
+  it comes to coupling or contradictory design?", then, after the answer: "okay make note of this
+  retro so you can avoide that and refer to this down the line."
+- **Ruling:** the "Architecture rules" bullet under [Project and delivery](#project-and-delivery).
