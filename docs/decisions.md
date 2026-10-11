@@ -213,7 +213,8 @@ the old one, and the bullet above it is updated to link the new entry. The proce
 - **Clear, simple installation.**
 - **A simple website with docs hosted on GitHub Pages**, including a first-time setup guide
   (why and how to register OAuth apps, Proton Bridge, app passwords, keyring).
-- **A neomail logo.**
+- **A neomail logo** ([DEC-2026-10-11-logo](#dec-2026-10-11-logo)): variation 05, "Split and
+  statusline", in `assets/logo/`.
 - **Autonomy:** agents work on GitButler branches; changes are merged to `main` once CI passes; the
   docs site is published to GitHub Pages; pre-release builds may be cut without asking.
 - Commits in this repository are unsigned (local `commit.gpgsign=false`) while agents work
@@ -391,3 +392,12 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   dataset, we just needed a representitive set to get an idea and measure the metrics and compare
   speed vs accuracy metrics and decide base on the tradeoffs..."
 - **Ruling:** the "Benchmarks" bullet under [Project and delivery](#project-and-delivery).
+
+### <a id="dec-2026-10-11-logo"></a>DEC-2026-10-11-logo: the Split and statusline logo
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Context:** six variations were drafted for PR #2 (`assets/logo/variations/`), next to the
+  original cursor-n mark. The art director ranked 05 first.
+- **Owner's words:** "i like the split and status line logo"
+- **Ruling:** the "A neomail logo" bullet under [Project and delivery](#project-and-delivery):
+  variation 05 replaces the original mark in `assets/logo/`.
