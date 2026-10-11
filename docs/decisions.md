@@ -218,8 +218,10 @@ the old one, and the bullet above it is updated to link the new entry. The proce
   (why and how to register OAuth apps, Proton Bridge, app passwords, keyring).
 - **A neomail logo** ([DEC-2026-10-11-logo](#dec-2026-10-11-logo)): variation 05, "Split and
   statusline", in `assets/logo/`.
-- **Autonomy:** agents work on GitButler branches; changes are merged to `main` once CI passes; the
-  docs site is published to GitHub Pages; pre-release builds may be cut without asking.
+- **Autonomy:** agents work on GitButler branches; Claude creates, updates and merges PRs without
+  asking ([DEC-2026-10-11-pr-autonomy](#dec-2026-10-11-pr-autonomy)); changes are merged to `main`
+  once CI passes; the docs site is published to GitHub Pages; pre-release builds may be cut without
+  asking.
 - Commits in this repository are unsigned (local `commit.gpgsign=false`) while agents work
   unattended.
 - **`main` is always usable** ([DEC-2026-10-11-main-usable](#dec-2026-10-11-main-usable)): every
@@ -452,3 +454,12 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   - Keep models out of the default. A model detector may come later as an opt-in level, if its
     speed keeps up with the sorter.
 - **Builds on:** [DEC-2026-10-11-pii-rules](#dec-2026-10-11-pii-rules).
+
+### <a id="dec-2026-10-11-pr-autonomy"></a>DEC-2026-10-11-pr-autonomy: Claude creates and merges PRs
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Context:** a push to update PR #2 was held back, because pushing had not been allowed in that
+  session.
+- **Owner's words:** "I give you full permission for creating prs and merging prs!"
+- **Ruling:** the "Autonomy" bullet under [Project and delivery](#project-and-delivery). It keeps
+  the bullet's merge condition: changes reach `main` once CI passes.
