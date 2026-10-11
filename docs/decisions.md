@@ -226,7 +226,8 @@ the new entry.
   the gains ([DEC-2026-10-11-agent-kit-skill](#dec-2026-10-11-agent-kit-skill)).
 - **Autonomy:** agents work on GitButler branches; Claude creates, updates and merges PRs without
   asking ([DEC-2026-10-11-pr-autonomy](#dec-2026-10-11-pr-autonomy)); changes are merged to `main`
-  once CI passes; the docs site is published to GitHub Pages; pre-release builds may be cut without
+  once CI passes and a review agent has passed them
+  ([DEC-2026-10-11-merge-gate](#dec-2026-10-11-merge-gate), proposed); the docs site is published to GitHub Pages; pre-release builds may be cut without
   asking.
 - Commits in this repository are unsigned (local `commit.gpgsign=false`) while agents work
   unattended.
@@ -263,8 +264,8 @@ Statuses:
 
 - **proposed:** made on the owner's behalf while they were away; followed until the owner accepts
   or rejects it.
-- **recorded:** the owner ruled, and the docs are not yet updated to match.
-- **live:** the docs match.
+- **recorded:** the owner ruled; the bullet the entry names states the ruling.
+- **paused:** recorded, but on hold until the entry that paused it is superseded.
 - **superseded** or **rejected.**
 
 Never edit an entry's text. To change a ruling, add an entry that supersedes it.
@@ -289,8 +290,8 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   parallel independant features we can use try them out when they get merged. think of how you
   would set up the cicd and versioning if you hvae not already thought of that"
 - **Ruling:** the "`main` is always usable" bullet under [Project and delivery](#project-and-delivery).
-  The concrete CI/CD and versioning design is
-  [DEC-2026-10-11-edge-channel](#dec-2026-10-11-edge-channel).
+  Its first CI/CD design, [DEC-2026-10-11-edge-channel](#dec-2026-10-11-edge-channel), was
+  superseded by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first); CI/CD is now built with the first slice.
 
 ### <a id="dec-2026-10-11-test-accounts"></a>DEC-2026-10-11-test-accounts: test accounts send and receive freely
 
@@ -324,9 +325,9 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 
 - **Status:** superseded by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
   **Source:** owner, chat, 2026-10-11, delegating the decision to Claude.
-- **Owner's words:** "based on this how would avoide that from happening down the line? think of
+- **Owner's words:** "based on this how would avoid that from happening down the line? think of
   how you would structure your workflows to catch this or to routinely check I will leave the
-  decision to you."
+  decision to you." (8e661b24:761)
 - **Ruling:** a process in `docs/process/consistency/`, withdrawn before it merged.
 
 ### <a id="dec-2026-10-11-walking-skeleton"></a>DEC-2026-10-11-walking-skeleton: walking skeleton, then a thin slice
@@ -379,8 +380,8 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Status:** proposed by Claude on 2026-10-11.
 - **Proposal:** agents may draft freely. This covers MCP clients and the CLI under an agent profile.
   Sending and deleting need the owner's approval for each action.
-- **Why:** this settles the conflict between the permission profiles in `07-actions-api-cli.md` and
-  the agent rules in `12-extensions-agents-mcp.md`.
+- **Why:** this settles a conflict in the draft architecture, which was not kept: its permission
+  profiles for actions and its rules for agents disagreed.
 
 ### <a id="dec-2026-10-11-redaction-default"></a>DEC-2026-10-11-redaction-default: redact in the daemon; the benchmark picks the detectors
 
@@ -444,11 +445,12 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 ### <a id="dec-2026-10-11-pii-rules"></a>DEC-2026-10-11-pii-rules: redaction uses our own rules
 
 - **Status:** recorded. **Source:** owner, chat, 2026-10-11.
-- **Context:** on the PII benchmark's email excerpts (the first 1,500 characters, as jev receives
-  them), the rules caught 99–100% of email addresses, 96% of phone numbers, all links and 67% of
-  other IDs, at about 0.04 ms per email and 55 MB. They caught at most 29% of people's names. The
-  detectors that catch names took 1.7–1.8 s per email, which would hold up the jev sorter, or had
-  no speed measurement yet.
+- **Context:** on the PII benchmark's sample (200 email excerpts of 1,500 characters, as jev
+  receives them), the rules take 0.036 ms per email and 54.5 MB. They catch 97.6% of email-address
+  characters, 71.4% of phone numbers and 73.1% of IDs, but almost no names (0.3%), and leave 58.6%
+  of PII characters unmasked. The detectors that catch names cost far more: presidio-lg takes 56 ms
+  per email but needs Python and about 1 GB of memory, and the small models that could ship in Rust
+  take 130–148 ms and 420–580 MB. Paired with the rules, those models leave 8–10% unmasked.
 - **Owner's words:** "okay so ai say we go with our own rules for pii then, seems to be the most
   pragmatic thing to do agree or no?"
 - **Settles:** the detector default that
@@ -461,8 +463,8 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Proposal:**
   - Mask the names the daemon already knows, as whole words: the display names in From, To and Cc,
     the owner's contacts and the owner's own name.
-  - Add patterns for the identifier formats the rules miss (they caught 73% of IDs on the benchmark sample, the rules row of the
-    benchmark's `REPORT.md`).
+  - Add patterns for the identifier formats the rules miss (they caught 73% of IDs on the
+    benchmark sample).
   - Say plainly at consent that, at `standard`, other people's and organisations' names in the
     body still go to jev.
   - Keep models out of the default. A model detector may come later as an opt-in level, if its
@@ -480,7 +482,8 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 
 ### <a id="dec-2026-10-11-agent-kit"></a>DEC-2026-10-11-agent-kit: a project-agnostic agent kit
 
-- **Status:** recorded. **Source:** owner, chat, 2026-10-11 (ef6ee949:812, ef6ee949:1610).
+- **Status:** paused by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+  **Source:** owner, chat, 2026-10-11 (ef6ee949:812, ef6ee949:1610).
 - **Owner's words:** "yes but what I am saying is that this linter and wait skill and continue
   etc.. can be abstracted for any workflow right? we can just remove anything specific to neomail,
   so that any workflow can use it and tweak it as a base" and "okay for the agent-spec-kit, it
@@ -489,7 +492,8 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 
 ### <a id="dec-2026-10-11-agent-kit-skill"></a>DEC-2026-10-11-agent-kit-skill: the kit's skill follows 80/20
 
-- **Status:** recorded. **Source:** owner, chat, 2026-10-11 (ef6ee949:1992).
+- **Status:** paused by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+  **Source:** owner, chat, 2026-10-11 (ef6ee949:1992).
 - **Owner's words:** "for the skill agent skill it doesn't need to cover absolutely eveerything
   think of the 80/20 what is the least amount I can include that will give me the most gains"
 - **Builds on:** [DEC-2026-10-11-agent-kit](#dec-2026-10-11-agent-kit).
