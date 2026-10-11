@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 chrono.workspace = true
 html2text.workspace = true
+html5ever.workspace = true
 mail-parser.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

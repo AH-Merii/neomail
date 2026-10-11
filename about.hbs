@@ -1,0 +1,14 @@
+Third-party licences for nmail
+
+The nmail binary statically links the Rust crates listed below. Each licence text follows,
+with the crates it covers. The Linux (musl) build also statically links musl libc; its
+notice is the last section of this file in that build.
+{{#each licenses}}
+
+================================================================================
+{{{name}}} ({{{id}}})
+Used by: {{#each used_by}}{{{crate.name}}} {{{crate.version}}}{{#unless @last}}, {{/unless}}{{/each}}
+--------------------------------------------------------------------------------
+
+{{{text}}}
+{{/each}}

@@ -25,6 +25,9 @@ pub struct SyncReport {
     pub updated: usize,
     /// Cached messages dropped: expunged on the server, or all of them on a UIDVALIDITY change.
     pub removed: usize,
+    /// Messages asked for that came back without a body. They are not cached, and the next sync
+    /// asks for them again.
+    pub missing: usize,
     /// The server's UIDVALIDITY changed, so the cache was rebuilt.
     pub reset: bool,
 }
@@ -43,11 +46,13 @@ pub enum SyncError<E: std::error::Error + 'static> {
 /// - The first sync lists every message and fetches the `limit` that arrived last (by
 ///   INTERNALDATE, not UID: some servers number old mail highest). Its watermark is the highest
 ///   UID on the server, set only once the first sync completes; an interrupted first sync is
-///   simply run again.
+///   simply run again, and keeps what it already cached.
 /// - Later syncs fetch every UID above the watermark, with no cap, so no new mail is skipped.
 /// - Cached messages get their flags refreshed, and the ones gone from the server are dropped.
 /// - New messages are fetched oldest UID first, and each batch of a later sync raises the
 ///   watermark, so an interrupted sync resumes where it stopped.
+/// - A message the source returns without a body is counted in [`SyncReport::missing`], and the
+///   watermark stays below it, so the next sync asks for it again.
 pub async fn sync_inbox<S: MailSource>(
     source: &mut S,
     cache: &mut Cache,
@@ -77,12 +82,14 @@ pub async fn sync_inbox<S: MailSource>(
                 } else {
                     source.list_all().await.map_err(SyncError::Source)?
                 };
-                let (server, watermark) = newest_arrivals(listing, limit);
-                let new = server
-                    .keys()
-                    .copied()
+                let (chosen, watermark) = newest_arrivals(&listing, limit);
+                let new = chosen
+                    .into_iter()
                     .filter(|uid| cached.binary_search_by_key(uid, |c| c.uid).is_err())
                     .collect();
+                // The whole listing, so a first sync that runs again keeps the messages it
+                // cached before, even once newer mail pushes them out of the chosen set.
+                let server = listing.into_iter().map(|m| (m.uid, m.flags)).collect();
                 (server, new, watermark)
             }
             Some(highest) => {
@@ -109,6 +116,8 @@ pub async fn sync_inbox<S: MailSource>(
                     .keys()
                     .copied()
                     .filter(|uid| *uid > highest)
+                    // Already cached: stored above a message that came back without a body.
+                    .filter(|uid| cached.binary_search_by_key(uid, |c| c.uid).is_err())
                     .collect();
                 (server, new, None)
             }
@@ -131,40 +140,50 @@ pub async fn sync_inbox<S: MailSource>(
     report.removed += removed.len();
 
     let first_sync = mailbox.highest_uid.is_none();
+    // The lowest UID that was asked for but came back without a body. The watermark never passes
+    // it, so the next sync asks for it again.
+    let mut lowest_missing: Option<Uid> = None;
     for batch in new.chunks(FETCH_BATCH) {
         let mut fetched = source.fetch(batch).await.map_err(SyncError::Source)?;
         fetched.retain(|m| batch.binary_search(&m.uid).is_ok());
         fetched.sort_by_key(|m| m.uid);
         fetched.dedup_by_key(|m| m.uid);
-        if first_sync {
-            cache.store_messages(mailbox.id, &fetched)?;
+        let missing = batch
+            .iter()
+            .filter(|uid| fetched.binary_search_by_key(*uid, |m| m.uid).is_err());
+        report.missing += missing.clone().count();
+        lowest_missing = lowest_missing.or_else(|| missing.min().copied());
+        // A later sync raises the watermark to the highest UID of this batch below the lowest
+        // missing one; a first sync sets it only at the end.
+        let raise_to = if first_sync {
+            None
         } else {
-            cache.insert_messages(mailbox.id, &fetched)?;
-        }
+            batch
+                .iter()
+                .copied()
+                .filter(|uid| lowest_missing.is_none_or(|lowest| *uid < lowest))
+                .max()
+        };
+        cache.store_messages(mailbox.id, &fetched, raise_to)?;
         report.new += fetched.len();
     }
-    if let Some(watermark) = watermark {
+    if let Some(watermark) = watermark.filter(|_| lowest_missing.is_none()) {
         cache.raise_highest_uid(mailbox.id, watermark)?;
     }
     Ok(report)
 }
 
-/// Picks the `limit` messages that arrived last (ties and unknown dates by UID, highest first),
-/// keyed by UID, and returns them with the highest UID in the whole listing.
-fn newest_arrivals(
-    mut listing: Vec<ListedMessage>,
-    limit: NonZeroU32,
-) -> (BTreeMap<Uid, Flags>, Option<Uid>) {
+/// Picks the UIDs of the `limit` messages that arrived last (ties and unknown dates by UID,
+/// highest first), in UID order, and the highest UID in the whole listing.
+fn newest_arrivals(listing: &[ListedMessage], limit: NonZeroU32) -> (Vec<Uid>, Option<Uid>) {
     let watermark = listing.iter().map(|m| m.uid).max();
-    listing.sort_by_key(|m| m.uid);
-    listing.dedup_by_key(|m| m.uid);
+    let mut arrivals: Vec<&ListedMessage> = listing.iter().collect();
+    arrivals.sort_by_key(|m| m.uid);
+    arrivals.dedup_by_key(|m| m.uid);
     // `None` sorts before any date, so messages without one count as the oldest.
-    listing.sort_by_key(|m| std::cmp::Reverse((m.received, m.uid)));
+    arrivals.sort_by_key(|m| std::cmp::Reverse((m.received, m.uid)));
     let cap = usize::try_from(limit.get()).unwrap_or(usize::MAX);
-    let chosen = listing
-        .into_iter()
-        .take(cap)
-        .map(|m| (m.uid, m.flags))
-        .collect();
+    let mut chosen: Vec<Uid> = arrivals.into_iter().take(cap).map(|m| m.uid).collect();
+    chosen.sort_unstable();
     (chosen, watermark)
 }

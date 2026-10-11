@@ -8,6 +8,7 @@ use std::process::{Command, Output};
 use chrono::DateTime;
 use nm_core::{Cache, FetchedMessage, Flags, Uid, UidValidity};
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
 const LONG_SUBJECT: &str =
     "A rather long subject line that will certainly not fit in eighty columns at all";
@@ -104,7 +105,7 @@ fn list_prints_newest_first_within_80_columns() {
     );
     assert!(lines[3].contains("Home"), "{out}");
     for line in &lines {
-        assert!(line.chars().count() <= 80, "too wide: {line:?}");
+        assert!(line.width() <= 80, "too wide: {line:?}");
     }
     // Unread mark after the id.
     assert_eq!(lines[0].split_whitespace().nth(1), Some("*"));
@@ -159,6 +160,96 @@ fn show_human_json_and_raw() {
 
     let o = nmail(dir.path(), &["show", &id, "--raw"]);
     assert!(o.stdout.starts_with(b"From: Ada Lovelace"));
+}
+
+#[test]
+fn list_counts_emoji_sequences_as_two_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache = Cache::open(&dir.path().join("cache.sqlite3")).unwrap();
+    let work = cache
+        .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
+        .unwrap();
+    // U+2764 U+FE0F is one character wide on its own, two as an emoji sequence.
+    let hearts = "\u{2764}\u{FE0F}".repeat(40);
+    cache
+        .insert_messages(
+            work.id,
+            &[message(
+                1,
+                100,
+                "\u{2764}\u{FE0F} <a@mail.example>",
+                &hearts,
+                false,
+            )],
+        )
+        .unwrap();
+    let o = nmail(dir.path(), &["list"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = stdout(&o);
+    let line = out.lines().next().unwrap();
+    assert!(line.width() <= 80, "too wide ({}): {line:?}", line.width());
+    assert!(line.contains('…'), "{line:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_files_are_made_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = seeded();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cache = dir.path().join("cache.sqlite3");
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // An open connection keeps the -wal and -shm files, which SQLite creates with the cache
+    // file's mode, from being removed when nmail exits.
+    let _open = Cache::open(&cache).unwrap();
+    let mode = |file: &str| {
+        let meta = std::fs::metadata(dir.path().join(file)).unwrap();
+        meta.permissions().mode() & 0o777
+    };
+    assert_eq!(mode("cache.sqlite3-wal"), 0o644);
+    assert_eq!(mode("cache.sqlite3-shm"), 0o644);
+
+    assert!(nmail(dir.path(), &["list"]).status.success());
+    for file in ["cache.sqlite3", "cache.sqlite3-wal", "cache.sqlite3-shm"] {
+        assert_eq!(mode(file), 0o600, "{file}");
+    }
+}
+
+#[test]
+fn config_errors_give_the_place_but_not_the_text() {
+    let dir = tempfile::tempdir().unwrap();
+    // A secret pasted without quotes: a syntax error on line 3.
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[[accounts]]\nname = \"work\"\npassword = s3cret-fake-value\n",
+    )
+    .unwrap();
+    let o = nmail(dir.path(), &["sync"]);
+    assert_eq!(o.status.code(), Some(1));
+    let all = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(all.contains("line 3, column"), "{all}");
+    assert!(!all.contains("s3cret"), "{all}");
+    assert_eq!(all.lines().count(), 1, "{all}");
+}
+
+#[test]
+fn empty_nmail_config_counts_as_unset() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_nmail"))
+        .arg("sync")
+        .env("NMAIL_DATA_DIR", dir.path())
+        .env("NMAIL_CONFIG", "")
+        .env("HOME", dir.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .unwrap();
+    // Not a usage error (2): the default path is used, and it holds no config.
+    assert_eq!(o.status.code(), Some(1));
+    let err = stderr(&o);
+    assert!(err.contains("no config file at"), "{err}");
+    assert!(err.contains(".config/neomail/config.toml"), "{err}");
 }
 
 #[test]

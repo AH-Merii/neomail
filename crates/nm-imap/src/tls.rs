@@ -46,7 +46,8 @@ impl FromStr for CertPin {
     /// Accepts `ab12…` or `AB:12:…`.
     fn from_str(s: &str) -> Result<Self, InvalidPin> {
         let hex: Vec<u8> = s.trim().bytes().filter(|b| *b != b':').collect();
-        if hex.len() != 64 {
+        // Only ASCII hex digits: `u8::from_str_radix` alone would also take a sign, as in "+f".
+        if hex.len() != 64 || !hex.iter().all(u8::is_ascii_hexdigit) {
             return Err(InvalidPin);
         }
         let mut out = [0u8; 32];
@@ -160,6 +161,9 @@ mod tests {
             &"g".repeat(64),
             &"a".repeat(66),
             "é".repeat(32).as_str(),
+            // A sign inside a pair: from_str_radix would read "+f" as 15.
+            &format!("+f{}", "a".repeat(62)),
+            &format!("{}+f", "a".repeat(62)),
         ] {
             assert_eq!(bad.parse::<CertPin>(), Err(InvalidPin), "{bad}");
         }

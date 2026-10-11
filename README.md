@@ -17,14 +17,15 @@ cargo install --locked --git https://github.com/AH-Merii/neomail nmail
 ```
 
 Or download a build of the latest `main` from the
-[edge pre-release](https://github.com/AH-Merii/neomail/releases/tag/edge) (Linux x86_64 and
-macOS on Apple silicon), unpack it, and put `nmail` on your `PATH`. Edge is rebuilt on every
-merge, so expect changes.
+[edge pre-release](https://github.com/AH-Merii/neomail/releases/tag/edge) (Linux x86_64, a
+static binary that needs no particular glibc, and macOS on Apple silicon), unpack it, and put
+`nmail` on your `PATH`. Edge is rebuilt on every merge, so expect changes. Each tarball carries
+the licences of the crates built into it in `THIRD-PARTY-LICENSES`.
 
 ### Configure
 
 Create `~/.config/neomail/config.toml` (or `$XDG_CONFIG_HOME/neomail/config.toml`; `--config PATH`
-or `NMAIL_CONFIG` point elsewhere):
+or `NMAIL_CONFIG` point elsewhere, and an empty `NMAIL_CONFIG` counts as unset):
 
 ```toml
 [[accounts]]

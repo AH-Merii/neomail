@@ -8,7 +8,8 @@ use nm_core::cache::{ListEntry, StoredMessage};
 use nm_core::parse::{Attachment, BodyKind, EmailAddress, ParsedMessage};
 use nm_core::{Flags, MessageId, Uid};
 use serde::Serialize;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// The human list fits this many columns.
 pub const WIDTH: usize = 80;
@@ -188,21 +189,23 @@ fn text(s: &str) -> String {
         .collect()
 }
 
-/// Cuts `s` to `width` display columns with an ellipsis; pads it when `pad` is set.
+/// Cuts `s` to `width` display columns with an ellipsis; pads it when `pad` is set. Widths are
+/// measured per grapheme cluster, so an emoji sequence such as U+2764 U+FE0F counts as the two
+/// columns a terminal gives it, and is never cut in half.
 fn fit(s: &str, width: usize, pad: bool) -> String {
-    let full: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
+    let full = s.width();
     let mut out = String::new();
     let mut used = 0;
     if full <= width {
         out.push_str(s);
         used = full;
     } else if width > 0 {
-        for c in s.chars() {
-            let w = c.width().unwrap_or(0);
+        for g in s.graphemes(true) {
+            let w = g.width();
             if used + w > width - 1 {
                 break;
             }
-            out.push(c);
+            out.push_str(g);
             used += w;
         }
         out.push('…');
@@ -224,6 +227,13 @@ mod tests {
         assert_eq!(fit("hello world", 6, false), "hello…");
         assert_eq!(fit("日本語のテキスト", 7, true), "日本語…");
         assert_eq!(fit("日本語のテキスト", 8, true), "日本語… ");
+        // U+2764 alone is one column; with U+FE0F it is an emoji, two columns.
+        assert_eq!(fit("\u{2764}\u{FE0F}", 2, true), "\u{2764}\u{FE0F}");
+        assert_eq!(fit("a\u{2764}\u{FE0F}b", 3, false), "a…");
+        assert_eq!(
+            fit("\u{2764}\u{FE0F}\u{2764}\u{FE0F}", 3, true),
+            "\u{2764}\u{FE0F}…"
+        );
     }
 
     #[test]

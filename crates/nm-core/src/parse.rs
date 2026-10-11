@@ -7,6 +7,15 @@ use serde::Serialize;
 /// Width that HTML bodies are wrapped to when converted to text.
 const HTML_WRAP: usize = 80;
 
+/// Above this size or nesting depth, HTML is not laid out (html2text's work grows faster than
+/// linearly with nesting, so hostile mail could stall `nmail show`); its tags are stripped instead.
+const HTML_MAX_BYTES: usize = 1 << 20;
+const HTML_MAX_DEPTH: usize = 100;
+
+/// The first line of a body whose HTML was only stripped of tags.
+pub const HTML_STRIPPED_NOTE: &str =
+    "[nmail: this HTML is too large or too deeply nested to lay out; showing its text only]";
+
 /// A sender or recipient.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EmailAddress {
@@ -115,14 +124,7 @@ pub fn parse(raw: &[u8]) -> Result<ParsedMessage, ParseError> {
         .find(|p| p.is_text_html())
         .and_then(MessagePart::text_contents)
     {
-        // Mail uses tables for layout, so their borders are noise. A conversion failure falls
-        // back to the HTML source rather than hiding the body.
-        let text = html2text::config::plain()
-            .no_table_borders()
-            .string_from_read(html.as_bytes(), HTML_WRAP)
-            .unwrap_or_else(|_| html.into());
-        let trimmed: Vec<&str> = text.lines().map(str::trim_end).collect();
-        (BodyKind::Html, trimmed.join("\n"))
+        (BodyKind::Html, html_to_text(html))
     } else {
         (BodyKind::None, String::new())
     };
@@ -153,6 +155,117 @@ pub fn parse(raw: &[u8]) -> Result<ParsedMessage, ParseError> {
         body,
         attachments,
     })
+}
+
+/// Converts an HTML body to text, with a bounded amount of work.
+fn html_to_text(html: &str) -> String {
+    let text = html_layout(html)
+        .unwrap_or_else(|| format!("{HTML_STRIPPED_NOTE}\n\n{}", strip_tags(html)));
+    let trimmed: Vec<&str> = text.lines().map(str::trim_end).collect();
+    trimmed.join("\n")
+}
+
+/// Lays `html` out as text, or `None` when it is too large or its parsed DOM too deep to lay out
+/// in bounded time. The depth is measured on html5ever's tree, not on the tags in the source,
+/// because the parser ignores stray end tags and reopens formatting elements on its own.
+fn html_layout(html: &str) -> Option<String> {
+    if html.len() > HTML_MAX_BYTES {
+        return None;
+    }
+    let dom = parse_bounded(html)?;
+    // Mail uses tables for layout, so their borders are noise. A conversion failure falls back
+    // to the HTML source rather than hiding the body.
+    let config = html2text::config::plain().no_table_borders();
+    let laid_out = config
+        .dom_to_render_tree(&dom)
+        .and_then(|tree| config.render_to_string(tree, HTML_WRAP));
+    Some(laid_out.unwrap_or_else(|_| html.into()))
+}
+
+/// Parses `html` as html2text would, or gives up with `None` once the tree nests deeper than
+/// `HTML_MAX_DEPTH`. html5ever's own work also grows with nesting (its scope checks walk the
+/// stack of open elements), so the input is fed in chunks and the depth checked after each one:
+/// a hostile body costs at most one chunk's worth of deep parsing.
+fn parse_bounded(html: &str) -> Option<html2text::RcDom> {
+    use html5ever::tendril::{StrTendril, TendrilSink};
+    const CHUNK: usize = 16 << 10;
+
+    let opts = html5ever::ParseOpts {
+        tree_builder: html5ever::tree_builder::TreeBuilderOpts {
+            scripting_enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut parser = html5ever::parse_document(html2text::RcDom::default(), opts);
+    let mut rest = html;
+    while !rest.is_empty() {
+        let mut end = rest.len().min(CHUNK);
+        while !rest.is_char_boundary(end) {
+            end += 1;
+        }
+        let (chunk, tail) = rest.split_at(end);
+        parser.process(StrTendril::from_slice(chunk));
+        if dom_depth(&parser.tokenizer.sink.sink.document) > HTML_MAX_DEPTH {
+            return None;
+        }
+        rest = tail;
+    }
+    let dom = parser.finish();
+    (dom_depth(&dom.document) <= HTML_MAX_DEPTH).then_some(dom)
+}
+
+/// How deeply the elements under `root` nest, counted without recursion so a hostile tree cannot
+/// overflow the stack. Stops counting once past `HTML_MAX_DEPTH`.
+fn dom_depth(root: &html2text::Handle) -> usize {
+    let mut max = 0;
+    let mut stack = vec![(root.clone(), 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        let depth = match node.data {
+            html2text::Element { .. } => depth + 1,
+            _ => depth,
+        };
+        max = max.max(depth);
+        if max > HTML_MAX_DEPTH {
+            break;
+        }
+        stack.extend(node.children.borrow().iter().map(|c| (c.clone(), depth)));
+    }
+    max
+}
+
+/// The text between tags, with the commonest entities decoded and blank runs collapsed: the
+/// fallback for HTML too large or deep to lay out.
+fn strip_tags(html: &str) -> String {
+    let mut text = String::with_capacity(html.len() / 2);
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => {
+                in_tag = true;
+                text.push(' ');
+            }
+            '>' if in_tag => in_tag = false,
+            c if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    let text = text
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if !words.is_empty() {
+            out.push_str(&words.join(" "));
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn addresses(header: Option<&Address<'_>>) -> Vec<EmailAddress> {
@@ -212,6 +325,54 @@ Content-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--b1--\r\n";
         assert_eq!(m.body_kind, BodyKind::Html);
         assert!(m.body.contains("Hello"), "{}", m.body);
         assert!(!m.body.contains("<p>"), "{}", m.body);
+    }
+
+    fn html_mail(html: &str) -> String {
+        format!("From: a@mail.example\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n")
+    }
+
+    /// Parses `html` as a mail body within two seconds and checks it was only stripped.
+    fn assert_stripped_quickly(html: &str) {
+        let start = std::time::Instant::now();
+        let m = parse(html_mail(html).as_bytes()).unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(m.body_kind, BodyKind::Html);
+        assert!(m.body.starts_with(HTML_STRIPPED_NOTE), "{}", m.body);
+        assert!(m.body.contains("deep text"), "{}", m.body);
+        assert!(!m.body.contains('<'), "{}", m.body);
+    }
+
+    #[test]
+    fn deeply_nested_html_is_stripped_quickly() {
+        let depth = 50_000;
+        let html = format!(
+            "{}deep text{}",
+            "<div>".repeat(depth),
+            "</div>".repeat(depth)
+        );
+        assert_stripped_quickly(&html);
+    }
+
+    #[test]
+    fn stray_end_tags_do_not_hide_nesting() {
+        // The parser ignores an end tag that matches no open element, so these nest 50,000 deep.
+        assert_stripped_quickly(&("<div></b>".repeat(50_000) + "deep text"));
+        assert_stripped_quickly(&("<span></x>".repeat(50_000) + "deep text"));
+    }
+
+    #[test]
+    fn long_flat_html_is_still_laid_out() {
+        let html = "<p>line<br>".repeat(500) + "<img src=x><table><tr><td>cell</td></tr></table>";
+        let m = parse(html_mail(&html).as_bytes()).unwrap();
+        assert!(!m.body.starts_with(HTML_STRIPPED_NOTE), "{}", m.body);
+        assert!(m.body.contains("cell"), "{}", m.body);
+        let dom = html2text::config::plain()
+            .parse_html("<div><div><span>x</span></div></div>".as_bytes())
+            .unwrap();
+        // html, body, then the three written elements.
+        assert_eq!(dom_depth(&dom.document), 5);
+        assert_eq!(strip_tags("<b>a &amp; b</b>\n\n<i>c</i>"), "a & b\nc\n");
     }
 
     #[test]
