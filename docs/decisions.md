@@ -221,7 +221,8 @@ the old one, and the bullet above it is updated to link the new entry. The proce
 - **Agent kit** ([DEC-2026-10-11-agent-kit](#dec-2026-10-11-agent-kit)): the workflow helpers
   (the script linter, the wait helpers, run continuation and the rest) become a project-agnostic
   Claude Code plugin with nothing specific to neomail, kept in the owner's public plugin
-  marketplace, AH-Merii/claude-plugins.
+  marketplace, AH-Merii/claude-plugins. Its skill carries only the few practices that give most of
+  the gains ([DEC-2026-10-11-agent-kit-skill](#dec-2026-10-11-agent-kit-skill)).
 - **Autonomy:** agents work on GitButler branches; Claude creates, updates and merges PRs without
   asking ([DEC-2026-10-11-pr-autonomy](#dec-2026-10-11-pr-autonomy)); changes are merged to `main`
   once CI passes; the docs site is published to GitHub Pages; pre-release builds may be cut without
@@ -475,4 +476,12 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   etc.. can be abstracted for any workflow right? we can just remove anything specific to neomail,
   so that any workflow can use it and tweak it as a base" and "okay for the agent-spec-kit, it
   should go in @~/Projects/claude-plugins/"
+- **Ruling:** the "Agent kit" bullet under [Project and delivery](#project-and-delivery).
+
+### <a id="dec-2026-10-11-agent-kit-skill"></a>DEC-2026-10-11-agent-kit-skill: the kit's skill follows 80/20
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11 (ef6ee949:1992).
+- **Owner's words:** "for the skill agent skill it doesn't need to cover absolutely eveerything
+  think of the 80/20 what is the least amount I can include that will give me the most gains"
+- **Builds on:** [DEC-2026-10-11-agent-kit](#dec-2026-10-11-agent-kit).
 - **Ruling:** the "Agent kit" bullet under [Project and delivery](#project-and-delivery).
