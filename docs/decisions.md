@@ -1,8 +1,13 @@
 # neomail — product decisions
 
 The source of truth for what neomail must do. Decisions are made by the project owner; agents
-implement them. When a decision changes, edit this file in the same change. Newest first within
-each section is not required — keep related decisions together.
+implement them. The bullets below say what is decided now; keep related decisions together.
+
+Each ruling also has an entry in the [decision log](#decision-log) with an ID
+(`DEC-YYYY-MM-DD-slug`), the owner's own words and a status. Docs and workflow scripts cite the
+ID and never copy the text. Log entries are append-only: a change is a new entry that supersedes
+the old one, and the bullet above it is updated to link the new entry. The process is
+[process/consistency/process.md](process/consistency/process.md).
 
 ## Identity
 
@@ -73,6 +78,10 @@ each section is not required — keep related decisions together.
   rule above is the only exception).
 - **Each email is classified once** (results cached locally with model id, probabilities and
   timestamp so thresholds can be re-tuned without re-calling the model).
+- **First run** ([DEC-2026-10-11-first-run](#dec-2026-10-11-first-run)): neomail classifies the last 365 days
+  automatically, newest first, without asking, capped at the newest 1,000 emails. It then shows an
+  estimate of what classifying all the remaining emails would cost (count, requests, time, money),
+  and the user can start that with one action. The window and the cap are configurable.
 
 ## Data and storage
 
@@ -100,6 +109,12 @@ each section is not required — keep related decisions together.
     - The confidence bar fills in alongside it.
   - The other prototyped concepts (Sorting machine, Scan & stamp) are not required for v1. The
     animation-style seam keeps them possible later. Prototypes: PR #1, `prototypes/sort-animation`.
+- **Refined motion** ([DEC-2026-10-10-motion](#dec-2026-10-10-motion)): small, tasteful animations
+  and transitions across the whole experience. The design is delegated: there are no mock-ups for
+  the owner to choose from.
+- **Thoughtful sound** ([DEC-2026-10-11-sound](#dec-2026-10-11-sound)): a few tasteful sounds for
+  meaningful moments, such as sending an email or receiving a notification. Never on navigation or
+  other frequent actions.
 - **Drafting feels like Neovim.**
   - Full modal editing with motions, counts and text objects.
   - Absolute, relative and hybrid line numbers (`number` / `relativenumber`), so jumps like `5j`, `12k` and `3dd` are quick.
@@ -203,3 +218,163 @@ each section is not required — keep related decisions together.
   docs site is published to GitHub Pages; pre-release builds may be cut without asking.
 - Commits in this repository are unsigned (local `commit.gpgsign=false`) while agents work
   unattended.
+- **`main` is always usable** ([DEC-2026-10-11-main-usable](#dec-2026-10-11-main-usable)): every
+  merge to `main` builds and publishes `nmail`, so whatever has landed can be tried while the rest
+  is still being built. A merged CLI command works before the TUI exists, and independent features
+  become usable as each one merges.
+- **Live tests** ([DEC-2026-10-11-test-accounts](#dec-2026-10-11-test-accounts)): the three
+  dedicated test accounts may send and receive freely. The owner's personal accounts are never used.
+- **Design consistency** ([DEC-2026-10-11-consistency-process](#dec-2026-10-11-consistency-process)):
+  the process in [process/consistency/process.md](process/consistency/process.md) binds every
+  workflow, agent and CI job that writes `docs/` or code.
+
+## Decision log
+
+Statuses:
+
+- **proposed:** made on the owner's behalf while they were away; followed until the owner accepts
+  or rejects it.
+- **recorded:** the owner ruled, and the docs are not yet updated to match.
+- **live:** the docs match.
+- **superseded** or **rejected.**
+
+Never edit an entry's text. To change a ruling, add an entry that supersedes it.
+
+### <a id="dec-2026-10-11-first-run"></a>DEC-2026-10-11-first-run: classify the last year on first run
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Supersedes:** `PROV-07`, the plan's provisional default P7, which asked before classifying more
+  than 5,000 messages.
+- **Owner's words:** "yes do the first 365 automatically and the limit is capped to the first 1000
+  emails. with an estimate on how much it would cost to do all of them."
+- **Ruling:** the "First run" bullet under [Classification](#classification-jev).
+- **Retires:** the key `classify.ask_above`, the value "5,000 messages", and the phrases "asks
+  above" and "cost confirmation above".
+
+### <a id="dec-2026-10-11-main-usable"></a>DEC-2026-10-11-main-usable: `main` is always usable
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Owner's words:** "we should have ci/cd nmail always gets built on merge to main that makes it
+  to se we can try it while it is being built. for example if the cli is built and the interface is
+  not, we can still use the cli and do stuff with it, even for the cli, if we are developing
+  parallel independant features we can use try them out when they get merged. think of how you
+  would set up the cicd and versioning if you hvae not already thought of that"
+- **Ruling:** the "`main` is always usable" bullet under [Project and delivery](#project-and-delivery).
+  The concrete CI/CD and versioning design is
+  [DEC-2026-10-11-edge-channel](#dec-2026-10-11-edge-channel).
+
+### <a id="dec-2026-10-11-test-accounts"></a>DEC-2026-10-11-test-accounts: test accounts send and receive freely
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Supersedes:** the architecture brief's provisional D4 (sends only between test accounts, at
+  most 3 per run), which was never recorded here.
+- **Owner's words:** "As for the emails, they can send and recieve, we don't need to be worried
+  since these are brand new emails and they have not been used for anything."
+- **Ruling:** the "Live tests" bullet under [Project and delivery](#project-and-delivery).
+
+### <a id="dec-2026-10-10-motion"></a>DEC-2026-10-10-motion: refined motion, design delegated
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-10.
+- **Owner's words:** "I also want us to think of the small animations here and there that add a
+  touch of refinements to the entire experience. Some tasteful animations and transitions. I will
+  leave that to you though, no need to mock and have me decide, just know that I am expecting a
+  refined experience"
+- **Ruling:** the "Refined motion" bullet under [UX](#ux).
+
+### <a id="dec-2026-10-11-sound"></a>DEC-2026-10-11-sound: a few thoughtful sounds
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Owner's words:** "also since we thought of the small animations it would also be useful to
+  think of any sounds that go with them, I don't want everything to have a sound, but it would be
+  nice to have sounds thoughtfully added, for example when sending an email, when receiving a
+  notification, I would not want a sound for example on each navigation. thoughtful, tasteful, the
+  small things that add je ne se quoi."
+- **Ruling:** the "Thoughtful sound" bullet under [UX](#ux).
+
+### <a id="dec-2026-10-11-consistency-process"></a>DEC-2026-10-11-consistency-process: how the design stays consistent
+
+- **Status:** recorded; the tooling it needs is not built yet. **Source:** owner, chat,
+  2026-10-11, delegating the decision to Claude.
+- **Owner's words:** "based on this how would avoide that from happening down the line? think of
+  how you would structure your workflows to catch this or to routinely check I will leave the
+  decision to you."
+- **Ruling:** [process/consistency/process.md](process/consistency/process.md). Its evidence is in
+  the same folder.
+
+### <a id="dec-2026-10-11-walking-skeleton"></a>DEC-2026-10-11-walking-skeleton: walking skeleton, then a thin slice
+
+- **Status:** proposed by Claude on 2026-10-11 while the owner was hands-off. It was D1 in the
+  architecture brief.
+- **Proposal:**
+  - Wave 0 ends with every crate compiling behind its real traits, and with the composition roots
+    (`nm-daemon`, `nm-tui`, `nmail`) running end to end on stubs and fakes (`nmail --demo`, one
+    action over IPC).
+  - Work is then ordered by a thin-slice milestone, 0.1.0-alpha.1: read, search and triage
+    (archive, delete, move, classify) real mail in the TUI from Proton (via Bridge) and Gmail.
+  - Everything else follows that milestone.
+
+### <a id="dec-2026-10-11-crate-reasons"></a>DEC-2026-10-11-crate-reasons: every crate has a reason
+
+- **Status:** proposed by Claude on 2026-10-11. It was D2 in the architecture brief.
+- **Proposal:** every crate states its reason in the manifest, from a fixed list:
+  - an interface;
+  - an adapter for a port with a realistic alternative;
+  - isolation of a heavy or optional dependency;
+  - a licence boundary;
+  - a process or sandbox boundary;
+  - a composition root;
+  - test-only;
+  - a work package that would otherwise be larger than XL.
+
+  A crate with no reason merges into a neighbour. There is no target crate count.
+
+### <a id="dec-2026-10-11-jev-offline"></a>DEC-2026-10-11-jev-offline: tests never call jev
+
+- **Status:** proposed by Claude on 2026-10-11. It was D3 in the architecture brief.
+- **Proposal:** CI and automated tests never call jev; they use fakes and recorded fixtures. Live
+  calls happen only in gated live tests, capped at 20 requests per run and recorded in a spend
+  ledger.
+
+### <a id="dec-2026-10-11-merge-gate"></a>DEC-2026-10-11-merge-gate: how work merges
+
+- **Status:** proposed by Claude on 2026-10-11. It was D5 in the architecture brief.
+- **Proposal:** one PR per work package, squash-merged once CI is green and an independent review
+  agent has passed it. There is no owner review gate.
+- **Open question for the owner:** does this refine the "Autonomy" bullet (CI must pass, and a
+  review agent must also pass) or replace it? Claude follows "refine" until the owner says
+  otherwise.
+
+### <a id="dec-2026-10-11-agent-send"></a>DEC-2026-10-11-agent-send: agents draft freely, send with approval
+
+- **Status:** proposed by Claude on 2026-10-11.
+- **Proposal:** agents may draft freely. This covers MCP clients and the CLI under an agent profile.
+  Sending and deleting need the owner's approval for each action.
+- **Why:** this settles the conflict between the permission profiles in `07-actions-api-cli.md` and
+  the agent rules in `12-extensions-agents-mcp.md`.
+
+### <a id="dec-2026-10-11-redaction-default"></a>DEC-2026-10-11-redaction-default: redact in the daemon; the benchmark picks the detectors
+
+- **Status:** proposed by Claude on 2026-10-11.
+- **Proposal:** text leaves the daemon, for jev or for MCP clients, only after redaction inside the
+  daemon. `privacy.detectors` defaults to `["rules"]` until the PII benchmark reports, and the
+  benchmark's result then sets the default.
+- **Owner's words on the benchmark:** "you will benchmark it later and that will enforce your
+  decision."
+
+### <a id="dec-2026-10-11-edge-channel"></a>DEC-2026-10-11-edge-channel: the edge channel and versioning
+
+- **Status:** proposed by Claude on 2026-10-11. This is the concrete design for
+  [DEC-2026-10-11-main-usable](#dec-2026-10-11-main-usable).
+- **Proposal:**
+  - The composition roots (`nmail`, `nm-daemon`, `nm-tui`) exist from wave 0 and call every
+    crate's frozen constructor. A crate that is not built yet returns a typed
+    `NotImplemented { wp }` error, so a merge lights up its feature without re-wiring.
+  - Each crate reports its status: stub, partial or ready. `nmail features` lists what works, and
+    `nmail --demo` runs on fixtures.
+  - Every PR runs a smoke test of the binary. Every merge to `main` publishes a rolling `edge`
+    pre-release, like Neovim's nightly.
+  - Versions are `0.1.0-dev.N+gSHA` on edge, with `v0.1.0-alpha.N` tags at milestones. The storage
+    schema and the IPC protocol carry their own version numbers.
+  - Edge installs as `nmail-edge`, with its own data directory and keyring namespace, and can
+    update itself. Tagged releases do not update themselves.
+- **Refines:** D1 in the brief, which had stewards re-wire the roots at each phase.
