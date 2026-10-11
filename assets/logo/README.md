@@ -1,6 +1,6 @@
 # neomail logo
 
-**Split and statusline**, adopted by [DEC-2026-10-11-logo](../../docs/decisions.md#dec-2026-10-11-logo). It was variation 05; the drafts are in [`variations/`](variations/) and the retired cursor-n set is in [`variations/00-cursor-n/`](variations/00-cursor-n/).
+**Split and statusline**, adopted by [DEC-2026-10-11-logo](../../docs/decisions.md#dec-2026-10-11-logo). It was variation 05 of the drafts in [PR #2](https://github.com/AH-Merii/neomail/pull/2). The other drafts and the retired cursor-n set were removed once 05 was chosen; they stay in that PR's history.
 
 ## The idea
 
