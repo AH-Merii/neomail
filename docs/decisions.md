@@ -3,11 +3,11 @@
 The source of truth for what neomail must do. Decisions are made by the project owner; agents
 implement them. The bullets below say what is decided now; keep related decisions together.
 
-Each ruling also has an entry in the [decision log](#decision-log) with an ID
-(`DEC-YYYY-MM-DD-slug`), the owner's own words and a status. Docs and workflow scripts cite the
-ID and never copy the text. Log entries are append-only: a change is a new entry that supersedes
-the old one, and the bullet above it is updated to link the new entry. The process is
-[process/consistency/process.md](process/consistency/process.md).
+Bullets that link to an entry in the [decision log](#decision-log) were added with the log. The
+entry gives the ruling an ID (`DEC-YYYY-MM-DD-slug`), the owner's own words and a status. Bullets
+without a link predate the log. Docs cite the ID instead of copying the ruling. Log entries are
+append-only: a change is a new entry that supersedes the old one, and the bullet is updated to link
+the new entry.
 
 ## Identity
 
@@ -218,7 +218,8 @@ the old one, and the bullet above it is updated to link the new entry. The proce
   (why and how to register OAuth apps, Proton Bridge, app passwords, keyring).
 - **A neomail logo** ([DEC-2026-10-11-logo](#dec-2026-10-11-logo)): variation 05, "Split and
   statusline", in `assets/logo/`.
-- **Agent kit** ([DEC-2026-10-11-agent-kit](#dec-2026-10-11-agent-kit)): the workflow helpers
+- **Agent kit** ([DEC-2026-10-11-agent-kit](#dec-2026-10-11-agent-kit)): paused by
+  [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first). When it resumes, the workflow helpers
   (the script linter, the wait helpers, run continuation and the rest) become a project-agnostic
   Claude Code plugin with nothing specific to neomail, kept in the owner's public plugin
   marketplace, AH-Merii/claude-plugins. Its skill carries only the few practices that give most of
@@ -233,21 +234,25 @@ the old one, and the bullet above it is updated to link the new entry. The proce
   merge to `main` builds and publishes `nmail`, so whatever has landed can be tried while the rest
   is still being built. A merged CLI command works before the TUI exists, and independent features
   become usable as each one merges.
+- **Build first** ([DEC-2026-10-11-build-first](#dec-2026-10-11-build-first)): neomail grows in
+  thin slices, each usable on its own and merged to `main` when it works. The first slice is a
+  read-only inbox in the CLI: `nmail` syncs one account's inbox, lists its messages and shows one.
+  Design docs stay short and follow the code. A review runs at most two rounds, and what is left
+  becomes an issue. The agent kit and the docs lint wait until the app needs them.
 - **Live tests** ([DEC-2026-10-11-test-accounts](#dec-2026-10-11-test-accounts)): the three
   dedicated test accounts may send and receive freely. The owner's personal accounts are never used.
-- **Design consistency** ([DEC-2026-10-11-consistency-process](#dec-2026-10-11-consistency-process)):
-  the process in [process/consistency/process.md](process/consistency/process.md) binds every
-  workflow, agent and CI job that writes `docs/` or code.
-- **Architecture rules** ([DEC-2026-10-11-architecture-retro](#dec-2026-10-11-architecture-retro)):
-  - a seams inventory comes first;
+- **Architecture rules** ([DEC-2026-10-11-architecture-retro](#dec-2026-10-11-architecture-retro)),
+  applied to code as it lands ([DEC-2026-10-11-build-first](#dec-2026-10-11-build-first)):
+  - each slice lists the seams it touches before it is built;
   - a capability with two or more consumers, or a realistic alternative, gets a port with a contract
     and a conformance suite;
   - each cross-cutting concern has one owner section, which others link to and never redefine;
-  - the architecture is machine-checkable: a manifest, generated tables and a docs lint;
   - invariants live in types, not comments;
-  - adversarial review runs until a round finds nothing new;
+  - reviews are adversarial and stop after two rounds;
   - when requirements change, the affected sections are re-derived, not patched;
-  - a walking skeleton comes early.
+  - a walking skeleton comes early: the first slice is one;
+  - the machine-checkable architecture (a manifest, generated tables and a docs lint) waits until
+    there is code for it to check.
 - **Benchmarks** ([DEC-2026-10-11-bench-sample](#dec-2026-10-11-bench-sample)): a benchmark runs
   on a representative sample, just large enough to measure the metrics, never on whole datasets.
   The choice weighs speed against accuracy.
@@ -317,18 +322,18 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 
 ### <a id="dec-2026-10-11-consistency-process"></a>DEC-2026-10-11-consistency-process: how the design stays consistent
 
-- **Status:** recorded; the tooling it needs is not built yet. **Source:** owner, chat,
-  2026-10-11, delegating the decision to Claude.
+- **Status:** superseded by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+  **Source:** owner, chat, 2026-10-11, delegating the decision to Claude.
 - **Owner's words:** "based on this how would avoide that from happening down the line? think of
   how you would structure your workflows to catch this or to routinely check I will leave the
   decision to you."
-- **Ruling:** [process/consistency/process.md](process/consistency/process.md). Its evidence is in
-  the same folder.
+- **Ruling:** a process in `docs/process/consistency/`, withdrawn before it merged.
 
 ### <a id="dec-2026-10-11-walking-skeleton"></a>DEC-2026-10-11-walking-skeleton: walking skeleton, then a thin slice
 
-- **Status:** proposed by Claude on 2026-10-11 while the owner was hands-off. It was D1 in the
-  architecture brief.
+- **Status:** superseded by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+  Proposed by Claude on 2026-10-11 while the owner was hands-off. It was D1 in the architecture
+  brief.
 - **Proposal:**
   - Wave 0 ends with every crate compiling behind its real traits, and with the composition roots
     (`nm-daemon`, `nm-tui`, `nmail`) running end to end on stubs and fakes (`nmail --demo`, one
@@ -339,7 +344,8 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 
 ### <a id="dec-2026-10-11-crate-reasons"></a>DEC-2026-10-11-crate-reasons: every crate has a reason
 
-- **Status:** proposed by Claude on 2026-10-11. It was D2 in the architecture brief.
+- **Status:** superseded by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+  Proposed by Claude on 2026-10-11. It was D2 in the architecture brief.
 - **Proposal:** every crate states its reason in the manifest, from a fixed list:
   - an interface;
   - an adapter for a port with a realistic alternative;
@@ -387,7 +393,8 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 
 ### <a id="dec-2026-10-11-edge-channel"></a>DEC-2026-10-11-edge-channel: the edge channel and versioning
 
-- **Status:** proposed by Claude on 2026-10-11. This is the concrete design for
+- **Status:** superseded by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+  Proposed by Claude on 2026-10-11 as the concrete design for
   [DEC-2026-10-11-main-usable](#dec-2026-10-11-main-usable).
 - **Proposal:**
   - The composition roots (`nmail`, `nm-daemon`, `nm-tui`) exist from wave 0 and call every
@@ -401,7 +408,8 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
     schema and the IPC protocol carry their own version numbers.
   - Edge installs as `nmail-edge`, with its own data directory and keyring namespace, and can
     update itself. Tagged releases do not update themselves.
-- **Refines:** D1 in the brief, which had stewards re-wire the roots at each phase.
+- **Refines:** [DEC-2026-10-11-walking-skeleton](#dec-2026-10-11-walking-skeleton) (D1 in the
+  brief), which had stewards re-wire the roots at each phase.
 
 ### <a id="dec-2026-10-11-bench-sample"></a>DEC-2026-10-11-bench-sample: benchmarks decide on a representative sample
 
@@ -453,7 +461,8 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Proposal:**
   - Mask the names the daemon already knows, as whole words: the display names in From, To and Cc,
     the owner's contacts and the owner's own name.
-  - Add patterns for the identifier formats the rules miss (they caught 67% of IDs).
+  - Add patterns for the identifier formats the rules miss (they caught 73% of IDs on the benchmark sample, the rules row of the
+    benchmark's `REPORT.md`).
   - Say plainly at consent that, at `standard`, other people's and organisations' names in the
     body still go to jev.
   - Keep models out of the default. A model detector may come later as an opt-in level, if its
@@ -485,3 +494,27 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   think of the 80/20 what is the least amount I can include that will give me the most gains"
 - **Builds on:** [DEC-2026-10-11-agent-kit](#dec-2026-10-11-agent-kit).
 - **Ruling:** the "Agent kit" bullet under [Project and delivery](#project-and-delivery).
+
+### <a id="dec-2026-10-11-build-first"></a>DEC-2026-10-11-build-first: build usable slices, not more design
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11 (ef6ee949:2139, ef6ee949:2168,
+  ef6ee949:2208, ef6ee949:2216, ef6ee949:2249).
+- **Context:** no code existed yet. The draft architecture had grown to 4,807 lines and the plan to
+  1,065, each review round of them still found new problems, and the design and tooling runs kept
+  going without finishing.
+- **Owner's words:** "maybe this is to do with trying to perfect everything instead of building",
+  then "if you look at it, nothing is finishing..". Asked whether to change course, the owner chose
+  "Stop polishing, build now" and, for the first slice, "Read-only inbox in the CLI". Then: "forget
+  about agent kit now, let us focus on what matters" and "we need to simplify what we have, and fix
+  this mess..."
+- **Ruling:** the "Build first" bullet under [Project and delivery](#project-and-delivery).
+- **Supersedes:** [DEC-2026-10-11-consistency-process](#dec-2026-10-11-consistency-process), and
+  the proposals [DEC-2026-10-11-walking-skeleton](#dec-2026-10-11-walking-skeleton),
+  [DEC-2026-10-11-crate-reasons](#dec-2026-10-11-crate-reasons) and
+  [DEC-2026-10-11-edge-channel](#dec-2026-10-11-edge-channel), which assumed the whole crate design
+  up front.
+- **Pauses:** [DEC-2026-10-11-agent-kit](#dec-2026-10-11-agent-kit) and
+  [DEC-2026-10-11-agent-kit-skill](#dec-2026-10-11-agent-kit-skill).
+- **Refines:** [DEC-2026-10-11-architecture-retro](#dec-2026-10-11-architecture-retro). Its rules
+  apply to code as it lands: seams are listed per slice, reviews stop after two rounds, and the
+  manifest and docs lint wait until there is code to check. These details are Claude's.
