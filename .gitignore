@@ -21,3 +21,7 @@ token*.json
 # Local development data
 /.dev/
 /dev-data/
+
+# Python bytecode from the asset build scripts
+__pycache__/
+*.pyc
