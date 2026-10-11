@@ -218,6 +218,10 @@ the old one, and the bullet above it is updated to link the new entry. The proce
   (why and how to register OAuth apps, Proton Bridge, app passwords, keyring).
 - **A neomail logo** ([DEC-2026-10-11-logo](#dec-2026-10-11-logo)): variation 05, "Split and
   statusline", in `assets/logo/`.
+- **Agent kit** ([DEC-2026-10-11-agent-kit](#dec-2026-10-11-agent-kit)): the workflow helpers
+  (the script linter, the wait helpers, run continuation and the rest) become a project-agnostic
+  Claude Code plugin with nothing specific to neomail, kept in the owner's public plugin
+  marketplace, AH-Merii/claude-plugins.
 - **Autonomy:** agents work on GitButler branches; Claude creates, updates and merges PRs without
   asking ([DEC-2026-10-11-pr-autonomy](#dec-2026-10-11-pr-autonomy)); changes are merged to `main`
   once CI passes; the docs site is published to GitHub Pages; pre-release builds may be cut without
@@ -463,3 +467,12 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Owner's words:** "I give you full permission for creating prs and merging prs!"
 - **Ruling:** the "Autonomy" bullet under [Project and delivery](#project-and-delivery). It keeps
   the bullet's merge condition: changes reach `main` once CI passes.
+
+### <a id="dec-2026-10-11-agent-kit"></a>DEC-2026-10-11-agent-kit: a project-agnostic agent kit
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11 (ef6ee949:812, ef6ee949:1610).
+- **Owner's words:** "yes but what I am saying is that this linter and wait skill and continue
+  etc.. can be abstracted for any workflow right? we can just remove anything specific to neomail,
+  so that any workflow can use it and tweak it as a base" and "okay for the agent-spec-kit, it
+  should go in @~/Projects/claude-plugins/"
+- **Ruling:** the "Agent kit" bullet under [Project and delivery](#project-and-delivery).
