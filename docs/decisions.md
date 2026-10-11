@@ -1,8 +1,13 @@
 # neomail — product decisions
 
 The source of truth for what neomail must do. Decisions are made by the project owner; agents
-implement them. When a decision changes, edit this file in the same change. Newest first within
-each section is not required — keep related decisions together.
+implement them. The bullets below say what is decided now; keep related decisions together.
+
+Bullets that link to an entry in the [decision log](#decision-log) were added with the log. The
+entry gives the ruling an ID (`DEC-YYYY-MM-DD-slug`), the owner's own words and a status. Bullets
+without a link predate the log. Docs cite the ID instead of copying the ruling. Log entries are
+append-only: a change is a new entry that supersedes the old one, and the bullet is updated to link
+the new entry.
 
 ## Identity
 
@@ -73,6 +78,13 @@ each section is not required — keep related decisions together.
   rule above is the only exception).
 - **Each email is classified once** (results cached locally with model id, probabilities and
   timestamp so thresholds can be re-tuned without re-calling the model).
+- **First run** ([DEC-2026-10-11-first-run](#dec-2026-10-11-first-run)): neomail classifies the last 365 days
+  automatically, newest first, without asking, capped at the newest 1,000 emails. It then shows an
+  estimate of what classifying all the remaining emails would cost (count, requests, time, money),
+  and the user can start that with one action. The window and the cap are configurable.
+- **Redaction uses our own rules** ([DEC-2026-10-11-pii-rules](#dec-2026-10-11-pii-rules)): the PII
+  redaction that runs before text goes to jev is neomail's own rule redactor. No model is part of
+  the default.
 
 ## Data and storage
 
@@ -100,6 +112,12 @@ each section is not required — keep related decisions together.
     - The confidence bar fills in alongside it.
   - The other prototyped concepts (Sorting machine, Scan & stamp) are not required for v1. The
     animation-style seam keeps them possible later. Prototypes: PR #1, `prototypes/sort-animation`.
+- **Refined motion** ([DEC-2026-10-10-motion](#dec-2026-10-10-motion)): small, tasteful animations
+  and transitions across the whole experience. The design is delegated: there are no mock-ups for
+  the owner to choose from.
+- **Thoughtful sound** ([DEC-2026-10-11-sound](#dec-2026-10-11-sound)): a few tasteful sounds for
+  meaningful moments, such as sending an email or receiving a notification. Never on navigation or
+  other frequent actions.
 - **Drafting feels like Neovim.**
   - Full modal editing with motions, counts and text objects.
   - Absolute, relative and hybrid line numbers (`number` / `relativenumber`), so jumps like `5j`, `12k` and `3dd` are quick.
@@ -198,8 +216,309 @@ each section is not required — keep related decisions together.
 - **Clear, simple installation.**
 - **A simple website with docs hosted on GitHub Pages**, including a first-time setup guide
   (why and how to register OAuth apps, Proton Bridge, app passwords, keyring).
-- **A neomail logo.**
-- **Autonomy:** agents work on GitButler branches; changes are merged to `main` once CI passes; the
-  docs site is published to GitHub Pages; pre-release builds may be cut without asking.
+- **A neomail logo** ([DEC-2026-10-11-logo](#dec-2026-10-11-logo)): variation 05, "Split and
+  statusline", in `assets/logo/`.
+- **Agent kit** ([DEC-2026-10-11-agent-kit](#dec-2026-10-11-agent-kit)): paused by
+  [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first). When it resumes, the workflow helpers
+  (the script linter, the wait helpers, run continuation and the rest) become a project-agnostic
+  Claude Code plugin with nothing specific to neomail, kept in the owner's public plugin
+  marketplace, AH-Merii/claude-plugins. Its skill carries only the few practices that give most of
+  the gains ([DEC-2026-10-11-agent-kit-skill](#dec-2026-10-11-agent-kit-skill)).
+- **Autonomy:** agents work on GitButler branches; Claude creates, updates and merges PRs without
+  asking ([DEC-2026-10-11-pr-autonomy](#dec-2026-10-11-pr-autonomy)); changes are merged to `main`
+  once CI passes and a review agent has passed them
+  ([DEC-2026-10-11-merge-gate](#dec-2026-10-11-merge-gate), proposed); the docs site is published to GitHub Pages; pre-release builds may be cut without
+  asking.
 - Commits in this repository are unsigned (local `commit.gpgsign=false`) while agents work
   unattended.
+- **`main` is always usable** ([DEC-2026-10-11-main-usable](#dec-2026-10-11-main-usable)): every
+  merge to `main` builds and publishes `nmail`, so whatever has landed can be tried while the rest
+  is still being built. A merged CLI command works before the TUI exists, and independent features
+  become usable as each one merges.
+- **Build first** ([DEC-2026-10-11-build-first](#dec-2026-10-11-build-first)): neomail grows in
+  thin slices, each usable on its own and merged to `main` when it works. The first slice is a
+  read-only inbox in the CLI: `nmail` syncs one account's inbox, lists its messages and shows one.
+  Design docs stay short and follow the code. A review runs at most two rounds, and what is left
+  becomes an issue. The agent kit and the docs lint wait until the app needs them.
+- **Live tests** ([DEC-2026-10-11-test-accounts](#dec-2026-10-11-test-accounts)): the three
+  dedicated test accounts may send and receive freely. The owner's personal accounts are never used.
+- **Architecture rules** ([DEC-2026-10-11-architecture-retro](#dec-2026-10-11-architecture-retro)),
+  applied to code as it lands ([DEC-2026-10-11-build-first](#dec-2026-10-11-build-first)):
+  - each slice lists the seams it touches before it is built;
+  - a capability with two or more consumers, or a realistic alternative, gets a port with a contract
+    and a conformance suite;
+  - each cross-cutting concern has one owner section, which others link to and never redefine;
+  - invariants live in types, not comments;
+  - reviews are adversarial and stop after two rounds;
+  - when requirements change, the affected sections are re-derived, not patched;
+  - a walking skeleton comes early: the first slice is one;
+  - the machine-checkable architecture (a manifest, generated tables and a docs lint) waits until
+    there is code for it to check.
+- **Benchmarks** ([DEC-2026-10-11-bench-sample](#dec-2026-10-11-bench-sample)): a benchmark runs
+  on a representative sample, just large enough to measure the metrics, never on whole datasets.
+  The choice weighs speed against accuracy.
+
+## Decision log
+
+Statuses:
+
+- **proposed:** made on the owner's behalf while they were away; followed until the owner accepts
+  or rejects it.
+- **recorded:** the owner ruled; the bullet the entry names states the ruling.
+- **paused:** recorded, but on hold until the entry that paused it is superseded.
+- **superseded** or **rejected.**
+
+Never edit an entry's text. To change a ruling, add an entry that supersedes it.
+
+### <a id="dec-2026-10-11-first-run"></a>DEC-2026-10-11-first-run: classify the last year on first run
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Supersedes:** `PROV-07`, the plan's provisional default P7, which asked before classifying more
+  than 5,000 messages.
+- **Owner's words:** "yes do the first 365 automatically and the limit is capped to the first 1000
+  emails. with an estimate on how much it would cost to do all of them."
+- **Ruling:** the "First run" bullet under [Classification](#classification-jev).
+- **Retires:** the key `classify.ask_above`, the value "5,000 messages", and the phrases "asks
+  above" and "cost confirmation above".
+
+### <a id="dec-2026-10-11-main-usable"></a>DEC-2026-10-11-main-usable: `main` is always usable
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Owner's words:** "we should have ci/cd nmail always gets built on merge to main that makes it
+  to se we can try it while it is being built. for example if the cli is built and the interface is
+  not, we can still use the cli and do stuff with it, even for the cli, if we are developing
+  parallel independant features we can use try them out when they get merged. think of how you
+  would set up the cicd and versioning if you hvae not already thought of that"
+- **Ruling:** the "`main` is always usable" bullet under [Project and delivery](#project-and-delivery).
+  Its first CI/CD design, [DEC-2026-10-11-edge-channel](#dec-2026-10-11-edge-channel), was
+  superseded by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first); CI/CD is now built with the first slice.
+
+### <a id="dec-2026-10-11-test-accounts"></a>DEC-2026-10-11-test-accounts: test accounts send and receive freely
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Supersedes:** the architecture brief's provisional D4 (sends only between test accounts, at
+  most 3 per run), which was never recorded here.
+- **Owner's words:** "As for the emails, they can send and recieve, we don't need to be worried
+  since these are brand new emails and they have not been used for anything."
+- **Ruling:** the "Live tests" bullet under [Project and delivery](#project-and-delivery).
+
+### <a id="dec-2026-10-10-motion"></a>DEC-2026-10-10-motion: refined motion, design delegated
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-10.
+- **Owner's words:** "I also want us to think of the small animations here and there that add a
+  touch of refinements to the entire experience. Some tasteful animations and transitions. I will
+  leave that to you though, no need to mock and have me decide, just know that I am expecting a
+  refined experience"
+- **Ruling:** the "Refined motion" bullet under [UX](#ux).
+
+### <a id="dec-2026-10-11-sound"></a>DEC-2026-10-11-sound: a few thoughtful sounds
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Owner's words:** "also since we thought of the small animations it would also be useful to
+  think of any sounds that go with them, I don't want everything to have a sound, but it would be
+  nice to have sounds thoughtfully added, for example when sending an email, when receiving a
+  notification, I would not want a sound for example on each navigation. thoughtful, tasteful, the
+  small things that add je ne se quoi."
+- **Ruling:** the "Thoughtful sound" bullet under [UX](#ux).
+
+### <a id="dec-2026-10-11-consistency-process"></a>DEC-2026-10-11-consistency-process: how the design stays consistent
+
+- **Status:** superseded by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+  **Source:** owner, chat, 2026-10-11, delegating the decision to Claude.
+- **Owner's words:** "based on this how would avoid that from happening down the line? think of
+  how you would structure your workflows to catch this or to routinely check I will leave the
+  decision to you." (8e661b24:761)
+- **Ruling:** a process in `docs/process/consistency/`, withdrawn before it merged.
+
+### <a id="dec-2026-10-11-walking-skeleton"></a>DEC-2026-10-11-walking-skeleton: walking skeleton, then a thin slice
+
+- **Status:** superseded by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+  Proposed by Claude on 2026-10-11 while the owner was hands-off. It was D1 in the architecture
+  brief.
+- **Proposal:**
+  - Wave 0 ends with every crate compiling behind its real traits, and with the composition roots
+    (`nm-daemon`, `nm-tui`, `nmail`) running end to end on stubs and fakes (`nmail --demo`, one
+    action over IPC).
+  - Work is then ordered by a thin-slice milestone, 0.1.0-alpha.1: read, search and triage
+    (archive, delete, move, classify) real mail in the TUI from Proton (via Bridge) and Gmail.
+  - Everything else follows that milestone.
+
+### <a id="dec-2026-10-11-crate-reasons"></a>DEC-2026-10-11-crate-reasons: every crate has a reason
+
+- **Status:** superseded by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+  Proposed by Claude on 2026-10-11. It was D2 in the architecture brief.
+- **Proposal:** every crate states its reason in the manifest, from a fixed list:
+  - an interface;
+  - an adapter for a port with a realistic alternative;
+  - isolation of a heavy or optional dependency;
+  - a licence boundary;
+  - a process or sandbox boundary;
+  - a composition root;
+  - test-only;
+  - a work package that would otherwise be larger than XL.
+
+  A crate with no reason merges into a neighbour. There is no target crate count.
+
+### <a id="dec-2026-10-11-jev-offline"></a>DEC-2026-10-11-jev-offline: tests never call jev
+
+- **Status:** proposed by Claude on 2026-10-11. It was D3 in the architecture brief.
+- **Proposal:** CI and automated tests never call jev; they use fakes and recorded fixtures. Live
+  calls happen only in gated live tests, capped at 20 requests per run and recorded in a spend
+  ledger.
+
+### <a id="dec-2026-10-11-merge-gate"></a>DEC-2026-10-11-merge-gate: how work merges
+
+- **Status:** proposed by Claude on 2026-10-11. It was D5 in the architecture brief.
+- **Proposal:** one PR per work package, squash-merged once CI is green and an independent review
+  agent has passed it. There is no owner review gate.
+- **Open question for the owner:** does this refine the "Autonomy" bullet (CI must pass, and a
+  review agent must also pass) or replace it? Claude follows "refine" until the owner says
+  otherwise.
+
+### <a id="dec-2026-10-11-agent-send"></a>DEC-2026-10-11-agent-send: agents draft freely, send with approval
+
+- **Status:** proposed by Claude on 2026-10-11.
+- **Proposal:** agents may draft freely. This covers MCP clients and the CLI under an agent profile.
+  Sending and deleting need the owner's approval for each action.
+- **Why:** this settles a conflict in the draft architecture, which was not kept: its permission
+  profiles for actions and its rules for agents disagreed.
+
+### <a id="dec-2026-10-11-redaction-default"></a>DEC-2026-10-11-redaction-default: redact in the daemon; the benchmark picks the detectors
+
+- **Status:** proposed by Claude on 2026-10-11.
+- **Proposal:** text leaves the daemon, for jev or for MCP clients, only after redaction inside the
+  daemon. `privacy.detectors` defaults to `["rules"]` until the PII benchmark reports, and the
+  benchmark's result then sets the default.
+- **Owner's words on the benchmark:** "you will benchmark it later and that will enforce your
+  decision."
+
+### <a id="dec-2026-10-11-edge-channel"></a>DEC-2026-10-11-edge-channel: the edge channel and versioning
+
+- **Status:** superseded by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+  Proposed by Claude on 2026-10-11 as the concrete design for
+  [DEC-2026-10-11-main-usable](#dec-2026-10-11-main-usable).
+- **Proposal:**
+  - The composition roots (`nmail`, `nm-daemon`, `nm-tui`) exist from wave 0 and call every
+    crate's frozen constructor. A crate that is not built yet returns a typed
+    `NotImplemented { wp }` error, so a merge lights up its feature without re-wiring.
+  - Each crate reports its status: stub, partial or ready. `nmail features` lists what works, and
+    `nmail --demo` runs on fixtures.
+  - Every PR runs a smoke test of the binary. Every merge to `main` publishes a rolling `edge`
+    pre-release, like Neovim's nightly.
+  - Versions are `0.1.0-dev.N+gSHA` on edge, with `v0.1.0-alpha.N` tags at milestones. The storage
+    schema and the IPC protocol carry their own version numbers.
+  - Edge installs as `nmail-edge`, with its own data directory and keyring namespace, and can
+    update itself. Tagged releases do not update themselves.
+- **Refines:** [DEC-2026-10-11-walking-skeleton](#dec-2026-10-11-walking-skeleton) (D1 in the
+  brief), which had stewards re-wire the roots at each phase.
+
+### <a id="dec-2026-10-11-bench-sample"></a>DEC-2026-10-11-bench-sample: benchmarks decide on a representative sample
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Context:** the PII benchmark had run every detector over the whole corpus (8,629 documents) for
+  hours. The owner stopped it.
+- **Owner's words:** "forget it, stop the tests for pii, you didn't have to run it on the entire
+  dataset, we just needed a representitive set to get an idea and measure the metrics and compare
+  speed vs accuracy metrics and decide base on the tradeoffs..."
+- **Ruling:** the "Benchmarks" bullet under [Project and delivery](#project-and-delivery).
+
+### <a id="dec-2026-10-11-logo"></a>DEC-2026-10-11-logo: the Split and statusline logo
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Context:** six variations were drafted for PR #2 (`assets/logo/variations/`), next to the
+  original cursor-n mark. The art director ranked 05 first.
+- **Owner's words:** "i like the split and status line logo"
+- **Ruling:** the "A neomail logo" bullet under [Project and delivery](#project-and-delivery):
+  variation 05 replaces the original mark in `assets/logo/`.
+
+### <a id="dec-2026-10-11-architecture-retro"></a>DEC-2026-10-11-architecture-retro: rules against coupling and contradictions
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Context:** the architecture had buried PII redaction inside `nm-classify` while MCP claimed to
+  reuse it. Asked how to avoid such coupling and contradictions, Claude wrote a retro with seven
+  rules, and the owner asked to keep them.
+- **Owner's words:** "looking back in retrospective how would you avoid the "mistakes" you made when
+  it comes to coupling or contradictory design?", then, after the answer: "okay make note of this
+  retro so you can avoide that and refer to this down the line."
+- **Ruling:** the "Architecture rules" bullet under [Project and delivery](#project-and-delivery).
+
+### <a id="dec-2026-10-11-pii-rules"></a>DEC-2026-10-11-pii-rules: redaction uses our own rules
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Context:** on the PII benchmark's sample (200 email excerpts of 1,500 characters, as jev
+  receives them), the rules take 0.036 ms per email and 54.5 MB. They catch 97.6% of email-address
+  characters, 71.4% of phone numbers and 73.1% of IDs, but almost no names (0.3%), and leave 58.6%
+  of PII characters unmasked. The detectors that catch names cost far more: presidio-lg takes 56 ms
+  per email but needs Python and about 1 GB of memory, and the small models that could ship in Rust
+  take 130–148 ms and 420–580 MB. Paired with the rules, those models leave 8–10% unmasked.
+- **Owner's words:** "okay so ai say we go with our own rules for pii then, seems to be the most
+  pragmatic thing to do agree or no?"
+- **Settles:** the detector default that
+  [DEC-2026-10-11-redaction-default](#dec-2026-10-11-redaction-default) left to the benchmark.
+- **Ruling:** the "Redaction uses our own rules" bullet under [Classification](#classification-jev).
+
+### <a id="dec-2026-10-11-redaction-gaps"></a>DEC-2026-10-11-redaction-gaps: close the rules' gaps without a model
+
+- **Status:** proposed by Claude on 2026-10-11.
+- **Proposal:**
+  - Mask the names the daemon already knows, as whole words: the display names in From, To and Cc,
+    the owner's contacts and the owner's own name.
+  - Add patterns for the identifier formats the rules miss (they caught 73% of IDs on the
+    benchmark sample).
+  - Say plainly at consent that, at `standard`, other people's and organisations' names in the
+    body still go to jev.
+  - Keep models out of the default. A model detector may come later as an opt-in level, if its
+    speed keeps up with the sorter.
+- **Builds on:** [DEC-2026-10-11-pii-rules](#dec-2026-10-11-pii-rules).
+
+### <a id="dec-2026-10-11-pr-autonomy"></a>DEC-2026-10-11-pr-autonomy: Claude creates and merges PRs
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Context:** a push to update PR #2 was held back, because pushing had not been allowed in that
+  session.
+- **Owner's words:** "I give you full permission for creating prs and merging prs!"
+- **Ruling:** the "Autonomy" bullet under [Project and delivery](#project-and-delivery). It keeps
+  the bullet's merge condition: changes reach `main` once CI passes.
+
+### <a id="dec-2026-10-11-agent-kit"></a>DEC-2026-10-11-agent-kit: a project-agnostic agent kit
+
+- **Status:** paused by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+  **Source:** owner, chat, 2026-10-11 (ef6ee949:812, ef6ee949:1610).
+- **Owner's words:** "yes but what I am saying is that this linter and wait skill and continue
+  etc.. can be abstracted for any workflow right? we can just remove anything specific to neomail,
+  so that any workflow can use it and tweak it as a base" and "okay for the agent-spec-kit, it
+  should go in @~/Projects/claude-plugins/"
+- **Ruling:** the "Agent kit" bullet under [Project and delivery](#project-and-delivery).
+
+### <a id="dec-2026-10-11-agent-kit-skill"></a>DEC-2026-10-11-agent-kit-skill: the kit's skill follows 80/20
+
+- **Status:** paused by [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+  **Source:** owner, chat, 2026-10-11 (ef6ee949:1992).
+- **Owner's words:** "for the skill agent skill it doesn't need to cover absolutely eveerything
+  think of the 80/20 what is the least amount I can include that will give me the most gains"
+- **Builds on:** [DEC-2026-10-11-agent-kit](#dec-2026-10-11-agent-kit).
+- **Ruling:** the "Agent kit" bullet under [Project and delivery](#project-and-delivery).
+
+### <a id="dec-2026-10-11-build-first"></a>DEC-2026-10-11-build-first: build usable slices, not more design
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11 (ef6ee949:2139, ef6ee949:2168,
+  ef6ee949:2208, ef6ee949:2216, ef6ee949:2249).
+- **Context:** no code existed yet. The draft architecture had grown to 4,807 lines and the plan to
+  1,065, each review round of them still found new problems, and the design and tooling runs kept
+  going without finishing.
+- **Owner's words:** "maybe this is to do with trying to perfect everything instead of building",
+  then "if you look at it, nothing is finishing..". Asked whether to change course, the owner chose
+  "Stop polishing, build now" and, for the first slice, "Read-only inbox in the CLI". Then: "forget
+  about agent kit now, let us focus on what matters" and "we need to simplify what we have, and fix
+  this mess..."
+- **Ruling:** the "Build first" bullet under [Project and delivery](#project-and-delivery).
+- **Supersedes:** [DEC-2026-10-11-consistency-process](#dec-2026-10-11-consistency-process), and
+  the proposals [DEC-2026-10-11-walking-skeleton](#dec-2026-10-11-walking-skeleton),
+  [DEC-2026-10-11-crate-reasons](#dec-2026-10-11-crate-reasons) and
+  [DEC-2026-10-11-edge-channel](#dec-2026-10-11-edge-channel), which assumed the whole crate design
+  up front.
+- **Pauses:** [DEC-2026-10-11-agent-kit](#dec-2026-10-11-agent-kit) and
+  [DEC-2026-10-11-agent-kit-skill](#dec-2026-10-11-agent-kit-skill).
+- **Refines:** [DEC-2026-10-11-architecture-retro](#dec-2026-10-11-architecture-retro). Its rules
+  apply to code as it lands: seams are listed per slice, reviews stop after two rounds, and the
+  manifest and docs lint wait until there is code to check. These details are Claude's.
