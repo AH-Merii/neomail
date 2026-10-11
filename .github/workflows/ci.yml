@@ -76,7 +76,7 @@ jobs:
         with:
           tool: cargo-about
       # The licence notices of the statically linked crates; about.toml lists the accepted ones.
-      - run: cargo about generate --locked --fail -c about.toml -m crates/nmail/Cargo.toml -o THIRD-PARTY-LICENSES about.hbs
+      - run: cargo about generate --locked --fail -c about.toml -m crates/nmail/Cargo.toml --target ${{ matrix.target }} -o THIRD-PARTY-LICENSES about.hbs
       # The musl target also links musl libc statically (MIT, some files BSD, ISC or public domain);
       # cargo-about only sees crates. The Ubuntu musl package that musl-tools installs carries
       # musl's full notice; `test -s` fails the build if it ever goes missing.
@@ -122,10 +122,10 @@ jobs:
           path: dist
           merge-multiple: true
       # A newer push can cancel this job at any step. Once the release exists the tag moves
-      # last, so a cancelled run never leaves edge pointing at a commit whose assets were not
-      # uploaded: at worst the assets and notes are newer than the tag, and the next run sets
-      # all three. The first publish must push the tag before creating the release; if it is
-      # cancelled, the next run takes whichever branch applies and finishes the job.
+      # last, so it never runs ahead of the uploaded assets. A cancel during the upload can still
+      # leave a tarball missing until the next publishing run, because --clobber deletes the old
+      # asset before it uploads the new one. The first publish must push the tag before creating
+      # the release; if it is cancelled, the next run takes whichever branch applies.
       - name: Publish the edge pre-release
         run: |
           notes="Rolling build of main at ${GITHUB_SHA} ($(date -u +%Y-%m-%dT%H:%MZ)). Replaced on every push to main; expect breaking changes."

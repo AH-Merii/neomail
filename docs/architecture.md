@@ -115,9 +115,10 @@ publishes them as the rolling `edge` pre-release
 `THIRD-PARTY-LICENSES` file that cargo-about generates from the dependency tree (`about.toml`
 lists the accepted licences; a crate under any other fails the build). Once the release exists,
 publishing uploads the assets, then updates the notes, which name the commit, and moves the
-`edge` tag last, so a cancelled run never leaves the tag on a commit whose assets are missing.
-The very first publish has to push the tag before it can create the release; if that run is
-cancelled, the next one finishes it. Only the publishing job
+`edge` tag last, so the tag never runs ahead of the uploaded assets. A run cancelled during the
+upload can leave a tarball missing until the next publishing run, because `--clobber` deletes the
+old asset before it uploads the new one. The very first publish has to push the tag before it can
+create the release; if that run is cancelled, the next one finishes it. Only the publishing job
 can write to the repository, and a newer push cancels an older run.
 
 ## What comes next
