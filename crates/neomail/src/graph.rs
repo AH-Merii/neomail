@@ -37,7 +37,8 @@ pub async fn check(access_token: &Secret) -> Result<u64> {
         .map_err(check_failed)
 }
 
-/// A failed check with what to do next: nothing is saved yet, so it is `account add` again.
+/// A failed check with what to do next. Nothing is saved yet, and the sign-in has already
+/// shown it grants Mail.Read, so a 403 here is the mailbox, not the grant.
 fn check_failed(e: GraphError) -> anyhow::Error {
     const CHECK: &str = "the read-only check of the INBOX through Microsoft Graph failed";
     match e {
@@ -45,8 +46,9 @@ fn check_failed(e: GraphError) -> anyhow::Error {
             anyhow!("{CHECK} ({e}); nothing was saved; run `neomail account add outlook` again")
         }
         GraphError::Forbidden => anyhow!(
-            "{CHECK} ({e}); nothing was saved; run `neomail account add outlook` again and \
-             accept the permission to read your email"
+            "{CHECK} ({e}) although the sign-in granted Mail.Read; nothing was saved. The \
+             account may have no Outlook mailbox or licence, or a policy of its organisation \
+             blocks the app"
         ),
         other => anyhow::Error::new(other).context(format!("{CHECK}; nothing was saved")),
     }
@@ -75,9 +77,11 @@ pub async fn sync(
 fn explain(e: GraphError, account: &str) -> anyhow::Error {
     match e {
         GraphError::Unauthorized => anyhow!("access token refused; run sync again"),
-        GraphError::Forbidden => {
-            anyhow!("Mail.Read not granted; run `neomail account login {account}`")
-        }
+        GraphError::Forbidden => anyhow!(
+            "{e}; run `neomail account login {account}` and accept the permission to read your \
+             email; if it persists, the account may have no Outlook mailbox or a policy blocks \
+             the app"
+        ),
         other => anyhow::Error::new(other),
     }
 }
@@ -95,15 +99,24 @@ mod tests {
         );
         assert_eq!(
             check_failed(GraphError::Forbidden).to_string(),
-            "the read-only check of the INBOX through Microsoft Graph failed (Mail.Read not \
-             granted); nothing was saved; run `neomail account add outlook` again and accept the \
-             permission to read your email"
+            "the read-only check of the INBOX through Microsoft Graph failed (Microsoft Graph \
+             refused access to the mailbox (HTTP 403)) although the sign-in granted Mail.Read; \
+             nothing was saved. The account may have no Outlook mailbox or licence, or a policy \
+             of its organisation blocks the app"
         );
         let e = check_failed(GraphError::Malformed);
         assert_eq!(
             format!("{e:#}"),
             "the read-only check of the INBOX through Microsoft Graph failed; nothing was saved: \
              Microsoft Graph's answer is not the expected JSON"
+        );
+        // Any other error keeps its cause, such as why Graph could not be reached.
+        let cause: nm_graph::TransportError = Box::new(io::Error::other("tls handshake failed"));
+        let e = check_failed(GraphError::Transport(cause));
+        assert!(
+            format!("{e:#}")
+                .ends_with("nothing was saved: cannot reach Microsoft Graph: tls handshake failed"),
+            "{e:#}"
         );
     }
 
@@ -115,7 +128,9 @@ mod tests {
         );
         assert_eq!(
             explain(GraphError::Forbidden, "outlook").to_string(),
-            "Mail.Read not granted; run `neomail account login outlook`"
+            "Microsoft Graph refused access to the mailbox (HTTP 403); run `neomail account \
+             login outlook` and accept the permission to read your email; if it persists, the \
+             account may have no Outlook mailbox or a policy blocks the app"
         );
         assert_eq!(
             explain(GraphError::Throttled { status: 429 }, "outlook").to_string(),

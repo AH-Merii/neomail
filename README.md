@@ -91,7 +91,7 @@ input, or come from `--password-command`. `--no-check` skips the login. `neomail
   imap.example.com` (`--port`, `--security tls|starttls`, `--cert-sha256`).
 
 ```sh
-neomail account list               # name, login, username, server, security, pinned
+neomail account list               # name, login, username, host, port, security, pinned
 neomail config path                # where the config file is
 neomail config check               # parse it offline: PATH:LINE:COL: message, or "ok: N accounts"
 ```

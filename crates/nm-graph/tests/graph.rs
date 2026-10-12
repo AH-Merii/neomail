@@ -381,7 +381,10 @@ async fn throttling_waits_retry_after_else_backs_off() {
 async fn statuses_become_short_errors_that_never_hold_the_token() {
     let cases = [
         (reply(401, b"{}".to_vec()), "access token refused"),
-        (reply(403, b"{}".to_vec()), "Mail.Read not granted"),
+        (
+            reply(403, b"{}".to_vec()),
+            "Microsoft Graph refused access to the mailbox (HTTP 403)",
+        ),
         (
             json_reply(
                 400,

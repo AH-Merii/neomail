@@ -83,8 +83,10 @@ pub enum GraphError {
     /// 401: the access token expired or was revoked since it was fetched.
     #[error("access token refused")]
     Unauthorized,
-    /// 403: the sign-in has no Mail.Read grant.
-    #[error("Mail.Read not granted")]
+    /// 403: Graph refuses the mailbox. The sign-in may lack Mail.Read, the account may have no
+    /// mailbox or licence, or a Conditional Access policy may block the app
+    /// (<https://learn.microsoft.com/en-us/graph/errors>).
+    #[error("Microsoft Graph refused access to the mailbox (HTTP 403)")]
     Forbidden,
     #[error(
         "Microsoft Graph is throttling requests (HTTP {status}) after {MAX_TRIES} tries; try again later"

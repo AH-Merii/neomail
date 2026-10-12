@@ -3,7 +3,8 @@
 `neomail list`, `neomail account list` and `neomail show` print JSON for scripts and agents with
 `--json`, and JSON Lines (one compact object per line, the same objects as `--json`'s array) with
 `--jsonl`. The shapes below are stable: later versions may add fields but will not rename, remove
-or retype these ones, and a field that can be `null` says so. Ignore fields you do not know. Listings also have a plain format, below.
+or retype these ones, and a field that can be `null` says so. Ignore fields you do not know.
+Listings also have a plain format, below.
 
 Common rules:
 
@@ -110,6 +111,7 @@ every case. Missing messages are left out of the output and reported on standard
 ```
 
 - `date` is the Date header; `received` is when the server got the message.
+- `subject` is `null` when the message has none.
 - `body_type` is `"text/plain"` (the plain part), `"text/html"` (the HTML part converted to
   text) or `"none"` (no text body; `body` is `""`). HTML larger than 1 MiB or nested more than
   100 levels deep is not laid out: its tags are stripped, and `body` starts with a line

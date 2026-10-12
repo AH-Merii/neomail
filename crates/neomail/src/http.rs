@@ -4,7 +4,7 @@
 //! pulled in. One connection per request (`Connection: close`); keep-alive is left for later.
 //!
 //! [`Http`] is the seam OAuth's tests replace with a scripted fake; Graph's seam is
-//! `nm_graph::Transport`, which [`Https`] implements in `main.rs`.
+//! `nm_graph::Transport`, which [`Https`] implements in `graph.rs`.
 
 use std::fmt;
 use std::sync::Arc;

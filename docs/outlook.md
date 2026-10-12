@@ -49,7 +49,7 @@ browser may resolve `localhost` to either. Microsoft prefers `127.0.0.1`, but it
 
 On the same **Authentication** page, under **Advanced settings**, set **Allow public client
 flows** to **Yes**, then select **Save**
-([desktop app registration](https://learn.microsoft.com/en-us/entra/identity-platform/scenario-desktop-app-registration)).
+([desktop app configuration](https://learn.microsoft.com/en-us/entra/identity-platform/scenario-desktop-app-configuration)).
 
 *Why:* the device code sign-in (below) is a public client flow. Microsoft recommends leaving the
 setting off unless the app is a public client that uses such a flow, as neomail is
@@ -129,9 +129,12 @@ oldest cached message, is not seen. Graph's delta query, in the
 - **"access token refused":** during `neomail sync`, the token expired between the refresh and
   the request, and the next sync gets a new one. During `account add`, nothing was saved: run it
   again.
-- **"Mail.Read not granted":** the sign-in lacks mail access. During `account add`, nothing was
-  saved: run it again and accept the permission to read your email. For a saved account, run
-  `neomail account login NAME` and accept it.
+- **"Microsoft Graph refused access to the mailbox (HTTP 403)":** Graph answers 403 when the
+  sign-in lacks the permission, the account has no mailbox or licence, or a Conditional Access
+  policy blocks the app ([Graph errors](https://learn.microsoft.com/en-us/graph/errors)). During
+  `account add`, the sign-in has already granted `Mail.Read`, so it is one of the others; nothing
+  was saved. For a saved account, run `neomail account login NAME` and accept the permission to
+  read your email first.
 - **"the app registration is not multitenant" or "is for Microsoft Entra accounts only":** the
   supported account types in step 2 are wrong. Register the app again with the right type, and
   use its client ID.

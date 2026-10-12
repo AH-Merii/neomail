@@ -195,7 +195,7 @@ pub const MICROSOFT: Provider = Provider {
 /// The one-time Outlook setup. The why of each step is in the guide; the wording follows
 /// <https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app>,
 /// <https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-redirect-uri> and
-/// <https://learn.microsoft.com/en-us/entra/identity-platform/scenario-desktop-app-registration>.
+/// <https://learn.microsoft.com/en-us/entra/identity-platform/scenario-desktop-app-configuration>.
 const OUTLOOK_STEPS: &str = "\
 Outlook signs in through your own Microsoft Entra app registration: neomail ships none, so no
 one else's app is ever granted access to your mail. Set one up once (about 10 minutes; why each
