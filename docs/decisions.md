@@ -551,6 +551,7 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Ruling:** the "Linux first" bullet under [Platforms](#platforms). It changes the order, not the
   scope: the "First release" bullet still lists macOS. WSL runs Linux, so it stays in. Keeping
   macOS CI jobs as non-blocking, rather than removing them, is Claude's call.
-- **Refines:** [DEC-2026-10-11-merge-gate](#dec-2026-10-11-merge-gate): "CI passes" means the CI
-  workflow run concludes `success`. A failed macOS job still shows as a failed check, but it
-  leaves the run green, so it no longer holds back a merge.
+- **Refines:** the merge condition in [DEC-2026-10-11-pr-autonomy](#dec-2026-10-11-pr-autonomy)
+  ("once CI passes") and [DEC-2026-10-11-merge-gate](#dec-2026-10-11-merge-gate) ("once CI is
+  green"): both mean the CI workflow run concludes `success`. A failed macOS job still shows as a
+  failed check, but it leaves the run green, so it no longer holds back a merge.
