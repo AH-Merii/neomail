@@ -37,6 +37,9 @@ die() { say "install.sh: error: $*"; exit 1; }
 detect_target() {
 	case "$(uname -s)/$(uname -m)" in
 		Linux/x86_64 | Linux/amd64) echo x86_64-unknown-linux-musl ;;
+		# 64-bit ARM (Raspberry Pi OS 64-bit, ARM laptops and servers). 32-bit ARM (armv7l, armv6l)
+		# has no build yet.
+		Linux/aarch64 | Linux/arm64) echo aarch64-unknown-linux-musl ;;
 		Darwin/arm64 | Darwin/aarch64) echo aarch64-apple-darwin ;;
 		# An x86_64 shell under Rosetta on Apple silicon still gets the native build.
 		Darwin/x86_64)

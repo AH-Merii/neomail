@@ -19,9 +19,13 @@ A fast, modal terminal email client for Outlook, Gmail and Proton Mail.
 
 Everything is pre-alpha. The builds come from the
 [edge pre-release](https://github.com/AH-Merii/neomail/releases/tag/edge), which is rebuilt from
-`main` on every merge, so expect breaking changes. They cover Linux x86_64 (WSL included; a
-static musl binary that needs no particular glibc) and, when its build passed, macOS on Apple
-silicon.
+`main` on every merge, so expect breaking changes. Prebuilt builds exist for:
+
+- Linux x86_64 (WSL included) and Linux on 64-bit ARM (aarch64: Raspberry Pi OS 64-bit, ARM
+  laptops and servers): static musl binaries that need no particular glibc;
+- macOS on Apple silicon, when its build passed.
+
+Anything else, 32-bit ARM (armv7l) included, builds from source (below).
 
 The installer downloads the edge build for your platform, checks it against the release's
 `SHA256SUMS` and puts `neomail` in `~/.local/bin` (or `$XDG_BIN_HOME`, `$NEOMAIL_INSTALL_DIR`,
@@ -51,7 +55,7 @@ cargo install --locked --git https://github.com/AH-Merii/neomail neomail
 ```
 
 Each tarball carries `neomail`, this README, `LICENSE-MIT`, `LICENSE-APACHE`, the licences of the
-crates built into it (and, in the Linux build, of musl libc) in `THIRD-PARTY-LICENSES`, and the
+crates built into it (and, in the Linux builds, of musl libc) in `THIRD-PARTY-LICENSES`, and the
 Rust standard library's notices in `COPYRIGHT-library.html`.
 
 ### Add an account
