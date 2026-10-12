@@ -2,9 +2,9 @@
 //! stays current without `neomail sync`.
 //!
 //! A round syncs every account of the config, read again before each round, through the same
-//! [`Syncer`] as `neomail sync`. What starts a round is a [`Wake`]: the timer for now. Push (IMAP
-//! IDLE, Graph delta, Gmail history) will be another kind of wake that names one account and
-//! feeds the same `Syncer` under the same account lock.
+//! [`Syncer`] as `neomail sync`. What starts one is a [`Wake`]: the timer, or the wall clock after
+//! a suspend. Push ([`crate::push`], IMAP IDLE for now) adds a wake that names one account: it
+//! syncs that account through the same `Syncer` under the same account lock, between the rounds.
 //!
 //! After a round, each account that got new mail in it gets one desktop notification
 //! ([`notify_round`], through [`crate::notify`]).
@@ -25,6 +25,7 @@ use tokio::time::Instant;
 
 use crate::config::{self, Account, Config};
 use crate::notify::{self, NewMail, Notification, Notifier};
+use crate::push::{self, Push, WatchLogin};
 use crate::sync::{PASSWORD_COMMAND_TIMEOUT, Synced, Syncer, report_line};
 use crate::{lock, output};
 
@@ -105,8 +106,49 @@ pub fn parse_interval(s: &str) -> Result<Interval, String> {
 pub enum Wake {
     /// The next round is due.
     Timer,
+    /// The next round is due on the wall clock only: the machine slept (or the clock was set).
+    /// The round replaces every watcher, since their connections may have died meanwhile.
+    Resumed,
+    /// Sync this one account: its watcher woke it, and [`SETTLE`] has passed since, or the start
+    /// limit held its watcher back and the minute is up.
+    Account(String),
+    /// A watcher's other news: on, no IDLE, failed, ended.
+    Watch(push::Event),
     /// SIGINT or SIGTERM: stop after the account being synced.
     Stop,
+}
+
+/// How long an account wake waits for more: the wakes in that time make one sync.
+pub const SETTLE: Duration = Duration::from_secs(2);
+
+/// The watchers' events, and the account wakes waiting out their [`SETTLE`] time.
+pub struct Wakes {
+    events: tokio::sync::mpsc::UnboundedReceiver<push::Event>,
+    open: bool,
+    /// When each woken account's sync is due.
+    pending: HashMap<String, Instant>,
+}
+
+impl Wakes {
+    pub fn new(events: tokio::sync::mpsc::UnboundedReceiver<push::Event>) -> Self {
+        Self {
+            events,
+            open: true,
+            pending: HashMap::new(),
+        }
+    }
+
+    /// The first account whose settle time is over, earliest first.
+    fn due(&mut self, now: Instant) -> Option<String> {
+        let (account, _) = self
+            .pending
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .min_by_key(|(name, at)| (**at, (*name).clone()))?;
+        let account = account.clone();
+        self.pending.remove(&account);
+        Some(account)
+    }
 }
 
 /// The stop request: set by the first SIGINT or SIGTERM, which also writes a byte to a socket so
@@ -163,9 +205,15 @@ impl Stop {
         self.requested.load(Ordering::SeqCst)
     }
 
-    /// Waits until `due` has passed or a stop is requested, whichever comes first. `wall` is the
-    /// wall clock, read inside the runtime.
-    pub async fn wait_until(&self, due: Due, wall: &impl Fn() -> SystemTime) -> Wake {
+    /// Waits until `due` has passed, an account woken through `wakes` has settled, a watcher
+    /// has other news, or a stop is requested, whichever comes first. `wall` is the wall clock,
+    /// read inside the runtime.
+    pub async fn wait_until(
+        &self,
+        due: Due,
+        wall: &impl Fn() -> SystemTime,
+        wakes: &mut Wakes,
+    ) -> Wake {
         let wake = self
             .wake
             .try_clone()
@@ -176,23 +224,48 @@ impl Stop {
             }
             let now = Instant::now();
             if due.passed(now, wall()) {
-                return Wake::Timer;
+                return if now >= due.at {
+                    Wake::Timer
+                } else {
+                    Wake::Resumed
+                };
+            }
+            if let Some(account) = wakes.due(now) {
+                return Wake::Account(account);
             }
             // The runtime's clock stops while the machine sleeps; look at the wall clock too.
-            let until = due.at.min(now + WALL_CLOCK_CHECK);
-            let Ok(wake) = &wake else {
+            let mut until = due.at.min(now + WALL_CLOCK_CHECK);
+            if let Some(settled) = wakes.pending.values().min() {
+                until = until.min(*settled);
+            }
+            if wake.is_err() {
                 // Without the socket a signal still sets the flag; look at it every second.
-                tokio::time::sleep_until(until.min(now + Duration::from_secs(1))).await;
-                continue;
+                until = until.min(now + Duration::from_secs(1));
+            }
+            let signalled = async {
+                match &wake {
+                    Ok(wake) => {
+                        if wake.readable().await.is_ok() {
+                            let mut drain = [0; 16];
+                            while matches!(wake.try_read(&mut drain), Ok(n) if n > 0) {}
+                        }
+                    }
+                    Err(_) => std::future::pending().await,
+                }
             };
             tokio::select! {
                 () = tokio::time::sleep_until(until) => {}
-                ready = wake.readable() => {
-                    if ready.is_ok() {
-                        let mut drain = [0; 16];
-                        while matches!(wake.try_read(&mut drain), Ok(n) if n > 0) {}
+                () = signalled => {}
+                event = wakes.events.recv(), if wakes.open => match event {
+                    None => wakes.open = false,
+                    Some(event) if event.kind == push::Kind::Wake => {
+                        wakes.pending.entry(event.account).or_insert(Instant::now() + SETTLE);
                     }
-                }
+                    Some(push::Event { account, kind: push::Kind::WakeAt(at), .. }) => {
+                        wakes.pending.entry(account).or_insert(at);
+                    }
+                    Some(event) => return Wake::Watch(event),
+                },
             }
         }
     }
@@ -246,25 +319,36 @@ pub fn next_round(started: (Instant, SystemTime), interval: Duration, now: Insta
     }
 }
 
-/// Runs `round` now and then every `interval` until `stop` is requested. `round` runs outside
+/// Hands `on` a round ([`Wake::Timer`] or [`Wake::Resumed`]) now and then every `interval`, and
+/// every other wake in between, until `stop` is requested. An account wake never moves the next
+/// round; a round drops the account wakes waiting, since it syncs every account. `on` runs outside
 /// the runtime; `wall` (the wall clock) inside it.
 pub fn run_rounds(
     runtime: &Runtime,
     interval: Duration,
     stop: &Stop,
     wall: impl Fn() -> SystemTime,
-    mut round: impl FnMut(),
+    wakes: &mut Wakes,
+    mut on: impl FnMut(Wake),
 ) {
     let clocks = || runtime.block_on(async { (Instant::now(), wall()) });
     let (at, wall_now) = clocks();
     let mut due = Due::now(at, wall_now);
-    while runtime.block_on(stop.wait_until(due, &wall)) == Wake::Timer {
-        let started = clocks();
-        round();
+    loop {
+        let wake = runtime.block_on(stop.wait_until(due, &wall, wakes));
+        match wake {
+            Wake::Stop => break,
+            Wake::Timer | Wake::Resumed => {
+                wakes.pending.clear();
+                let started = clocks();
+                on(wake);
+                due = next_round(started, interval, now(runtime));
+            }
+            other => on(other),
+        }
         if stop.requested() {
             break;
         }
-        due = next_round(started, interval, now(runtime));
     }
 }
 
@@ -384,21 +468,107 @@ impl<O: Write, E: Write> Printer<O, E> {
 /// One round: each account in turn, skipping one whose lock another sync holds, stopping early
 /// once a stop is requested. One account's failure never stops the others. Returns the accounts
 /// that got new mail, for [`notify_round`], including what a failed sync stored before it failed.
-pub fn round<O: Write, E: Write>(
+///
+/// `lock` takes an account's sync lock, `None` when someone else holds it: `run` passes
+/// [`lock::try_account`]. A parameter so that tests need no real lock, which a child process
+/// forked by a concurrent test can briefly hold through its inherited file descriptor.
+pub fn round<O: Write, E: Write, G>(
     accounts: &[Account],
-    data_dir: &Path,
+    lock: impl FnMut(&str) -> Result<Option<G>>,
+    stop: &Stop,
+    reports: &mut Reports,
+    printer: &mut Printer<O, E>,
+    sync: impl FnMut(&Account) -> Synced,
+) -> io::Result<Vec<NewMail>> {
+    reports.retain(accounts);
+    sync_each(accounts, lock, stop, reports, printer, sync)
+}
+
+/// What a wake syncs, before its notifications: a round every account, an account wake that one
+/// account (none when it is no longer configured), each through `sync` under its lock (see
+/// [`round`] for `lock`). A sync
+/// that hands over its login starts the account's watcher (under [`Push::start`]'s rules). A
+/// resume first ends every watcher; a watcher's news is printed when the account's push state
+/// changed. Returns the accounts that got new mail.
+#[allow(clippy::too_many_arguments)]
+pub fn on_wake<O: Write, E: Write, G, W, F>(
+    wake: Wake,
+    accounts: &[Account],
+    mut lock: impl FnMut(&str) -> Result<Option<G>>,
+    stop: &Stop,
+    push: &mut Push<W>,
+    reports: &mut Reports,
+    printer: &mut Printer<O, E>,
+    sync: impl FnMut(&Account) -> Synced,
+) -> io::Result<Vec<NewMail>>
+where
+    W: FnMut(WatchLogin, push::Events) -> F,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match wake {
+        Wake::Stop => Ok(Vec::new()),
+        Wake::Watch(event) => {
+            if let Some(line) = push.event(event) {
+                printer.print(&line)?;
+            }
+            Ok(Vec::new())
+        }
+        Wake::Account(name) => match accounts.iter().find(|a| a.name == name) {
+            Some(account) => {
+                let one = std::slice::from_ref(account);
+                sync_each(one, &mut lock, stop, reports, printer, starting(push, sync))
+            }
+            None => Ok(Vec::new()),
+        },
+        Wake::Timer | Wake::Resumed => {
+            if wake == Wake::Resumed {
+                push.replace_all();
+            }
+            push.retain(accounts);
+            round(
+                accounts,
+                &mut lock,
+                stop,
+                reports,
+                printer,
+                starting(push, sync),
+            )
+        }
+    }
+}
+
+/// `sync`, then the account's watcher started with the login it handed over.
+fn starting<W, F>(
+    push: &mut Push<W>,
+    mut sync: impl FnMut(&Account) -> Synced,
+) -> impl FnMut(&Account) -> Synced
+where
+    W: FnMut(WatchLogin, push::Events) -> F,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    move |account| {
+        let mut synced = sync(account);
+        if let Some(login) = synced.watch.take() {
+            push.start(&account.name, login);
+        }
+        synced
+    }
+}
+
+fn sync_each<O: Write, E: Write, G>(
+    accounts: &[Account],
+    mut lock: impl FnMut(&str) -> Result<Option<G>>,
     stop: &Stop,
     reports: &mut Reports,
     printer: &mut Printer<O, E>,
     mut sync: impl FnMut(&Account) -> Synced,
 ) -> io::Result<Vec<NewMail>> {
-    reports.retain(accounts);
     let mut new_mail = Vec::new();
     for account in accounts {
         if stop.requested() {
             break;
         }
-        let synced = match lock::try_account(data_dir, &account.name) {
+        let synced = match lock(&account.name) {
             // `neomail sync` has it: it reports, and the next round catches up.
             Ok(None) => continue,
             Ok(Some(_held)) => sync(account),
@@ -406,6 +576,7 @@ pub fn round<O: Write, E: Write>(
                 report: Err(e),
                 partial: SyncReport::default(),
                 warnings: Vec::new(),
+                watch: None,
             },
         };
         for warning in &synced.warnings {
@@ -515,7 +686,10 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
         nm_core::sync::DEFAULT_LIMIT,
         output::ProgressLine::new(false),
     )
-    .unattended(PASSWORD_COMMAND_TIMEOUT);
+    .unattended(PASSWORD_COMMAND_TIMEOUT)
+    .push_logins();
+    let (mut push, events) = Push::new(runtime.handle().clone(), push::watch);
+    let mut wakes = Wakes::new(events);
     let mut config = config;
     let mut config_error = None;
     let mut reports = Reports::default();
@@ -530,18 +704,24 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
         interval.duration(),
         &stop,
         SystemTime::now,
-        || {
+        &mut wakes,
+        |wake| {
             let mut printed = Ok(());
-            if let Some(line) = reload(&config_path, &mut config, &mut config_error) {
-                printed = printer.print(&line);
+            if matches!(wake, Wake::Timer | Wake::Resumed) {
+                if let Some(line) = reload(&config_path, &mut config, &mut config_error) {
+                    printed = printer.print(&line);
+                }
+                // Next to the reports' and watchers' retain in `on_wake`: a removed account's
+                // tokens go too.
+                syncer.retain(&config.accounts);
             }
-            // Next to the reports' retain in `round`: a removed account's tokens go too.
-            syncer.retain(&config.accounts);
             let printed = printed.and_then(|()| {
-                let new_mail = round(
+                let new_mail = on_wake(
+                    wake,
                     &config.accounts,
-                    &data_dir,
+                    |name| lock::try_account(&data_dir, name),
                     &stop,
+                    &mut push,
                     &mut reports,
                     &mut printer,
                     |account| syncer.sync(account, &mut cache),
@@ -575,6 +755,8 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
             }
         },
     );
+    // Every watcher ends at once; the runtime would end them too when it is dropped.
+    push.stop_all();
     failed?;
     Ok(ExitCode::SUCCESS)
 }
@@ -586,6 +768,8 @@ fn no_accounts() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    mod push;
+
     use std::cell::RefCell;
 
     use anyhow::bail;
@@ -628,6 +812,11 @@ mod tests {
         }
     }
 
+    /// No watcher ever sends anything.
+    fn no_wakes() -> Wakes {
+        Wakes::new(tokio::sync::mpsc::unbounded_channel().1)
+    }
+
     fn paused_runtime() -> Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -656,7 +845,7 @@ mod tests {
         let lengths = [10, 700, 20, 0];
         let starts = RefCell::new(Vec::new());
         let wall = wall_clock(t0, |_| Duration::ZERO);
-        run_rounds(&runtime, interval, &stop, wall, || {
+        run_rounds(&runtime, interval, &stop, wall, &mut no_wakes(), |_| {
             let mut starts = starts.borrow_mut();
             starts.push((now(&runtime) - t0).as_secs());
             let length = Duration::from_secs(lengths[starts.len() - 1]);
@@ -686,14 +875,22 @@ mod tests {
         };
         let starts = RefCell::new(Vec::new());
         let interval = Duration::from_secs(3600);
-        run_rounds(&runtime, interval, &stop, wall_clock(t0, suspended), || {
-            let mut starts = starts.borrow_mut();
-            starts.push((now(&runtime) - t0).as_secs());
-            if starts.len() == 2 {
-                stop.request();
-            }
-        });
-        assert_eq!(*starts.borrow(), [0, 60]);
+        run_rounds(
+            &runtime,
+            interval,
+            &stop,
+            wall_clock(t0, suspended),
+            &mut no_wakes(),
+            |wake| {
+                let mut starts = starts.borrow_mut();
+                starts.push(((now(&runtime) - t0).as_secs(), wake));
+                if starts.len() == 2 {
+                    stop.request();
+                }
+            },
+        );
+        // The second is a resume: it replaces the watchers.
+        assert_eq!(*starts.borrow(), [(0, Wake::Timer), (60, Wake::Resumed)]);
     }
 
     #[test]
@@ -723,7 +920,8 @@ mod tests {
             Duration::from_secs(300),
             &stop,
             SystemTime::now,
-            || {
+            &mut no_wakes(),
+            |_| {
                 rounds += 1;
                 stop.request();
             },
@@ -734,7 +932,14 @@ mod tests {
         stop.request();
         let mut rounds = 0;
         let interval = Duration::from_secs(300);
-        run_rounds(&runtime, interval, &stop, SystemTime::now, || rounds += 1);
+        run_rounds(
+            &runtime,
+            interval,
+            &stop,
+            SystemTime::now,
+            &mut no_wakes(),
+            |_| rounds += 1,
+        );
         assert_eq!(rounds, 0);
     }
 
@@ -748,7 +953,8 @@ mod tests {
         let woke = runtime.block_on(async {
             let hour = Duration::from_secs(3600);
             let due = next_round((Instant::now(), SystemTime::now()), hour, Instant::now());
-            let waiting = stop.wait_until(due, &SystemTime::now);
+            let mut wakes = no_wakes();
+            let waiting = stop.wait_until(due, &SystemTime::now, &mut wakes);
             let stopping = async {
                 tokio::task::yield_now().await;
                 stop.request();
@@ -784,6 +990,13 @@ mod tests {
         }
     }
 
+    /// An account lock that is always free. A real lock can be held for a moment by a child
+    /// that a concurrent test forked, between its fork and its exec, and the account would be
+    /// skipped: only `a_locked_account_is_skipped_for_the_round` takes real locks.
+    fn unlocked(_: &str) -> Result<Option<()>> {
+        Ok(Some(()))
+    }
+
     /// A sync without warnings.
     fn quiet(
         mut sync: impl FnMut(&Account) -> Result<SyncReport>,
@@ -792,6 +1005,7 @@ mod tests {
             report: sync(a),
             partial: SyncReport::default(),
             warnings: Vec::new(),
+            watch: None,
         }
     }
 
@@ -804,7 +1018,6 @@ mod tests {
 
     #[test]
     fn one_failing_account_never_stops_the_others_and_errors_are_not_repeated() {
-        let dir = tempfile::tempdir().unwrap();
         let stop = Stop::new().unwrap();
         let mut reports = Reports::default();
         let mut p = printer();
@@ -822,7 +1035,7 @@ mod tests {
         for (n, work) in work.into_iter().enumerate() {
             round(
                 &all,
-                dir.path(),
+                unlocked,
                 &stop,
                 &mut reports,
                 &mut p,
@@ -883,7 +1096,6 @@ mod tests {
     /// every round: it is reported when it changes, not every time.
     #[test]
     fn messages_without_a_body_are_reported_when_their_number_changes() {
-        let dir = tempfile::tempdir().unwrap();
         let stop = Stop::new().unwrap();
         let mut reports = Reports::default();
         let mut p = printer();
@@ -891,7 +1103,7 @@ mod tests {
         let mut rounds = |r: SyncReport, p: &mut Printer<Vec<u8>, Vec<u8>>| {
             round(
                 &all,
-                dir.path(),
+                unlocked,
                 &stop,
                 &mut reports,
                 p,
@@ -917,16 +1129,16 @@ mod tests {
 
     #[test]
     fn a_warning_is_printed_with_the_time_unless_it_repeats() {
-        let dir = tempfile::tempdir().unwrap();
         let stop = Stop::new().unwrap();
         let mut reports = Reports::default();
         let mut p = printer();
         let all = accounts(&["work"]);
         for warning in ["warning: not saved", "warning: not saved", "warning: other"] {
-            round(&all, dir.path(), &stop, &mut reports, &mut p, |_| Synced {
+            round(&all, unlocked, &stop, &mut reports, &mut p, |_| Synced {
                 report: Ok(report(0)),
                 partial: SyncReport::default(),
                 warnings: vec![warning.to_owned()],
+                watch: None,
             })
             .unwrap();
         }
@@ -948,7 +1160,7 @@ mod tests {
         let all = accounts(&["work", "home"]);
         round(
             &all,
-            dir.path(),
+            |name| lock::try_account(dir.path(), name),
             &stop,
             &mut reports,
             &mut p,
@@ -972,7 +1184,7 @@ mod tests {
         drop(held);
         round(
             &all,
-            dir.path(),
+            |name| lock::try_account(dir.path(), name),
             &stop,
             &mut reports,
             &mut p,
@@ -987,13 +1199,12 @@ mod tests {
 
     #[test]
     fn a_stop_lets_the_account_being_synced_finish_and_skips_the_rest() {
-        let dir = tempfile::tempdir().unwrap();
         let stop = Stop::new().unwrap();
         let mut p = printer();
         let mut synced = Vec::new();
         round(
             &accounts(&["work", "home"]),
-            dir.path(),
+            unlocked,
             &stop,
             &mut Reports::default(),
             &mut p,
@@ -1045,14 +1256,13 @@ mod tests {
 
     #[test]
     fn each_account_with_new_mail_gets_one_notification_per_round_and_a_first_sync_none() {
-        let dir = tempfile::tempdir().unwrap();
         let stop = Stop::new().unwrap();
         let mut reports = Reports::default();
         let mut p = printer();
         let all = accounts(&["work", "home", "club", "new"]);
         let mut shown = Vec::new();
         for n in 0..2 {
-            let new_mail = round(&all, dir.path(), &stop, &mut reports, &mut p, |a| Synced {
+            let new_mail = round(&all, unlocked, &stop, &mut reports, &mut p, |a| Synced {
                 report: Ok(match (a.name.as_str(), n) {
                     ("work", 0) => added(false, &[1, 2, 3, 4, 5]),
                     ("work", _) => added(false, &[9]),
@@ -1064,6 +1274,7 @@ mod tests {
                 }),
                 partial: SyncReport::default(),
                 warnings: Vec::new(),
+                watch: None,
             })
             .unwrap();
             let notify = |n: &Notification| {
@@ -1094,7 +1305,6 @@ and 2 more"
 
     #[test]
     fn a_failing_notification_is_reported_once_and_syncing_goes_on() {
-        let dir = tempfile::tempdir().unwrap();
         let stop = Stop::new().unwrap();
         let mut reports = Reports::default();
         let mut p = printer();
@@ -1102,12 +1312,13 @@ and 2 more"
         let mut synced = 0;
         // Per round: whether the notification service answers.
         for works in [false, false, false, true, false] {
-            let new_mail = round(&all, dir.path(), &stop, &mut reports, &mut p, |_| {
+            let new_mail = round(&all, unlocked, &stop, &mut reports, &mut p, |_| {
                 synced += 1;
                 Synced {
                     report: Ok(added(false, &[synced])),
                     partial: SyncReport::default(),
                     warnings: Vec::new(),
+                    watch: None,
                 }
             })
             .unwrap();
@@ -1184,15 +1395,15 @@ and 2 more"
 
     #[test]
     fn a_sync_that_fails_after_storing_some_mail_still_announces_it() {
-        let dir = tempfile::tempdir().unwrap();
         let stop = Stop::new().unwrap();
         let mut reports = Reports::default();
         let mut p = printer();
         let all = accounts(&["work"]);
-        let new_mail = round(&all, dir.path(), &stop, &mut reports, &mut p, |_| Synced {
+        let new_mail = round(&all, unlocked, &stop, &mut reports, &mut p, |_| Synced {
             report: Err(anyhow::anyhow!("the mail server request failed")),
             partial: added(false, &[1, 2]),
             warnings: Vec::new(),
+            watch: None,
         })
         .unwrap();
         assert_eq!(

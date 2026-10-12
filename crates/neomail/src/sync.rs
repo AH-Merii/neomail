@@ -15,6 +15,7 @@ use tokio::runtime::Runtime;
 use crate::config::{Account, Login, OAuthSettings, Server};
 use crate::keyring::Keyring;
 use crate::oauth::{Refreshed, Secret};
+use crate::push::WatchLogin;
 use crate::{account, graph, output, secret};
 
 /// An access token is refreshed this long before it expires, so it never runs out mid-sync.
@@ -32,6 +33,7 @@ pub struct Syncer<'a> {
     tokens: Tokens,
     limit: NonZeroU32,
     password_mode: secret::CommandMode,
+    push_logins: bool,
     pub progress: output::ProgressLine,
 }
 
@@ -43,6 +45,7 @@ impl<'a> Syncer<'a> {
             tokens: Tokens::default(),
             limit,
             password_mode: secret::CommandMode::Interactive,
+            push_logins: false,
             progress,
         }
     }
@@ -55,16 +58,25 @@ impl<'a> Syncer<'a> {
         self
     }
 
+    /// For the daemon's push: a successful IMAP sync hands over what it logged in with
+    /// ([`Synced::watch`]), so the account's watcher never reads the keyring itself.
+    pub fn push_logins(mut self) -> Self {
+        self.push_logins = true;
+        self
+    }
+
     /// Syncs one account's INBOX into `cache`. Keyring calls stay outside `block_on`: their
     /// blocking calls start a runtime of their own, which panics inside another.
     pub fn sync(&mut self, account: &Account, cache: &mut Cache) -> Synced {
         let mut warnings = Vec::new();
         let mut stored = SyncReport::default();
-        match self.sync_inner(account, cache, &mut stored, &mut warnings) {
+        let mut watch = None;
+        match self.sync_inner(account, cache, &mut stored, &mut warnings, &mut watch) {
             Ok(()) => Synced {
                 report: Ok(stored),
                 partial: SyncReport::default(),
                 warnings,
+                watch,
             },
             Err(e) => {
                 // The token may be what failed (revoked, or refused by the server): ask for a new
@@ -76,6 +88,7 @@ impl<'a> Syncer<'a> {
                     report: Err(e),
                     partial: stored,
                     warnings,
+                    watch: None,
                 }
             }
         }
@@ -92,8 +105,12 @@ impl<'a> Syncer<'a> {
         cache: &mut Cache,
         report: &mut SyncReport,
         warnings: &mut Vec<String>,
+        watch: &mut Option<WatchLogin>,
     ) -> Result<()> {
         let runtime = self.runtime;
+        let push = self.push_logins;
+        // Only once the sync succeeded: its login works.
+        let hand_over = |imap: &ImapConfig, login| push.then(|| WatchLogin::new(imap, login));
         let limit = self.limit;
         let progress = &mut self.progress;
         match &account.login {
@@ -116,7 +133,9 @@ impl<'a> Syncer<'a> {
                     limit,
                     report,
                     progress,
-                ))
+                ))?;
+                *watch = hand_over(imap, login);
+                Ok(())
             }
             Login::OAuth(settings) => {
                 let keyring = &mut self.keyring;
@@ -125,17 +144,22 @@ impl<'a> Syncer<'a> {
                 })?;
                 // The same token reaches IMAP (XOAUTH2) or Microsoft Graph.
                 match &account.server {
-                    Server::Imap(imap) => runtime.block_on(sync_imap(
-                        imap,
-                        &account.name,
-                        nm_imap::Login::XOAuth2 {
+                    Server::Imap(imap) => {
+                        let login = nm_imap::Login::XOAuth2 {
                             access_token: token.expose(),
-                        },
-                        cache,
-                        limit,
-                        report,
-                        progress,
-                    )),
+                        };
+                        runtime.block_on(sync_imap(
+                            imap,
+                            &account.name,
+                            login,
+                            cache,
+                            limit,
+                            report,
+                            progress,
+                        ))?;
+                        *watch = hand_over(imap, login);
+                        Ok(())
+                    }
                     Server::Graph { .. } => runtime.block_on(graph::sync(
                         &account.name,
                         token,
@@ -159,6 +183,9 @@ pub struct Synced {
     /// with their [`SyncReport::new_ids`]. Empty when it succeeded; `report` has it all then.
     pub partial: SyncReport,
     pub warnings: Vec<String>,
+    /// After a successful IMAP sync by a [`Syncer::push_logins`] syncer: the login it used, for
+    /// the account's watcher.
+    pub watch: Option<WatchLogin>,
 }
 
 /// A new access token from the keyring's refresh token. A rotated refresh token is written back

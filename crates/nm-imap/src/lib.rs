@@ -1,6 +1,7 @@
 //! The IMAP [`MailSource`]: TLS or STARTTLS over rustls, then read-only IMAP on INBOX.
 
 mod tls;
+mod watch;
 #[cfg(test)]
 mod wire_tests;
 
@@ -22,6 +23,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 pub use tls::{CertPin, InvalidPin};
+pub use watch::{IDLE_RENEW, WatchEvent, Watcher};
 
 /// How long one network step may take: connecting, the handshake, a command's reply, or the
 /// next response of a FETCH. A FETCH as a whole has no bound, so a slow but working transfer of
@@ -146,6 +148,12 @@ pub enum ImapError {
     NoUidValidity,
     #[error("timed out during {0}")]
     Timeout(&'static str),
+    #[error("the server closed the connection")]
+    Closed,
+    #[error("the server ended the session: {0}")]
+    Bye(String),
+    #[error("the server ended IDLE")]
+    IdleEnded,
 }
 
 type Stream = TlsStream<TcpStream>;

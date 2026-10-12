@@ -29,9 +29,49 @@ The config is read again before each round, so an account you add or remove take
 next round. If the config becomes invalid, the daemon says so once and keeps the last good one.
 Without a config file or accounts it prints the start lines and exits 2.
 
+## Push
+
+IMAP accounts get push: new mail is synced, and notified, seconds after it arrives instead of at
+the next round. That covers every account the daemon syncs over IMAP: plain IMAP and
+app-password accounts, Proton through Bridge, and Gmail, which signs in with OAuth. Outlook and
+other Microsoft accounts sync through Microsoft Graph, not IMAP, and get no push yet.
+
+For each IMAP account whose server supports IDLE (RFC 2177), the daemon keeps one extra
+connection open next to the syncs, with INBOX opened read-only. It never changes anything on the
+server. When INBOX changes, the daemon syncs that account alone, about 2 seconds later, so a
+burst of changes makes one sync, and notifies as after a round. Rounds keep their times, as a
+safety net.
+
+- The connection opens after a successful sync of the account, with the login that sync used,
+  so the password or token is not asked for again. It is renewed every 29 minutes, as RFC 2177
+  advises.
+- A server without IDLE gets no extra connection; that account keeps syncing every round, as
+  Microsoft (Graph) accounts do for now.
+- When the connection drops, the daemon syncs the account to catch up and opens a new one, at
+  most once a minute per account: if the last one opened less than a minute before, the daemon
+  syncs the account again once the minute is up and opens it then. A connection that dies
+  without a word is noticed within 30 minutes, and the next round still syncs the account in the
+  meantime.
+- If the connection fails before its first IDLE, the daemon prints `push failing` and tries
+  again after the account's sync in the next round.
+- If a round fell due while the machine slept, that round opens every connection again. After a
+  shorter sleep, a connection that died meanwhile is noticed within 30 minutes, as above.
+- Ctrl-C or SIGTERM closes them all at once.
+
+Each IMAP account's push state is printed when its first connection opens or fails, and again
+when it changes. Like the start line, these lines go to standard error:
+
+```text
+14:00:01 neomail daemon: work: push on
+14:00:01 neomail daemon: home: push off (the server has no IDLE)
+14:20:00 neomail: work: push failing: could not connect to imap.example.com:993: Connection refused (os error 111)
+```
+
+A failure that repeats is not printed again; `push on` follows when it works again.
+
 ## Notifications
 
-On Linux, after each round, every account that got new mail in it shows one desktop
+On Linux, after each round or push sync, every account that got new mail in it shows one desktop
 notification:
 
 ```text
@@ -229,8 +269,8 @@ Then `SVDIR=~/.config/service sv up neomail` (or `SVDIR=~/service`) starts it ag
 
 Each account's first successful sync after the daemon starts prints a line, even with nothing
 new, so the log shows the daemon working. After that the daemon is quiet: it prints a line only
-when an account changed or failed. Each line starts with the local time, then the line
-`neomail sync` prints:
+when an account changed or failed, or its push state changed (see [Push](#push)). Each sync line
+starts with the local time, then the line `neomail sync` prints:
 
 ```text
 14:00:00 work: 0 new, 0 updated, 0 removed
@@ -240,11 +280,11 @@ when an account changed or failed. Each line starts with the local time, then th
 14:35:00 home: 0 new, 0 updated, 0 removed
 ```
 
-Changes go to standard output; failures and warnings go to standard error. One account failing
-never stops the others. A failure or warning that repeats the account's last one is not printed
-again; the account's next success is printed even with nothing new, so you can see it recovered
-(the last line above). Messages whose body could not be fetched (`N without a body`) are retried
-every round but printed only when their number changes. There is no progress counter.
+Changes go to standard output; failures, warnings and the push lines go to standard error. One
+account failing never stops the others. A failure or warning that repeats the account's last one is
+not printed again; the account's next success is printed even with nothing new, so you can see it
+recovered (the last line above). Messages whose body could not be fetched (`N without a body`) are
+retried every round but printed only when their number changes. There is no progress counter.
 
 An OAuth account's access token is kept in memory, never on disk, until 5 minutes before it
 expires, and only while the account (its server and signed-in user) stays as it was; then it is
@@ -259,6 +299,6 @@ when `neomail sync` holds an account, the daemon skips it for that round.
 
 ## Coming next
 
-For now the daemon polls. Later parts of the same slice add push, so new mail arrives without
-waiting for the interval: IMAP IDLE, Microsoft Graph's delta query, and Gmail through the Gmail
-API with its history.
+Push for IMAP accounts, Gmail included, is here. Later parts of the same slice give Microsoft
+(Graph) accounts push through Graph's delta query, and move Gmail from IMAP IDLE to the Gmail
+API's history.

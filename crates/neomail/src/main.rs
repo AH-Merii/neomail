@@ -16,6 +16,7 @@ mod notify;
 mod oauth;
 mod output;
 mod pager;
+mod push;
 mod secret;
 mod setup;
 mod style;
