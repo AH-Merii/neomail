@@ -1,8 +1,12 @@
 Third-party licences for nmail
 
 The nmail binary statically links the Rust crates listed below. Each licence text follows,
-with the crates it covers. The Linux (musl) build also statically links musl libc; its
-notice is the last section of this file in that build.
+with the crates it covers. The Linux (musl) build also statically links musl libc; its notice
+is the last section of this file in that build.
+
+The Rust standard library (std, core, alloc and the crates they use) is linked too. Its
+notices, including Unicode-3.0 for core's Unicode tables, are in COPYRIGHT-library.html,
+next to this file.
 {{#each licenses}}
 
 ================================================================================

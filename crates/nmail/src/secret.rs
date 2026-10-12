@@ -83,16 +83,24 @@ pub fn read_new_password(account: &str) -> Result<Password> {
 /// standard input. `what` names it in errors ("password", "client secret").
 pub fn read_secret(prompt: &str, what: &str) -> Result<String> {
     let stdin = io::stdin();
-    let secret = if stdin.is_terminal() {
-        rpassword::prompt_password(prompt).with_context(|| format!("cannot read the {what}"))?
-    } else {
-        let mut line = String::new();
-        stdin
-            .lock()
-            .read_line(&mut line)
-            .with_context(|| format!("cannot read the {what} from standard input"))?;
-        trim_newline(line)
-    };
+    if !stdin.is_terminal() {
+        return read_secret_line(stdin.lock(), what);
+    }
+    let secret =
+        rpassword::prompt_password(prompt).with_context(|| format!("cannot read the {what}"))?;
+    non_empty(secret, what)
+}
+
+/// A secret as one line of `input`, without its line ending.
+fn read_secret_line(mut input: impl BufRead, what: &str) -> Result<String> {
+    let mut line = String::new();
+    input
+        .read_line(&mut line)
+        .with_context(|| format!("cannot read the {what} from standard input"))?;
+    non_empty(trim_newline(line), what)
+}
+
+fn non_empty(secret: String, what: &str) -> Result<String> {
     if secret.is_empty() {
         bail!("the {what} is empty; nothing was stored");
     }
@@ -171,5 +179,18 @@ mod tests {
         assert_eq!(trim_newline("a\n\n".into()), "a\n");
         assert_eq!(trim_newline("a\r".into()), "a\r");
         assert!(run_password_command("printf '\\377'").is_err());
+    }
+
+    #[test]
+    fn a_secret_line_is_one_line_and_never_empty() {
+        for input in ["", "\n", "\r\n"] {
+            let e = read_secret_line(input.as_bytes(), "password").unwrap_err();
+            assert_eq!(
+                format!("{e:#}"),
+                "the password is empty; nothing was stored"
+            );
+        }
+        let secret = read_secret_line("hunter2 \r\nnext\n".as_bytes(), "password").unwrap();
+        assert_eq!(secret, "hunter2 ");
     }
 }

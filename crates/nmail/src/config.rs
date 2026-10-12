@@ -34,9 +34,10 @@ pub fn data_dir() -> Result<PathBuf> {
 }
 
 /// A TOML error as its message and position only. toml's own `Display` quotes the offending
-/// line, which could echo a secret pasted into the config.
+/// line, and serde's type, value and variant errors quote the value; either could echo a
+/// secret pasted into the config.
 fn syntax_error(text: &str, e: &toml::de::Error) -> anyhow::Error {
-    let message = e.message().trim_end();
+    let message = without_value(e.message().trim_end());
     match e.span() {
         Some(span) => {
             let before = text.get(..span.start).unwrap_or(text);
@@ -46,6 +47,30 @@ fn syntax_error(text: &str, e: &toml::de::Error) -> anyhow::Error {
         }
         None => anyhow::anyhow!("{message}"),
     }
+}
+
+/// serde's "invalid type: string \"x\", expected u16", "invalid value: integer `x`, expected
+/// ..." and "unknown variant `x`, expected ..." with the value left out: "invalid type: string,
+/// expected u16". The expected part comes from neomail's own types and never holds ", expected ".
+fn without_value(message: &str) -> String {
+    for prefix in ["invalid type: ", "invalid value: ", "unknown variant "] {
+        let Some(rest) = message.strip_prefix(prefix) else {
+            continue;
+        };
+        let (found, expected) = match rest.rfind(", expected ") {
+            Some(i) => rest.split_at(i),
+            None => (rest, ""),
+        };
+        // The kind ("string", "integer") comes before the quoted or backticked value.
+        let kind = found.split(['"', '`']).next().unwrap_or("").trim_end();
+        let head = prefix.trim_end();
+        return if kind.is_empty() {
+            format!("{head}{expected}")
+        } else {
+            format!("{head} {kind}{expected}")
+        };
+    }
+    message.to_owned()
 }
 
 /// An XDG base directory. Per the spec, a relative value is ignored.
@@ -255,8 +280,8 @@ impl Config {
 fn oauth_account(name: String, username: String, raw: RawOAuth) -> Result<Account> {
     let Some(provider) = oauth::provider(&raw.provider) else {
         bail!(
-            "account {name:?}: unknown oauth provider {:?}; known: {}",
-            raw.provider,
+            "account {name:?}: unknown oauth provider (the value is not shown, in case it is a \
+             pasted secret); known: {}",
             oauth::PROVIDERS
                 .iter()
                 .map(|p| p.id)
@@ -329,8 +354,41 @@ pub fn check_can_add(path: &Path, name: &str) -> Result<()> {
 /// Appends `block` (one `[[accounts]]` table named `name`) to the config file, keeping its text
 /// and comments. A missing file is created with mode 0600 in a directory created with mode 0700.
 /// The result is parsed before it is written, and written atomically: to a temporary file in the
-/// same directory, then renamed over the old one, keeping its permissions.
+/// same directory, then renamed over the old one, keeping its permissions. A symlinked config
+/// (stow, home-manager, chezmoi) is written at its target, so the link stays.
 pub fn append_account(path: &Path, name: &str, block: &str) -> Result<()> {
+    write_account(path, name, block, true)
+}
+
+/// Fails unless [`append_account`] would succeed: everything but the write itself, so a
+/// config that cannot take the account (an inline `accounts = [...]`, say) or a directory that
+/// cannot be written is found before the sign-in.
+pub fn check_append(path: &Path, name: &str, block: &str) -> Result<()> {
+    write_account(path, name, block, false)
+}
+
+/// The file a path names, following symlinks; the path itself when it is not a link. Unlike
+/// `canonicalize`, a link to a file that does not exist yet resolves too.
+fn resolve_links(path: &Path) -> Result<PathBuf> {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&path)
+                    .with_context(|| format!("cannot read the link {}", path.display()))?;
+                path = match path.parent() {
+                    Some(dir) => dir.join(target),
+                    None => target,
+                };
+            }
+            _ => return Ok(path),
+        }
+    }
+    bail!("{}: too many levels of symbolic links", path.display())
+}
+
+fn write_account(path: &Path, name: &str, block: &str, commit: bool) -> Result<()> {
+    let path = &resolve_links(path)?;
     check_can_add(path, name)?;
     let existing = read_existing(path)?;
     let mut text = existing.clone().unwrap_or_default();
@@ -377,6 +435,11 @@ pub fn append_account(path: &Path, name: &str, block: &str) -> Result<()> {
         if existing.is_some() {
             let perms = std::fs::metadata(path)?.permissions();
             file.set_permissions(perms)?;
+        }
+        if !commit {
+            drop(file);
+            std::fs::remove_file(&tmp)?;
+            return Ok(());
         }
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
@@ -474,6 +537,39 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
         assert!(message.starts_with("line 3, column "), "{message}");
     }
 
+    #[test]
+    fn type_value_and_variant_errors_never_quote_the_value() {
+        let secret = "hunter2-not-a-real-secret";
+        let base = "[[accounts]]\nname = \"a\"\nusername = \"u\"\n[accounts.imap]\nhost = \"h\"\n";
+        for (field, expected) in [
+            (
+                format!("port = \"{secret}\""),
+                "invalid type: string, expected u16",
+            ),
+            (
+                "port = 70000".to_owned(),
+                "invalid value: integer, expected u16",
+            ),
+            (
+                format!("security = \"{secret}\""),
+                "unknown variant, expected `tls` or `starttls`",
+            ),
+            (
+                format!("cert_sha256 = [\"{secret}\"]"),
+                "invalid type: sequence, expected a string",
+            ),
+        ] {
+            let text = format!("{base}{field}\n");
+            let message = format!("{:#}", Config::parse(&text).unwrap_err());
+            assert!(!message.contains(secret), "{message}");
+            assert!(message.ends_with(expected), "{field}: {message}");
+        }
+        assert_eq!(
+            without_value("missing field `host`"),
+            "missing field `host`"
+        );
+    }
+
     const GMAIL: &str = "[[accounts]]\nname = \"gmail\"\nusername = \"you@example.com\"\n\
                          oauth = { provider = \"google\", client_id = \"1234-abc.apps.googleusercontent.com\" }\n";
 
@@ -500,7 +596,8 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             ),
             (
                 GMAIL.replace("google", "yahoo"),
-                "unknown oauth provider \"yahoo\"; known: google",
+                "unknown oauth provider (the value is not shown, in case it is a pasted secret); \
+                 known: google",
             ),
             (format!("{GMAIL}imap = {{ host = \"h\" }}\n"), "remove imap"),
             (
@@ -580,5 +677,59 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             1,
             "no temporary file left"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_follows_a_symlinked_config_and_keeps_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path().join("dotfiles/neomail.toml");
+        std::fs::create_dir(managed.parent().unwrap()).unwrap();
+        std::fs::write(&managed, "# managed\n").unwrap();
+        let link = dir.path().join("config/neomail/config.toml");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../../dotfiles/neomail.toml", &link).unwrap();
+        let block = oauth_account_toml(
+            "gmail",
+            "you@example.com",
+            &oauth::GOOGLE,
+            "1234-abc.apps.googleusercontent.com",
+        );
+        append_account(&link, "gmail", &block).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&managed).unwrap(),
+            format!("# managed\n\n{GMAIL}")
+        );
+        assert_eq!(
+            std::fs::read_dir(link.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_dir(managed.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn check_append_finds_what_the_write_would_hit_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let block = oauth_account_toml("gmail", "you@example.com", &oauth::GOOGLE, "id");
+        check_append(&path, "gmail", &block).unwrap();
+        assert!(!path.exists());
+        let inline =
+            "accounts = [{ name = \"work\", username = \"u\", imap = { host = \"h\" } }]\n";
+        std::fs::write(&path, inline).unwrap();
+        assert!(check_append(&path, "gmail", &block).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), inline);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

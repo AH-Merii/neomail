@@ -27,8 +27,8 @@ GUIDE):
     Why: a client belongs to a project; its own keeps it apart from anything else. No billing.
  2. Enable the Gmail API: https://console.cloud.google.com/apis/library/gmail.googleapis.com
     Why: so the Gmail scope is offered in step 4 (a later neomail also uses the API).
- 3. Google Auth Platform > Branding: an app name and your address. Audience: External, and
-    under Test users add your Gmail address.
+ 3. Google Auth Platform > Branding > Get started: an app name, your address, Audience
+    External, then Create. Then Audience > Test users: add your Gmail address.
     Why: External lets a personal Gmail account sign in; in Testing only test users can.
  4. Data Access > Add or remove scopes: add https://mail.google.com/ and save.
     Why: it is the scope Gmail's IMAP requires.
@@ -38,10 +38,10 @@ GUIDE):
     Why: a Desktop app client may send the sign-in back to http://127.0.0.1 on any port,
     which is where nmail waits for it.
 
+At sign-in Google warns that it hasn't verified the app: it is yours, so click Continue.
 While the app's publishing status is Testing, Google ends the sign-in after 7 days and you
-run `nmail account login NAME` again. To avoid that, publish it (Audience > Publish app):
-Google then shows \"Google hasn't verified this app\" at sign-in, and an app for your own
-use (under 100 users) needs no verification.
+run `nmail account login NAME` again. To avoid that, publish it (Audience > Publish app): an
+app for your own use (under 100 users) needs no verification.
 ";
 
 pub struct AddArgs {
@@ -112,9 +112,21 @@ pub fn add(
     let client_secret =
         secret::read_secret("Client secret (from step 5, not shown): ", "client secret")?;
     // Before the browser: no point signing in when the sign-in cannot be kept. Opening the
-    // store does not reach it yet; reading an entry does.
+    // store does not reach it yet; reading an entry does. The append is tried with the address
+    // given, which the sign-in must match.
     let keyring = Keyring::open_for_oauth()?;
-    keyring.get_oauth(&name)?;
+    let leftover = match keyring.get_oauth(&name) {
+        Err(e) if e.is::<keyring::Malformed>() => None,
+        other => other?,
+    };
+    config::check_append(
+        config_path,
+        &name,
+        &config::oauth_account_toml(&name, &email, provider, &client_id),
+    )?;
+    if let Some(leftover) = leftover {
+        revoke_leftover(provider, &keyring, &name, &leftover)?;
+    }
     let client = oauth::Client {
         id: client_id,
         secret: Secret::new(client_secret),
@@ -135,6 +147,35 @@ pub fn add(
         keyring.name(),
         keyring::OAUTH_SERVICE,
     )?;
+    Ok(())
+}
+
+/// A sign-in left in the keyring under `name` with no account in the config (a config edited by
+/// hand, or an `add` whose append failed). It is revoked before the new sign-in, not after:
+/// Google's revocation invalidates every token the user granted the project, the new one too
+/// (<https://developers.google.com/identity/protocols/oauth2/native-app#tokenrevoke>).
+fn revoke_leftover(
+    provider: &Provider,
+    keyring: &Keyring,
+    name: &str,
+    leftover: &OAuthEntry,
+) -> Result<()> {
+    if let Some(token) = leftover.refresh_token() {
+        let result = Https::new()
+            .and_then(|http| runtime()?.block_on(oauth::revoke(&http, provider, &token)));
+        if let Err(e) = result {
+            eprintln!(
+                "nmail: warning: {} did not revoke the earlier sign-in for {name:?} ({e:#})",
+                provider.name
+            );
+        }
+    }
+    keyring.delete_oauth(name)?;
+    eprintln!(
+        "nmail: {} held an earlier sign-in for {name:?} with no account in the config; \
+         revoked and deleted it",
+        keyring.name()
+    );
     Ok(())
 }
 
@@ -190,7 +231,15 @@ pub fn logout(account: &Account, out: &mut impl Write) -> Result<()> {
             // Unreadable (malformed, say): delete it anyway. An unreachable keyring fails the
             // delete too, with the same one-line error.
             keyring.delete_oauth(&account.name)?;
-            eprintln!("nmail: warning: {e:#}; deleted it without revoking");
+            if e.is::<keyring::Malformed>() {
+                eprintln!(
+                    "nmail: warning: the keyring entry for {:?} was malformed; deleted it \
+                     without revoking",
+                    account.name
+                );
+            } else {
+                eprintln!("nmail: warning: {e:#}; deleted it without revoking");
+            }
             writeln!(
                 out,
                 "Signed out {:?}: deleted from {}.",

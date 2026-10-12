@@ -177,6 +177,31 @@ async fn listener_skips_stray_and_oversized_requests_and_returns_the_code() {
 }
 
 #[tokio::test]
+async fn an_idle_connection_does_not_hold_up_the_redirect() {
+    let listener = Listener::bind().await.unwrap();
+    let port: u16 = listener
+        .redirect_uri()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // A browser's speculative preconnect: opened first, kept open, never sends a byte.
+    let idle = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let redirect = format!("GET /?state=st4te&code={CODE} HTTP/1.1\r\n\r\n");
+    tokio::spawn(async move { send(port, redirect.as_bytes()).await });
+    // Well under the 10 s a single request may take, so a serial listener would time out.
+    let code = listener
+        .wait("st4te", Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_eq!(code.expose(), CODE);
+    drop(idle);
+}
+
+#[tokio::test]
 async fn listener_reports_a_declined_sign_in_and_times_out() {
     let listener = Listener::bind().await.unwrap();
     let port: u16 = listener
@@ -295,7 +320,7 @@ async fn token_responses_without_mail_scope_or_refresh_token_are_refused() {
 }
 
 #[tokio::test]
-async fn refresh_gets_an_access_token_and_explains_invalid_grant() {
+async fn refresh_gets_an_access_token_and_explains_invalid_grant_and_invalid_client() {
     let http = FakeHttp::new(&[
         (
             200,
@@ -304,6 +329,10 @@ async fn refresh_gets_an_access_token_and_explains_invalid_grant() {
         (
             400,
             r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#,
+        ),
+        (
+            401,
+            r#"{"error":"invalid_client","error_description":"Unauthorized"}"#,
         ),
     ]);
     let refresh_token = Secret::new(REFRESH.into());
@@ -321,6 +350,18 @@ async fn refresh_gets_an_access_token_and_explains_invalid_grant() {
     assert!(message.contains("7 days"), "{message}");
     assert!(
         message.ends_with("run `nmail account login gmail`"),
+        "{message}"
+    );
+    let e = refresh(&http, &GOOGLE, &client(), &refresh_token, "gmail")
+        .await
+        .unwrap_err();
+    let message = format!("{e:#}");
+    assert!(
+        message.contains("check the client ID and secret"),
+        "{message}"
+    );
+    assert!(
+        message.ends_with("run `nmail account logout gmail`, then `nmail account login gmail`"),
         "{message}"
     );
 }

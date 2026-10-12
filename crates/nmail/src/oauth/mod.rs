@@ -259,8 +259,8 @@ pub async fn exchange_code<H: Http>(
     let granted = tokens.scope.as_deref().unwrap_or("");
     if !granted.split(' ').any(|s| s == provider.mail_scope) {
         bail!(
-            "{} did not grant mail access ({}); sign in again and leave the mail access box \
-             ticked on the consent screen",
+            "{} did not grant mail access ({}); sign in again and, if the consent screen shows \
+             a checkbox for mail access, tick it",
             provider.name,
             provider.mail_scope
         );
@@ -304,6 +304,11 @@ pub async fn refresh<H: Http>(
              that last 7 days; see docs/gmail.md); run `nmail account login {account}`",
             provider.name
         ),
+        Err(e) if e.is::<BadClient>() => bail!(
+            "cannot refresh the {} sign-in: {e:#}; run `nmail account logout {account}`, then \
+             `nmail account login {account}`",
+            provider.name
+        ),
         Err(e) => Err(e.context(format!("cannot refresh the {} sign-in", provider.name))),
     }
 }
@@ -330,6 +335,18 @@ impl fmt::Display for InvalidGrant {
 }
 
 impl std::error::Error for InvalidGrant {}
+
+/// `invalid_client` or `unauthorized_client`: the client ID or secret is wrong.
+#[derive(Debug)]
+struct BadClient(String);
+
+impl fmt::Display for BadClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}; check the client ID and secret", self.0)
+    }
+}
+
+impl std::error::Error for BadClient {}
 
 async fn token_request<H: Http>(
     http: &H,
@@ -360,13 +377,13 @@ fn endpoint_error(body: &[u8], status: u16) -> anyhow::Error {
             .take(200)
             .collect::<String>()
     };
-    let hint = match e.error.as_str() {
-        "invalid_client" | "unauthorized_client" => "; check the client ID and secret",
-        _ => "",
+    let message = match e.error_description.as_deref().map(clean) {
+        Some(d) if !d.is_empty() => format!("{}: {d}", clean(&e.error)),
+        _ => clean(&e.error),
     };
-    match e.error_description.as_deref().map(clean) {
-        Some(d) if !d.is_empty() => anyhow!("{}: {d}{hint}", clean(&e.error)),
-        _ => anyhow!("{}{hint}", clean(&e.error)),
+    match e.error.as_str() {
+        "invalid_client" | "unauthorized_client" => anyhow::Error::new(BadClient(message)),
+        _ => anyhow!("{message}"),
     }
 }
 

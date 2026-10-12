@@ -176,12 +176,17 @@ next one succeeds; the release notes say so. Only a push to `main` publishes the
 the rolling `edge` pre-release
 ([DEC-2026-10-11-main-usable](decisions.md#dec-2026-10-11-main-usable)). Each tarball holds a
 `THIRD-PARTY-LICENSES` file that cargo-about generates from the dependency tree (`about.toml`
-lists the accepted licences; a crate under any other fails the build). Once the release exists,
+lists the accepted licences; a crate under any other fails the build). cargo-about sees only
+crates, so each tarball also holds the toolchain's `COPYRIGHT-library.html`, the Rust standard
+library's notices (several licences, Unicode-3.0 among them), which `about.hbs` points to, and the
+Linux build appends the notice of musl 1.2.5, the musl that Rust ships for the target and links statically
+(`licenses/musl-1.2.5-COPYRIGHT`). Once the release exists,
 publishing uploads the assets, then updates the notes, which name the commit, and moves the
 `edge` tag last, so the tag never runs ahead of the uploaded assets. A run cancelled during the
 upload can leave a tarball missing until the next publishing run, because `--clobber` deletes the
-old asset before it uploads the new one. The very first publish has to push the tag before it can
-create the release; if that run is cancelled, the next one finishes it. Only the publishing job
+old asset before it uploads the new one. The very first publish creates the release as a draft,
+uploads, then publishes it, which creates the tag; a cancelled first publish leaves a draft
+without a tag, which the next run uploads to and publishes. Only the publishing job
 can write to the repository, and a newer push cancels an older run.
 
 ## What comes next
