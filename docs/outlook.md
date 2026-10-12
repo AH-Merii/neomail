@@ -15,6 +15,8 @@ and [redirect URI guide](https://learn.microsoft.com/en-us/entra/identity-platfo
 A work or school account already belongs to a directory (tenant): skip this step. A personal
 account (Outlook.com, Hotmail) needs one first: create a free
 [Azure account](https://azure.microsoft.com/pricing/purchase-options/azure-account) with it.
+Microsoft asks for a phone number and a credit or debit card "for identity verification"; it
+charges nothing at sign-up, but may place a small verification hold on the card (same page).
 
 *Why:* an app registration lives in a directory. Microsoft lists "an Azure account that has an
 active subscription" as the prerequisite and suggests the account's **Default Directory**
