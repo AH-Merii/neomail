@@ -1,4 +1,9 @@
-# neomail
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/neomail-logo-dark.svg">
+    <img alt="neomail" src="assets/logo/neomail-logo-light.svg" height="48">
+  </picture>
+</h1>
 
 A fast, modal terminal email client for Outlook, Gmail and Proton Mail.
 
