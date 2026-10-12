@@ -83,22 +83,42 @@ exchange has one 60-second bound. `MailSource` does not change.
 code. The code is exchanged at the token endpoint; the sign-in is refused without the mail scope
 (Google's consent screen lets it be unticked) or a refresh token, and the address comes from the
 ID token's `email` claim, with no signature check because it arrives straight from the token endpoint
-over TLS (OpenID Connect Core 1.0, 3.1.3.7 step 6). A **provider is data** (`Provider`:
-endpoints, scopes, IMAP host), so Microsoft becomes a second value, not a trait. **HTTP** is one
+over TLS (OpenID Connect Core 1.0, 3.1.3.7 step 6), falling back to `preferred_username`, which
+Microsoft sends when `email` is missing. A **provider is data** (`Provider` in `oauth/provider.rs`:
+endpoints, an optional revocation and device code endpoint, `ClientKind` (Google's confidential
+client sends its secret, Microsoft's public client never does), the redirect host, the scopes, the
+accepted mail grants and their prefix, the refresh scope, `MailApi` (IMAP host and port, or Graph),
+numeric error-code hints and the setup text), so `MICROSOFT` is a second value, not a trait; it is
+defined but not in `PROVIDERS` until the Graph source lands. A missing `scope` in a token answer
+counts as the scopes requested; a granted scope matches a mail grant after the prefix is stripped,
+ignoring case. **Device code** (`oauth/device.rs`, RFC 8628) asks for a code, shows the provider's
+`message` (else the URL and code), and polls the token endpoint every `interval` seconds (default
+5), adding 5 s for good on `slow_down`, stopping on a declined, expired or unknown code or after
+`expires_in` (default 900 s); its tokens pass the same checks as the code exchange. Google has no
+device code endpoint here: its device flow does not allow Gmail's scope. **HTTP** is one
 seam, `oauth::http::Http` (a form POST): `Https` writes HTTP/1.1 over the same rustls, ring and
 platform verifier as IMAP, so no HTTP client crate is needed, and the tests give a scripted fake.
 **The browser** is opened by `browser.rs` (`$BROWSER`, else `wslview` or `explorer.exe` on WSL,
 else `xdg-open`, never with `--no-browser`); the URL is always printed, and choosing the command
 is a pure function, so no test launches anything.
 
-**Where OAuth secrets live:** the client secret and refresh token are one OS keyring entry, JSON,
-with the service `neomail-oauth` and the account name as its `username` attribute, so it can never
-collide with a password entry (`neomail`). Access tokens are never stored: `neomail sync` reads the
-entry before it enters `block_on`, then refreshes the access token and logs in inside it. An
-`invalid_grant` says the sign-in expired or was revoked (7 days while the app is in Testing) and to
-run `neomail account login NAME`. Every type holding a token or secret (`Secret`, `OAuthEntry`,
-`Pkce`, `Login`, the HTTP `Response`) has a redacted `Debug`, and errors never quote a response
-body.
+**Where OAuth secrets live:** the client secret (omitted for a public client) and refresh token
+are one OS keyring entry, JSON, with the service `neomail-oauth` and the account name as its
+`username` attribute, so it can never collide with a password entry (`neomail`). Access tokens are
+never stored: `neomail sync` reads the entry before it enters `block_on`, refreshes the access
+token inside it, and leaves it again to write back a **rotated refresh token** (Microsoft sends a
+new one with each refresh; a failed write is a warning, since the old token is not revoked), then
+syncs. An `invalid_grant` gives the provider's reason (7 days while a Google app is in Testing; 90
+days unused, a password change or revoked access at Microsoft) and says to run
+`neomail account login NAME`. Logout skips revocation for a provider without a revocation endpoint
+(Microsoft) and says the sign-in was only deleted from the keyring.
+
+The provider work touches three seams and adds none: the `Provider` data, the `Http` form POST
+(device code is form POSTs too, so the scripted fake and tokio's paused time test it), and the
+keyring entry's JSON, whose `client_secret` became optional so Gmail entries round-trip unchanged.
+
+Every type holding a token or secret (`Secret`, `OAuthEntry`, `Pkce`, `Login`, the HTTP
+`Response`) has a redacted `Debug`, and errors never quote a response body.
 
 **The config writer** (`config::append_account`, used by `neomail account add`) appends one
 `[[accounts]]` table to the file as text, so existing text and comments stay. It refuses a taken

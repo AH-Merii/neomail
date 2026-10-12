@@ -55,9 +55,10 @@ impl Listener {
         Ok(Self { listener, port })
     }
 
-    /// The `redirect_uri`: Google accepts any port on the loopback address for a desktop client.
-    pub fn redirect_uri(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+    /// The `redirect_uri` with the provider's host: Google accepts any port on 127.0.0.1 for a
+    /// desktop client, Microsoft any port on `localhost` for a public client.
+    pub fn redirect_uri(&self, host: &str) -> String {
+        format!("http://{host}:{}", self.port)
     }
 
     /// Waits for the redirect carrying `state`, for at most `timeout`.

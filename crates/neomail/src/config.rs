@@ -330,10 +330,16 @@ fn oauth_account(name: String, username: String, raw: RawOAuth) -> Result<Accoun
     if client_id.is_empty() {
         bail!("account {name:?}: oauth.client_id is empty");
     }
+    let oauth::MailApi::Imap { host, port } = provider.mail else {
+        bail!(
+            "account {name:?}: {} mail through Microsoft Graph is not supported yet",
+            provider.name
+        );
+    };
     Ok(Account {
         imap: ImapConfig {
-            host: provider.imap_host.to_owned(),
-            port: provider.imap_port,
+            host: host.to_owned(),
+            port,
             security: Security::Tls,
             username: username.trim().to_owned(),
             cert_pin: None,

@@ -14,10 +14,11 @@ const REFRESH: &str = "1//refresh-not-real";
 const ACCESS: &str = "ya29.access-not-real";
 const CODE: &str = "4/0code-not-real";
 
-/// A token endpoint that answers from a script and records each form it got.
+/// A token endpoint that answers from a script and records each form it got, and when.
 struct FakeHttp {
     answers: RefCell<Vec<(u16, String)>>,
     forms: RefCell<Vec<(String, HashMap<String, String>)>>,
+    times: RefCell<Vec<tokio::time::Instant>>,
 }
 
 impl FakeHttp {
@@ -25,7 +26,18 @@ impl FakeHttp {
         Self {
             answers: RefCell::new(answers.iter().map(|(s, b)| (*s, (*b).to_owned())).collect()),
             forms: RefCell::default(),
+            times: RefCell::default(),
         }
+    }
+
+    /// Seconds from the first request to each later one.
+    fn offsets(&self) -> Vec<u64> {
+        let times = self.times.borrow();
+        times
+            .iter()
+            .skip(1)
+            .map(|t| (*t - times[0]).as_secs())
+            .collect()
     }
 }
 
@@ -36,6 +48,7 @@ impl http::Http for FakeHttp {
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         self.forms.borrow_mut().push((url.to_owned(), form));
+        self.times.borrow_mut().push(tokio::time::Instant::now());
         let (status, body) = self.answers.borrow_mut().remove(0);
         Ok(Response {
             status,
@@ -47,7 +60,15 @@ impl http::Http for FakeHttp {
 fn client() -> Client {
     Client {
         id: "1234-abc.apps.googleusercontent.com".into(),
-        secret: Secret::new(SECRET.into()),
+        secret: Some(Secret::new(SECRET.into())),
+    }
+}
+
+/// A Microsoft public client: no secret.
+fn public_client() -> Client {
+    Client {
+        id: "00000000-0000-0000-0000-000000000000".into(),
+        secret: None,
     }
 }
 
@@ -148,7 +169,7 @@ async fn send(port: u16, request: &[u8]) -> String {
 #[tokio::test]
 async fn listener_skips_stray_and_oversized_requests_and_returns_the_code() {
     let listener = Listener::bind().await.unwrap();
-    let uri = listener.redirect_uri();
+    let uri = listener.redirect_uri("127.0.0.1");
     let port: u16 = uri.rsplit(':').next().unwrap().parse().unwrap();
     let browser = tokio::spawn(async move {
         let favicon = send(port, b"GET /favicon.ico HTTP/1.1\r\n\r\n").await;
@@ -180,7 +201,7 @@ async fn listener_skips_stray_and_oversized_requests_and_returns_the_code() {
 async fn an_idle_connection_does_not_hold_up_the_redirect() {
     let listener = Listener::bind().await.unwrap();
     let port: u16 = listener
-        .redirect_uri()
+        .redirect_uri("127.0.0.1")
         .rsplit(':')
         .next()
         .unwrap()
@@ -205,7 +226,7 @@ async fn an_idle_connection_does_not_hold_up_the_redirect() {
 async fn the_listener_handles_at_most_max_connections_at_once() {
     let listener = Listener::bind().await.unwrap();
     let port: u16 = listener
-        .redirect_uri()
+        .redirect_uri("127.0.0.1")
         .rsplit(':')
         .next()
         .unwrap()
@@ -243,7 +264,7 @@ async fn the_listener_handles_at_most_max_connections_at_once() {
 async fn listener_reports_a_declined_sign_in_and_times_out() {
     let listener = Listener::bind().await.unwrap();
     let port: u16 = listener
-        .redirect_uri()
+        .redirect_uri("127.0.0.1")
         .rsplit(':')
         .next()
         .unwrap()
@@ -374,12 +395,19 @@ async fn refresh_gets_an_access_token_and_explains_invalid_grant_and_invalid_cli
         ),
     ]);
     let refresh_token = Secret::new(REFRESH.into());
-    let access = refresh(&http, &GOOGLE, &client(), &refresh_token, "gmail")
+    let refreshed = refresh(&http, &GOOGLE, &client(), &refresh_token, "gmail")
         .await
         .unwrap();
-    assert_eq!(access.expose(), ACCESS);
-    assert_eq!(http.forms.borrow()[0].1["grant_type"], "refresh_token");
-    assert_eq!(http.forms.borrow()[0].1["refresh_token"], REFRESH);
+    assert_eq!(refreshed.access_token.expose(), ACCESS);
+    assert!(refreshed.refresh_token.is_none(), "Google does not rotate");
+    let form = http.forms.borrow()[0].1.clone();
+    assert_eq!(form["grant_type"], "refresh_token");
+    assert_eq!(form["refresh_token"], REFRESH);
+    assert_eq!(
+        form["client_secret"], SECRET,
+        "Gmail's form still sends the secret"
+    );
+    assert!(!form.contains_key("scope"));
     let e = refresh(&http, &GOOGLE, &client(), &refresh_token, "gmail")
         .await
         .unwrap_err();
@@ -435,11 +463,348 @@ fn id_token_email_claim() {
 
 #[test]
 fn providers_are_data() {
-    assert_eq!(provider("google").unwrap().imap_host, "imap.gmail.com");
+    assert_eq!(
+        provider("google").unwrap().mail,
+        MailApi::Imap {
+            host: "imap.gmail.com",
+            port: 993
+        }
+    );
     assert!(provider("microsoft").is_none());
     assert_eq!(
         format!("{:?}", Secret::new(SECRET.into())),
         "Secret(<redacted>)"
     );
     assert!(!format!("{:?}", client()).contains(SECRET));
+}
+
+const DEVICE: &str = "GMQCQAFFAAEAAAAAAAAA-device-not-real";
+const MS_REFRESH: &str = "M.C5-refresh-not-real";
+
+/// Microsoft's token answer: `scope` is left out when `None`, and the ID token has only
+/// `preferred_username`, as a personal account's may.
+fn ms_token(scope: Option<&str>, refresh: &str) -> String {
+    let scope = scope
+        .map(|s| format!(r#""scope":"{s}","#))
+        .unwrap_or_default();
+    let id = id_token(r#"{"preferred_username":"you@example.com"}"#);
+    format!(
+        r#"{{"token_type":"Bearer",{scope}"access_token":"{ACCESS}","refresh_token":"{refresh}","id_token":"{id}"}}"#
+    )
+}
+
+fn device_answer(extra: &str) -> String {
+    format!(
+        r#"{{"device_code":"{DEVICE}","user_code":"ABCD-EFGH","verification_uri":"https://microsoft.com/devicelogin"{extra}}}"#
+    )
+}
+
+const PENDING: (u16, &str) = (400, r#"{"error":"authorization_pending"}"#);
+
+async fn device_sign_in(http: &FakeHttp) -> (Result<SignedIn>, String) {
+    let shown = RefCell::new(String::new());
+    let result = device::sign_in(http, &MICROSOFT, &public_client(), |text| {
+        *shown.borrow_mut() = text.to_owned();
+    })
+    .await;
+    (result, shown.into_inner())
+}
+
+#[tokio::test(start_paused = true)]
+async fn device_code_polls_at_the_interval_and_slow_down_adds_5_s_for_good() {
+    let message = "To sign in, use a web browser to open the page \
+                   https://microsoft.com/devicelogin and enter the code ABCD-EFGH.";
+    let token = ms_token(
+        Some("https://graph.microsoft.com/Mail.Read openid"),
+        MS_REFRESH,
+    );
+    let http = FakeHttp::new(&[
+        (
+            200,
+            &device_answer(&format!(
+                r#","expires_in":900,"interval":5,"message":"{message}""#
+            )),
+        ),
+        PENDING,
+        (400, r#"{"error":"slow_down"}"#),
+        PENDING,
+        (200, &token),
+    ]);
+    let (result, shown) = device_sign_in(&http).await;
+    let signed_in = result.unwrap();
+    assert_eq!(shown, message);
+    assert_eq!(signed_in.email, "you@example.com");
+    assert_eq!(signed_in.refresh_token.expose(), MS_REFRESH);
+    // Polls 5 s after the code, then 5, 10 and 10 s apart.
+    assert_eq!(http.offsets(), [5, 10, 20, 30]);
+    let forms = http.forms.borrow();
+    let (url, form) = &forms[0];
+    assert_eq!(
+        url,
+        "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
+    );
+    assert_eq!(form["scope"], MICROSOFT.scope);
+    assert_eq!(form["client_id"], public_client().id);
+    for (url, form) in &forms[1..] {
+        assert_eq!(url, MICROSOFT.token_url);
+        assert_eq!(
+            form["grant_type"],
+            "urn:ietf:params:oauth:grant-type:device_code"
+        );
+        assert_eq!(form["device_code"], DEVICE);
+        assert_eq!(form["client_id"], public_client().id);
+    }
+    assert!(forms.iter().all(|(_, f)| !f.contains_key("client_secret")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn device_code_stops_when_declined_expired_unknown_or_past_its_deadline() {
+    let cases: [(&[(u16, &str)], &str); 4] = [
+        (
+            &[PENDING, (400, r#"{"error":"authorization_declined"}"#)],
+            "the sign-in was declined",
+        ),
+        // RFC 8628's name for the same thing.
+        (
+            &[(400, r#"{"error":"access_denied"}"#)],
+            "the sign-in was declined",
+        ),
+        (&[(400, r#"{"error":"expired_token"}"#)], "the code expired"),
+        (
+            &[(400, r#"{"error":"bad_verification_code"}"#)],
+            "did not recognise the device code",
+        ),
+    ];
+    for (polls, expected) in cases {
+        let mut answers = vec![(200, device_answer(""))];
+        answers.extend(polls.iter().map(|(s, b)| (*s, (*b).to_owned())));
+        let answers: Vec<(u16, &str)> = answers.iter().map(|(s, b)| (*s, b.as_str())).collect();
+        let http = FakeHttp::new(&answers);
+        let (result, shown) = device_sign_in(&http).await;
+        let e = result.unwrap_err();
+        let message = format!("{e:#} {e:?}");
+        assert!(message.contains(expected), "{message}");
+        assert!(!message.contains(DEVICE), "{message}");
+        // Without `message`, the URL and the code are shown.
+        assert_eq!(
+            shown,
+            "To sign in, open https://microsoft.com/devicelogin and enter the code ABCD-EFGH."
+        );
+        // Default interval: 5 s.
+        assert_eq!(http.offsets()[0], 5);
+    }
+
+    // expires_in 120 with a 50 s interval: polls at 50 and 100 s, then the deadline.
+    let device = device_answer(r#","expires_in":120,"interval":50"#);
+    let http = FakeHttp::new(&[(200, &device), PENDING, PENDING]);
+    let (result, _) = device_sign_in(&http).await;
+    let e = result.unwrap_err();
+    assert!(
+        format!("{e:#}").contains("did not finish within 2 minutes"),
+        "{e:#}"
+    );
+    assert_eq!(http.offsets(), [50, 100]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn device_code_instructions_reach_the_terminal_without_control_characters() {
+    let device =
+        device_answer(r#","message":"\u001b[2JOpen https://microsoft.com/devicelogin\u0007""#);
+    let token = ms_token(
+        Some("https://graph.microsoft.com/Mail.Read openid"),
+        MS_REFRESH,
+    );
+    let http = FakeHttp::new(&[(200, &device), (200, &token)]);
+    let (result, shown) = device_sign_in(&http).await;
+    result.unwrap();
+    assert_eq!(shown, "[2JOpen https://microsoft.com/devicelogin");
+}
+
+#[tokio::test]
+async fn a_device_code_error_names_the_cause_and_never_the_code() {
+    let http = FakeHttp::new(&[(
+        400,
+        r#"{"error":"invalid_client","error_description":"AADSTS7000218: The request body must contain the following parameter: 'client_assertion' or 'client_secret'.","error_codes":[7000218]}"#,
+    )]);
+    let (result, _) = device_sign_in(&http).await;
+    let message = format!("{:#}", result.unwrap_err());
+    assert!(
+        message.starts_with(
+            "Microsoft refused the device code request: invalid_client: AADSTS7000218"
+        ),
+        "{message}"
+    );
+    assert!(
+        message.ends_with("; probably the app registration's public client flows are off: set Authentication > Allow public client flows to Yes"),
+        "{message}"
+    );
+}
+
+async fn exchange_with(provider: &Provider, client: &Client, answer: &str) -> Result<SignedIn> {
+    let http = FakeHttp::new(&[(200, answer)]);
+    let result = exchange_code(
+        &http,
+        provider,
+        client,
+        &Secret::new(CODE.into()),
+        &Pkce::new().unwrap(),
+        "http://localhost:1",
+    )
+    .await;
+    // A confidential client without its secret fails before anything is sent.
+    if let Some((_, form)) = http.forms.borrow().first() {
+        assert_eq!(
+            form.contains_key("client_secret"),
+            provider.client == ClientKind::Confidential
+        );
+    }
+    result
+}
+
+#[tokio::test]
+async fn a_public_client_never_sends_a_secret_and_a_confidential_one_needs_one() {
+    // Even a secret the client holds stays out of a public client's form.
+    let holding = Client {
+        secret: Some(Secret::new(SECRET.into())),
+        ..public_client()
+    };
+    let token = ms_token(None, MS_REFRESH);
+    let signed_in = exchange_with(&MICROSOFT, &holding, &token).await.unwrap();
+    assert_eq!(signed_in.email, "you@example.com");
+    let e = exchange_with(
+        &GOOGLE,
+        &Client {
+            secret: None,
+            ..client()
+        },
+        &token,
+    )
+    .await;
+    assert!(format!("{:#}", e.unwrap_err()).contains("the Google client secret is missing"));
+}
+
+#[tokio::test]
+async fn graph_scopes_are_matched_without_prefix_or_case() {
+    assert!(
+        grants_mail(&MICROSOFT, None),
+        "missing scope: the requested ones"
+    );
+    assert!(grants_mail(
+        &MICROSOFT,
+        Some("openid https://graph.microsoft.com/mail.read")
+    ));
+    assert!(grants_mail(&MICROSOFT, Some("Mail.ReadWrite profile")));
+    assert!(!grants_mail(
+        &MICROSOFT,
+        Some("openid profile email https://graph.microsoft.com/User.Read")
+    ));
+    assert!(!grants_mail(
+        &MICROSOFT,
+        Some("https://graph.microsoft.com/Mail.Send")
+    ));
+    assert!(grants_mail(&GOOGLE, Some(FULL_SCOPE)));
+    assert!(!grants_mail(&GOOGLE, Some("openid email")));
+    let no_mail = ms_token(
+        Some("openid https://graph.microsoft.com/User.Read"),
+        MS_REFRESH,
+    );
+    let e = exchange_with(&MICROSOFT, &public_client(), &no_mail)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{e:#}").contains(
+            "did not grant mail access (https://graph.microsoft.com/Mail.Read or \
+             https://graph.microsoft.com/Mail.ReadWrite)"
+        ),
+        "{e:#}"
+    );
+}
+
+#[tokio::test]
+async fn microsoft_refresh_asks_for_the_refresh_scope_and_returns_the_rotated_token() {
+    let http = FakeHttp::new(&[
+        (200, &ms_token(None, MS_REFRESH)),
+        (
+            400,
+            r#"{"error":"invalid_grant","error_description":"AADSTS70000: The grant is expired.","error_codes":[70000]}"#,
+        ),
+    ]);
+    let saved = Secret::new(REFRESH.into());
+    let refreshed = refresh(&http, &MICROSOFT, &public_client(), &saved, "outlook")
+        .await
+        .unwrap();
+    assert_eq!(refreshed.access_token.expose(), ACCESS);
+    assert_eq!(refreshed.rotated(&saved).unwrap().expose(), MS_REFRESH);
+    let debug = format!("{refreshed:?}");
+    assert!(
+        !debug.contains(ACCESS) && !debug.contains(MS_REFRESH),
+        "{debug}"
+    );
+    let form = http.forms.borrow()[0].1.clone();
+    assert_eq!(
+        form["scope"],
+        "offline_access https://graph.microsoft.com/Mail.Read"
+    );
+    assert!(!form.contains_key("client_secret"));
+    let e = refresh(&http, &MICROSOFT, &public_client(), &saved, "outlook")
+        .await
+        .unwrap_err();
+    let message = format!("{e:#}");
+    assert!(message.contains("unused for 90 days"), "{message}");
+    assert!(
+        message.ends_with("run `neomail account login outlook`"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_refresh_token_is_written_back_only_when_it_changed() {
+    let saved = Secret::new(REFRESH.into());
+    let with = |token: Option<&str>| Refreshed {
+        access_token: Secret::new(ACCESS.into()),
+        refresh_token: token.map(|t| Secret::new(t.into())),
+    };
+    assert!(with(None).rotated(&saved).is_none());
+    assert!(with(Some(REFRESH)).rotated(&saved).is_none());
+    assert_eq!(
+        with(Some(MS_REFRESH)).rotated(&saved).unwrap().expose(),
+        MS_REFRESH
+    );
+}
+
+#[tokio::test]
+async fn revoke_fails_without_a_revocation_endpoint() {
+    let http = FakeHttp::new(&[]);
+    let e = revoke(&http, &MICROSOFT, &Secret::new(REFRESH.into()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        format!("{e:#}"),
+        "Microsoft has no token revocation endpoint"
+    );
+    assert!(http.forms.borrow().is_empty());
+}
+
+#[test]
+fn the_address_falls_back_to_preferred_username() {
+    let token = |claims: &str| id_token_email(&id_token(claims));
+    assert_eq!(
+        token(r#"{"preferred_username":"you@example.com"}"#).unwrap(),
+        "you@example.com"
+    );
+    assert_eq!(
+        token(r#"{"email":"a@example.com","preferred_username":"b@example.com"}"#).unwrap(),
+        "a@example.com"
+    );
+    assert!(token(r#"{"preferred_username":"not-an-address"}"#).is_err());
+}
+
+#[test]
+fn microsoft_is_defined_but_not_offered() {
+    assert!(!PROVIDERS.contains(&&MICROSOFT));
+    assert_eq!(MICROSOFT.mail, MailApi::Graph);
+    assert_eq!(MICROSOFT.client, ClientKind::Public);
+    assert!(MICROSOFT.revoke_url.is_none());
+    assert!(GOOGLE.device_code_url.is_none());
+    assert!(MICROSOFT.auth_params.is_empty(), "no prompt=consent");
 }

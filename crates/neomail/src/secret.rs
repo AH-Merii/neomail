@@ -54,9 +54,12 @@ pub fn account_password(
     }
 }
 
-/// An OAuth account's client secret and refresh token from the keyring, opened on first use
-/// like [`account_password`]. Blocking, like it.
-pub fn oauth_secrets(account: &str, keyring: &mut Option<Keyring>) -> Result<(Secret, Secret)> {
+/// An OAuth account's client secret (`None` for a public client's entry) and refresh token from
+/// the keyring, opened on first use like [`account_password`]. Blocking, like it.
+pub fn oauth_secrets(
+    account: &str,
+    keyring: &mut Option<Keyring>,
+) -> Result<(Option<Secret>, Secret)> {
     let keyring = match keyring {
         Some(k) => k,
         None => keyring.insert(Keyring::open_for_oauth()?),
@@ -70,6 +73,25 @@ pub fn oauth_secrets(account: &str, keyring: &mut Option<Keyring>) -> Result<(Se
     let entry = keyring.get_oauth(account)?.ok_or_else(not_signed_in)?;
     let refresh_token = entry.refresh_token().ok_or_else(not_signed_in)?;
     Ok((entry.client_secret(), refresh_token))
+}
+
+/// Writes a rotated refresh token back to the account's keyring entry, keeping its client
+/// secret. Blocking, like [`oauth_secrets`].
+pub fn save_refresh_token(
+    account: &str,
+    keyring: &mut Option<Keyring>,
+    client_secret: Option<&Secret>,
+    refresh_token: &Secret,
+) -> Result<()> {
+    let keyring = match keyring {
+        Some(k) => k,
+        None => keyring.insert(Keyring::open_for_oauth()?),
+    };
+    let entry = crate::keyring::OAuthEntry {
+        client_secret: client_secret.map(|s| s.expose().to_owned()),
+        refresh_token: Some(refresh_token.expose().to_owned()),
+    };
+    keyring.set_oauth(account, &entry)
 }
 
 /// Whether neomail may ask for something: standard input is a terminal, and neither

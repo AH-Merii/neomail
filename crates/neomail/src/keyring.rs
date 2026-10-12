@@ -1,7 +1,7 @@
 //! The OS keyring: the Secret Service over D-Bus on Linux (zbus, pure Rust), the login keychain
 //! on macOS. A password account's entry has the service `neomail` and the account name as the
-//! user; an OAuth account's has the service `neomail-oauth` and holds its client secret and
-//! refresh token as JSON, so the two kinds can never overwrite each other.
+//! user; an OAuth account's has the service `neomail-oauth` and holds its client secret (if any)
+//! and refresh token as JSON, so the two kinds can never overwrite each other.
 //!
 //! Errors are written here rather than passed through: keyring-core's `BadEncoding` and
 //! `BadDataFormat` carry the stored bytes, so they are never formatted with `{:?}`.
@@ -21,11 +21,13 @@ pub const SERVICE: &str = "neomail";
 /// The keyring service OAuth sign-ins are stored under.
 pub const OAUTH_SERVICE: &str = "neomail-oauth";
 
-/// An OAuth account's keyring entry: the user's client secret and, once signed in, the refresh
-/// token. Stored as JSON; `Debug` is redacted.
+/// An OAuth account's keyring entry: the user's client secret (a public client has none) and,
+/// once signed in, the refresh token. Stored as JSON; `Debug` is redacted. A Gmail entry written
+/// before the secret became optional parses and is written back unchanged.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthEntry {
-    pub client_secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
     pub refresh_token: Option<String>,
 }
 
@@ -36,8 +38,8 @@ impl std::fmt::Debug for OAuthEntry {
 }
 
 impl OAuthEntry {
-    pub fn client_secret(&self) -> Secret {
-        Secret::new(self.client_secret.clone())
+    pub fn client_secret(&self) -> Option<Secret> {
+        self.client_secret.clone().map(Secret::new)
     }
 
     pub fn refresh_token(&self) -> Option<Secret> {
@@ -319,12 +321,12 @@ mod tests {
         k.set("gmail", &Password::new(SECRET.into())).unwrap();
         assert!(k.get_oauth("gmail").unwrap().is_none());
         let entry = OAuthEntry {
-            client_secret: SECRET.into(),
+            client_secret: Some(SECRET.into()),
             refresh_token: Some("1//refresh-not-real".into()),
         };
         k.set_oauth("gmail", &entry).unwrap();
         let back = k.get_oauth("gmail").unwrap().unwrap();
-        assert_eq!(back.client_secret().expose(), SECRET);
+        assert_eq!(back.client_secret().unwrap().expose(), SECRET);
         assert_eq!(
             back.refresh_token().unwrap().expose(),
             "1//refresh-not-real"
@@ -360,6 +362,23 @@ mod tests {
             message.contains("OAuth sign-ins are kept only there"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn a_gmail_entry_round_trips_unchanged_and_a_public_client_entry_has_no_secret() {
+        // The JSON a Gmail entry has held since slice 3, field order included.
+        let gmail = format!(r#"{{"client_secret":"{SECRET}","refresh_token":"1//r"}}"#);
+        let entry: OAuthEntry = serde_json::from_str(&gmail).unwrap();
+        assert_eq!(entry.client_secret().unwrap().expose(), SECRET);
+        assert_eq!(serde_json::to_string(&entry).unwrap(), gmail);
+        let public = OAuthEntry {
+            client_secret: None,
+            refresh_token: Some("M.r".into()),
+        };
+        let json = serde_json::to_string(&public).unwrap();
+        assert_eq!(json, r#"{"refresh_token":"M.r"}"#);
+        let back: OAuthEntry = serde_json::from_str(&json).unwrap();
+        assert!(back.client_secret().is_none());
     }
 
     #[test]
