@@ -1,10 +1,12 @@
 //! `neomail`: the neomail command line: a read-only INBOX (sync, list, show), passwords in the OS
-//! keyring, Gmail through the user's own OAuth client, and setup (`account add`, `account list`,
-//! `config path|check`).
+//! keyring, Gmail and Outlook through the user's own OAuth client (Outlook read through Microsoft
+//! Graph), and setup (`account add`, `account list`, `config path|check`).
 
 mod account;
 mod browser;
 mod config;
+mod graph;
+mod http;
 mod keyring;
 mod oauth;
 mod output;
@@ -22,9 +24,9 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use nm_core::{Cache, MessageId, sync_inbox_with_progress};
-use nm_imap::{CertPin, ImapSource, Security};
+use nm_imap::{CertPin, ImapConfig, ImapSource, Security};
 
-use crate::config::{Account, Config, Login, PasswordSource};
+use crate::config::{Account, Config, Login, PasswordSource, Server};
 use crate::keyring::Keyring;
 use crate::output::Mode;
 use crate::secret::{Input, Password};
@@ -58,6 +60,8 @@ Examples:
       --username you@example.com --host imap.example.com
   neomail account add gmail --email you@example.com \\
       --client-id 1234-abc.apps.googleusercontent.com
+  neomail account add outlook --email you@outlook.example \\
+      --client-id 00000000-0000-0000-0000-000000000000 --device-code
 
 Secrets are never flags: they are prompted for without echo, read as one line of standard input,
 or come from --password-command.";
@@ -245,6 +249,9 @@ enum AccountCommand {
         /// Print the sign-in URL without opening a browser
         #[arg(long)]
         no_browser: bool,
+        /// Sign in with a code on another device (Outlook; automatic over SSH without a display)
+        #[arg(long)]
+        device_code: bool,
     },
     /// Revoke an OAuth account's sign-in and delete it from the OS keyring
     Logout {
@@ -270,18 +277,21 @@ enum AccountCommand {
 struct AddCommand {
     /// The provider; without it, a menu on a terminal
     provider: Option<AddProvider>,
-    /// The account's name in neomail [default: gmail, proton; required for imap]
+    /// The account's name in neomail [default: gmail, outlook, proton; required for imap]
     #[arg(long, value_name = "NAME")]
     name: Option<String>,
-    /// gmail: the address to sign in with
+    /// gmail, outlook: the address to sign in with
     #[arg(long, value_name = "ADDR")]
     email: Option<String>,
-    /// gmail: your OAuth client's ID (the secret is prompted for, or read from stdin)
+    /// gmail, outlook: your OAuth client's ID (gmail's secret is prompted for, or read from stdin; outlook has none)
     #[arg(long, value_name = "ID")]
     client_id: Option<String>,
-    /// gmail: print the sign-in URL without opening a browser
+    /// gmail, outlook: print the sign-in URL without opening a browser
     #[arg(long)]
     no_browser: bool,
+    /// outlook: sign in with a code on another device (automatic over SSH without a display)
+    #[arg(long)]
+    device_code: bool,
     /// imap, proton, gmail-app-password: the login name (usually the address)
     #[arg(long, value_name = "USER")]
     username: Option<String>,
@@ -300,7 +310,7 @@ struct AddCommand {
     /// imap, proton: the server certificate's SHA-256 to pin (64 hex digits, colons allowed)
     #[arg(long, value_name = "HEX", value_parser = parse_pin)]
     cert_sha256: Option<CertPin>,
-    /// imap, proton, gmail-app-password: skip the read-only login before the config is written
+    /// imap, proton, gmail-app-password, outlook: skip the read-only check before the config is written
     #[arg(long)]
     no_check: bool,
 }
@@ -309,6 +319,8 @@ struct AddCommand {
 enum AddProvider {
     /// Gmail, through your own Google OAuth app (https://github.com/AH-Merii/neomail/blob/main/docs/gmail.md)
     Gmail,
+    /// Outlook or Hotmail, through your own Microsoft Entra app (https://github.com/AH-Merii/neomail/blob/main/docs/outlook.md)
+    Outlook,
     /// Gmail with an app password over IMAP (needs Google 2-Step Verification)
     GmailAppPassword,
     /// Proton Mail, through Proton Mail Bridge on this computer
@@ -318,8 +330,9 @@ enum AddProvider {
 }
 
 impl AddProvider {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Gmail,
+        Self::Outlook,
         Self::GmailAppPassword,
         Self::Proton,
         Self::Imap,
@@ -328,6 +341,7 @@ impl AddProvider {
     fn id(self) -> &'static str {
         match self {
             Self::Gmail => "gmail",
+            Self::Outlook => oauth::MICROSOFT.setup.default_name,
             Self::GmailAppPassword => setup::GMAIL_APP_PASSWORD.id,
             Self::Proton => setup::PROTON.id,
             Self::Imap => setup::IMAP.id,
@@ -337,6 +351,7 @@ impl AddProvider {
     fn label(self) -> &'static str {
         match self {
             Self::Gmail => "Gmail, through your own Google OAuth app",
+            Self::Outlook => "Outlook or Hotmail, through your own Microsoft Entra app",
             Self::GmailAppPassword => "Gmail with an app password (needs 2-Step Verification)",
             Self::Proton => "Proton Mail, through Proton Mail Bridge",
             Self::Imap => "any IMAP server, with a password",
@@ -503,15 +518,24 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
                 // Keyring reads stay outside block_on: their blocking calls start a runtime of
                 // their own.
                 let result = match &account.login {
-                    Login::Password(source) => secret::account_password(
-                        &account.name,
-                        source,
-                        &mut keyring,
-                    )
-                    .and_then(|password| {
-                        let login = nm_imap::Login::Password(password.expose());
-                        runtime.block_on(sync_account(account, login, &mut cache, limit, progress))
-                    }),
+                    Login::Password(source) => {
+                        secret::account_password(&account.name, source, &mut keyring).and_then(
+                            |password| {
+                                let Server::Imap(imap) = &account.server else {
+                                    bail!("a password account reads mail over IMAP");
+                                };
+                                let login = nm_imap::Login::Password(password.expose());
+                                runtime.block_on(sync_imap(
+                                    imap,
+                                    &account.name,
+                                    login,
+                                    &mut cache,
+                                    limit,
+                                    progress,
+                                ))
+                            },
+                        )
+                    }
                     Login::OAuth(settings) => secret::oauth_secrets(&account.name, &mut keyring)
                         .and_then(|(client_secret, refresh_token)| {
                             let refreshed = runtime.block_on(account::refresh(
@@ -538,13 +562,30 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
                                     account.name, settings.provider.name
                                 );
                             }
-                            let login = nm_imap::Login::XOAuth2 {
-                                access_token: refreshed.access_token.expose(),
-                            };
-                            runtime
-                                .block_on(sync_account(account, login, &mut cache, limit, progress))
+                            // The same token reaches IMAP (XOAUTH2) or Microsoft Graph.
+                            let token = &refreshed.access_token;
+                            match &account.server {
+                                Server::Imap(imap) => runtime.block_on(sync_imap(
+                                    imap,
+                                    &account.name,
+                                    nm_imap::Login::XOAuth2 {
+                                        access_token: token.expose(),
+                                    },
+                                    &mut cache,
+                                    limit,
+                                    progress,
+                                )),
+                                Server::Graph { .. } => runtime.block_on(graph::sync(
+                                    &account.name,
+                                    token,
+                                    &mut cache,
+                                    limit,
+                                    progress,
+                                )),
+                            }
                         }),
-                };
+                }
+                .map(|report| report_line(&account.name, &report));
                 progress.clear(&mut io::stderr());
                 match result {
                     Ok(line) => {
@@ -670,8 +711,13 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
                 AccountCommand::Add(_) | AccountCommand::List { .. } => {
                     unreachable!("handled above")
                 }
-                AccountCommand::Login { name, no_browser } => {
-                    account::login(config.select(Some(&name))?[0], no_browser, input, &mut out)?;
+                AccountCommand::Login {
+                    name,
+                    no_browser,
+                    device_code,
+                } => {
+                    let account = config.select(Some(&name))?[0];
+                    account::login(account, no_browser, device_code, input, &mut out)?;
                 }
                 AccountCommand::Logout { name } => {
                     account::logout(config.select(Some(&name))?[0], &mut out)?;
@@ -900,16 +946,18 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
             )));
         }
     };
+    // --device-code on gmail reaches account::add, which says why Google cannot use it.
     let oauth_only = [
         ("--email", add.email.is_some()),
         ("--client-id", add.client_id.is_some()),
         ("--no-browser", add.no_browser),
+        ("--device-code", add.device_code),
     ];
     let password_only = [
         ("--username", add.username.is_some()),
         ("--password-command", add.password_command.is_some()),
-        ("--no-check", add.no_check),
     ];
+    let no_check = [("--no-check", add.no_check)];
     let imap_only = [
         ("--host", add.host.is_some()),
         ("--security", add.security.is_some()),
@@ -919,7 +967,8 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
         ("--cert-sha256", add.cert_sha256.is_some()),
     ];
     let refused: Vec<(&str, bool)> = match provider {
-        AddProvider::Gmail => [&password_only[..], &imap_only, &port_pin].concat(),
+        AddProvider::Gmail => [&password_only[..], &no_check, &imap_only, &port_pin].concat(),
+        AddProvider::Outlook => [&password_only[..], &imap_only, &port_pin].concat(),
         AddProvider::GmailAppPassword => [&oauth_only[..], &imap_only, &port_pin].concat(),
         AddProvider::Proton => [&oauth_only[..], &imap_only].concat(),
         AddProvider::Imap => oauth_only.to_vec(),
@@ -931,14 +980,20 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
         )));
     }
     let preset = match provider {
-        AddProvider::Gmail => {
+        AddProvider::Gmail | AddProvider::Outlook => {
             let args = account::AddArgs {
                 name: add.name,
                 email: add.email,
                 client_id: add.client_id,
                 no_browser: add.no_browser,
+                device_code: add.device_code,
+                no_check: add.no_check,
             };
-            return account::add(&oauth::GOOGLE, path, args, input, out);
+            let oauth_provider = match provider {
+                AddProvider::Outlook => &oauth::MICROSOFT,
+                _ => &oauth::GOOGLE,
+            };
+            return account::add(oauth_provider, path, args, input, out);
         }
         AddProvider::GmailAppPassword => &setup::GMAIL_APP_PASSWORD,
         AddProvider::Proton => &setup::PROTON,
@@ -1081,22 +1136,28 @@ fn set_password(keyring: &Keyring, account: &Account, password: &Password) -> Re
     Ok(line)
 }
 
-async fn sync_account(
-    account: &Account,
+/// Syncs an IMAP account's INBOX.
+async fn sync_imap(
+    imap: &ImapConfig,
+    account: &str,
     login: nm_imap::Login<'_>,
     cache: &mut Cache,
     limit: NonZeroU32,
     progress: &mut output::ProgressLine,
-) -> Result<String> {
-    let mut source = ImapSource::connect(&account.imap, login).await?;
-    let result = sync_inbox_with_progress(&mut source, cache, &account.name, limit, |p| {
-        progress.update(&mut io::stderr(), &account.name, p);
+) -> Result<nm_core::SyncReport> {
+    let mut source = ImapSource::connect(imap, login).await?;
+    let result = sync_inbox_with_progress(&mut source, cache, account, limit, |p| {
+        progress.update(&mut io::stderr(), account, p);
     })
     .await;
     source.logout().await;
-    let r = result?;
+    Ok(result?)
+}
+
+/// `sync`'s line for one account, the same for IMAP and Graph.
+fn report_line(account: &str, r: &nm_core::SyncReport) -> String {
     let reset = if r.reset {
-        " (UIDVALIDITY changed; cache rebuilt)"
+        " (the server's mailbox is not the cached one; cache rebuilt)"
     } else {
         ""
     };
@@ -1105,10 +1166,10 @@ async fn sync_account(
     } else {
         String::new()
     };
-    Ok(format!(
-        "{}: {} new, {} updated, {} removed{missing}{reset}",
-        account.name, r.new, r.updated, r.removed
-    ))
+    format!(
+        "{account}: {} new, {} updated, {} removed{missing}{reset}",
+        r.new, r.updated, r.removed
+    )
 }
 
 #[cfg(test)]
@@ -1118,13 +1179,18 @@ mod tests {
     #[test]
     fn menu_answers_are_a_number_or_a_name() {
         assert!(matches!(parse_choice("1"), Some(AddProvider::Gmail)));
-        assert!(matches!(parse_choice(" 3 "), Some(AddProvider::Proton)));
+        assert!(matches!(parse_choice("2"), Some(AddProvider::Outlook)));
+        assert!(matches!(parse_choice(" 4 "), Some(AddProvider::Proton)));
+        assert!(matches!(
+            parse_choice("outlook"),
+            Some(AddProvider::Outlook)
+        ));
         assert!(matches!(parse_choice("IMAP"), Some(AddProvider::Imap)));
         assert!(matches!(
             parse_choice("gmail-app-password"),
             Some(AddProvider::GmailAppPassword)
         ));
-        for bad in ["", "0", "5", "outlook"] {
+        for bad in ["", "0", "6", "hotmail"] {
             assert!(parse_choice(bad).is_none(), "{bad}");
         }
     }

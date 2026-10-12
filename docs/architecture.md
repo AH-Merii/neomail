@@ -4,7 +4,8 @@ This page follows the code: it describes what exists, not what is planned. Produ
 in [decisions.md](decisions.md). The slices so far follow
 [DEC-2026-10-11-build-first](decisions.md#dec-2026-10-11-build-first): a read-only INBOX in the
 CLI (slice 1), IMAP passwords in the OS keyring (slice 2), Gmail through the user's own OAuth
-client (slice 3) and getting started and setup (slice 4).
+client (slice 3), getting started and setup (slice 4), output for people and pipes (slice 5) and
+Outlook through Microsoft Graph with the user's own Entra app (slice 6).
 
 ## Crates
 
@@ -12,7 +13,8 @@ client (slice 3) and getting started and setup (slice 4).
 | ----- | ------------- | ----------------- |
 | `crates/neomail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, output, wiring. | The composition root. Nothing depends on it. |
 | `crates/nm-core` | Domain types, the `MailSource` and `IdSource` traits, the SQLite cache, the sync engines, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
-| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap). | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; Graph and the Gmail API become sibling crates. |
+| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap). | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; the Gmail API becomes a sibling crate. |
+| `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
 
 A new crate needs a reason of the same kind: a second implementation of a seam, or a heavy
 dependency to isolate.
@@ -45,6 +47,28 @@ arrival times and fails rather than pass vacuously. The in-memory reference sour
 `nm-core/tests/id_sync.rs` passes it; sources that ignore `since`, list the oldest or list nothing
 fail it. No other trait is needed: the cache stays a concrete type with by-id
 methods, and the engine reuses `SyncReport`, `SyncError` and `Progress`.
+
+**`Transport`** (`nm-graph/src/lib.rs`) is the port `GraphSource` reads Graph through: one HTTPS
+GET with request headers and a body cap, answered with the status, `Retry-After` and the body.
+`neomail/src/graph.rs` implements it with neomail's HTTP client, and `nm-graph/tests/graph.rs`
+with a fake Graph: a mailbox model that pages with next page links, plus scripted replies. That
+fake passes `nm_core::conformance::id_source`. `GraphSource` sends `Authorization: Bearer`,
+`Prefer: IdType="ImmutableId"` (it applies only to the request that carries it) and, for JSON,
+`Accept: application/json` on every request. `newest` and `arrived_since` list
+`/me/mailFolders/inbox/messages` (`$select=id,isRead,receivedDateTime`,
+`$orderby=receivedDateTime desc`, `$top` up to 1000, and for `arrived_since` a
+`$filter=receivedDateTime ge …` that names the ordered property first, as Graph requires), and
+follow `@odata.nextLink` verbatim, but only to `https://graph.microsoft.com/`, so the token never
+leaves Graph. `fetch` downloads `/me/messages/{id}/$value` (the id percent-encoded), four at once
+(Outlook's limit per app and mailbox), and leaves out a 404. `isRead` maps to `\Seen`; an item
+without `receivedDateTime` is skipped. 429 and 503 wait `Retry-After` (at most 5 minutes), else 1,
+2, 4 and 8 s, for at most five tries; 401 and 403 become "access token refused" and "Mail.Read not
+granted"; any other status gives Graph's `error.code`, cleaned, never the body or the token. JSON
+is capped at 8 MiB, a message at 160 MiB. Known limit: mail moved into the inbox with an older
+`receivedDateTime` than the sync's window is missed until Graph's delta query (roadmap row 7).
+
+Graph needs no other trait: `IdSource` is the source seam, `Transport` the network one, and the
+sign-in reuses the `Provider` data, the `Http` seam and the keyring entry of slice 3.
 
 **The password** comes from one of two sources, fixed per account when the config is parsed
 (`PasswordSource` in `neomail/src/config.rs`): the account's `password_command`, run with `sh -c`,
@@ -88,16 +112,22 @@ Microsoft sends when `email` is missing. A **provider is data** (`Provider` in `
 endpoints, an optional revocation and device code endpoint, `ClientKind` (Google's confidential
 client sends its secret, Microsoft's public client never does), the redirect host, the scopes, the
 accepted mail grants and their prefix, the refresh scope, `MailApi` (IMAP host and port, or Graph),
-numeric error-code hints and the setup text), so `MICROSOFT` is a second value, not a trait; it is
-defined but not in `PROVIDERS` until the Graph source lands. A missing `scope` in a token answer
+numeric error-code hints and the setup text), so `MICROSOFT` is a second value, not a trait. A missing `scope` in a token answer
 counts as the scopes requested; a granted scope matches a mail grant after the prefix is stripped,
 ignoring case. **Device code** (`oauth/device.rs`, RFC 8628) asks for a code, shows the provider's
 `message` (else the URL and code), and polls the token endpoint every `interval` seconds (default
 5), adding 5 s for good on `slow_down`, stopping on a declined, expired or unknown code or after
 `expires_in` (default 900 s); its tokens pass the same checks as the code exchange. Google has no
-device code endpoint here: its device flow does not allow Gmail's scope. **HTTP** is one
-seam, `oauth::http::Http` (a form POST): `Https` writes HTTP/1.1 over the same rustls, ring and
-platform verifier as IMAP, so no HTTP client crate is needed, and the tests give a scripted fake.
+device code endpoint here: its device flow does not allow Gmail's scope, so `--device-code` on a
+Google account is a usage error that says so. Device code is also chosen on its own over SSH
+without a display (`browser::ssh_without_display`, a pure function of the environment). For a
+`localhost` redirect (Microsoft) the loopback listener also binds `[::1]` on the same port, best
+effort, and accepts on both within the same connection cap. **HTTP** (`neomail/src/http.rs`):
+`Https` writes HTTP/1.1 over the same rustls, ring and platform verifier as IMAP, so no HTTP client
+crate is needed: a form POST for OAuth (the `Http` seam, which the OAuth tests replace with a
+scripted fake) and a GET with request headers for Graph, each with a body cap, reading
+`Retry-After`, one connection per request, and a 60-second bound on each network step rather than
+the whole response.
 **The browser** is opened by `browser.rs` (`$BROWSER`, else `wslview` or `explorer.exe` on WSL,
 else `xdg-open`, never with `--no-browser`); the URL is always printed, and choosing the command
 is a pure function, so no test launches anything.
@@ -141,7 +171,7 @@ before the keyring write writes nothing and stores nothing; if the final `append
 password stays in the keyring and the error says so. The steps that leave the process are fields of
 `Deps`, plain function values, so the tests give a mock keyring and fake certificate and login
 steps; the login check itself is tested on the wire against the scripted server
-(`nm-imap/src/wire_tests.rs`). Gmail with OAuth keeps its own flow (`account.rs`); `main.rs` picks
+(`nm-imap/src/wire_tests.rs`). Gmail and Outlook with OAuth keep their own flow (`account.rs`); `main.rs` picks
 the provider, from a numbered menu on a terminal. No new trait: the presets are values, `Deps` has
 one real and one fake set, and the seams below it (`CredentialStore`, `Transport`, the config
 writer) already exist.
@@ -195,6 +225,12 @@ response of a FETCH. A FETCH as a whole is not bounded, so a slow transfer of la
 off.
 
 ## How sync works
+
+`neomail sync` picks the engine from the account's server (`config::Server`, fixed at parse: a
+password account is always IMAP, an OAuth account's provider decides): `Imap` runs `sync_inbox`
+over `ImapSource`, `Graph` runs `sync_inbox_by_id` over `GraphSource`. An OAuth account's access
+token comes from the same refresh and rotated-token write-back either way, and both print the same
+line and progress.
 
 `sync_inbox` (`nm-core/src/sync.rs`) runs once per account:
 
@@ -316,8 +352,8 @@ nothing. mise reads the same release through its GitHub backend.
 
 The order of the slices is in [roadmap.md](roadmap.md). What they change in the code:
 
-- **More providers:** Microsoft Graph becomes an `IdSource` crate (slice 6), and its delta query
-  may add a sync token to that trait; the Gmail API becomes another source crate.
+- **More providers:** Graph's delta query may add a sync token to `IdSource`; the Gmail API
+  becomes another source crate.
 - **More mail:** folders beyond INBOX, CONDSTORE/QRESYNC to refresh flags cheaply, and IDLE.
 - **Actions:** flags, moves and deletes need a write side on the source and a way to record
   pending changes in the cache.

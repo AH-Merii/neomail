@@ -6,15 +6,7 @@
 //! Tokens and the client secret are [`Secret`]s, whose `Debug` is redacted; errors never quote
 //! them, nor a token endpoint's response body.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "part 3 of slice 6 wires it into `account add outlook`"
-    )
-)]
 pub mod device;
-pub mod http;
 pub mod loopback;
 mod provider;
 #[cfg(test)]
@@ -29,11 +21,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use self::http::Http;
 use self::loopback::Listener;
-#[cfg(test)]
-pub use self::provider::MICROSOFT;
-pub use self::provider::{ClientKind, GOOGLE, MailApi, PROVIDERS, Provider, provider};
+pub use self::provider::{ClientKind, GOOGLE, MICROSOFT, MailApi, PROVIDERS, Provider, provider};
+use crate::http::Http;
 
 /// How long the browser has to come back to the loopback listener.
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -169,11 +159,13 @@ pub fn auth_url(
     format!("{}?{}", provider.auth_url, form_encode(&pairs))
 }
 
-/// What a sign-in leaves: the account's address and a refresh token.
+/// What a sign-in leaves: the account's address, a refresh token, and the access token that came
+/// with it (for a check before anything is saved; never stored).
 #[derive(Debug)]
 pub struct SignedIn {
     pub email: String,
     pub refresh_token: Secret,
+    pub access_token: Option<Secret>,
 }
 
 /// Signs in: listens on the loopback, hands the authorization URL to `show` (which prints it and
@@ -185,7 +177,8 @@ pub async fn sign_in<H: Http>(
     login_hint: Option<&str>,
     show: impl FnOnce(&str),
 ) -> Result<SignedIn> {
-    let listener = Listener::bind().await?;
+    // Microsoft's `localhost` may resolve to [::1] in the browser.
+    let listener = Listener::bind(provider.redirect_host == "localhost").await?;
     let pkce = Pkce::new()?;
     let state = random_url_safe(24)?;
     let redirect_uri = listener.redirect_uri(provider.redirect_host);
@@ -273,6 +266,7 @@ fn check_sign_in(provider: &Provider, tokens: TokenResponse) -> Result<SignedIn>
     Ok(SignedIn {
         email: id_token_email(&id_token)?,
         refresh_token: Secret(refresh_token),
+        access_token: tokens.access_token.filter(|t| !t.is_empty()).map(Secret),
     })
 }
 

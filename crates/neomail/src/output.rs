@@ -12,7 +12,7 @@ use serde::Serialize;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::{Account, Login, PasswordSource};
+use crate::config::{Account, Login, PasswordSource, Server};
 use crate::style::Paint;
 
 /// The human list's width when the terminal's is unknown.
@@ -23,8 +23,7 @@ const FROM_WIDTH: usize = 20;
 pub struct ListItem<'a> {
     pub id: MessageId,
     pub account: &'a str,
-    /// Always set for IMAP mail, the only kind cached so far. A message with no UID (by-id
-    /// mailboxes) would print `null`; slice 6 part 3 settles that shape before one can exist.
+    /// `None` (JSON `null`) for a message read through Microsoft Graph, which has no UIDs.
     pub uid: Option<Uid>,
     pub date: Option<DateTime<Utc>>,
     pub from: Option<&'a EmailAddress>,
@@ -261,15 +260,31 @@ pub struct AccountItem<'a> {
     /// "password" (the OS keyring), "password_command" or "oauth".
     pub login: &'static str,
     pub username: &'a str,
+    /// Where the mail is read: the IMAP server, or Microsoft Graph for a Graph account.
     pub host: &'a str,
     pub port: u16,
-    /// "tls" or "starttls".
+    /// "tls" or "starttls"; Graph is HTTPS, so "tls".
     pub security: &'static str,
     pub cert_pinned: bool,
+    /// "imap" or "graph" (Microsoft Graph).
+    pub server: &'static str,
 }
 
 impl<'a> From<&'a Account> for AccountItem<'a> {
     fn from(a: &'a Account) -> Self {
+        let (host, port, security, cert_pinned, server) = match &a.server {
+            Server::Imap(i) => (
+                i.host.as_str(),
+                i.port,
+                match i.security {
+                    Security::Tls => "tls",
+                    Security::StartTls => "starttls",
+                },
+                i.cert_pin.is_some(),
+                "imap",
+            ),
+            Server::Graph { .. } => (graph_host(), 443, "tls", false, "graph"),
+        };
         Self {
             name: &a.name,
             login: match &a.login {
@@ -277,16 +292,21 @@ impl<'a> From<&'a Account> for AccountItem<'a> {
                 Login::Password(PasswordSource::Command(_)) => "password_command",
                 Login::OAuth(_) => "oauth",
             },
-            username: &a.imap.username,
-            host: &a.imap.host,
-            port: a.imap.port,
-            security: match a.imap.security {
-                Security::Tls => "tls",
-                Security::StartTls => "starttls",
-            },
-            cert_pinned: a.imap.cert_pin.is_some(),
+            username: a.username(),
+            host,
+            port,
+            security,
+            cert_pinned,
+            server,
         }
     }
+}
+
+/// Microsoft Graph's host, "graph.microsoft.com", from the origin nm-graph sends requests to.
+fn graph_host() -> &'static str {
+    nm_graph::GRAPH_ORIGIN
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
 }
 
 /// `account list` as TSV: name, login, username, host, port, security, `pinned` or empty.

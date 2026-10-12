@@ -127,8 +127,38 @@ fn xdg_dir(var: &str, fallback: &str) -> Result<PathBuf> {
 #[derive(Debug, Clone)]
 pub struct Account {
     pub name: String,
-    pub imap: ImapConfig,
+    pub server: Server,
     pub login: Login,
+}
+
+impl Account {
+    /// The login name: the IMAP username, or the address signed in to Graph.
+    pub fn username(&self) -> &str {
+        match &self.server {
+            Server::Imap(imap) => &imap.username,
+            Server::Graph { username } => username,
+        }
+    }
+
+    /// The IMAP server, for an IMAP account. Only the tests need it; code matches on `server`.
+    #[cfg(test)]
+    pub fn imap(&self) -> Option<&ImapConfig> {
+        match &self.server {
+            Server::Imap(imap) => Some(imap),
+            Server::Graph { .. } => None,
+        }
+    }
+}
+
+/// Where the account's mail is read. A password account is always IMAP; an OAuth account's
+/// provider decides ([`oauth::MailApi`]).
+#[derive(Debug, Clone)]
+pub enum Server {
+    Imap(ImapConfig),
+    /// Microsoft Graph, for the signed-in user's own mailbox.
+    Graph {
+        username: String,
+    },
 }
 
 /// How an account logs in: with a password, or with OAuth through the user's own client.
@@ -238,7 +268,7 @@ impl Config {
                 }
                 if a.imap.is_some() {
                     bail!(
-                        "account {name:?}: an oauth account takes its IMAP server from the \
+                        "account {name:?}: an oauth account takes its mail server from the \
                          provider; remove imap"
                     );
                 }
@@ -273,13 +303,13 @@ impl Config {
                 .transpose()
                 .with_context(|| format!("account {name:?}: imap.cert_sha256"))?;
             accounts.push(Account {
-                imap: ImapConfig {
+                server: Server::Imap(ImapConfig {
                     host: imap.host.trim().to_owned(),
                     port,
                     security,
                     username: a.username,
                     cert_pin,
-                },
+                }),
                 login: Login::Password(password),
                 name,
             });
@@ -313,7 +343,8 @@ impl Config {
     }
 }
 
-/// An OAuth account: the provider fixes the IMAP server (TLS, the system's trust store).
+/// An OAuth account: the provider fixes the server, IMAP (TLS, the system's trust store) or
+/// Microsoft Graph.
 fn oauth_account(name: String, username: String, raw: RawOAuth) -> Result<Account> {
     let Some(provider) = oauth::provider(&raw.provider) else {
         bail!(
@@ -330,20 +361,19 @@ fn oauth_account(name: String, username: String, raw: RawOAuth) -> Result<Accoun
     if client_id.is_empty() {
         bail!("account {name:?}: oauth.client_id is empty");
     }
-    let oauth::MailApi::Imap { host, port } = provider.mail else {
-        bail!(
-            "account {name:?}: {} mail through Microsoft Graph is not supported yet",
-            provider.name
-        );
-    };
-    Ok(Account {
-        imap: ImapConfig {
+    let username = username.trim().to_owned();
+    let server = match provider.mail {
+        oauth::MailApi::Imap { host, port } => Server::Imap(ImapConfig {
             host: host.to_owned(),
             port,
             security: Security::Tls,
-            username: username.trim().to_owned(),
+            username,
             cert_pin: None,
-        },
+        }),
+        oauth::MailApi::Graph => Server::Graph { username },
+    };
+    Ok(Account {
+        server,
         login: Login::OAuth(OAuthSettings {
             provider,
             client_id,
@@ -554,14 +584,17 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
         let c = Config::parse(EXAMPLE).unwrap();
         assert_eq!(c.accounts.len(), 2);
         let work = &c.accounts[0];
-        assert_eq!((work.imap.port, work.imap.security), (993, Security::Tls));
-        assert!(work.imap.cert_pin.is_none());
+        assert_eq!(
+            (work.imap().unwrap().port, work.imap().unwrap().security),
+            (993, Security::Tls)
+        );
+        assert!(work.imap().unwrap().cert_pin.is_none());
         let bridge = &c.accounts[1];
         assert_eq!(
-            (bridge.imap.port, bridge.imap.security),
+            (bridge.imap().unwrap().port, bridge.imap().unwrap().security),
             (1143, Security::StartTls)
         );
-        assert!(bridge.imap.cert_pin.is_some());
+        assert!(bridge.imap().unwrap().cert_pin.is_some());
         assert_eq!(
             work.login,
             Login::Password(PasswordSource::Command("pass show mail/work".into()))
@@ -653,10 +686,14 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
         let c = Config::parse(GMAIL).unwrap();
         let a = &c.accounts[0];
         assert_eq!(
-            (a.imap.host.as_str(), a.imap.port, a.imap.security),
+            (
+                a.imap().unwrap().host.as_str(),
+                a.imap().unwrap().port,
+                a.imap().unwrap().security
+            ),
             ("imap.gmail.com", 993, Security::Tls)
         );
-        assert_eq!(a.imap.username, "you@example.com");
+        assert_eq!(a.imap().unwrap().username, "you@example.com");
         let Login::OAuth(o) = &a.login else {
             panic!("{:?}", a.login)
         };
@@ -672,7 +709,7 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             (
                 GMAIL.replace("google", "yahoo"),
                 "unknown oauth provider (the value is not shown, in case it is a pasted secret); \
-                 known: google",
+                 known: google, microsoft",
             ),
             (format!("{GMAIL}imap = {{ host = \"h\" }}\n"), "remove imap"),
             (
@@ -684,6 +721,56 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             let e = format!("{:#}", Config::parse(&bad).unwrap_err());
             assert!(e.contains(why), "{bad}: {e}");
         }
+    }
+
+    const OUTLOOK: &str = "[[accounts]]\nname = \"outlook\"\nusername = \"you@outlook.example\"\n\
+                           oauth = { provider = \"microsoft\", client_id = \"00000000-0000-0000-0000-000000000000\" }\n";
+
+    #[test]
+    fn a_microsoft_account_reads_through_graph_without_an_imap_server() {
+        let c = Config::parse(OUTLOOK).unwrap();
+        let a = &c.accounts[0];
+        assert!(
+            matches!(&a.server, Server::Graph { username } if username == "you@outlook.example"),
+            "{:?}",
+            a.server
+        );
+        assert_eq!(a.username(), "you@outlook.example");
+        assert!(a.imap().is_none());
+        let Login::OAuth(o) = &a.login else {
+            panic!("{:?}", a.login)
+        };
+        assert_eq!(o.provider.id, "microsoft");
+        // A password account is always IMAP: a password with the microsoft provider, or a
+        // Graph account given an IMAP server, is refused.
+        for (bad, why) in [
+            (
+                OUTLOOK.replace("oauth =", "password_command = \"true\"\noauth ="),
+                "not both",
+            ),
+            (
+                format!("{OUTLOOK}imap = {{ host = \"outlook.office365.com\" }}\n"),
+                "remove imap",
+            ),
+        ] {
+            let e = format!("{:#}", Config::parse(&bad).unwrap_err());
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_graph_account_round_trips_through_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let block = oauth_account_toml(
+            "outlook",
+            "you@outlook.example",
+            &crate::oauth::MICROSOFT,
+            "00000000-0000-0000-0000-000000000000",
+        );
+        append_account(&path, "outlook", &block).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, OUTLOOK);
     }
 
     #[cfg(unix)]
@@ -842,7 +929,11 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
         let c = Config::load(&path).unwrap();
         let proton = c.find("proton").unwrap();
         assert_eq!(
-            (proton.imap.port, proton.imap.security, proton.imap.cert_pin),
+            (
+                proton.imap().unwrap().port,
+                proton.imap().unwrap().security,
+                proton.imap().unwrap().cert_pin
+            ),
             (1143, Security::StartTls, Some(pin))
         );
         assert_eq!(
@@ -851,7 +942,11 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
         );
         let work = c.find("work").unwrap();
         assert_eq!(
-            (work.imap.host.as_str(), work.imap.port, work.imap.cert_pin),
+            (
+                work.imap().unwrap().host.as_str(),
+                work.imap().unwrap().port,
+                work.imap().unwrap().cert_pin
+            ),
             ("imap.mail.example", 993, None)
         );
         assert_eq!(work.login, Login::Password(PasswordSource::Keyring));

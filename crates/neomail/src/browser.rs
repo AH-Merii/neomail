@@ -55,6 +55,15 @@ pub fn open(url: &str) -> Result<String> {
     Ok(program.clone())
 }
 
+/// Whether this is an SSH session without a display: `SSH_CONNECTION` or `SSH_TTY` is set, and
+/// `DISPLAY` and `WAYLAND_DISPLAY` are both unset or empty. A browser opened here would not
+/// reach the user, so sign-in uses a device code where the provider has one. `env` reads a
+/// variable.
+pub fn ssh_without_display(env: impl Fn(&str) -> Option<String>) -> bool {
+    let set = |name: &str| env(name).is_some_and(|v| !v.is_empty());
+    (set("SSH_CONNECTION") || set("SSH_TTY")) && !set("DISPLAY") && !set("WAYLAND_DISPLAY")
+}
+
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
@@ -85,5 +94,46 @@ mod tests {
         );
         assert_eq!(command_for(URL, None, true, none), ["explorer.exe", URL]);
         assert_eq!(command_for(URL, None, false, |_| true), ["xdg-open", URL]);
+    }
+
+    #[test]
+    fn device_code_is_automatic_only_over_ssh_without_a_display() {
+        // (variables set, with their values; expected)
+        let cases: [(&[(&str, &str)], bool); 9] = [
+            (&[], false),
+            (&[("SSH_CONNECTION", "10.0.0.2 5000 10.0.0.1 22")], true),
+            (&[("SSH_TTY", "/dev/pts/3")], true),
+            (&[("SSH_CONNECTION", "")], false),
+            (&[("SSH_TTY", "/dev/pts/3"), ("DISPLAY", ":0")], false),
+            (
+                &[("SSH_TTY", "/dev/pts/3"), ("WAYLAND_DISPLAY", "wayland-1")],
+                false,
+            ),
+            (
+                &[
+                    ("SSH_TTY", "/dev/pts/3"),
+                    ("DISPLAY", ""),
+                    ("WAYLAND_DISPLAY", ""),
+                ],
+                true,
+            ),
+            (&[("DISPLAY", ":0")], false),
+            (
+                &[
+                    ("SSH_CONNECTION", "x"),
+                    ("SSH_TTY", "y"),
+                    ("DISPLAY", "localhost:10.0"),
+                ],
+                false,
+            ),
+        ];
+        for (vars, want) in cases {
+            let env = |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| (*v).to_owned())
+            };
+            assert_eq!(ssh_without_display(env), want, "{vars:?}");
+        }
     }
 }

@@ -12,10 +12,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use tokio::time::Instant;
 
-use super::http::Http;
 use super::{
     Client, EndpointError, Provider, Secret, SignedIn, check_sign_in, endpoint_error, printable,
 };
+use crate::http::Http;
 
 /// The polling interval when the answer names none (RFC 8628 section 3.2).
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);

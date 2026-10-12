@@ -1,4 +1,5 @@
-//! `neomail account add`, `login` and `logout`: OAuth accounts through the user's own client.
+//! `neomail account add`, `login` and `logout`: OAuth accounts through the user's own client,
+//! signed in through the browser or with a device code.
 //!
 //! Keyring calls stay outside the async runtime (zbus starts one of its own); only the sign-in,
 //! the token refresh and the revocation run inside it.
@@ -9,9 +10,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Account, Login, OAuthSettings};
+use crate::http::Https;
 use crate::keyring::{self, Keyring, OAuthEntry};
-use crate::oauth::http::Https;
-use crate::oauth::{self, ClientKind, Provider, Refreshed, Secret, SignedIn};
+use crate::oauth::{self, ClientKind, MailApi, Provider, Refreshed, Secret, SignedIn};
 use crate::secret::Input;
 use crate::{browser, secret};
 
@@ -20,10 +21,54 @@ pub struct AddArgs {
     pub email: Option<String>,
     pub client_id: Option<String>,
     pub no_browser: bool,
+    pub device_code: bool,
+    /// Skip the read-only check of a Graph mailbox before the config is written.
+    pub no_check: bool,
 }
 
-/// `neomail account add gmail`: shows the provider's setup steps, asks for what is missing,
-/// signs in, stores the sign-in in the keyring, then appends the account to the config file.
+/// How the user signs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    /// The authorization code flow with a loopback redirect, in a browser.
+    Browser,
+    /// The device code flow, asked for with `--device-code`.
+    DeviceCode,
+    /// The device code flow, chosen because this is SSH without a display.
+    AutoDeviceCode,
+}
+
+/// The sign-in flow: a device code when asked for, or over SSH without a display when the
+/// provider has a device code endpoint; the browser otherwise. Asking a provider without one
+/// for a device code is a usage error that says why.
+fn choose_flow(provider: &Provider, asked: bool, ssh_without_display: bool) -> Result<Flow> {
+    let has_device_code = provider.device_code_url.is_some();
+    Ok(match (asked, has_device_code) {
+        (true, true) => Flow::DeviceCode,
+        (true, false) => {
+            return Err(crate::usage(format!(
+                "--device-code: {}'s device code sign-in does not allow the mail scope \
+                 ({}); sign in through the browser, with --no-browser to only print the URL",
+                provider.name, provider.setup.guide
+            )));
+        }
+        (false, true) if ssh_without_display => Flow::AutoDeviceCode,
+        (false, _) => Flow::Browser,
+    })
+}
+
+/// The flow for this process's environment.
+fn flow_here(provider: &Provider, asked: bool) -> Result<Flow> {
+    choose_flow(
+        provider,
+        asked,
+        browser::ssh_without_display(|name| std::env::var(name).ok()),
+    )
+}
+
+/// `neomail account add gmail` or `outlook`: shows the provider's setup steps, asks for what is
+/// missing, signs in, checks a Graph mailbox with one read-only request (unless `no_check`),
+/// stores the sign-in in the keyring, then appends the account to the config file. A failed
+/// sign-in or check stores and writes nothing.
 pub fn add(
     provider: &'static Provider,
     config_path: &Path,
@@ -31,6 +76,7 @@ pub fn add(
     input: Input,
     out: &mut impl Write,
 ) -> Result<()> {
+    let flow = flow_here(provider, args.device_code)?;
     let interactive = input.can_prompt();
     let setup = &provider.setup;
     let confidential = provider.client == ClientKind::Confidential;
@@ -120,7 +166,21 @@ pub fn add(
         secret: client_secret,
     };
 
-    let signed_in = sign_in(provider, &client, &email, args.no_browser)?;
+    let signed_in = sign_in(provider, &client, &email, args.no_browser, flow)?;
+    if provider.mail == MailApi::Graph && !args.no_check {
+        let token = signed_in.access_token.as_ref().with_context(|| {
+            format!(
+                "{} returned no access token; nothing was saved",
+                provider.name
+            )
+        })?;
+        let count = runtime()?.block_on(crate::graph::check(token))?;
+        eprintln!(
+            "neomail: checked {} through Microsoft Graph: its INBOX holds {count} message{}",
+            signed_in.email,
+            if count == 1 { "" } else { "s" }
+        );
+    }
     keyring.set_oauth(&name, &entry(&client, &signed_in))?;
     let block = config::oauth_account_toml(&name, &signed_in.email, provider, &client.id);
     config::append_account(config_path, &name, &block).context(
@@ -192,10 +252,12 @@ fn clear_leftover(
 pub fn login(
     account: &Account,
     no_browser: bool,
+    device_code: bool,
     input: Input,
     out: &mut impl Write,
 ) -> Result<()> {
     let settings = oauth_settings(account, "set-password")?;
+    let flow = flow_here(settings.provider, device_code)?;
     let keyring = Keyring::open_for_oauth()?;
     let saved = keyring
         .get_oauth(&account.name)?
@@ -216,8 +278,9 @@ pub fn login(
     let signed_in = sign_in(
         settings.provider,
         &client,
-        &account.imap.username,
+        account.username(),
         no_browser,
+        flow,
     )?;
     keyring.set_oauth(&account.name, &entry(&client, &signed_in))?;
     writeln!(
@@ -268,17 +331,9 @@ pub fn logout(account: &Account, out: &mut impl Write) -> Result<()> {
             return Ok(());
         }
     };
-    let provider = settings.provider;
-    if provider.revoke_url.is_none() {
-        keyring.delete_oauth(&account.name)?;
-        writeln!(
-            out,
-            "Signed out {:?}: {} has no token revocation endpoint, so the sign-in was deleted \
-             from {} only.",
-            account.name,
-            provider.name,
-            keyring.name()
-        )?;
+    if settings.provider.revoke_url.is_none() {
+        let line = delete_unrevocable(&keyring, &account.name, settings.provider.name)?;
+        writeln!(out, "{line}")?;
         return Ok(());
     }
     let mut revoked = false;
@@ -308,6 +363,17 @@ pub fn logout(account: &Account, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+/// Logout for a provider with no revocation endpoint (Microsoft): deletes the sign-in from the
+/// keyring and returns the line that says only that happened.
+fn delete_unrevocable(keyring: &Keyring, name: &str, provider: &str) -> Result<String> {
+    keyring.delete_oauth(name)?;
+    Ok(format!(
+        "Signed out {name:?}: {provider} has no token revocation endpoint, so the sign-in was \
+         deleted from {} only.",
+        keyring.name()
+    ))
+}
+
 /// The account's OAuth settings, or an error pointing a password account to `password_command`.
 fn oauth_settings<'a>(account: &'a Account, password_command: &str) -> Result<&'a OAuthSettings> {
     match &account.login {
@@ -327,35 +393,30 @@ fn entry(client: &oauth::Client, signed_in: &SignedIn) -> OAuthEntry {
     }
 }
 
-/// Signs in through the browser and checks the address is `email`.
+/// Signs in through the browser or with a device code, and checks the address is `email`.
 fn sign_in(
     provider: &Provider,
     client: &oauth::Client,
     email: &str,
     no_browser: bool,
+    flow: Flow,
 ) -> Result<SignedIn> {
     let http = Https::new()?;
-    let signed_in = runtime()?.block_on(oauth::sign_in(
-        &http,
-        provider,
-        client,
-        Some(email),
-        |url| {
-            eprintln!(
-                "\nSign in with {} in your browser. If it does not open, open this URL:\n\n{url}\n",
-                provider.name
-            );
-            if no_browser {
-                // Printing the URL is all.
-            } else if let Err(e) = browser::open(url) {
-                eprintln!("neomail: cannot open a browser ({e:#}); open the URL yourself");
-            }
-            eprintln!(
-                "Waiting up to {} minutes for the sign-in...",
-                oauth::SIGN_IN_TIMEOUT.as_secs() / 60
-            );
-        },
-    ))?;
+    if flow == Flow::AutoDeviceCode {
+        eprintln!("neomail: over SSH without a display: using device code sign-in");
+    }
+    let signed_in = if flow == Flow::Browser {
+        browser_sign_in(&http, provider, client, email, no_browser)?
+    } else {
+        runtime()?.block_on(oauth::device::sign_in(
+            &http,
+            provider,
+            client,
+            |instructions| {
+                eprintln!("\n{instructions}\n\nSign in as {email}. Waiting for the sign-in...");
+            },
+        ))?
+    };
     if !signed_in.email.eq_ignore_ascii_case(email) {
         bail!(
             "you signed in as {}, not {email}; nothing was saved. Sign in with {email}, or use \
@@ -365,6 +426,37 @@ fn sign_in(
         );
     }
     Ok(signed_in)
+}
+
+/// The authorization code flow: prints the URL, opens the browser unless `no_browser`, and waits
+/// on the loopback for the redirect.
+fn browser_sign_in(
+    http: &Https,
+    provider: &Provider,
+    client: &oauth::Client,
+    email: &str,
+    no_browser: bool,
+) -> Result<SignedIn> {
+    runtime()?.block_on(oauth::sign_in(http, provider, client, Some(email), |url| {
+        let opening = if no_browser {
+            "Open this URL"
+        } else {
+            "If it does not open, open this URL"
+        };
+        eprintln!(
+            "\nSign in with {} in your browser. {opening}:\n\n{url}\n",
+            provider.name
+        );
+        if no_browser {
+            // Printing the URL is all.
+        } else if let Err(e) = browser::open(url) {
+            eprintln!("neomail: cannot open a browser ({e:#}); open the URL yourself");
+        }
+        eprintln!(
+            "Waiting up to {} minutes for the sign-in...",
+            oauth::SIGN_IN_TIMEOUT.as_secs() / 60
+        );
+    }))
 }
 
 /// A fresh access token for an OAuth account, and the refresh token if the provider rotated it,
@@ -478,6 +570,56 @@ mod tests {
                 .ends_with("needs; run `neomail account login gmail`"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn device_code_is_used_when_asked_or_over_ssh_and_refused_for_google() {
+        use oauth::{GOOGLE, MICROSOFT};
+        // (provider, --device-code, SSH without a display, expected)
+        let cases = [
+            (&MICROSOFT, false, false, Flow::Browser),
+            (&MICROSOFT, true, false, Flow::DeviceCode),
+            (&MICROSOFT, true, true, Flow::DeviceCode),
+            (&MICROSOFT, false, true, Flow::AutoDeviceCode),
+            (&GOOGLE, false, false, Flow::Browser),
+            // Google has no device code for Gmail: over SSH the URL is printed instead.
+            (&GOOGLE, false, true, Flow::Browser),
+        ];
+        for (provider, asked, ssh, want) in cases {
+            assert_eq!(
+                choose_flow(provider, asked, ssh).unwrap(),
+                want,
+                "{}",
+                provider.id
+            );
+        }
+        for ssh in [false, true] {
+            let e = choose_flow(&GOOGLE, true, ssh).unwrap_err();
+            assert!(e.is::<crate::UsageError>());
+            assert!(
+                e.to_string().starts_with(
+                    "--device-code: Google's device code sign-in does not allow the mail scope"
+                ),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn logout_without_a_revocation_endpoint_deletes_and_says_so() {
+        let keyring = Keyring::with_store(mock::Store::new().unwrap(), "the mock", false);
+        let saved = OAuthEntry {
+            client_secret: None,
+            refresh_token: Some("rt".into()),
+        };
+        keyring.set_oauth("outlook", &saved).unwrap();
+        let line = delete_unrevocable(&keyring, "outlook", "Microsoft").unwrap();
+        assert_eq!(
+            line,
+            "Signed out \"outlook\": Microsoft has no token revocation endpoint, so the sign-in \
+             was deleted from the mock only."
+        );
+        assert!(keyring.get_oauth("outlook").unwrap().is_none(), "deleted");
     }
 
     #[test]

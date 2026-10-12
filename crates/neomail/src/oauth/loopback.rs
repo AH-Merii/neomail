@@ -1,5 +1,7 @@
 //! The loopback redirect (RFC 8252 section 7.3): a listener on 127.0.0.1 with a port the OS
-//! picks, waiting for the browser to bring back the authorization code.
+//! picks, waiting for the browser to bring back the authorization code. For a `localhost`
+//! redirect it also listens on [::1] on the same port when it can, since a browser may resolve
+//! `localhost` to either.
 //!
 //! It answers anything that is not the redirect (a favicon, a stray tab) with 404 and keeps
 //! waiting, ignores a redirect with the wrong `state` (another page cannot end the sign-in),
@@ -26,6 +28,8 @@ pub const MAX_CONNECTIONS: usize = 16;
 
 pub struct Listener {
     listener: TcpListener,
+    /// [::1] on the same port, when it could be bound.
+    v6: Option<TcpListener>,
     port: u16,
 }
 
@@ -47,12 +51,27 @@ pub enum Request {
 }
 
 impl Listener {
-    pub async fn bind() -> Result<Self> {
+    /// Listens on 127.0.0.1, and with `also_v6` on [::1] on the same port as well, best effort:
+    /// a machine without IPv6, or with the port taken there, keeps the IPv4 listener only.
+    pub async fn bind(also_v6: bool) -> Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .context("cannot listen on 127.0.0.1 for the sign-in redirect")?;
         let port = listener.local_addr()?.port();
-        Ok(Self { listener, port })
+        let v6 = if also_v6 {
+            TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port))
+                .await
+                .ok()
+        } else {
+            None
+        };
+        Ok(Self { listener, v6, port })
+    }
+
+    /// Whether [::1] is listened on too.
+    #[cfg(test)]
+    pub fn has_v6(&self) -> bool {
+        self.v6.is_some()
     }
 
     /// The `redirect_uri` with the provider's host: Google accepts any port on 127.0.0.1 for a
@@ -87,6 +106,11 @@ impl Listener {
                     handlers.spawn(handle(stream, state.clone()));
                     continue;
                 }
+                accepted = accept_v6(self.v6.as_ref()), if handlers.len() < MAX_CONNECTIONS => {
+                    let (stream, _) = accepted.context("the sign-in listener failed")?;
+                    handlers.spawn(handle(stream, state.clone()));
+                    continue;
+                }
                 Some(joined) = handlers.join_next() => joined.unwrap_or(Request::Stray),
             };
             match request {
@@ -97,6 +121,14 @@ impl Listener {
                 Request::WrongState | Request::Stray => continue,
             }
         }
+    }
+}
+
+/// Accepts on the [::1] listener; never finishes without one.
+async fn accept_v6(v6: Option<&TcpListener>) -> std::io::Result<(TcpStream, std::net::SocketAddr)> {
+    match v6 {
+        Some(listener) => listener.accept().await,
+        None => std::future::pending().await,
     }
 }
 

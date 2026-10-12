@@ -73,8 +73,13 @@ fn isolate(c: &mut Command, data: &Path) {
         .env("NEOMAIL_CONFIG", data.join("config.toml"))
         .env("HOME", data)
         .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
-        .env("TERM", "xterm-256color");
+        .env("TERM", "xterm-256color")
+        // Should anything get as far as opening a browser, it runs `true`.
+        .env("BROWSER", "true");
     for var in [
+        // Not SSH: the sign-in flow would otherwise switch to a device code.
+        "SSH_CONNECTION",
+        "SSH_TTY",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
         "NEOMAIL_NO_INPUT",
@@ -534,6 +539,109 @@ fn add_off_a_terminal_names_the_missing_flags() {
     assert!(!dir.path().join("config.toml").exists());
 }
 
+const OUTLOOK_CONFIG: &str = "[[accounts]]\nname = \"outlook\"\nusername = \"you@outlook.example\"\n\
+                              oauth = { provider = \"microsoft\", client_id = \"00000000-0000-0000-0000-000000000000\" }\n";
+
+#[test]
+fn add_outlook_off_a_terminal_names_the_missing_flags_and_asks_no_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    for (extra, want) in [
+        (&[][..], "pass --email and --client-id\n"),
+        (&["--email", "you@outlook.example"], "pass --client-id\n"),
+        (
+            &["--client-id", "00000000-0000-0000-0000-000000000000"],
+            "pass --email\n",
+        ),
+    ] {
+        let mut args = vec!["account", "add", "outlook", "--no-browser"];
+        args.extend_from_slice(extra);
+        let o = neomail_stdin(dir.path(), &args, "");
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        let err = stderr(&o);
+        assert!(err.contains("not a terminal"), "{err}");
+        assert!(err.ends_with(want), "{args:?}: {err}");
+        assert!(
+            !err.contains("secret"),
+            "a public client has no secret: {err}"
+        );
+    }
+    assert!(!dir.path().join("config.toml").exists());
+}
+
+#[test]
+fn device_code_on_a_google_account_fails_with_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), GMAIL_CONFIG).unwrap();
+    let add = [
+        "account",
+        "add",
+        "gmail",
+        "--name",
+        "other",
+        "--email",
+        "you@example.com",
+        "--client-id",
+        "1234-abc.apps.googleusercontent.com",
+        "--device-code",
+    ];
+    for args in [&add[..], &["account", "login", "gmail", "--device-code"]] {
+        let o = neomail_stdin(dir.path(), args, "");
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        let err = stderr(&o);
+        assert!(
+            err.contains(
+                "--device-code: Google's device code sign-in does not allow the mail scope"
+            ),
+            "{args:?}: {err}"
+        );
+        assert!(
+            !err.contains("keyring"),
+            "refused before the keyring: {err}"
+        );
+    }
+    // Password providers do not take it at all.
+    let o = neomail_stdin(
+        dir.path(),
+        &["account", "add", "proton", "--device-code"],
+        "",
+    );
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stderr(&o).contains("--device-code does not apply to `neomail account add proton`"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        GMAIL_CONFIG
+    );
+}
+
+#[test]
+fn a_graph_account_lists_microsoft_graph_as_its_server() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!("{OUTLOOK_CONFIG}{GMAIL_CONFIG}"),
+    )
+    .unwrap();
+    let o = neomail_stdin(dir.path(), &["account", "list"], "");
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "outlook\toauth\tyou@outlook.example\tgraph.microsoft.com\t443\ttls\t\n\
+         gmail\toauth\tyou@example.com\timap.gmail.com\t993\ttls\t\n"
+    );
+    let v = json(&neomail(dir.path(), &["account", "list", "--json"]));
+    assert_eq!(
+        v[0],
+        serde_json::json!({
+            "name": "outlook", "login": "oauth", "username": "you@outlook.example",
+            "host": "graph.microsoft.com", "port": 443, "security": "tls", "cert_pinned": false,
+            "server": "graph"
+        })
+    );
+    assert_eq!(v[1]["server"], "imap");
+    let o = neomail_stdin(dir.path(), &["config", "check"], "");
+    assert_eq!(stdout(&o), "ok: 2 accounts\n");
+}
+
 #[test]
 fn password_and_oauth_commands_refuse_the_other_kind_of_account() {
     let dir = tempfile::tempdir().unwrap();
@@ -605,6 +713,41 @@ fn oauth_commands_without_a_keyring_fail_before_signing_in() {
         std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
         GMAIL_CONFIG
     );
+
+    // Outlook too, with either sign-in flow, and a Graph account's sync.
+    std::fs::write(dir.path().join("config.toml"), OUTLOOK_CONFIG).unwrap();
+    let add = [
+        "account",
+        "add",
+        "outlook",
+        "--name",
+        "other",
+        "--email",
+        "you@outlook.example",
+        "--client-id",
+        "00000000-0000-0000-0000-000000000000",
+    ];
+    for args in [
+        [&add[..], &["--no-browser"]].concat(),
+        [&add[..], &["--device-code"]].concat(),
+        vec!["account", "login", "outlook", "--device-code"],
+        vec!["account", "logout", "outlook"],
+        vec!["sync"],
+    ] {
+        let o = neomail_stdin(dir.path(), &args, "");
+        assert_eq!(o.status.code(), Some(1), "{args:?}");
+        let err = stderr(&o);
+        assert!(
+            err.contains("the OS keyring is unavailable ("),
+            "{args:?}: {err}"
+        );
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(!err.contains("microsoft"), "{err}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        OUTLOOK_CONFIG
+    );
 }
 
 #[test]
@@ -619,7 +762,7 @@ fn add_without_a_provider_off_a_terminal_lists_the_providers() {
         let err = stderr(&o);
         assert!(err.starts_with(&format!("neomail: {why}")), "{err}");
         assert!(
-            err.contains("one of gmail, gmail-app-password, proton, imap"),
+            err.contains("one of gmail, outlook, gmail-app-password, proton, imap"),
             "{err}"
         );
         assert!(!err.contains("Which kind of account?"), "no menu: {err}");
@@ -721,7 +864,8 @@ fn add_proton_without_a_check_then_list_and_check_the_config() {
         v[0],
         serde_json::json!({
             "name": "proton", "login": "password_command", "username": "you@example.com",
-            "host": "127.0.0.1", "port": 1143, "security": "starttls", "cert_pinned": true
+            "host": "127.0.0.1", "port": 1143, "security": "starttls", "cert_pinned": true,
+            "server": "imap"
         })
     );
     assert_jsonl_matches_json(dir.path(), &["account", "list"]);

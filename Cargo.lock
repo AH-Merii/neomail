@@ -1149,6 +1149,7 @@ dependencies = [
  "clap_complete",
  "keyring-core",
  "nm-core",
+ "nm-graph",
  "nm-imap",
  "ring",
  "rpassword",
@@ -1185,6 +1186,19 @@ dependencies = [
  "rusqlite",
  "serde",
  "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "nm-graph"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures-util",
+ "nm-core",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
 ]
