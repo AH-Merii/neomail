@@ -27,12 +27,14 @@ will use the API in a later version.
 
 ## 3. Set up the Google Auth Platform: Branding and Audience
 
-In the console, go to **Google Auth platform > Branding**, enter an app name (only you will see
-it) and your address as the support and contact email, and agree to the user data policy
-([Google's guide](https://developers.google.com/workspace/guides/configure-oauth-consent)).
+In the console, go to **Google Auth platform > Branding**. In a new project it says the platform
+is not configured yet: click **Get started** and fill in its steps: **App information** (an app
+name only you will see, and your address as the support email), **Audience** (**External**),
+**Contact information** (your address) and **Finish** (agree to the user data policy), then
+click **Create** ([Google's guide](https://developers.google.com/workspace/guides/configure-oauth-consent)).
 
-Then, under **Audience**, choose **External**, and under **Test users** click **Add users** and add
-the Gmail address you will read.
+Then open **Audience** and, under **Test users**, click **Add users** and add the Gmail address
+you will read.
 
 *Why:* *External* lets a personal `@gmail.com` account sign in (*Internal* is only for a Google
 Workspace organisation's own users). While the app is in *Testing*, only the test users listed
@@ -69,7 +71,10 @@ nmail account add gmail
 
 It asks for a name for the account (default `gmail`), your address, the client ID and the client
 secret (not shown as you type), then opens Google's sign-in in your browser. Use `--no-browser` to
-only print the URL, for example over SSH. Then:
+only print the URL, for example over SSH. Google first shows a warning that it hasn't verified
+the app, in Testing mode too
+([Google: publishing status](https://support.google.com/cloud/answer/15549945)): it is your own
+app, so click **Continue**. Then:
 
 ```sh
 nmail sync --account gmail
@@ -88,9 +93,10 @@ While the app's publishing status is *Testing*, Google gives it refresh tokens t
 7 days ([Google: refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration)).
 `nmail sync` then says the sign-in expired; run `nmail account login gmail` to sign in again.
 
-To avoid that, publish the app: **Audience > Publish app**. Google then shows "Google hasn't
-verified this app" when you sign in; click **Advanced** and continue. An app for your own use
-(fewer than 100 users) needs no verification
+To avoid that, publish the app: **Audience > Publish app**. The unverified-app warning stays,
+now behind **Advanced**, then **Go to** your app's name
+([Google's troubleshooting guide](https://developers.google.com/apps-script/api/troubleshoot-authentication-authorization)),
+and an app for your own use (fewer than 100 users) needs no verification
 ([Google: verification exceptions](https://support.google.com/cloud/answer/13464323)).
 
 ## Where things are kept
@@ -113,13 +119,14 @@ verified this app" when you sign in; click **Advanced** and continue. An app for
 
 ## When something goes wrong
 
-- **"did not grant mail access":** Google's consent screen lets you untick permissions. Sign in
-  again and leave mail access ticked.
+- **"did not grant mail access":** when Google's consent screen shows a checkbox per
+  permission, mail access may have been left unticked. Sign in again and tick it.
 - **"Access blocked" or "has not completed the Google verification process":** the address is
   not a test user (step 3), or you signed in with another account.
 - **"you signed in as …, not …":** the browser used another Google account. Sign in with the
   address you gave, or add the other one as its own account.
-- **"invalid_client":** the client ID or secret is wrong. Run `nmail account logout NAME`, then
-  `nmail account login NAME`, which asks for the secret again. Google shows a secret only when it
-  is created; if you no longer have it, open the client under **Clients** and click
-  **Add secret** (step 5).
+- **"invalid_client":** the client ID or secret is wrong. During `nmail account add`, run it
+  again with the right ones. For an account already added, run `nmail account logout NAME`, then
+  `nmail account login NAME`, which asks for the secret again (a wrong client ID is fixed in the
+  config file). Google shows a secret only when it is created; if you no longer have it, open the
+  client under **Clients** and click **Add secret** (step 5).

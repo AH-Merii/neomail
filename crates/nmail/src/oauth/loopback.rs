@@ -3,14 +3,16 @@
 //!
 //! It answers anything that is not the redirect (a favicon, a stray tab) with 404 and keeps
 //! waiting, ignores a redirect with the wrong `state` (another page cannot end the sign-in),
-//! bounds each request's size and time, gives up after the overall timeout, and never puts the
-//! code in a page, a message or an error.
+//! handles connections concurrently, bounds each request's size and time, gives up after the
+//! overall timeout, and never puts the code in a page, a message or an error.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
 
 use super::Secret;
 
@@ -67,37 +69,20 @@ impl Listener {
             })?
     }
 
+    /// Accepts connections and handles each on its own task, so an idle one (a browser's
+    /// speculative preconnect) cannot hold up the redirect. Dropping the set aborts the rest.
     async fn accept_until_done(&self, state: &str) -> Result<Secret> {
+        let state: Arc<str> = state.into();
+        let mut handlers = JoinSet::new();
         loop {
-            let (mut stream, _) = self
-                .listener
-                .accept()
-                .await
-                .context("the sign-in listener failed")?;
-            let request = match read_head(&mut stream).await {
-                Ok(head) => parse_request(&head, state),
-                Err(Oversized) => {
-                    let _ = respond(&mut stream, "431 Request Header Fields Too Large", "").await;
-                    drain(&mut stream).await;
+            let request = tokio::select! {
+                accepted = self.listener.accept() => {
+                    let (stream, _) = accepted.context("the sign-in listener failed")?;
+                    handlers.spawn(handle(stream, state.clone()));
                     continue;
                 }
+                Some(joined) = handlers.join_next() => joined.unwrap_or(Request::Stray),
             };
-            let (status, page) = match &request {
-                Request::Code(_) => (
-                    "200 OK",
-                    "Signed in. You can close this tab and return to the terminal.",
-                ),
-                Request::Denied => ("200 OK", "Sign-in cancelled. You can close this tab."),
-                Request::Error(_) | Request::NoCode => {
-                    ("400 Bad Request", "Sign-in failed; see the terminal.")
-                }
-                Request::WrongState => (
-                    "400 Bad Request",
-                    "This sign-in link is not the current one.",
-                ),
-                Request::Stray => ("404 Not Found", ""),
-            };
-            let _ = respond(&mut stream, status, page).await;
             match request {
                 Request::Code(code) => return Ok(code),
                 Request::Denied => bail!("access was declined in the browser; nothing was saved"),
@@ -107,6 +92,35 @@ impl Listener {
             }
         }
     }
+}
+
+/// Reads one request, answers it and says what it was.
+async fn handle(mut stream: TcpStream, state: Arc<str>) -> Request {
+    let request = match read_head(&mut stream).await {
+        Ok(head) => parse_request(&head, &state),
+        Err(Oversized) => {
+            let _ = respond(&mut stream, "431 Request Header Fields Too Large", "").await;
+            drain(&mut stream).await;
+            return Request::Stray;
+        }
+    };
+    let (status, page) = match &request {
+        Request::Code(_) => (
+            "200 OK",
+            "Signed in. You can close this tab and return to the terminal.",
+        ),
+        Request::Denied => ("200 OK", "Sign-in cancelled. You can close this tab."),
+        Request::Error(_) | Request::NoCode => {
+            ("400 Bad Request", "Sign-in failed; see the terminal.")
+        }
+        Request::WrongState => (
+            "400 Bad Request",
+            "This sign-in link is not the current one.",
+        ),
+        Request::Stray => ("404 Not Found", ""),
+    };
+    let _ = respond(&mut stream, status, page).await;
+    request
 }
 
 /// The request was larger than [`MAX_REQUEST`].

@@ -269,8 +269,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 AccountCommand::SetPassword { name } => {
                     let account = config.select(Some(&name))?[0];
                     refuse_oauth(account, "login")?;
+                    // Before the password: no one should type it only to learn it cannot be
+                    // stored. On Linux, opening connects to the Secret Service.
+                    let keyring = Keyring::open()?;
                     let password = secret::read_new_password(&account.name)?;
-                    writeln!(out, "{}", set_password(account, &password)?)?;
+                    writeln!(out, "{}", set_password(&keyring, account, &password)?)?;
                 }
                 AccountCommand::DeletePassword { name } => {
                     let account = config.select(Some(&name))?[0];
@@ -399,8 +402,7 @@ fn refuse_oauth(account: &Account, instead: &str) -> Result<()> {
 }
 
 /// Stores the password and says where, in one line.
-fn set_password(account: &Account, password: &Password) -> Result<String> {
-    let keyring = Keyring::open()?;
+fn set_password(keyring: &Keyring, account: &Account, password: &Password) -> Result<String> {
     keyring.set(&account.name, password)?;
     let mut line = format!(
         "Stored the password for {:?} in {} (service {:?}, user {:?}).",

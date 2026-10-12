@@ -85,24 +85,31 @@ jobs:
       # The licence notices of the statically linked crates; about.toml lists the accepted ones.
       - run: cargo about generate --locked --fail -c about.toml -m crates/nmail/Cargo.toml --target ${{ matrix.target }} -o THIRD-PARTY-LICENSES about.hbs
       # The musl target also links musl libc statically (MIT, some files BSD, ISC or public domain);
-      # cargo-about only sees crates. The Ubuntu musl package that musl-tools installs carries
-      # musl's full notice; `test -s` fails the build if it ever goes missing.
+      # cargo-about only sees crates. With crt-static, rustc links the musl that ships with the
+      # toolchain (lib/rustlib/<target>/lib/self-contained), not Ubuntu's: musl-tools only
+      # compiles the C code. Rust 1.93 and later bundle musl 1.2.5
+      # (https://blog.rust-lang.org/2025/12/05/Updating-musl-1.2.5/), whose COPYRIGHT file is in
+      # licenses/; update it when Rust moves to another musl.
       - name: Add the musl libc notice
         if: endsWith(matrix.target, '-musl')
         run: |
-          test -s /usr/share/doc/musl/copyright
           sep='================================================================================'
           dash='--------------------------------------------------------------------------------'
           {
-            printf '\n%s\nmusl libc (MIT; some files under other permissive terms, listed below)\n' "$sep"
+            printf '\n%s\nmusl libc 1.2.5 (MIT; some files under other permissive terms, listed below)\n' "$sep"
             printf 'Used by: the Linux (musl) build, statically linked\n%s\n\n' "$dash"
-            cat /usr/share/doc/musl/copyright
+            cat licenses/musl-1.2.5-COPYRIGHT
           } >> THIRD-PARTY-LICENSES
+      # The Rust standard library (std, core, alloc and the crates they use) is linked too, under
+      # several licences (Unicode-3.0 for core's Unicode tables among them). The toolchain's
+      # `rustc` component ships its notices as share/doc/rust/COPYRIGHT-library.html.
       - name: Package
         run: |
           name="nmail-${{ matrix.target }}"
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/nmail" README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES "$name/"
+          std_notice="$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html"
+          test -s "$std_notice"
+          cp "target/${{ matrix.target }}/release/nmail" README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES "$std_notice" "$name/"
           tar -czf "$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v7
         with:
@@ -137,8 +144,11 @@ jobs:
       # A newer push can cancel this job at any step. Once the release exists the tag moves
       # last, so it never runs ahead of the uploaded assets. A cancel during the upload can still
       # leave a tarball missing until the next publishing run, because --clobber deletes the old
-      # asset before it uploads the new one. The first publish must push the tag before creating
-      # the release; if it is cancelled, the next run takes whichever branch applies.
+      # asset before it uploads the new one. The first publish lets `gh release create` make a
+      # draft, upload, then publish, which creates the tag at --target (`gh release create
+      # --help`). A cancel leaves a draft without a tag, which `gh release view` still finds, so
+      # the next run takes the first branch, where --draft=false publishes it at --target.
+      # --target is ignored for a tag that already exists, so a tag without a release goes first.
       - name: Publish the edge pre-release
         # bash -eo pipefail, so a failing `gh release view` in the asset loop fails the step.
         shell: bash
@@ -148,19 +158,26 @@ jobs:
             notes="$notes No macOS build for this commit: it failed, which does not block Linux (Linux first)."
             echo "::warning::the macOS edge build is missing; publishing Linux only"
           fi
-          if gh release view edge >/dev/null 2>&1; then
+          # Only "release not found" means a first publish; any other error (an API hiccup) must
+          # not reach the else branch, which deletes the edge tag.
+          if view_err=$(gh release view edge 2>&1 >/dev/null); then
             gh release upload edge dist/*.tar.gz --clobber
             # --clobber only replaces assets of the same name, so drop any this build did not
             # produce (such as a renamed target), or they would linger frozen at an old commit.
             gh release view edge --json assets --jq '.assets[].name' | while read -r asset; do
               [ -e "dist/$asset" ] || gh release delete-asset edge "$asset" --yes
             done
-            gh release edit edge --prerelease --title "edge" --notes "$notes"
+            gh release edit edge --draft=false --target "$GITHUB_SHA" --prerelease --title "edge" \
+              --notes "$notes"
             git tag -f edge "$GITHUB_SHA"
             git push -f origin refs/tags/edge
+          elif [ "$view_err" = "release not found" ]; then
+            if git ls-remote --exit-code origin refs/tags/edge >/dev/null; then
+              git push origin :refs/tags/edge
+            fi
+            gh release create edge dist/*.tar.gz --prerelease --title "edge" --notes "$notes" \
+              --target "$GITHUB_SHA"
           else
-            git tag -f edge "$GITHUB_SHA"
-            git push -f origin refs/tags/edge
-            gh release create edge --prerelease --title "edge" --notes "$notes" --verify-tag
-            gh release upload edge dist/*.tar.gz --clobber
+            echo "::error::cannot read the edge release: $view_err"
+            exit 1
           fi

@@ -45,6 +45,23 @@ impl OAuthEntry {
     }
 }
 
+/// An OAuth entry that is there but does not parse. Its message never quotes the entry.
+#[derive(Debug)]
+pub struct Malformed(String);
+
+impl std::fmt::Display for Malformed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let account = &self.0;
+        write!(
+            f,
+            "the keyring entry for {account:?} is malformed; run `nmail account logout \
+             {account}`, then `nmail account login {account}`"
+        )
+    }
+}
+
+impl std::error::Error for Malformed {}
+
 /// The platform's credential store, chosen once when it is opened.
 pub struct Keyring {
     store: Arc<CredentialStore>,
@@ -117,7 +134,7 @@ impl Keyring {
             // serde_json's errors can quote the input: never pass them on.
             Ok(json) => serde_json::from_str(&json)
                 .map(Some)
-                .map_err(|_| anyhow!("the keyring entry for {account:?} is malformed")),
+                .map_err(|_| anyhow::Error::new(Malformed(account.to_owned()))),
             Err(Error::NoEntry) => Ok(None),
             Err(e) => Err(error(&e, OAUTH_SERVICE, account, self.wsl)),
         }
@@ -328,6 +345,10 @@ mod tests {
             .unwrap();
         let message = format!("{:#}", k.get_oauth("bad").unwrap_err());
         assert!(!message.contains(SECRET), "{message}");
+        assert!(
+            message.ends_with("run `nmail account logout bad`, then `nmail account login bad`"),
+            "{message}"
+        );
         fail_next_in(
             &store,
             OAUTH_SERVICE,

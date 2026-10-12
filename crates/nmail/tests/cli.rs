@@ -339,7 +339,7 @@ fn nmail_stdin(data: &Path, args: &[&str], input: &str) -> Output {
 }
 
 #[test]
-fn set_password_checks_the_account_and_refuses_an_empty_password() {
+fn set_password_and_delete_password_check_the_account() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("config.toml"), KEYRING_CONFIG).unwrap();
 
@@ -352,17 +352,6 @@ fn set_password_checks_the_account_and_refuses_an_empty_password() {
         "{all}"
     );
     assert!(!all.contains(FAKE_PASSWORD), "{all}");
-
-    // The config has no password_command and loads: the empty password is what fails.
-    for input in ["", "\n", "\r\n"] {
-        let o = nmail_stdin(dir.path(), &["account", "set-password", "work"], input);
-        assert_eq!(o.status.code(), Some(1), "{input:?}");
-        assert!(
-            stderr(&o).contains("the password is empty"),
-            "{}",
-            stderr(&o)
-        );
-    }
 
     let o = nmail_stdin(dir.path(), &["account", "delete-password", "nope"], "");
     assert_eq!(o.status.code(), Some(1));
@@ -394,6 +383,12 @@ fn keyring_unavailable_is_one_line_with_a_hint() {
         assert_eq!(err.lines().count(), 1, "{err}");
         assert!(!err.contains(FAKE_PASSWORD), "{err}");
     }
+    // The keyring is checked before the password is read: with nothing on standard input, the
+    // error is the keyring, not the empty password.
+    let o = nmail_stdin(dir.path(), &["account", "set-password", "work"], "");
+    let err = stderr(&o);
+    assert!(err.contains("the OS keyring is unavailable ("), "{err}");
+    assert!(!err.contains("the password is empty"), "{err}");
 }
 
 const GMAIL_CONFIG: &str = "[[accounts]]\nname = \"gmail\"\nusername = \"you@example.com\"\n\
