@@ -187,3 +187,57 @@ pub struct IdFetched {
     pub id: RemoteId,
     pub raw: Vec<u8>,
 }
+
+/// Where an [`IdSource`](crate::IdSource)'s changes stopped: Graph's `@odata.deltaLink`, later
+/// Gmail's `historyId`. Opaque, never empty. Not a secret, but `Debug` leaves it out so it is
+/// never printed or logged.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Cursor(Box<str>);
+
+impl Cursor {
+    /// Returns `None` for an empty cursor.
+    pub fn new(cursor: impl Into<Box<str>>) -> Option<Self> {
+        let cursor = cursor.into();
+        (!cursor.is_empty()).then_some(Self(cursor))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Cursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Cursor(<redacted>)")
+    }
+}
+
+/// One change an [`IdSource`](crate::IdSource) reports since a [`Cursor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdChange {
+    /// A message that is in the INBOX now: new, or changed. A source may leave out what it does
+    /// not know (an update can carry only what changed); the engine keeps the cached value.
+    Present {
+        id: RemoteId,
+        flags: Option<Flags>,
+        received: Option<DateTime<Utc>>,
+    },
+    /// A message that left the INBOX: deleted, or moved to another folder.
+    Removed(RemoteId),
+}
+
+impl IdChange {
+    pub fn id(&self) -> &RemoteId {
+        match self {
+            Self::Present { id, .. } | Self::Removed(id) => id,
+        }
+    }
+}
+
+/// A whole round of changes, oldest first as the source saw them (they may repeat), and the
+/// cursor the next round starts from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdChanges {
+    pub changes: Vec<IdChange>,
+    pub cursor: Cursor,
+}

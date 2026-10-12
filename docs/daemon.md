@@ -34,7 +34,8 @@ Without a config file or accounts it prints the start lines and exits 2.
 IMAP accounts get push: new mail is synced, and notified, seconds after it arrives instead of at
 the next round. That covers every account the daemon syncs over IMAP: plain IMAP and
 app-password accounts, Proton through Bridge, and Gmail, which signs in with OAuth. Outlook and
-other Microsoft accounts sync through Microsoft Graph, not IMAP, and get no push yet.
+other Microsoft accounts sync through Microsoft Graph, not IMAP: they are checked every minute
+instead ([Outlook accounts](#outlook-accounts)).
 
 For each IMAP account whose server supports IDLE (RFC 2177), the daemon keeps one extra
 connection open next to the syncs, with INBOX opened read-only. It never changes anything on the
@@ -45,8 +46,7 @@ safety net.
 - The connection opens after a successful sync of the account, with the login that sync used,
   so the password or token is not asked for again. It is renewed every 29 minutes, as RFC 2177
   advises.
-- A server without IDLE gets no extra connection; that account keeps syncing every round, as
-  Microsoft (Graph) accounts do for now.
+- A server without IDLE gets no extra connection; that account keeps syncing every round.
 - When the connection drops, the daemon syncs the account to catch up and opens a new one, at
   most once a minute per account: if the last one opened less than a minute before, the daemon
   syncs the account again once the minute is up and opens it then. A connection that dies
@@ -69,10 +69,40 @@ when it changes. Like the start line, these lines go to standard error:
 
 A failure that repeats is not printed again; `push on` follows when it works again.
 
+### Outlook accounts
+
+Microsoft Graph has no push that reaches a program on your computer: it sends change
+notifications only to a publicly reachable HTTPS endpoint, or to Azure Event Hubs or Event Grid
+([webhook delivery](https://learn.microsoft.com/en-us/graph/change-notifications-delivery-webhooks)).
+Its pull model is the delta query
+([delta query overview](https://learn.microsoft.com/en-us/graph/delta-query-overview)), which
+every Outlook sync uses once it has a delta link ([docs/outlook.md](outlook.md)). So the daemon
+checks each Outlook account every minute between the rounds, and a check with nothing new costs one
+request. Two cases cost a full listing of the cached window on every check instead: a window of
+5,000 messages or more, which is more than Graph's filtered delta query returns
+([delta query for messages](https://learn.microsoft.com/en-us/graph/delta-query-messages)), and a
+message still missing its body.
+
+- A check syncs that account alone, as a push sync does: the same account lock, the same lines,
+  and a notification when new mail came in. Rounds keep their times.
+- The next check is due a minute after the account's last sync ended, a failed one included, so a
+  slow or failing Graph never stacks checks. A failure that repeats is not printed again.
+- When `neomail sync` holds the account, the check is skipped and tried again a minute later.
+- With `--interval` of a minute or less, the rounds alone check every account that often: there
+  are no extra checks and no line about them.
+- After a sleep, the round that falls due syncs the account, and its checks go on from there.
+  Ctrl-C or SIGTERM ends them at once.
+
+Each Outlook account gets one line, once, after its first sync:
+
+```text
+14:00:01 neomail daemon: outlook: checked every minute (Outlook can't push to this computer)
+```
+
 ## Notifications
 
-On Linux, after each round or push sync, every account that got new mail in it shows one desktop
-notification:
+On Linux, after each round, push sync or Outlook check, every account that got new mail in it
+shows one desktop notification:
 
 ```text
 work: 5 new messages
@@ -299,6 +329,6 @@ when `neomail sync` holds an account, the daemon skips it for that round.
 
 ## Coming next
 
-Push for IMAP accounts, Gmail included, is here. Later parts of the same slice give Microsoft
-(Graph) accounts push through Graph's delta query, and move Gmail from IMAP IDLE to the Gmail
-API's history.
+Push for IMAP accounts, Gmail included, and the one-minute checks of Outlook accounts through
+Graph's delta query are here. The next part of the same slice moves Gmail from IMAP IDLE to the
+Gmail API's history.

@@ -122,9 +122,35 @@ immutable ids, so they stay the same when a message moves. When Graph throttles,
 long as `Retry-After` says, else 1, 2, 4 and 8 seconds, for at most five tries. In `--json` output,
 `uid` is `null` for these messages ([json.md](json.md)).
 
+After the first sync, a sync asks Graph only for what changed since the last one, through the
+delta query ([message: delta](https://learn.microsoft.com/en-us/graph/api/message-delta)): new
+messages are downloaded, read changes update the cache, and messages deleted or moved out of the
+INBOX leave it. A sync with nothing new costs one request. neomail keeps Graph's delta link in the
+cache, never prints it, and follows it only to `https://graph.microsoft.com/`.
+
+The delta query filters on arrival time
+([delta query for messages](https://learn.microsoft.com/en-us/graph/delta-query-messages)), so a
+delta link starts at the oldest cached message: every cached message is inside it. Microsoft says a
+filtered delta query can also report read changes for messages outside its filter
+([message: delta](https://learn.microsoft.com/en-us/graph/api/message-delta)), but in our live
+check it did not, so neomail does not count on that. With a filter, Graph returns at most 5,000
+messages per round; when the cached window holds that many, neomail keeps listing the INBOX on
+every sync instead of storing a delta link, so nothing is missed, but each sync then costs a full
+listing of the window rather than one request. A later round can reach 5,000 too, after a change
+to thousands of messages at once such as marking them all read; neomail then starts over as after
+a reset (below).
+
+Microsoft can reset a delta link: it answers `410 Gone`, or an error such as `syncStateNotFound`
+when the link expired
+([delta query overview](https://learn.microsoft.com/en-us/graph/delta-query-overview)). A stored
+link Graph cannot use drew `400 BadRequest` in our live check, so neomail treats that as a reset
+too. The sync then lists the INBOX as the first sync after an upgrade does, applies what changed,
+and starts a new delta link. Nothing is lost and nothing needs doing. The same happens when a
+message comes back without its source: the next sync lists from it and asks again.
+
 Known limit: mail moved into the INBOX from another folder, with an arrival time older than the
-oldest cached message, is not seen. Graph's delta query, in the
-[background sync slice](roadmap.md), lifts it.
+oldest cached message, is never seen: the delta query and the listing both filter on arrival time
+and leave it out.
 
 ## When something goes wrong
 

@@ -5,10 +5,13 @@
 //! [`Syncer`] as `neomail sync`. What starts one is a [`Wake`]: the timer, or the wall clock after
 //! a suspend. Push ([`crate::push`], IMAP IDLE for now) adds a wake that names one account: it
 //! syncs that account through the same `Syncer` under the same account lock, between the rounds.
+//! Outlook cannot push to this computer: a check, due a minute after the account's last sync, is
+//! the same wake.
 //!
 //! After a round, each account that got new mail in it gets one desktop notification
 //! ([`notify_round`], through [`crate::notify`]).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -110,7 +113,7 @@ pub enum Wake {
     /// The round replaces every watcher, since their connections may have died meanwhile.
     Resumed,
     /// Sync this one account: its watcher woke it, and [`SETTLE`] has passed since, or the start
-    /// limit held its watcher back and the minute is up.
+    /// limit held its watcher back and the minute is up, or its check is due (Outlook).
     Account(String),
     /// A watcher's other news: on, no IDLE, failed, ended.
     Watch(push::Event),
@@ -148,6 +151,26 @@ impl Wakes {
         let account = account.clone();
         self.pending.remove(&account);
         Some(account)
+    }
+
+    /// Keeps a wake for later, or hands over a watcher's other news.
+    fn take(&mut self, event: push::Event) -> Option<Wake> {
+        match event.kind {
+            push::Kind::Wake => {
+                let at = Instant::now() + SETTLE;
+                self.pending.entry(event.account).or_insert(at);
+            }
+            push::Kind::WakeAt(at) => {
+                self.pending.entry(event.account).or_insert(at);
+            }
+            // Sent after each sync, in order: the last one is due, even when an earlier one was
+            // still unread at a round.
+            push::Kind::CheckAt(at) => {
+                self.pending.insert(event.account, at);
+            }
+            _ => return Some(Wake::Watch(event)),
+        }
+        None
     }
 }
 
@@ -258,13 +281,11 @@ impl Stop {
                 () = signalled => {}
                 event = wakes.events.recv(), if wakes.open => match event {
                     None => wakes.open = false,
-                    Some(event) if event.kind == push::Kind::Wake => {
-                        wakes.pending.entry(event.account).or_insert(Instant::now() + SETTLE);
+                    Some(event) => {
+                        if let Some(wake) = wakes.take(event) {
+                            return wake;
+                        }
                     }
-                    Some(push::Event { account, kind: push::Kind::WakeAt(at), .. }) => {
-                        wakes.pending.entry(account).or_insert(at);
-                    }
-                    Some(event) => return Wake::Watch(event),
                 },
             }
         }
@@ -466,8 +487,9 @@ impl<O: Write, E: Write> Printer<O, E> {
 }
 
 /// One round: each account in turn, skipping one whose lock another sync holds, stopping early
-/// once a stop is requested. One account's failure never stops the others. Returns the accounts
-/// that got new mail, for [`notify_round`], including what a failed sync stored before it failed.
+/// once a stop is requested. One account's failure never stops the others. `after` runs after
+/// each account synced or skipped, and its line is printed. Returns the accounts that got new
+/// mail, for [`notify_round`], including what a failed sync stored before it failed.
 ///
 /// `lock` takes an account's sync lock, `None` when someone else holds it: `run` passes
 /// [`lock::try_account`]. A parameter so that tests need no real lock, which a child process
@@ -479,17 +501,19 @@ pub fn round<O: Write, E: Write, G>(
     reports: &mut Reports,
     printer: &mut Printer<O, E>,
     sync: impl FnMut(&Account) -> Synced,
+    after: impl FnMut(&Account) -> Option<Line>,
 ) -> io::Result<Vec<NewMail>> {
     reports.retain(accounts);
-    sync_each(accounts, lock, stop, reports, printer, sync)
+    sync_each(accounts, lock, stop, reports, printer, sync, after)
 }
 
 /// What a wake syncs, before its notifications: a round every account, an account wake that one
 /// account (none when it is no longer configured), each through `sync` under its lock (see
 /// [`round`] for `lock`). A sync
-/// that hands over its login starts the account's watcher (under [`Push::start`]'s rules). A
-/// resume first ends every watcher; a watcher's news is printed when the account's push state
-/// changed. Returns the accounts that got new mail.
+/// that hands over its login starts the account's watcher (under [`Push::start`]'s rules); an
+/// Outlook account's sync, or its skip, schedules its next check ([`Push::checked`]). A resume
+/// first ends every watcher; a watcher's news is printed when the account's push state changed.
+/// Returns the accounts that got new mail.
 #[allow(clippy::too_many_arguments)]
 pub fn on_wake<O: Write, E: Write, G, W, F>(
     wake: Wake,
@@ -516,7 +540,17 @@ where
         Wake::Account(name) => match accounts.iter().find(|a| a.name == name) {
             Some(account) => {
                 let one = std::slice::from_ref(account);
-                sync_each(one, &mut lock, stop, reports, printer, starting(push, sync))
+                let push = RefCell::new(push);
+                let checked = |a: &Account| push.borrow_mut().checked(a);
+                sync_each(
+                    one,
+                    &mut lock,
+                    stop,
+                    reports,
+                    printer,
+                    starting(&push, sync),
+                    checked,
+                )
             }
             None => Ok(Vec::new()),
         },
@@ -525,23 +559,26 @@ where
                 push.replace_all();
             }
             push.retain(accounts);
+            let push = RefCell::new(push);
+            let checked = |a: &Account| push.borrow_mut().checked(a);
             round(
                 accounts,
                 &mut lock,
                 stop,
                 reports,
                 printer,
-                starting(push, sync),
+                starting(&push, sync),
+                checked,
             )
         }
     }
 }
 
 /// `sync`, then the account's watcher started with the login it handed over.
-fn starting<W, F>(
-    push: &mut Push<W>,
-    mut sync: impl FnMut(&Account) -> Synced,
-) -> impl FnMut(&Account) -> Synced
+fn starting<'p, W, F>(
+    push: &'p RefCell<&mut Push<W>>,
+    mut sync: impl FnMut(&Account) -> Synced + 'p,
+) -> impl FnMut(&Account) -> Synced + 'p
 where
     W: FnMut(WatchLogin, push::Events) -> F,
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -549,7 +586,7 @@ where
     move |account| {
         let mut synced = sync(account);
         if let Some(login) = synced.watch.take() {
-            push.start(&account.name, login);
+            push.borrow_mut().start(&account.name, login);
         }
         synced
     }
@@ -562,6 +599,7 @@ fn sync_each<O: Write, E: Write, G>(
     reports: &mut Reports,
     printer: &mut Printer<O, E>,
     mut sync: impl FnMut(&Account) -> Synced,
+    mut after: impl FnMut(&Account) -> Option<Line>,
 ) -> io::Result<Vec<NewMail>> {
     let mut new_mail = Vec::new();
     for account in accounts {
@@ -569,8 +607,13 @@ fn sync_each<O: Write, E: Write, G>(
             break;
         }
         let synced = match lock(&account.name) {
-            // `neomail sync` has it: it reports, and the next round catches up.
-            Ok(None) => continue,
+            // `neomail sync` has it: it reports, and the next round (or check) catches up.
+            Ok(None) => {
+                if let Some(line) = after(account) {
+                    printer.print(&line)?;
+                }
+                continue;
+            }
             Ok(Some(_held)) => sync(account),
             Err(e) => Synced {
                 report: Err(e),
@@ -585,6 +628,9 @@ fn sync_each<O: Write, E: Write, G>(
             }
         }
         if let Some(line) = reports.line(&account.name, &synced.report) {
+            printer.print(&line)?;
+        }
+        if let Some(line) = after(account) {
             printer.print(&line)?;
         }
         // A sync that failed after storing some batches still announces them: the next round
@@ -689,6 +735,7 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
     .unattended(PASSWORD_COMMAND_TIMEOUT)
     .push_logins();
     let (mut push, events) = Push::new(runtime.handle().clone(), push::watch);
+    push.check_between(interval.duration());
     let mut wakes = Wakes::new(events);
     let mut config = config;
     let mut config_error = None;
@@ -770,11 +817,21 @@ fn no_accounts() -> ExitCode {
 mod tests {
     mod push;
 
-    use std::cell::RefCell;
-
     use anyhow::bail;
 
     use super::*;
+
+    /// A round without push or checks.
+    fn round<O: Write, E: Write, G>(
+        accounts: &[Account],
+        lock: impl FnMut(&str) -> Result<Option<G>>,
+        stop: &Stop,
+        reports: &mut Reports,
+        printer: &mut Printer<O, E>,
+        sync: impl FnMut(&Account) -> Synced,
+    ) -> io::Result<Vec<NewMail>> {
+        super::round(accounts, lock, stop, reports, printer, sync, |_| None)
+    }
 
     #[test]
     fn interval_is_digits_and_a_unit_from_30s_to_24h() {

@@ -8,7 +8,25 @@
 //!   to the request that carries it, so ids stay the same when a message moves
 //!   (<https://learn.microsoft.com/en-us/graph/outlook-immutable-id>).
 //! - A listing follows `@odata.nextLink` verbatim, and only to `https://graph.microsoft.com/`, so
-//!   the token never leaves Graph.
+//!   the token never leaves Graph. A delta round follows `@odata.nextLink` and keeps
+//!   `@odata.deltaLink` under the same rule.
+//! - Changes come from the delta query on the INBOX
+//!   (<https://learn.microsoft.com/en-us/graph/api/message-delta>). A round's query options go
+//!   only in its first request; Graph encodes them into its next and delta links
+//!   (<https://learn.microsoft.com/en-us/graph/delta-query-messages>). The first request filters on
+//!   `receivedDateTime ge`, the only filter delta supports, from the start of the cached window,
+//!   so every cached message is inside the filter. Microsoft says a filtered round "can" also send
+//!   read changes for messages outside it (<https://learn.microsoft.com/en-us/graph/api/message-delta>),
+//!   but a live check found it did not, so nothing relies on that. With `$filter` a round holds at
+//!   most [`START_CAP`] messages (<https://learn.microsoft.com/en-us/graph/delta-query-messages>):
+//!   a round stops at the page that reaches it and is not used. A starting one leaves the engine
+//!   listing; a stored link carries the same filter, so a later one starts over. A listing that
+//!   alone holds that many asks for no round.
+//! - 410 Gone, or a 4xx with `syncStateNotFound`, means the round must start over
+//!   (<https://learn.microsoft.com/en-us/graph/delta-query-overview>). A round from a stored link
+//!   also starts over on 400: a live check found Graph answers a link it cannot use with 400
+//!   `BadRequest`. A 400 on a new round's first request stays an error, so a bad filter cannot
+//!   loop.
 //! - 429 and 503 are retried after `Retry-After`, else after 1, 2, 4 and 8 s, for at most
 //!   [`MAX_TRIES`] tries (<https://learn.microsoft.com/en-us/graph/throttling>).
 //! - At most [`CONCURRENT_FETCHES`] message downloads run at once: Outlook allows four concurrent
@@ -23,7 +41,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
-use nm_core::{Flags, IdFetched, IdListed, IdSource, RemoteId};
+use nm_core::{Cursor, Flags, IdChange, IdChanges, IdFetched, IdListed, IdSource, RemoteId};
 use serde::Deserialize;
 
 /// Where every request goes, and the only place a next page link may point.
@@ -46,7 +64,15 @@ const MAX_BACKOFF: Duration = Duration::from_secs(16);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 const PREFER: (&str, &str) = ("Prefer", "IdType=\"ImmutableId\"");
 const ACCEPT_JSON: (&str, &str) = ("Accept", "application/json");
+const SELECT: &str = "$select=id,isRead,receivedDateTime";
 const LIST_FIELDS: &str = "$select=id,isRead,receivedDateTime&$orderby=receivedDateTime%20desc";
+/// The error code Graph answers when a delta link expired
+/// (<https://learn.microsoft.com/en-us/graph/delta-query-overview>).
+const SYNC_STATE_NOT_FOUND: &str = "syncStateNotFound";
+/// The most messages a delta round with `$filter` returns
+/// (<https://learn.microsoft.com/en-us/graph/delta-query-messages>). A starting round that holds
+/// this many may have left cached messages out, so it is not used.
+pub const START_CAP: usize = 5_000;
 
 /// A transport's error: whatever went wrong below HTTP (DNS, TLS, a cap, a timeout).
 pub type TransportError = Box<dyn Error + Send + Sync>;
@@ -97,7 +123,7 @@ pub enum GraphError {
     Status { status: u16, code: Option<String> },
     #[error("Microsoft Graph's answer is not the expected JSON")]
     Malformed,
-    #[error("Microsoft Graph's next page link points outside {GRAPH_ORIGIN}; refused")]
+    #[error("Microsoft Graph's next page or delta link points outside {GRAPH_ORIGIN}; refused")]
     ForeignLink,
 }
 
@@ -126,32 +152,73 @@ struct Page {
     value: Vec<Item>,
     #[serde(rename = "@odata.nextLink")]
     next_link: Option<String>,
+    #[serde(rename = "@odata.deltaLink")]
+    delta_link: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Item {
     id: Option<String>,
-    is_read: Option<bool>,
+    /// A boolean, though Graph's own delta example shows `"true"` as a string
+    /// (<https://learn.microsoft.com/en-us/graph/delta-query-messages>); both are read.
+    is_read: Option<serde_json::Value>,
     received_date_time: Option<String>,
+    /// Present when the message left the folder: deleted or moved.
+    #[serde(rename = "@removed")]
+    removed: Option<serde::de::IgnoredAny>,
 }
 
 impl Item {
+    fn read(&self) -> Option<bool> {
+        match self.is_read.as_ref()? {
+            serde_json::Value::Bool(b) => Some(*b),
+            serde_json::Value::String(s) if s == "true" => Some(true),
+            serde_json::Value::String(s) if s == "false" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn received(&self) -> Option<DateTime<Utc>> {
+        Some(
+            DateTime::parse_from_rfc3339(self.received_date_time.as_deref()?)
+                .ok()?
+                .with_timezone(&Utc),
+        )
+    }
+
     /// The listing entry; `None` without an id or a valid `receivedDateTime`.
     fn listed(self) -> Option<IdListed> {
-        let received = DateTime::parse_from_rfc3339(self.received_date_time.as_deref()?)
-            .ok()?
-            .with_timezone(&Utc);
-        let flags = if self.is_read == Some(true) {
-            Flags::new([Flags::SEEN])
-        } else {
-            Flags::default()
-        };
+        let received = self.received()?;
+        let flags = seen_flags(self.read() == Some(true));
         Some(IdListed {
             id: RemoteId::new(self.id?)?,
             flags,
             received,
         })
+    }
+
+    /// The delta entry; `None` without an id. An update may leave out what did not change.
+    fn change(self) -> Option<IdChange> {
+        let read = self.read();
+        let received = self.received();
+        let id = RemoteId::new(self.id?)?;
+        Some(match self.removed {
+            Some(_) => IdChange::Removed(id),
+            None => IdChange::Present {
+                id,
+                flags: read.map(seen_flags),
+                received,
+            },
+        })
+    }
+}
+
+fn seen_flags(read: bool) -> Flags {
+    if read {
+        Flags::new([Flags::SEEN])
+    } else {
+        Flags::default()
     }
 }
 
@@ -196,6 +263,22 @@ fn encode_segment(s: &str) -> String {
         }
     }
     out
+}
+
+/// The first request of a delta round over the INBOX's messages that arrived at or after `from`.
+fn delta_url(from: DateTime<Utc>) -> String {
+    format!(
+        "{API}/me/mailFolders/inbox/messages/delta?$filter=receivedDateTime%20ge%20{}&{SELECT}",
+        from.to_rfc3339_opts(SecondsFormat::Secs, true)
+    )
+}
+
+/// Whether Graph refused a delta link: the round must start over.
+fn is_reset(reply: &Reply) -> bool {
+    reply.status == 410
+        || ((400..500).contains(&reply.status)
+            && error_code(&reply.body)
+                .is_some_and(|c| c.eq_ignore_ascii_case(SYNC_STATE_NOT_FOUND)))
 }
 
 /// The first page of the INBOX listing, newest first, with an optional filter.
@@ -290,6 +373,47 @@ impl<T: Transport> GraphSource<T> {
         }
     }
 
+    /// A whole delta round from `url`, through every next link to the delta link; `None` when
+    /// Graph refuses the round's state. Nothing of a round is returned until its delta link is in.
+    ///
+    /// `stored`: `url` is a delta link from an earlier round. Graph answers one it cannot use with
+    /// 400 `BadRequest` (seen live), so a 400 on such a round starts over too.
+    ///
+    /// `cap`: the round is not wanted once it holds this many changes, so it stops at the page
+    /// that reaches it and answers `None` without asking for the rest.
+    async fn round(
+        &self,
+        mut url: String,
+        stored: bool,
+        cap: Option<usize>,
+    ) -> Result<Option<IdChanges>, GraphError> {
+        let mut changes = Vec::new();
+        loop {
+            let reply = self.get(&url, true, MAX_JSON).await?;
+            if is_reset(&reply) || (stored && reply.status == 400) {
+                return Ok(None);
+            }
+            if reply.status != 200 {
+                return Err(status_error(&reply));
+            }
+            let page: Page =
+                serde_json::from_slice(&reply.body).map_err(|_| GraphError::Malformed)?;
+            changes.extend(page.value.into_iter().filter_map(Item::change));
+            if cap.is_some_and(|cap| changes.len() >= cap) {
+                return Ok(None);
+            }
+            match (page.next_link, page.delta_link) {
+                (Some(next), _) if next.starts_with(GRAPH_ORIGIN) => url = next,
+                (None, Some(delta)) if delta.starts_with(GRAPH_ORIGIN) => {
+                    let cursor = Cursor::new(delta).ok_or(GraphError::Malformed)?;
+                    return Ok(Some(IdChanges { changes, cursor }));
+                }
+                (Some(_), _) | (None, Some(_)) => return Err(GraphError::ForeignLink),
+                (None, None) => return Err(GraphError::Malformed),
+            }
+        }
+    }
+
     /// One message's MIME source (<https://learn.microsoft.com/en-us/graph/api/message-get>);
     /// `None` when it is gone (404).
     async fn fetch_one(&self, id: &RemoteId) -> Result<Option<IdFetched>, GraphError> {
@@ -315,6 +439,8 @@ fn status_error(reply: &Reply) -> GraphError {
 
 impl<T: Transport> IdSource for GraphSource<T> {
     type Error = GraphError;
+
+    const START_LIMIT: Option<usize> = Some(START_CAP);
 
     async fn newest(&mut self, limit: NonZeroU32) -> Result<Vec<IdListed>, GraphError> {
         let url = list_url(None, limit.get().min(MAX_PAGE));
@@ -343,6 +469,27 @@ impl<T: Transport> IdSource for GraphSource<T> {
             .try_collect()
             .await?;
         Ok(fetched.into_iter().flatten().collect())
+    }
+
+    async fn start_changes(
+        &mut self,
+        from: DateTime<Utc>,
+    ) -> Result<Option<IdChanges>, GraphError> {
+        // A round that reaches the cap may have left cached messages out, and their changes
+        // would never come: list instead, without paging through the rest of it.
+        self.round(delta_url(from), false, Some(START_CAP)).await
+    }
+
+    async fn changes_since(&mut self, cursor: &Cursor) -> Result<Option<IdChanges>, GraphError> {
+        // Never stored by this source; a cache holding one starts over rather than send the
+        // token elsewhere.
+        if !cursor.as_str().starts_with(GRAPH_ORIGIN) {
+            return Ok(None);
+        }
+        // A stored link carries the round's `$filter`, so the cap may cut it too, and the
+        // changes it left out would never come: start over instead.
+        self.round(cursor.as_str().to_owned(), true, Some(START_CAP))
+            .await
     }
 }
 

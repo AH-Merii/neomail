@@ -49,6 +49,19 @@ arrival times and fails rather than pass vacuously. The in-memory reference sour
 fail it. No other trait is needed: the cache stays a concrete type with by-id
 methods, and the engine reuses `SyncReport`, `SyncError` and `Progress`.
 
+**The cursor seam** is two more `IdSource` methods, for providers that report changes since a
+point: `start_changes(from)` starts tracking and returns a whole round (at least every message
+there now that arrived at or after `from`) with a `Cursor`, and `changes_since(cursor)` returns
+the whole round since it, or `None` when the provider refuses the cursor. A round is a list of
+`IdChange::Present { id, flags?, received? }` and `IdChange::Removed(id)`; fields a provider leaves
+out of an update stay as cached. Both default to `Ok(None)`, so a source without change tracking
+(the reference source, the conformance fakes) is unchanged and the engine lists as before. Graph's
+delta link is the first cursor; Gmail's `historyId` fits the same shape. They are methods with
+defaults rather than a second trait, because the engine is one engine either way: a separate
+`ChangeSource` bound would need a second entry point or specialisation to pick it, and every
+source that implements it also implements `IdSource`. `Cursor`'s `Debug` is redacted, so it is
+never printed.
+
 **`Transport`** (`nm-graph/src/lib.rs`) is the port `GraphSource` reads Graph through: one HTTPS
 GET with request headers and a body cap, answered with the status, `Retry-After` and the body.
 `neomail/src/graph.rs` implements it with neomail's HTTP client, and `nm-graph/tests/graph.rs`
@@ -65,8 +78,33 @@ leaves Graph. `fetch` downloads `/me/messages/{id}/$value` (the id percent-encod
 without `receivedDateTime` is skipped. 429 and 503 wait `Retry-After` (at most 5 minutes), else 1,
 2, 4 and 8 s, for at most five tries; 401 and 403 become "access token refused" and "Mail.Read not
 granted"; any other status gives Graph's `error.code`, cleaned, never the body or the token. JSON
-is capped at 8 MiB, a message at 160 MiB. Known limit: mail moved into the inbox with an older
-`receivedDateTime` than the sync's window is missed until Graph's delta query (roadmap row 7).
+is capped at 8 MiB, a message at 160 MiB.
+
+`start_changes` and `changes_since` run Graph's delta query
+([message: delta](https://learn.microsoft.com/en-us/graph/api/message-delta)). A round's first
+request is `/me/mailFolders/inbox/messages/delta?$filter=receivedDateTime ge …&$select=…`: query
+options go only there, and Graph encodes them into the next and delta links; `receivedDateTime ge`
+is the only filter delta supports
+([delta query for messages](https://learn.microsoft.com/en-us/graph/delta-query-messages)). The
+round follows `@odata.nextLink` to `@odata.deltaLink`, both only on Graph, with the same headers,
+and returns nothing until the delta link is in, so a stopped round leaves no half-round link. An
+entry with `@removed` is a removal; others are present, with `isRead` (a boolean, or the string
+Graph's own example shows) and `receivedDateTime` when sent. `410 Gone` and `syncStateNotFound`
+return `None` ([delta query overview](https://learn.microsoft.com/en-us/graph/delta-query-overview)),
+as does a stored link off Graph, which is never sent. A round from a stored link also returns
+`None` on 400: the live check found Graph answers a link it cannot use with 400 `BadRequest`. A
+400 on a new round's first request stays an error, so a bad filter cannot loop. Microsoft's page
+says a filtered delta query can report read changes for messages outside the filter
+([message: delta](https://learn.microsoft.com/en-us/graph/api/message-delta)); the live check
+found it did not, so the round starts at the window's start and covers every cached message. With
+`$filter` a round holds at most 5,000 messages
+([delta query for messages](https://learn.microsoft.com/en-us/graph/delta-query-messages)), so
+`start_changes` stops at the page that reaches it and returns `None`, and the engine keeps
+listing. A stored link carries the same filter, so `changes_since` stops there too and the round
+starts over. `IdSource::START_LIMIT` says so up front: a listing that alone holds 5,000 messages
+asks for no round, so such a window costs a listing per sync, not a listing and a round. Known
+limit: mail moved into the inbox with a `receivedDateTime` older than the window is never seen:
+the round's filter and the listing both leave it out.
 
 Graph needs no other trait: `IdSource` is the source seam, `Transport` the network one, and the
 sign-in reuses the `Provider` data, the `Http` seam and the keyring entry of slice 3.
@@ -196,17 +234,19 @@ directory (created with mode 0700). On Unix, `neomail` makes the file and SQLite
 `-shm` files mode 0600 each time it opens the cache, even in a directory that already existed
 with looser modes (`neomail/src/main.rs`, `restrict_cache_files`). Tables:
 
-- `mailbox (account, name, uid_validity, highest_uid, seen_until, synced)`: the sync state. A NULL
-  `uid_validity` marks a by-id mailbox, whose state is `seen_until` instead. `synced` is 0 from
-  the mailbox's creation until a sync of it completes;
+- `mailbox (account, name, uid_validity, highest_uid, seen_until, synced, cursor)`: the sync
+  state. A NULL `uid_validity` marks a by-id mailbox, whose state is `seen_until` and `cursor`
+  instead. `synced` is 0 from the mailbox's creation until a sync of it completes. `cursor` is the
+  source's change cursor (Graph's delta link), NULL until a sync stores one;
 - `message (mailbox_id, uid, remote_id, flags, received, date, from_*, subject, raw)`: the
   message source plus the few fields `list` needs, so listing never parses mail. Exactly one of
   `uid` and `remote_id` is set (a `CHECK`), each unique per mailbox.
 
-Schema 2 added the by-id columns, and schema 3 `mailbox.synced`. A schema 2 cache gets the column in
-one `BEGIN IMMEDIATE` transaction that reads the version again, with every existing mailbox counted
-as synced (a build without the column synced it). A schema 1 cache is migrated when it is opened,
-following SQLite's procedure for other table changes: foreign keys off outside any transaction
+Schema 2 added the by-id columns, schema 3 `mailbox.synced` and schema 4 `mailbox.cursor`. Each
+step from 2 runs in one `BEGIN IMMEDIATE` transaction that reads the version again. A schema 2 cache
+gets `synced` with every existing mailbox counted as synced (a build without the column synced it);
+a schema 3 cache gets `cursor` empty, so its next sync lists and stores one. A schema 1 cache is
+migrated when it is opened, following SQLite's procedure for other table changes: foreign keys off outside any transaction
 (inside one the pragma does nothing, and with them on, dropping the old `mailbox` would delete every
 message), then one `BEGIN IMMEDIATE` transaction that reads the version again, creates the new
 tables, copies every row with its id, drops the old tables, renames the new ones, restores the
@@ -300,9 +340,21 @@ other news (`Watch`), or `Stop`. `daemon::on_wake` handles each, outside the run
   goes through `round`'s per-account path, so the account lock, `Reports` and the notifications
   are the same.
 
+- **The Outlook check:** Graph sends change notifications only to a public HTTPS endpoint, Azure
+  Event Hubs or Event Grid
+  ([webhook delivery](https://learn.microsoft.com/en-us/graph/change-notifications-delivery-webhooks)),
+  so a Graph account gets no watcher. After each of its syncs, or a skip because `neomail sync`
+  holds its lock, `Push::checked` sends a `push::Kind::CheckAt` for a minute later (`CHECK_EVERY`)
+  on the watchers' channel and says `checked every minute` the first time. `Wakes` keeps the
+  latest one (unlike the start limit's `WakeAt`, which keeps the earliest), so a check that ran
+  into a round is replaced by the round's. When it falls due it is an account wake, through the
+  same path. `on_wake` runs it from `round`'s `after`, per account. `Push::check_between` turns
+  checks off when the rounds are a minute apart or less. Each check is a normal sync, which the
+  cursor seam makes one delta request when nothing changed.
+
 No trait: there is one watcher, and the tests give `Push` a closure that plays scripted events on
-tokio's paused clock, as `round` and `notify_round` take closures. Graph's delta query and Gmail's
-history will be other watchers that send the same events.
+tokio's paused clock, as `round` and `notify_round` take closures. Gmail's history, the next part,
+will fit as another source of the same events: a watcher or a check.
 
 **Notifications** (`neomail/src/notify.rs`) come after a round, never inside a sync. Which mail is
 new comes from the sync: `SyncReport::new_ids` holds the cache ids of the rows it added (the cache's
@@ -369,8 +421,27 @@ are dropped and changed flags updated. Listed ids not cached are fetched oldest 
 per request and transaction. With nothing missing, `seen_until` becomes the newest listed arrival,
 else the oldest missing one, saved with the batch it was missing from, so a missing body is asked
 for again even if a later batch fails, and an interrupted first sync is finished by the next run.
-Known limit: mail moved into the inbox with an arrival time older than the window is not seen
-until Graph's delta query (roadmap row 7).
+
+With a stored cursor, the engine asks `changes_since` instead of listing and applies the round; a
+refused cursor is cleared and the sync lists. After a listing with nothing missing, it calls
+`start_changes` from the window's start (the oldest cached arrival or `seen_until`, whichever is
+earlier), so every cached message is inside the round and a source need not report changes to
+older ones. It applies that round and stores its cursor; a source that cannot cover the window
+returns `None` (and the engine skips asking when the listing alone holds the source's
+`START_LIMIT`), and the engine lists again next time. Applying a round adds, updates and removes
+what it names (the last change per id wins, so replays are harmless). A later round never drops a
+message it leaves out. A starting round is complete from its start on, so it also drops a cached
+message from there on that it leaves out: one deleted or moved out between the listing and the
+round, whose removal no later round reports ("resources that were deleted before the initial delta
+query aren't returned",
+[delta query overview](https://learn.microsoft.com/en-us/graph/delta-query-overview)). A source
+never returns a starting round it cut short (Graph's 5,000 with `$filter`), so this cannot empty
+the cache. A present message that is not cached is fetched when it arrived
+inside the window and ignored otherwise. The cursor is stored only after the whole round is
+applied with no body missing; when one is missing, it is cleared so the next sync lists from that
+message, and a failed sync keeps the old cursor, whose round the next sync replays. Known limit:
+mail moved into the inbox with an arrival time older than the window is never seen: rounds and
+listings both leave out what arrived before the window.
 
 ## Output
 
@@ -452,10 +523,11 @@ nothing. mise reads the same release through its GitHub backend.
 
 The order of the slices is in [roadmap.md](roadmap.md). What they change in the code:
 
-- **More providers:** Graph's delta query may add a sync token to `IdSource`; the Gmail API
-  becomes another source crate.
+- **More providers:** the Gmail API becomes another source crate, with its history as the
+  cursor of `IdSource`'s change methods.
 - **More mail:** folders beyond INBOX, and CONDSTORE/QRESYNC to refresh flags cheaply.
-- **Push:** IMAP IDLE, Graph's delta query and the Gmail API with history, as wakes of the daemon.
+- **Push:** IMAP IDLE and the one-minute Outlook check (Graph's delta query) are wakes of the
+  daemon; the Gmail API with history comes next.
 - **Actions:** flags, moves and deletes need a write side on the source and a way to record
   pending changes in the cache.
 - **The TUI** builds on the same cache and actions as the CLI.
