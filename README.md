@@ -165,9 +165,33 @@ neomail show 42              # headers, body, attachments
 - `neomail sync --account work --limit 100`: the first sync takes the 500 messages that arrived
   last unless `--limit` says otherwise. Later syncs fetch all mail that is new since, however
   much, refresh flags and drop deleted mail. Messages are fetched without marking them read.
-- `neomail list --account work --limit 20 --json` and `neomail show 42 --json` print JSON for
-  scripts; see [docs/json.md](docs/json.md) for the shapes and exit codes.
-- `neomail show 42 --raw` prints the message source.
+- `neomail list --account work --limit all` lists every cached message; `--limit` takes a number
+  or `all` on `list` and `sync`.
+- `neomail show 42 43` shows several messages; `neomail show 42 --raw` prints one message's source.
+  On a terminal `show` goes through `$NEOMAIL_PAGER`, `$PAGER` or `less`; `--no-pager` turns it off.
+- `--json` and `--jsonl` print JSON for scripts; see [docs/json.md](docs/json.md) for the shapes,
+  the plain columns and the exit codes.
+
+On a terminal, listings are aligned columns. In a pipe, or with `--plain`, they are tab-separated:
+one message per line, the id first, nothing cut off. `show -` reads ids from standard input:
+
+```sh
+neomail list | fzf -m | neomail show -                          # pick messages, read them
+neomail list --color always | fzf --ansi -m | neomail show -    # the same, in colour
+neomail list | cut -f1,6                                        # id and subject
+neomail list --jsonl | jq -r 'select(.unread) | .subject'       # unread subjects
+```
+
+Colour follows `--color auto|always|never`, then `NO_COLOR` (no styling at all), then
+`CLICOLOR_FORCE` and `CLICOLOR`. JSON and `--raw` output are never coloured.
+
+Shell completions:
+
+```sh
+neomail completions bash > ~/.local/share/bash-completion/completions/neomail
+neomail completions zsh > ~/.zfunc/_neomail    # with fpath+=(~/.zfunc) before compinit in ~/.zshrc
+neomail completions fish > ~/.config/fish/completions/neomail.fish
+```
 
 How it fits together: [docs/architecture.md](docs/architecture.md).
 
