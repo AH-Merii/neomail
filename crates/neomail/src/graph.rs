@@ -46,7 +46,7 @@ fn check_failed(e: GraphError) -> anyhow::Error {
             anyhow!("{CHECK} ({e}); nothing was saved; run `neomail account add outlook` again")
         }
         GraphError::Forbidden => anyhow!(
-            "{CHECK} ({e}) although the sign-in granted Mail.Read; nothing was saved. The \
+            "{CHECK}: {e}, although the sign-in granted Mail.Read; nothing was saved. The \
              account may have no Outlook mailbox or licence, or a policy of its organisation \
              blocks the app"
         ),
@@ -91,7 +91,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_failed_check_says_to_add_the_account_again() {
+    fn a_failed_check_says_nothing_was_saved_and_what_to_do() {
         assert_eq!(
             check_failed(GraphError::Unauthorized).to_string(),
             "the read-only check of the INBOX through Microsoft Graph failed (access token \
@@ -99,8 +99,8 @@ mod tests {
         );
         assert_eq!(
             check_failed(GraphError::Forbidden).to_string(),
-            "the read-only check of the INBOX through Microsoft Graph failed (Microsoft Graph \
-             refused access to the mailbox (HTTP 403)) although the sign-in granted Mail.Read; \
+            "the read-only check of the INBOX through Microsoft Graph failed: Microsoft Graph \
+             refused access to the mailbox (HTTP 403), although the sign-in granted Mail.Read; \
              nothing was saved. The account may have no Outlook mailbox or licence, or a policy \
              of its organisation blocks the app"
         );
