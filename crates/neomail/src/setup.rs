@@ -143,13 +143,19 @@ pub fn add(
                     )
                 })
         },
-        confirm_pin: &|| Ok(secret::prompt_line("Pin it? [y/N] ")?.eq_ignore_ascii_case("y")),
+        confirm_pin: &|| Ok(is_yes(&secret::prompt_line("Pin it? [y/N] ")?)),
         check_login: &|imap, password| {
             let login = nm_imap::Login::Password(password.expose());
             Ok(crate::account::runtime()?.block_on(nm_imap::check_login(imap, login))?)
         },
     };
     execute(plan, config_path, &deps, out)
+}
+
+/// A yes to a `[y/N]` question: `y` or `yes`, in any case.
+fn is_yes(answer: &str) -> bool {
+    let answer = answer.trim();
+    answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
 }
 
 /// Asks for what the flags left out, or fails with a usage error naming the flags when nothing
@@ -164,19 +170,11 @@ pub fn gather(
     if ask && !preset.intro.is_empty() {
         eprintln!("{}", preset.intro);
     }
-    if preset.pin && args.cert_sha256.is_none() {
-        if args.no_check {
-            return Err(crate::usage(
-                "--no-check does not connect, so the certificate cannot be read: pass \
-                 --cert-sha256 too",
-            ));
-        }
-        if !ask {
-            return Err(secret::cannot_ask(
-                input,
-                "--cert-sha256 with the certificate's SHA-256, which cannot be confirmed here",
-            ));
-        }
+    if preset.pin && args.cert_sha256.is_none() && args.no_check {
+        return Err(crate::usage(
+            "--no-check does not connect, so the certificate cannot be read: pass --cert-sha256 \
+             too",
+        ));
     }
     let mut missing = Vec::new();
     let mut value =
@@ -211,8 +209,20 @@ pub fn gather(
         Some(host) => host.to_owned(),
         None => value(args.host, "--host", "IMAP server: ", None)?,
     };
+    let pin_missing = preset.pin && args.cert_sha256.is_none() && !ask;
+    if pin_missing {
+        missing.push("--cert-sha256");
+    }
     if !missing.is_empty() {
-        return Err(secret::cannot_ask(input, &missing.join(" and ")));
+        let mut flags = missing.join(" and ");
+        if pin_missing {
+            flags.push_str(&format!(
+                " (the certificate's SHA-256, which cannot be confirmed here: run `neomail \
+                 account add {}` on a terminal to see and confirm it)",
+                preset.id
+            ));
+        }
+        return Err(secret::cannot_ask(input, &flags));
     }
     for (what, v) in [
         ("account name", &name),
@@ -305,7 +315,7 @@ pub fn execute(
         (Some(keyring), Some(password)) => {
             keyring.set(&name, password)?;
             format!(
-                "Its password is in {} (service {:?}, user {name:?}).",
+                "Its password is in {} (service {:?}, username {name:?}).",
                 keyring.name(),
                 keyring::SERVICE
             )
@@ -604,9 +614,17 @@ mod tests {
             assert!(e.is::<crate::UsageError>(), "{e:#}");
             let e = format!("{e:#}");
             assert!(
-                e.starts_with(why) && e.contains("pass --cert-sha256"),
+                e.starts_with(why)
+                    && e.contains("pass --cert-sha256 (")
+                    && e.contains(
+                        "run `neomail account add proton` on a terminal to see and confirm it"
+                    ),
                 "{e}"
             );
+            // Every missing flag at once, the pin included.
+            let e = gather(&PROTON, &path, Args::default(), input).unwrap_err();
+            let e = format!("{e:#}");
+            assert!(e.contains("pass --username and --cert-sha256 ("), "{e}");
             let e = gather(&IMAP, &path, Args::default(), input).unwrap_err();
             assert!(e.is::<crate::UsageError>(), "{e:#}");
             let e = format!("{e:#}");
@@ -619,6 +637,16 @@ mod tests {
         let e = gather(&PROTON, &path, args, OFF_TERMINAL).unwrap_err();
         assert!(format!("{e:#}").contains("pass --cert-sha256 too"), "{e:#}");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn the_pin_question_takes_y_or_yes_in_any_case() {
+        for yes in ["y", "Y", "yes", "YES", "Yes", " yes "] {
+            assert!(is_yes(yes), "{yes:?}");
+        }
+        for no in ["", "n", "no", "ye", "yess", "sure"] {
+            assert!(!is_yes(no), "{no:?}");
+        }
     }
 
     #[test]

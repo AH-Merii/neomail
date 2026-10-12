@@ -8,8 +8,12 @@
 # Environment:
 #   NEOMAIL_INSTALL_DIR       where to put neomail (default: $XDG_BIN_HOME, else ~/.local/bin)
 #   NEOMAIL_INSTALL_BASE_URL  for tests and mirrors: the URL of the directory that holds the
-#                             tarballs and SHA256SUMS, used instead of the GitHub release
-#                             (https, or http on 127.0.0.1 or localhost only)
+#                             tarballs and SHA256SUMS, used instead of the GitHub release. It
+#                             must be https, or http on 127.0.0.1 or localhost only; any other is
+#                             refused before anything is downloaded. curl and GNU wget also
+#                             refuse a redirect to http; BusyBox wget (Alpine's) cannot limit
+#                             redirects, so with it only the checksum guards the download: the
+#                             tarball still has to match SHA256SUMS.
 
 REPO="AH-Merii/neomail"
 
@@ -43,16 +47,50 @@ detect_target() {
 	esac
 }
 
+# check_base_url URL: https, or http on 127.0.0.1 or localhost only. Checked in shell before
+# any download, so the rule holds whichever downloader runs.
+check_base_url() {
+	case "$1" in
+		https://?*) return ;;
+	esac
+	is_loopback_http "$1" ||
+		die "NEOMAIL_INSTALL_BASE_URL must be https (http only on 127.0.0.1 or localhost)"
+}
+
+# is_loopback_http URL: true if URL is http to 127.0.0.1 or localhost, with at most a numeric
+# port. Anything with an @ before the path is refused: in http://localhost@example.com the host
+# is example.com.
+is_loopback_http() {
+	case "$1" in
+		http://*) ;;
+		*) return 1 ;;
+	esac
+	url_host=${1#http://}
+	url_host=${url_host%%/*}
+	case "$url_host" in
+		*@*) return 1 ;;
+		127.0.0.1 | localhost) return 0 ;;
+		127.0.0.1:?* | localhost:?*)
+			case "${url_host#*:}" in
+				*[!0-9]*) return 1 ;;
+			esac
+			return 0
+			;;
+	esac
+	return 1
+}
+
 # download URL FILE: fails on an HTTP error such as a 404.
 download() {
 	proto='=https'
-	case "$1" in
-		http://127.0.0.1[:/]* | http://localhost[:/]*) proto='=http,https' ;;
-	esac
+	if is_loopback_http "$1"; then
+		proto='=http,https'
+	fi
 	if command -v curl >/dev/null 2>&1; then
 		curl --proto "$proto" --proto-redir "$proto" --tlsv1.2 -fsSL -o "$2" "$1"
 	elif command -v wget >/dev/null 2>&1; then
-		# BusyBox wget (Alpine) has no --https-only; the URLs it gets are https already.
+		# BusyBox wget (Alpine) has no --https-only: check_base_url vetted the URL, but a redirect
+		# to http is followed.
 		if [ "$proto" = '=https' ] && wget --help 2>&1 | grep -q -- '--https-only'; then
 			wget --https-only -q -O "$2" "$1"
 		else
@@ -100,15 +138,24 @@ cleanup() {
 uninstall() {
 	[ -e "$dest" ] || die "there is no neomail in $dir"
 	is_ours "$dest" || die "$dest is not neomail; leaving it"
-	rm -f "$dest" || die "cannot remove $dest"
-	say "Removed $dest."
-	say ""
-	say "Your config, cache and keyring entries are still there. To remove them too:"
-	say "  rm -r \"${XDG_CONFIG_HOME:-$HOME/.config}/neomail\" \"${XDG_DATA_HOME:-$HOME/.local/share}/neomail\""
-	say "The keyring entries (services 'neomail' and 'neomail-oauth') need neomail itself: reinstall,"
-	say "run one of these for each account, then uninstall again:"
+	say "This leaves the keyring entries (services 'neomail' and 'neomail-oauth'). Removing them"
+	say "needs neomail itself: before uninstalling (or after reinstalling), run one of these for"
+	say "each account:"
 	say "  neomail account delete-password NAME   # an account with a password"
 	say "  neomail account logout NAME            # a Gmail account (also revokes the sign-in)"
+	say ""
+	rm -f "$dest" || die "cannot remove $dest"
+	say "Removed $dest."
+	left=""
+	for d in "${XDG_CONFIG_HOME:-$HOME/.config}/neomail" \
+		"${NEOMAIL_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/neomail}"; do
+		[ -d "$d" ] && left="$left \"$d\""
+	done
+	if [ -n "$left" ]; then
+		say ""
+		say "To remove what neomail keeps in your home directory too:"
+		say "  rm -r$left"
+	fi
 }
 
 main() {
@@ -140,6 +187,9 @@ main() {
 		uninstall
 		return
 	fi
+	base="${NEOMAIL_INSTALL_BASE_URL:-https://github.com/$REPO/releases/download/$tag}"
+	base="${base%/}"
+	check_base_url "$base"
 
 	command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 ||
 		die "neither sha256sum nor shasum is installed, so the download cannot be checked"
@@ -156,13 +206,11 @@ main() {
 	if [ -e "$dest" ] && [ "$force" = 0 ] && ! is_ours "$dest"; then
 		die "$dest exists and is not neomail (d99kris/nmail and neomail are different programs); pick another directory with --to, or replace it with --force"
 	fi
-	for tool in tar mktemp; do
+	for tool in tar mktemp awk; do
 		command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed"
 	done
 
 	asset="neomail-$target.tar.gz"
-	base="${NEOMAIL_INSTALL_BASE_URL:-https://github.com/$REPO/releases/download/$tag}"
-	base="${base%/}"
 	tmp=$(mktemp -d) || die "cannot create a temporary directory"
 	partial=""
 	trap cleanup EXIT
@@ -212,7 +260,7 @@ main() {
 		say "Remove it, or put $dir before ${found%/*} in PATH."
 	fi
 	say ""
-	say "Next: write a config and run 'neomail sync', as in \"Try it\" in the README:"
+	say "Next: add an account with 'neomail account add', as in \"Try it\" in the README:"
 	say "  https://github.com/$REPO#try-it"
 }
 

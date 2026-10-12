@@ -35,8 +35,8 @@ source is also checked live against Proton Bridge.
 
 **The password** comes from one of two sources, fixed per account when the config is parsed
 (`PasswordSource` in `neomail/src/config.rs`): the account's `password_command`, run with `sh -c`,
-or, without one, the OS keyring entry with service `neomail` and the account name as the user.
-An account with a command never opens the keyring. `secret::account_password`
+or, without one, the OS keyring entry with service `neomail` and the account name as its
+`username` attribute. An account with a command never opens the keyring. `secret::account_password`
 (`neomail/src/secret.rs`) resolves it into a `Password` whose `Debug` is redacted; it is passed to
 `ImapSource::connect` and dropped after login. `neomail account set-password` and
 `delete-password` write and remove the keyring entry; the new password is prompted for without
@@ -79,12 +79,13 @@ else `xdg-open`, never with `--no-browser`); the URL is always printed, and choo
 is a pure function, so no test launches anything.
 
 **Where OAuth secrets live:** the client secret and refresh token are one OS keyring entry, JSON,
-with the service `neomail-oauth` and the account name as the user, so it can never collide with a
-password entry (`neomail`). Access tokens are never stored: `neomail sync` reads the entry before it
-enters `block_on`, then refreshes the access token and logs in inside it. An `invalid_grant`
-says the sign-in expired or was revoked (7 days while the app is in Testing) and to run
-`neomail account login NAME`. Every type holding a token or secret (`Secret`, `OAuthEntry`, `Pkce`,
-`Login`, the HTTP `Response`) has a redacted `Debug`, and errors never quote a response body.
+with the service `neomail-oauth` and the account name as its `username` attribute, so it can never
+collide with a password entry (`neomail`). Access tokens are never stored: `neomail sync` reads the
+entry before it enters `block_on`, then refreshes the access token and logs in inside it. An
+`invalid_grant` says the sign-in expired or was revoked (7 days while the app is in Testing) and to
+run `neomail account login NAME`. Every type holding a token or secret (`Secret`, `OAuthEntry`,
+`Pkce`, `Login`, the HTTP `Response`) has a redacted `Debug`, and errors never quote a response
+body.
 
 **The config writer** (`config::append_account`, used by `neomail account add`) appends one
 `[[accounts]]` table to the file as text, so existing text and comments stay. It refuses a taken
@@ -93,22 +94,24 @@ directory, then a rename). A new file gets mode 0600 in a directory created with
 existing one keeps its mode.
 
 **Setup** (`neomail/src/setup.rs`, DEC-2026-10-12-cli-ux): a password **provider is data**, a
-`Preset` (`IMAP`, `PROTON`, `GMAIL_APP_PASSWORD`: fixed host, port and security, prompts, an
-intro, and whether to pin the certificate), and one flow serves them all. `gather` takes the flags
-and asks for the rest only when `Input::can_prompt` (standard input is a terminal and neither
-`--no-input` nor `NEOMAIL_NO_INPUT` is set); otherwise a missing value is a `UsageError` (exit 2)
-naming the flags. `execute` then runs, in order: `check_append`, before any network or keyring
-step; for Proton, `nm_imap::server_certificate` reads Bridge's certificate over a connection that
-accepts any certificate and sends nothing, shows its SHA-256 and pins it only when it equals
-`--cert-sha256` or the user confirms; the secret (the keyring is opened before it is asked for,
-or the `--password-command` is run); `nm_imap::check_login`, a read-only login that opens INBOX
-with `EXAMINE` and logs out; and only then the keyring write and `append_account`. A failed step
-writes nothing and stores nothing. The steps that leave the process are fields of `Deps`, plain
-function values, so the tests give a mock keyring and fake certificate and login steps; the
-login check itself is tested on the wire against the scripted server (`nm-imap/src/wire_tests.rs`).
-Gmail with OAuth keeps its own flow (`account.rs`); `main.rs` picks the provider, from a numbered
-menu on a terminal. No new trait: the presets are values, `Deps` has one real and one fake set,
-and the seams below it (`CredentialStore`, `Transport`, the config writer) already exist.
+`Preset` (`IMAP`, `PROTON`, `GMAIL_APP_PASSWORD`: fixed host, port and security, prompts, an intro,
+and whether to pin the certificate), and one flow serves them all. `gather` takes the flags and asks
+for the rest only when `Input::can_prompt` (standard input is a terminal and neither `--no-input`
+nor `NEOMAIL_NO_INPUT` is set); otherwise a missing value is a `UsageError` (exit 2) naming the
+flags. `execute` then runs, in order: `check_append`, before any network or keyring step; for
+Proton, `nm_imap::server_certificate` reads Bridge's certificate over a connection that accepts any
+certificate and sends nothing, shows its SHA-256 and pins it only when it equals `--cert-sha256` or
+the user confirms; the secret (the keyring is opened before it is asked for, or the
+`--password-command` is run); `nm_imap::check_login`, a read-only login that opens INBOX with
+`EXAMINE` and logs out; and only then the keyring write and `append_account`. A step that fails
+before the keyring write writes nothing and stores nothing; if the final `append_account` fails, the
+password stays in the keyring and the error says so. The steps that leave the process are fields of
+`Deps`, plain function values, so the tests give a mock keyring and fake certificate and login
+steps; the login check itself is tested on the wire against the scripted server
+(`nm-imap/src/wire_tests.rs`). Gmail with OAuth keeps its own flow (`account.rs`); `main.rs` picks
+the provider, from a numbered menu on a terminal. No new trait: the presets are values, `Deps` has
+one real and one fake set, and the seams below it (`CredentialStore`, `Transport`, the config
+writer) already exist.
 
 **Getting started** (`main.rs`): bare `neomail` without a config file prints the start lines and
 the README's "Try it" URL on standard error and exits 2, never prompting; with a config it prints

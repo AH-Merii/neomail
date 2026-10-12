@@ -40,13 +40,18 @@ mise use -g github:AH-Merii/neomail@edge
 mise install --force github:AH-Merii/neomail@edge   # fetch a newer edge; the tag name never changes
 ```
 
+With mise's lockfile on, run `mise lock github:AH-Merii/neomail` before that `mise install --force`:
+edge is republished under the same tag, so the checksum in `mise.lock` goes out of date.
+
 Or from source, with Rust 1.88 or newer:
 
 ```sh
 cargo install --locked --git https://github.com/AH-Merii/neomail neomail
 ```
 
-Each tarball carries the licences of the crates built into it in `THIRD-PARTY-LICENSES`.
+Each tarball carries `neomail`, this README, `LICENSE-MIT`, `LICENSE-APACHE`, the licences of the
+crates built into it (and, in the Linux build, of musl libc) in `THIRD-PARTY-LICENSES`, and the
+Rust standard library's notices in `COPYRIGHT-library.html`.
 
 ### Add an account
 
@@ -71,7 +76,10 @@ input, or come from `--password-command`. `--no-check` skips the login. `neomail
 
   It asks for the username and the password Bridge shows, never your Proton password. It reads
   Bridge's self-signed certificate, shows its SHA-256 and asks before pinning it. Off a terminal,
-  pass the SHA-256 you expect with `--cert-sha256`; a different certificate is refused.
+  pass the SHA-256 you expect with `--cert-sha256`; a different certificate is refused. To get
+  it, run `neomail account add proton` on a terminal once, or, with Bridge running, read it with
+  `openssl s_client -connect 127.0.0.1:1143 -starttls imap </dev/null | openssl x509 -noout
+  -fingerprint -sha256 | cut -d= -f2`.
 - **Gmail with an app password:** `neomail account add gmail-app-password`. Google: "To create an
   app password, you need 2-Step Verification on your Google Account"
   ([Google's help](https://support.google.com/accounts/answer/185833)).
@@ -126,9 +134,9 @@ pass show mail/work | neomail account set-password work   # or one line on stdin
 neomail account delete-password work
 ```
 
-The entry has the service `neomail` and the account name as the user. An account with
-`password_command` runs the command instead and never touches the keyring. Either way the password
-is never written to the config, the cache or a log, and never printed.
+The entry has the service `neomail` and the account name as its `username` attribute. An account
+with `password_command` runs the command instead and never touches the keyring. Either way the
+password is never written to the config, the cache or a log, and never printed.
 
 - **WSL** often has no Secret Service. Use `password_command` (for example with `pass`), or run a
   Secret Service such as gnome-keyring.
@@ -179,7 +187,7 @@ one message per line, the id first, nothing cut off. `show -` reads ids from sta
 neomail list | fzf -m | neomail show -                          # pick messages, read them
 neomail list --color always | fzf --ansi -m | neomail show -    # the same, in colour
 neomail list | cut -f1,6                                        # id and subject
-neomail list --jsonl | jq -r 'select(.unread) | .subject'       # unread subjects
+neomail list --jsonl | jq -ac 'select(.unread) | .subject'      # unread subjects, ASCII-escaped
 ```
 
 Colour follows `--color auto|always|never`, then `NO_COLOR` (no styling at all), then

@@ -71,10 +71,10 @@ neomail account add gmail
 
 It asks for a name for the account (default `gmail`), your address, the client ID and the client
 secret (not shown as you type), then opens Google's sign-in in your browser. Use `--no-browser` to
-only print the URL, for example over SSH. Google first shows a warning that it hasn't verified
-the app, in Testing mode too
-([Google: publishing status](https://support.google.com/cloud/answer/15549945)): it is your own
-app, so click **Continue**. Then:
+only print the URL, for example over SSH. Google may first show a warning that it hasn't
+verified the app, in Testing mode too
+([Google: publishing status](https://support.google.com/cloud/answer/15549945)); it may also go
+straight to consent. If the warning shows, it is your own app, so click **Continue**. Then:
 
 ```sh
 neomail sync --account gmail
@@ -93,8 +93,8 @@ While the app's publishing status is *Testing*, Google gives it refresh tokens t
 7 days ([Google: refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration)).
 `neomail sync` then says the sign-in expired; run `neomail account login gmail` to sign in again.
 
-To avoid that, publish the app: **Audience > Publish app**. The unverified-app warning stays,
-now behind **Advanced**, then **Go to** your app's name
+To avoid that, publish the app: **Audience > Publish app**. The unverified-app warning may
+still show; its way through is then **Advanced**, then **Go to** your app's name
 ([Google's troubleshooting guide](https://developers.google.com/apps-script/api/troubleshoot-authentication-authorization)),
 and an app for your own use (fewer than 100 users) needs no verification
 ([Google: verification exceptions](https://support.google.com/cloud/answer/13464323)).
@@ -111,9 +111,9 @@ and an app for your own use (fewer than 100 users) needs no verification
   ```
 
 - The client secret and the refresh token are in the OS keyring only, in one entry with the
-  service `neomail-oauth` and the account name as the user. They are never written to the config,
-  the cache or a log, and never printed. Without a keyring (often on WSL) OAuth accounts cannot
-  be used yet.
+  service `neomail-oauth` and the account name as its `username` attribute. They are never written
+  to the config, the cache or a log, and never printed. Without a keyring (often on WSL) OAuth
+  accounts cannot be used yet.
 - `neomail account login NAME` signs in again and replaces the refresh token.
   `neomail account logout NAME` revokes it at Google and deletes the entry.
 
