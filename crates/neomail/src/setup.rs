@@ -463,12 +463,16 @@ mod tests {
             let config = Config::parse(&text).unwrap();
             let a = config.find("acct").unwrap();
             assert_eq!(
-                (a.imap.host.as_str(), a.imap.port, a.imap.security),
+                (
+                    a.imap().unwrap().host.as_str(),
+                    a.imap().unwrap().port,
+                    a.imap().unwrap().security
+                ),
                 (host, port, security),
                 "{}",
                 preset.id
             );
-            assert_eq!(a.imap.cert_pin, pinned.then(|| pin("ab")));
+            assert_eq!(a.imap().unwrap().cert_pin, pinned.then(|| pin("ab")));
             assert_eq!(a.login, Login::Password(PasswordSource::Keyring));
         }
     }
@@ -553,7 +557,10 @@ mod tests {
         fakes.run(plan, &path).unwrap();
         assert_eq!(fakes.logins.get(), 0);
         let c = Config::load(&path).unwrap();
-        assert_eq!(c.find("proton").unwrap().imap.cert_pin, Some(pin("cd")));
+        assert_eq!(
+            c.find("proton").unwrap().imap().unwrap().cert_pin,
+            Some(pin("cd"))
+        );
         assert_eq!(fakes.stored("proton").as_deref(), Some(SECRET));
     }
 
@@ -595,7 +602,10 @@ mod tests {
         let fakes = Fakes::new();
         fakes.run(plan(), &path).unwrap();
         let c = Config::load(&path).unwrap();
-        assert_eq!(c.find("proton").unwrap().imap.cert_pin, Some(pin("ab")));
+        assert_eq!(
+            c.find("proton").unwrap().imap().unwrap().cert_pin,
+            Some(pin("ab"))
+        );
     }
 
     #[test]

@@ -5,9 +5,9 @@ use std::collections::HashMap;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::http::Response;
 use super::loopback::{Listener, MAX_CONNECTIONS, Request, parse_request};
 use super::*;
+use crate::http::{self, Response};
 
 const SECRET: &str = "GOCSPX-not-a-real-secret";
 const REFRESH: &str = "1//refresh-not-real";
@@ -52,6 +52,7 @@ impl http::Http for FakeHttp {
         let (status, body) = self.answers.borrow_mut().remove(0);
         Ok(Response {
             status,
+            retry_after: None,
             body: body.into_bytes(),
         })
     }
@@ -168,7 +169,7 @@ async fn send(port: u16, request: &[u8]) -> String {
 
 #[tokio::test]
 async fn listener_skips_stray_and_oversized_requests_and_returns_the_code() {
-    let listener = Listener::bind().await.unwrap();
+    let listener = Listener::bind(false).await.unwrap();
     let uri = listener.redirect_uri("127.0.0.1");
     let port: u16 = uri.rsplit(':').next().unwrap().parse().unwrap();
     let browser = tokio::spawn(async move {
@@ -197,9 +198,66 @@ async fn listener_skips_stray_and_oversized_requests_and_returns_the_code() {
     assert!(!good.contains(CODE), "the page never echoes the code");
 }
 
+/// Sends `request` to the listener on [::1] and returns the response.
+async fn send_v6(port: u16, request: &[u8]) -> String {
+    let mut s = tokio::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    s.write_all(request).await.unwrap();
+    s.shutdown().await.unwrap();
+    let mut response = String::new();
+    s.read_to_string(&mut response).await.unwrap();
+    response
+}
+
+#[tokio::test]
+async fn a_localhost_listener_takes_the_redirect_on_either_address() {
+    // Without IPv6 on this machine the listener falls back to 127.0.0.1 alone; that is only
+    // allowed when [::1] cannot be bound at all.
+    let v6_works = tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+        .await
+        .is_ok();
+    for code_over_v6 in [true, false] {
+        let listener = Listener::bind(true).await.unwrap();
+        assert_eq!(listener.has_v6(), v6_works);
+        let uri = listener.redirect_uri("localhost");
+        assert!(uri.starts_with("http://localhost:"), "{uri}");
+        let port: u16 = uri.rsplit(':').next().unwrap().parse().unwrap();
+        if !v6_works {
+            let code = format!("GET /?state=st4te&code={CODE} HTTP/1.1\r\n\r\n");
+            tokio::spawn(async move { send(port, code.as_bytes()).await });
+            let got = listener.wait("st4te", Duration::from_secs(3)).await;
+            assert_eq!(got.unwrap().expose(), CODE);
+            return;
+        }
+        let browser = tokio::spawn(async move {
+            let code = format!("GET /?state=st4te&code={CODE} HTTP/1.1\r\n\r\n");
+            let stray = b"GET /favicon.ico HTTP/1.1\r\n\r\n";
+            if code_over_v6 {
+                (
+                    send(port, stray).await,
+                    send_v6(port, code.as_bytes()).await,
+                )
+            } else {
+                (
+                    send_v6(port, stray).await,
+                    send(port, code.as_bytes()).await,
+                )
+            }
+        });
+        let got = listener.wait("st4te", Duration::from_secs(3)).await;
+        assert_eq!(got.unwrap().expose(), CODE);
+        let (stray, good) = browser.await.unwrap();
+        assert!(stray.starts_with("HTTP/1.1 404 "), "{stray}");
+        assert!(good.starts_with("HTTP/1.1 200 "), "{good}");
+    }
+    // A 127.0.0.1 redirect (Google) listens on IPv4 only.
+    assert!(!Listener::bind(false).await.unwrap().has_v6());
+}
+
 #[tokio::test]
 async fn an_idle_connection_does_not_hold_up_the_redirect() {
-    let listener = Listener::bind().await.unwrap();
+    let listener = Listener::bind(false).await.unwrap();
     let port: u16 = listener
         .redirect_uri("127.0.0.1")
         .rsplit(':')
@@ -224,7 +282,7 @@ async fn an_idle_connection_does_not_hold_up_the_redirect() {
 
 #[tokio::test]
 async fn the_listener_handles_at_most_max_connections_at_once() {
-    let listener = Listener::bind().await.unwrap();
+    let listener = Listener::bind(false).await.unwrap();
     let port: u16 = listener
         .redirect_uri("127.0.0.1")
         .rsplit(':')
@@ -262,7 +320,7 @@ async fn the_listener_handles_at_most_max_connections_at_once() {
 
 #[tokio::test]
 async fn listener_reports_a_declined_sign_in_and_times_out() {
-    let listener = Listener::bind().await.unwrap();
+    let listener = Listener::bind(false).await.unwrap();
     let port: u16 = listener
         .redirect_uri("127.0.0.1")
         .rsplit(':')
@@ -470,7 +528,8 @@ fn providers_are_data() {
             port: 993
         }
     );
-    assert!(provider("microsoft").is_none());
+    assert_eq!(provider("microsoft").unwrap().mail, MailApi::Graph);
+    assert!(provider("yahoo").is_none());
     assert_eq!(
         format!("{:?}", Secret::new(SECRET.into())),
         "Secret(<redacted>)"
@@ -635,7 +694,7 @@ async fn a_device_code_error_names_the_cause_and_never_the_code() {
         "{message}"
     );
     assert!(
-        message.ends_with("; probably the app registration's public client flows are off: set Authentication > Allow public client flows to Yes"),
+        message.ends_with("; probably the app registration's public client flows are off: set Authentication > Advanced settings > Allow public client flows to Yes"),
         "{message}"
     );
 }
@@ -800,11 +859,37 @@ fn the_address_falls_back_to_preferred_username() {
 }
 
 #[test]
-fn microsoft_is_defined_but_not_offered() {
-    assert!(!PROVIDERS.contains(&&MICROSOFT));
+fn microsoft_is_offered_as_a_public_graph_client() {
+    assert_eq!(provider("microsoft"), Some(&MICROSOFT));
     assert_eq!(MICROSOFT.mail, MailApi::Graph);
     assert_eq!(MICROSOFT.client, ClientKind::Public);
     assert!(MICROSOFT.revoke_url.is_none());
     assert!(GOOGLE.device_code_url.is_none());
     assert!(MICROSOFT.auth_params.is_empty(), "no prompt=consent");
+}
+
+#[test]
+fn the_client_id_prompt_points_at_the_step_that_shows_the_id() {
+    for p in PROVIDERS {
+        let step = p
+            .setup
+            .client_id_prompt
+            .split("step ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .unwrap();
+        let text = p
+            .setup
+            .steps
+            .split(&format!("\n {step}. "))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{}: no step {step}", p.id));
+        let text = text.split("\n 6. ").next().unwrap();
+        assert!(
+            text.contains("client ID") || text.contains("(client) ID"),
+            "{}: {text}",
+            p.id
+        );
+        assert!(p.setup.steps.contains("GUIDE"), "{}", p.id);
+    }
 }

@@ -1,5 +1,5 @@
 //! The OAuth providers, as data: endpoints, client kind, scopes, the mail API and the setup text.
-//! Slice 6 adds Microsoft as another value, not another type.
+//! Microsoft is another value, not another type.
 
 /// Whether the client registration has a secret (RFC 6749 section 2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,7 +15,7 @@ pub enum ClientKind {
 pub enum MailApi {
     /// IMAP over TLS with XOAUTH2.
     Imap { host: &'static str, port: u16 },
-    /// Microsoft Graph, which part 3 of slice 6 adds.
+    /// Microsoft Graph (`nm-graph`).
     Graph,
 }
 
@@ -135,7 +135,7 @@ app for your own use (under 100 users) needs no verification.
 ";
 
 /// Microsoft's identity platform, v2 endpoints on the `common` tenant, for work, school and
-/// personal accounts. Not in [`PROVIDERS`] until part 3 of slice 6 adds the Graph source.
+/// personal accounts, read through Microsoft Graph.
 ///
 /// - No revocation endpoint: the v2 endpoints list none
 ///   (<https://learn.microsoft.com/en-us/entra/identity-platform/v2-protocols-oidc>).
@@ -143,10 +143,6 @@ app for your own use (under 100 users) needs no verification.
 ///   must be the original's or a subset, for the first scope's resource
 ///   (<https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow>).
 /// - Mail.Read only, pending the owner: Mail.ReadWrite changes only the scope strings.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "part 3 of slice 6 adds it to PROVIDERS")
-)]
 pub const MICROSOFT: Provider = Provider {
     id: "microsoft",
     name: "Microsoft",
@@ -181,13 +177,13 @@ pub const MICROSOFT: Provider = Provider {
         (
             7000218,
             "probably the app registration's public client flows are off: set Authentication > \
-             Allow public client flows to Yes",
+             Advanced settings > Allow public client flows to Yes",
         ),
     ],
     setup: Setup {
         default_name: "outlook",
         address_prompt: "Outlook address: ",
-        client_id_prompt: "Application (client) ID (from step 4): ",
+        client_id_prompt: "Application (client) ID (from step 5): ",
         client_secret_prompt: "",
         steps: OUTLOOK_STEPS,
         guide: "https://github.com/AH-Merii/neomail/blob/main/docs/outlook.md",
@@ -196,24 +192,34 @@ pub const MICROSOFT: Provider = Provider {
     },
 };
 
-/// The one-time Outlook setup; part 3 of slice 6 writes the guide.
+/// The one-time Outlook setup. The why of each step is in the guide; the wording follows
+/// <https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app>,
+/// <https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-redirect-uri> and
+/// <https://learn.microsoft.com/en-us/entra/identity-platform/scenario-desktop-app-configuration>.
 const OUTLOOK_STEPS: &str = "\
 Outlook signs in through your own Microsoft Entra app registration: neomail ships none, so no
-one else's app is ever granted access to your mail. Set one up once (why each step exists:
-GUIDE):
+one else's app is ever granted access to your mail. Set one up once (about 10 minutes; why each
+step exists: GUIDE):
 
- 1. Sign in at https://entra.microsoft.com. A personal account (Outlook.com, Hotmail) needs a
-    directory first: a free Azure account gives it one.
- 2. App registrations > New registration. Supported account types: any organizational
-    directory and personal Microsoft accounts. Redirect URI: Public client/native,
-    http://localhost.
-    Why: so both work and personal addresses can sign in, with no client secret.
- 3. Authentication > Allow public client flows: Yes.
-    Why: it allows the device code sign-in, for a machine without a browser.
- 4. Overview: copy the Application (client) ID.
+ 1. Work or school account: skip this step. Personal account (Outlook.com, Hotmail): create a
+    free Azure account: https://azure.microsoft.com/pricing/purchase-options/azure-account
+    Why: an app registration lives in a directory (tenant), and a personal account has none
+    until the Azure account gives it its Default Directory.
+ 2. Sign in at https://entra.microsoft.com. Entra ID > App registrations > New registration:
+    any name, Supported account types: Any Entra ID Tenant + Personal Microsoft accounts.
+    Register.
+    Why: so both work and personal addresses can sign in with it.
+ 3. Authentication > Add Redirect URI > Mobile and desktop applications. Under Custom
+    redirect URIs enter http://localhost and Configure.
+    Why: Microsoft sends the sign-in back to http://localhost on any port, where neomail
+    waits for it.
+ 4. Authentication > Advanced settings: set Allow public client flows to Yes, then Save.
+    Why: it allows the device code sign-in, for a machine without a browser (over SSH).
+ 5. Overview: copy the Application (client) ID. There is no secret to create.
+    Why: neomail is a public client: it runs on your machine, so it cannot keep a secret.
 ";
 
-pub const PROVIDERS: &[&Provider] = &[&GOOGLE];
+pub const PROVIDERS: &[&Provider] = &[&GOOGLE, &MICROSOFT];
 
 pub fn provider(id: &str) -> Option<&'static Provider> {
     PROVIDERS.iter().copied().find(|p| p.id == id)

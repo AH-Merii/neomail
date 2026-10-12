@@ -3,7 +3,8 @@
 `neomail list`, `neomail account list` and `neomail show` print JSON for scripts and agents with
 `--json`, and JSON Lines (one compact object per line, the same objects as `--json`'s array) with
 `--jsonl`. The shapes below are stable: later versions may add fields but will not rename, remove
-or retype these ones. Ignore fields you do not know. Listings also have a plain format, below.
+or retype these ones, and a field that can be `null` says so. Ignore fields you do not know.
+Listings also have a plain format, below.
 
 Common rules:
 
@@ -11,7 +12,8 @@ Common rules:
 - `id` is neomail's id for the message, the one `neomail show` takes. It stays the same across syncs,
   unless the server's UIDVALIDITY changes and the cache is rebuilt. An id is never reused: once
   its message is gone, `neomail show` reports it as not found rather than showing another message.
-- `uid` is the IMAP UID in the account's INBOX.
+- `uid` is the IMAP UID in the account's INBOX, or `null` for a message read through Microsoft
+  Graph (Outlook), which has no UIDs.
 - `flags` are the IMAP flags, sorted, with system flags spelled `\Seen`, `\Flagged` and so on (`"\\Seen"` in JSON).
   `unread` is `true` when `\Seen` is absent.
 - An address is `{"name": string | null, "address": string | null}`.
@@ -55,13 +57,16 @@ never included.
     "host": "imap.example.com",
     "port": 993,
     "security": "tls",
-    "cert_pinned": false
+    "cert_pinned": false,
+    "server": "imap"
   }
 ]
 ```
 
 `login` is `"password"` (the OS keyring), `"password_command"` or `"oauth"`; `security` is `"tls"`
-or `"starttls"`.
+or `"starttls"`. `server` is `"imap"` or `"graph"`. A Graph account (Outlook) reads its mail from
+Microsoft Graph over HTTPS, so its `host`, `port` and `security` are `"graph.microsoft.com"`, `443`
+and `"tls"`.
 
 ## Plain output
 
@@ -106,6 +111,7 @@ every case. Missing messages are left out of the output and reported on standard
 ```
 
 - `date` is the Date header; `received` is when the server got the message.
+- `subject` is `null` when the message has none.
 - `body_type` is `"text/plain"` (the plain part), `"text/html"` (the HTML part converted to
   text) or `"none"` (no text body; `body` is `""`). HTML larger than 1 MiB or nested more than
   100 levels deep is not laid out: its tags are stripped, and `body` starts with a line

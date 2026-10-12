@@ -7,10 +7,11 @@
 
 A fast, modal terminal email client for Outlook, Gmail and Proton Mail.
 
-> **Status:** early development. What works today: a read-only INBOX over IMAP in the command
-> line (`neomail sync`, `neomail list`, `neomail show`), with passwords (an app password, Proton Mail
-> Bridge) or, for Gmail, OAuth sign-in through your own Google client. Nothing changes on the
-> server. There is no TUI yet, and no Outlook sign-in.
+> **Status:** early development. What works today: a read-only INBOX in the command line
+> (`neomail sync`, `neomail list`, `neomail show`): over IMAP with passwords (an app password,
+> Proton Mail Bridge) or, for Gmail, OAuth sign-in through your own Google client; and Outlook or
+> Hotmail through Microsoft Graph, signed in through your own Microsoft Entra app. Nothing changes
+> on the server. There is no TUI yet.
 
 ## Try it
 
@@ -56,12 +57,13 @@ Rust standard library's notices in `COPYRIGHT-library.html`.
 ### Add an account
 
 ```sh
-neomail account add                # a menu: gmail, gmail-app-password, proton, imap
+neomail account add                # a menu: gmail, outlook, gmail-app-password, proton, imap
 neomail sync && neomail list
 ```
 
-`neomail account add` asks for what it needs, logs in read-only (it opens INBOX with `EXAMINE`)
-and only then writes the account to the config file. Every question has a flag, so scripts can
+`neomail account add` asks for what it needs, logs in read-only (it opens INBOX with `EXAMINE`,
+or for Outlook reads the INBOX's message count through Graph) and only then writes the account to
+the config file. Every question has a flag, so scripts can
 run it with `--no-input` (or `NEOMAIL_NO_INPUT=1`), which turns any missing value into a usage
 error. Secrets are never flags: they are prompted for without echo, read as one line of standard
 input, or come from `--password-command`. `--no-check` skips the login. `neomail account add
@@ -84,11 +86,12 @@ input, or come from `--password-command`. `--no-check` skips the login. `neomail
   app password, you need 2-Step Verification on your Google Account"
   ([Google's help](https://support.google.com/accounts/answer/185833)).
 - **Gmail with your own OAuth app:** `neomail account add gmail`, below.
+- **Outlook or Hotmail with your own Entra app:** `neomail account add outlook`, below.
 - **Any IMAP server:** `neomail account add imap --name work --username you@example.com --host
   imap.example.com` (`--port`, `--security tls|starttls`, `--cert-sha256`).
 
 ```sh
-neomail account list               # name, login, username, server, security, pinned
+neomail account list               # name, login, username, host, port, security, pinned
 neomail config path                # where the config file is
 neomail config check               # parse it offline: PATH:LINE:COL: message, or "ok: N accounts"
 ```
@@ -159,6 +162,21 @@ neomail account logout gmail       # revoke the sign-in and delete it from the k
 The account is added to the config file without secrets; the client secret and refresh token stay
 in the OS keyring (service `neomail-oauth`). `--no-browser` only prints the sign-in URL. On WSL the
 Windows browser opens (`wslview` or `explorer.exe`), or the one in `$BROWSER`.
+
+### Outlook
+
+Outlook, Outlook.com and Hotmail sign in with OAuth through a Microsoft Entra app registration you
+create yourself, and mail is read through Microsoft Graph. [docs/outlook.md](docs/outlook.md) walks
+through the five steps and why each exists; the wizard prints them too:
+
+```sh
+neomail account add outlook        # asks for the address and the Application (client) ID, then signs in
+neomail sync --account outlook
+neomail account login outlook --device-code   # sign in with a code on another device
+neomail account logout outlook     # delete the sign-in from the keyring
+```
+
+There is no client secret. Over SSH without a display, sign-in uses a device code on its own.
 
 The cache lives in `~/.local/share/neomail/` (`$XDG_DATA_HOME/neomail/`, or `NEOMAIL_DATA_DIR`).
 

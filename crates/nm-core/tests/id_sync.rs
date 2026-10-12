@@ -7,8 +7,8 @@ use std::num::NonZeroU32;
 use chrono::{DateTime, Utc};
 use nm_core::cache::MailboxKind;
 use nm_core::{
-    Cache, FetchedMessage, Flags, IdFetched, IdListed, IdSource, MessageId, RemoteId, SyncReport,
-    Uid, UidValidity, sync_inbox_by_id,
+    Cache, FetchedMessage, Flags, IdFetched, IdListed, IdSource, MessageId, Progress, RemoteId,
+    SyncReport, Uid, UidValidity, sync_inbox_by_id, sync_inbox_by_id_with_progress,
 };
 
 const T0: i64 = 1_790_000_000;
@@ -234,6 +234,29 @@ async fn first_sync_takes_the_newest_and_second_fetches_nothing() {
         "the window starts at the oldest cached"
     );
     assert!(source.fetched.is_empty());
+}
+
+#[tokio::test]
+async fn progress_counts_up_per_batch_and_stays_quiet_with_nothing_new() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let mut source = RefSource::new(1..=120);
+    let limit = NonZeroU32::new(100).unwrap();
+    let mut seen = Vec::new();
+    let r =
+        sync_inbox_by_id_with_progress(&mut source, &mut cache, "work", limit, |p| seen.push(p))
+            .await
+            .unwrap();
+    assert_eq!(r.new, 100);
+    let done: Vec<(usize, usize)> = seen.iter().map(|p| (p.done, p.total)).collect();
+    assert_eq!(done, [(0, 100), (50, 100), (100, 100)]);
+
+    let mut again: Vec<Progress> = Vec::new();
+    let r =
+        sync_inbox_by_id_with_progress(&mut source, &mut cache, "work", limit, |p| again.push(p))
+            .await
+            .unwrap();
+    assert_eq!(r, report(0, 0, 0, false));
+    assert!(again.is_empty(), "{again:?}");
 }
 
 #[tokio::test]
