@@ -118,6 +118,11 @@ the new entry.
 - **Refined motion** ([DEC-2026-10-10-motion](#dec-2026-10-10-motion)): small, tasteful animations
   and transitions across the whole experience. The design is delegated: there are no mock-ups for
   the owner to choose from.
+- **Desktop notifications for new mail**
+  ([DEC-2026-10-12-daemon-notifications](#dec-2026-10-12-daemon-notifications)): `neomail daemon`
+  shows new mail as desktop notifications (freedesktop notifications over D-Bus on Linux), one per
+  account per round, with up to three messages as "Sender: Subject" and then "and N more". They are
+  on when a notification service is running, and can be turned off.
 - **Thoughtful sound** ([DEC-2026-10-11-sound](#dec-2026-10-11-sound)): a few tasteful sounds for
   meaningful moments, such as sending an email or receiving a notification. Never on navigation or
   other frequent actions.
@@ -225,6 +230,9 @@ the new entry.
 - **Linux first** ([DEC-2026-10-12-linux-first](#dec-2026-10-12-linux-first)): for now all work
   targets Linux; the first goal is neomail working there. macOS stays in the first release, but no
   slice waits on it and a macOS-only CI failure doesn't block a merge.
+- **More of Linux** ([DEC-2026-10-12-daemon-notifications](#dec-2026-10-12-daemon-notifications)):
+  edge builds for aarch64 Linux as well as x86_64, and a daemon guide for OpenRC and runit beside
+  systemd.
 - **WSL specifics are first-class:** detect WSL (`WSL_DISTRO_NAME` / WSLInterop) and handle it —
   secrets fall back when no Secret Service is available (password command such as `pass`, Windows
   Credential Manager via interop, or an encrypted file store), OAuth opens the Windows browser
@@ -655,3 +663,27 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   sentence; Claude follows "no claim" until the owner says otherwise.
 - **Builds on:** "Outlook" in [Accounts and providers](#accounts-and-providers) and
   [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).
+
+### <a id="dec-2026-10-12-daemon-notifications"></a>DEC-2026-10-12-daemon-notifications: desktop notifications and more of Linux
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-12 (f679d889:4275 and f679d889:4278,
+  answers at f679d889:4334).
+- **Context:** the owner asked how `neomail daemon` handles notifications, whether it can use
+  system notifications, and whether it works on different Linux systems, Linux mattering more.
+  Part 1 of slice 7 only logs. Edge builds are x86_64 Linux and Apple Silicon only, and
+  docs/daemon.md covers systemd only.
+- **Owner's words:**
+  - To "When should the daemon get desktop notifications for new mail?" chose "Right after 7a
+    (Recommended)": "A small part of its own next: freedesktop notifications over D-Bus (zbus is
+    already in the tree), on when a notification service exists, with a flag to turn them off.
+    Push (IDLE) then makes them near-instant."
+  - To "What should a new-mail notification show?" chose "Sender and subject (Recommended)": "One
+    notification per account per round: up to 3 messages as 'Sender: Subject', then 'and N
+    more'. Most useful, but visible on a lock screen or a shared screen."
+  - To "Broaden Linux coverage now?" chose "ARM64 build + non-systemd docs (Recommended)": "Add an
+    aarch64-unknown-linux-musl edge build (Raspberry Pi, ARM laptops) and OpenRC/runit examples
+    in docs/daemon.md."
+- **Ruling:** "Desktop notifications for new mail" under [UX](#ux), built as the next part of
+  slice 7, before push. "More of Linux" under [Platforms](#platforms), done now, alongside that
+  part. Claude's reading: the WSL bullet under Platforms still holds on WSL, where notifications
+  go through Windows interop; this ruling covers Linux desktops.
