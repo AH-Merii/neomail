@@ -1,4 +1,5 @@
-//! The IMAP [`MailSource`]: TLS or STARTTLS over rustls, then read-only IMAP on INBOX.
+//! The IMAP [`MailSource`]: TLS or STARTTLS over rustls, then read-only IMAP on INBOX; and the
+//! one write, [`store_seen`], which sets or clears `\Seen` and never expunges.
 
 mod tls;
 mod watch;
@@ -15,6 +16,7 @@ use async_imap::{Client, Session};
 use futures_util::TryStreamExt;
 use nm_core::{
     FetchedMessage, Flags, ListedMessage, MailSource, MailboxStatus, Uid, UidFlags, UidValidity,
+    Written,
 };
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
@@ -146,6 +148,11 @@ pub enum ImapError {
     NoCertificate,
     #[error("the server did not report a valid UIDVALIDITY for INBOX")]
     NoUidValidity,
+    #[error(
+        "the server's INBOX is not the cached one (its UIDVALIDITY changed); nothing was changed, \
+         run `neomail sync` first"
+    )]
+    UidValidityChanged,
     #[error("timed out during {0}")]
     Timeout(&'static str),
     #[error("the server closed the connection")]
@@ -205,6 +212,41 @@ async fn check_on<T: Transport>(
     let status = source.examine_inbox().await;
     source.logout().await;
     Ok(status?.exists)
+}
+
+/// Sets (`seen`) or clears `\Seen` on `uids` in INBOX with `UID STORE +FLAGS` or `-FLAGS`
+/// (RFC 3501 section 6.4.6; RFC 9051 section 6.4.6 is the same), after checking that INBOX's
+/// UIDVALIDITY is still `uid_validity`: when it is not, nothing is stored. Each UID's flags are
+/// the server's, from the FETCH responses STORE sends or, for a UID it sent none for, from a
+/// `UID FETCH`; a UID in neither no longer exists ("a non-existent unique identifier is ignored
+/// without any error message", RFC 3501 section 6.4.8) and is reported as gone.
+///
+/// Never sends EXPUNGE or CLOSE, which expunges `\Deleted` messages (RFC 3501 section 6.4.2):
+/// the session ends with LOGOUT.
+pub async fn store_seen(
+    config: &ImapConfig,
+    login: Login<'_>,
+    uid_validity: UidValidity,
+    uids: &[Uid],
+    seen: bool,
+) -> Result<Written<Uid>, ImapError> {
+    let tls = tls::client_config(config.cert_pin).map_err(ImapError::TlsConfig)?;
+    let client = open(config, tls).await?;
+    let session = log_in(client, &config.username, login).await?;
+    store_seen_on(session, uid_validity, uids, seen).await
+}
+
+/// [`store_seen`] on a logged-in session, which it logs out. Shared with the wire tests.
+async fn store_seen_on<T: Transport>(
+    session: Session<T>,
+    uid_validity: UidValidity,
+    uids: &[Uid],
+    seen: bool,
+) -> Result<Written<Uid>, ImapError> {
+    let mut source = ImapSource { session, exists: 0 };
+    let result = source.store_seen(uid_validity, uids, seen).await;
+    source.logout().await;
+    result
 }
 
 /// The SHA-256 of the certificate the server at `config` presents, for the user to compare and
@@ -267,6 +309,67 @@ impl<T: Transport> ImapSource<T> {
     /// Ends the session politely. Errors are ignored: the work is already done.
     pub async fn logout(mut self) {
         let _ = step("logout", self.session.logout()).await;
+    }
+
+    /// SELECT INBOX read-write, check its UIDVALIDITY, then store. See [`store_seen`].
+    async fn store_seen(
+        &mut self,
+        uid_validity: UidValidity,
+        uids: &[Uid],
+        seen: bool,
+    ) -> Result<Written<Uid>, ImapError> {
+        let op = "SELECT INBOX";
+        let mailbox = step(op, self.session.select("INBOX"))
+            .await?
+            .map_err(|source| ImapError::Command { op, source })?;
+        let found = mailbox
+            .uid_validity
+            .and_then(UidValidity::new)
+            .ok_or(ImapError::NoUidValidity)?;
+        if found != uid_validity {
+            return Err(ImapError::UidValidityChanged);
+        }
+        if uids.is_empty() {
+            return Ok(Written::default());
+        }
+        let op = "UID STORE";
+        let query = if seen {
+            "+FLAGS (\\Seen)"
+        } else {
+            "-FLAGS (\\Seen)"
+        };
+        let stream = step(op, self.session.uid_store(uid_set(uids), query))
+            .await?
+            .map_err(|source| ImapError::Command { op, source })?;
+        let mut answered: Vec<UidFlags> = collect(op, stream)
+            .await?
+            .iter()
+            .filter_map(|f| {
+                let uid = f.uid.and_then(Uid::new).filter(|u| uids.contains(u))?;
+                Some(UidFlags {
+                    uid,
+                    flags: flags(f),
+                })
+            })
+            .collect();
+        let unanswered: Vec<Uid> = uids
+            .iter()
+            .copied()
+            .filter(|u| !answered.iter().any(|f| f.uid == *u))
+            .collect();
+        if !unanswered.is_empty() {
+            let set = uid_set(&unanswered);
+            let fetched = self.uid_flags("UID FETCH", Cmd::Uid(&set)).await?;
+            answered.extend(fetched.into_iter().filter(|f| unanswered.contains(&f.uid)));
+        }
+        let mut written = Written::default();
+        for &uid in uids {
+            match answered.iter().find(|f| f.uid == uid) {
+                Some(f) => written.done.push((uid, Some(f.flags.clone()))),
+                None => written.gone.push(uid),
+            }
+        }
+        Ok(written)
     }
 
     async fn uid_flags(
@@ -380,11 +483,7 @@ impl<T: Transport> MailSource for ImapSource<T> {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        let set = uids
-            .iter()
-            .map(Uid::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
+        let set = uid_set(uids);
         // BODY.PEEK[] leaves \Seen alone; a plain BODY[] would mark the message read.
         let fetches = self
             .run_fetch(
@@ -405,6 +504,14 @@ impl<T: Transport> MailSource for ImapSource<T> {
             })
             .collect())
     }
+}
+
+/// `uids` as an IMAP sequence set: `1,5,9`.
+fn uid_set(uids: &[Uid]) -> String {
+    uids.iter()
+        .map(Uid::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Reads the server greeting, which must come before any command.

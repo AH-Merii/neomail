@@ -1,7 +1,9 @@
 //! neomail's core: domain types, the [`MailSource`] and [`IdSource`] seams that providers
-//! implement, the SQLite [`cache`] and the read-only sync engines ([`sync`] for UIDs,
-//! [`id_source`] for opaque ids). Nothing here touches the network.
+//! implement, the SQLite [`cache`], the read-only sync engines ([`sync`] for UIDs,
+//! [`id_source`] for opaque ids) and the [`action`]s that change mail through the
+//! [`MailWriter`] seam. Nothing here touches the network.
 
+pub mod action;
 pub mod cache;
 #[cfg(feature = "conformance")]
 pub mod conformance;
@@ -11,7 +13,8 @@ pub mod source;
 pub mod sync;
 pub mod types;
 
-pub use cache::{Cache, CacheError};
+pub use action::{Action, MailWriter, Written};
+pub use cache::{Cache, CacheError, Located, MessageKey};
 pub use id_source::{IdSource, sync_inbox_by_id, sync_inbox_by_id_with_progress};
 pub use source::MailSource;
 pub use sync::{Progress, SyncError, SyncReport, sync_inbox, sync_inbox_with_progress};

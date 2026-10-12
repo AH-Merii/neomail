@@ -13,7 +13,7 @@ use crate::config::{self, Account, Login, OAuthSettings};
 use crate::http::Https;
 use crate::keyring::{self, Keyring, OAuthEntry};
 use crate::oauth::{self, ClientKind, MailApi, Provider, Refreshed, Secret, SignedIn};
-use crate::secret::Input;
+use crate::secret::{Input, SavedSignIn};
 use crate::{browser, secret};
 
 pub struct AddArgs {
@@ -390,6 +390,7 @@ fn entry(client: &oauth::Client, signed_in: &SignedIn) -> OAuthEntry {
     OAuthEntry {
         client_secret: client.secret.as_ref().map(|s| s.expose().to_owned()),
         refresh_token: Some(signed_in.refresh_token.expose().to_owned()),
+        mail_grant: Some(signed_in.grant),
     }
 }
 
@@ -459,16 +460,16 @@ fn browser_sign_in(
     }))
 }
 
-/// A fresh access token for an OAuth account, and the refresh token if the provider rotated it,
-/// inside the caller's runtime. A confidential provider's entry without a client secret cannot
-/// refresh: the error says to log in again, which asks for it.
+/// A fresh access token for an OAuth account, for no more than the saved sign-in grants, and the
+/// refresh token if the provider rotated it, inside the caller's runtime. A confidential
+/// provider's entry without a client secret cannot refresh: the error says to log in again,
+/// which asks for it.
 pub async fn refresh(
     account: &Account,
     settings: &OAuthSettings,
-    client_secret: Option<Secret>,
-    refresh_token: &Secret,
+    saved: &SavedSignIn,
 ) -> Result<Refreshed> {
-    if settings.provider.client == ClientKind::Confidential && client_secret.is_none() {
+    if settings.provider.client == ClientKind::Confidential && saved.client_secret.is_none() {
         bail!(
             "the keyring entry holds no client secret, which {} needs; run `neomail account \
              login {}`",
@@ -479,13 +480,14 @@ pub async fn refresh(
     let http = Https::new()?;
     let client = oauth::Client {
         id: settings.client_id.clone(),
-        secret: client_secret,
+        secret: saved.client_secret.clone(),
     };
     oauth::refresh(
         &http,
         settings.provider,
         &client,
-        refresh_token,
+        &saved.refresh_token,
+        saved.grant,
         &account.name,
     )
     .await
@@ -528,6 +530,7 @@ mod tests {
             let leftover = OAuthEntry {
                 client_secret: Some("cs".into()),
                 refresh_token: refresh_token.map(str::to_owned),
+                mail_grant: None,
             };
             keyring.set_oauth("gmail", &leftover).unwrap();
             let called = Cell::new(false);
@@ -559,11 +562,15 @@ mod tests {
         let Login::OAuth(settings) = &account.login else {
             panic!("{:?}", account.login)
         };
-        let refresh_token = Secret::new("rt".into());
+        let saved = SavedSignIn {
+            client_secret: None,
+            refresh_token: Secret::new("rt".into()),
+            grant: oauth::MailGrant::ReadWrite,
+        };
         // The check comes before any request, so this never reaches the network.
         let e = runtime()
             .unwrap()
-            .block_on(refresh(account, settings, None, &refresh_token))
+            .block_on(refresh(account, settings, &saved))
             .unwrap_err();
         assert!(
             e.to_string()
@@ -611,6 +618,7 @@ mod tests {
         let saved = OAuthEntry {
             client_secret: None,
             refresh_token: Some("rt".into()),
+            mail_grant: None,
         };
         keyring.set_oauth("outlook", &saved).unwrap();
         let line = delete_unrevocable(&keyring, "outlook", "Microsoft").unwrap();
@@ -628,6 +636,7 @@ mod tests {
         let leftover = OAuthEntry {
             client_secret: None,
             refresh_token: Some("rt".into()),
+            mail_grant: None,
         };
         keyring.set_oauth("outlook", &leftover).unwrap();
         let no_revoke: Option<fn(&Secret) -> Result<()>> = None;

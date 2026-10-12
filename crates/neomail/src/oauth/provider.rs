@@ -1,6 +1,8 @@
 //! The OAuth providers, as data: endpoints, client kind, scopes, the mail API and the setup text.
 //! Microsoft is another value, not another type.
 
+use super::MailGrant;
+
 /// Whether the client registration has a secret (RFC 6749 section 2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientKind {
@@ -37,6 +39,25 @@ pub struct Setup {
     pub expired_hint: &'static str,
 }
 
+/// The `scope` a refresh sends, by what the sign-in granted. Microsoft's refresh scope must be the
+/// original's or a subset
+/// (<https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow>), so a
+/// sign-in that granted only reading is never refreshed with the scope that changes mail.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RefreshScope {
+    pub read: &'static str,
+    pub read_write: &'static str,
+}
+
+impl RefreshScope {
+    pub fn for_grant(&self, grant: MailGrant) -> &'static str {
+        match grant {
+            MailGrant::Read => self.read,
+            MailGrant::ReadWrite => self.read_write,
+        }
+    }
+}
+
 /// An OAuth provider.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Provider {
@@ -59,10 +80,13 @@ pub struct Provider {
     /// The grants that give mail access, without [`Provider::scope_prefix`]. A user can untick
     /// mail on Google's granular consent screen, so the granted scopes are checked for one.
     pub mail_scopes: &'static [&'static str],
+    /// The grants among `mail_scopes` that also let neomail change mail (mark it read or
+    /// unread), without [`Provider::scope_prefix`].
+    pub write_scopes: &'static [&'static str],
     /// Stripped from a granted scope before it is matched against `mail_scopes`.
     pub scope_prefix: &'static str,
     /// The `scope` sent with a refresh, when the provider needs one.
-    pub refresh_scope: Option<&'static str>,
+    pub refresh_scope: Option<RefreshScope>,
     pub mail: MailApi,
     /// Extra query parameters for the authorization URL.
     pub auth_params: &'static [(&'static str, &'static str)],
@@ -87,6 +111,8 @@ pub const GOOGLE: Provider = Provider {
     redirect_host: "127.0.0.1",
     scope: "https://mail.google.com/ openid email",
     mail_scopes: &["https://mail.google.com/"],
+    // Full access: IMAP's STORE works with it.
+    write_scopes: &["https://mail.google.com/"],
     scope_prefix: "",
     refresh_scope: None,
     mail: MailApi::Imap {
@@ -142,7 +168,11 @@ app for your own use (under 100 users) needs no verification.
 /// - No `prompt=consent`: `offline_access` alone brings a refresh token, and the refresh scope
 ///   must be the original's or a subset, for the first scope's resource
 ///   (<https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow>).
-/// - Mail.Read only, pending the owner: Mail.ReadWrite changes only the scope strings.
+/// - Mail.ReadWrite, so neomail can mark mail read or unread
+///   (<https://learn.microsoft.com/en-us/graph/api/message-update>), and Mail.Read, though
+///   Mail.ReadWrite also reads: the previous release refreshes every sign-in with Mail.Read, which
+///   the subset rule above then allows. A sign-in made when neomail asked for Mail.Read only
+///   keeps Mail.Read: its refresh asks for no more than it granted.
 pub const MICROSOFT: Provider = Provider {
     id: "microsoft",
     name: "Microsoft",
@@ -152,10 +182,15 @@ pub const MICROSOFT: Provider = Provider {
     device_code_url: Some("https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"),
     client: ClientKind::Public,
     redirect_host: "localhost",
-    scope: "offline_access openid profile email https://graph.microsoft.com/Mail.Read",
+    scope: "offline_access openid profile email https://graph.microsoft.com/Mail.Read \
+            https://graph.microsoft.com/Mail.ReadWrite",
     mail_scopes: &["Mail.Read", "Mail.ReadWrite"],
+    write_scopes: &["Mail.ReadWrite"],
     scope_prefix: "https://graph.microsoft.com/",
-    refresh_scope: Some("offline_access https://graph.microsoft.com/Mail.Read"),
+    refresh_scope: Some(RefreshScope {
+        read: "offline_access https://graph.microsoft.com/Mail.Read",
+        read_write: "offline_access https://graph.microsoft.com/Mail.ReadWrite",
+    }),
     mail: MailApi::Graph,
     auth_params: &[],
     // <https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes>

@@ -1,7 +1,8 @@
 //! The read-only guarantee on the wire: `ImapSource` driven by the sync engine against a scripted
 //! IMAP server over an in-memory pipe. It must open INBOX with EXAMINE and fetch with
 //! BODY.PEEK[], and never send a command that can change the server. The push [`Watcher`] keeps
-//! the same guarantee.
+//! the same guarantee. The one write, `store_seen`, selects INBOX, stores `\Seen` and never
+//! sends a command that can remove a message.
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
 
 use std::num::NonZeroU32;
@@ -501,4 +502,172 @@ async fn a_server_without_idle_gets_no_watcher() {
     .await;
     assert!(watched.ended.is_none());
     assert_eq!(verbs(&watched), ["LOGIN", "CAPABILITY", "LOGOUT"]);
+}
+
+/// A server for the write side: SELECT reports UIDVALIDITY 7, and `answer` gives the untagged
+/// responses to `UID STORE` and `UID FETCH` (by their command line). Returns every command line.
+async fn store_server(
+    stream: DuplexStream,
+    answer: impl Fn(&str) -> String + Send + 'static,
+) -> Vec<String> {
+    let (read, mut write) = tokio::io::split(stream);
+    let mut lines = BufReader::new(read).lines();
+    let mut seen = Vec::new();
+    write
+        .write_all(b"* OK scripted IMAP ready\r\n")
+        .await
+        .unwrap();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let (tag, command) = line.split_once(' ').unwrap_or((&line, ""));
+        let upper = command.to_ascii_uppercase();
+        seen.push(command.to_owned());
+        let untagged = if upper.starts_with("LOGIN") {
+            String::new()
+        } else if upper.starts_with("SELECT") {
+            "* 3 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n".to_owned()
+        } else if upper.starts_with("UID STORE") || upper.starts_with("UID FETCH") {
+            answer(&upper)
+        } else if upper.starts_with("LOGOUT") {
+            "* BYE logging out\r\n".to_owned()
+        } else {
+            let reply = format!("{tag} BAD not scripted\r\n");
+            write.write_all(reply.as_bytes()).await.unwrap();
+            continue;
+        };
+        let reply = format!("{untagged}{tag} OK done\r\n");
+        write.write_all(reply.as_bytes()).await.unwrap();
+        if upper.starts_with("LOGOUT") {
+            break;
+        }
+    }
+    seen
+}
+
+/// Runs `store_seen` against [`store_server`] and returns its result and the commands sent.
+async fn store(
+    validity: u32,
+    uids: &[u32],
+    seen: bool,
+    answer: impl Fn(&str) -> String + Send + 'static,
+) -> (
+    Result<nm_core::Written<nm_core::Uid>, ImapError>,
+    Vec<String>,
+) {
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(store_server(server_end, answer));
+    let mut client = Client::new(client_end);
+    greeting(&mut client).await.unwrap();
+    let session = log_in(client, "user", Login::Password("password"))
+        .await
+        .unwrap();
+    let uids: Vec<nm_core::Uid> = uids
+        .iter()
+        .map(|&u| nm_core::Uid::new(u).unwrap())
+        .collect();
+    let validity = nm_core::UidValidity::new(validity).unwrap();
+    let result = super::store_seen_on(session, validity, &uids, seen).await;
+    (result, server.await.unwrap())
+}
+
+/// Nothing that can remove a message: no EXPUNGE, no CLOSE (it expunges, RFC 3501 6.4.2), no
+/// MOVE, COPY or `\Deleted`.
+fn assert_never_removes(commands: &[String]) {
+    assert!(!commands.is_empty());
+    for c in commands.iter().map(|c| c.to_ascii_uppercase()) {
+        for forbidden in ["EXPUNGE", "CLOSE", "MOVE", "COPY", "DELETED"] {
+            assert!(!c.contains(forbidden), "sent {forbidden}: {c}");
+        }
+    }
+}
+
+fn uid_flags(written: &nm_core::Written<nm_core::Uid>) -> Vec<(u32, Vec<String>)> {
+    written
+        .done
+        .iter()
+        .map(|(uid, flags)| {
+            let flags = flags.as_ref().unwrap().iter().map(str::to_owned).collect();
+            (uid.get(), flags)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn mark_read_selects_inbox_stores_plus_seen_and_takes_the_server_s_flags() {
+    let (written, commands) = store(7, &[1, 2], true, |_| {
+        "* 1 FETCH (UID 1 FLAGS (\\Seen \\Flagged))\r\n* 2 FETCH (UID 2 FLAGS (\\Seen))\r\n"
+            .to_owned()
+    })
+    .await;
+    let written = written.unwrap();
+    assert_eq!(
+        uid_flags(&written),
+        [
+            (1, vec!["\\Flagged".to_owned(), "\\Seen".to_owned()]),
+            (2, vec!["\\Seen".to_owned()])
+        ]
+    );
+    assert!(written.gone.is_empty());
+    assert_eq!(
+        commands,
+        [
+            "LOGIN \"user\" \"password\"",
+            "SELECT \"INBOX\"",
+            "UID STORE 1,2 +FLAGS (\\Seen)",
+            "LOGOUT"
+        ]
+    );
+    assert_never_removes(&commands);
+}
+
+#[tokio::test]
+async fn mark_unread_stores_minus_seen() {
+    let (written, commands) = store(7, &[3], false, |_| {
+        "* 3 FETCH (UID 3 FLAGS ())\r\n".to_owned()
+    })
+    .await;
+    assert_eq!(uid_flags(&written.unwrap()), [(3, Vec::<String>::new())]);
+    assert_eq!(commands[2], "UID STORE 3 -FLAGS (\\Seen)");
+    assert_never_removes(&commands);
+}
+
+#[tokio::test]
+async fn another_uidvalidity_stores_nothing_and_says_to_sync() {
+    let (written, commands) = store(8, &[1], true, |_| panic!("nothing is stored")).await;
+    let e = written.unwrap_err();
+    assert!(matches!(e, ImapError::UidValidityChanged), "{e:?}");
+    assert!(e.to_string().contains("neomail sync"), "{e}");
+    assert!(
+        !commands
+            .iter()
+            .any(|c| c.to_ascii_uppercase().contains("STORE")),
+        "{commands:?}"
+    );
+    assert_eq!(commands.last().unwrap(), "LOGOUT");
+    assert_never_removes(&commands);
+}
+
+/// The server answers STORE for UID 1 only; a UID FETCH finds 2 (already read, so no FETCH
+/// came back for it) but not 3, which is gone.
+#[tokio::test]
+async fn a_uid_the_server_no_longer_has_is_gone() {
+    let (written, commands) = store(7, &[1, 2, 3], true, |command| {
+        if command.starts_with("UID STORE") {
+            // An unsolicited FETCH for a message not asked about is ignored.
+            "* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n* 9 FETCH (UID 9 FLAGS ())\r\n".to_owned()
+        } else {
+            "* 2 FETCH (UID 2 FLAGS (\\Seen))\r\n".to_owned()
+        }
+    })
+    .await;
+    let written = written.unwrap();
+    assert_eq!(
+        uid_flags(&written),
+        [
+            (1, vec!["\\Seen".to_owned()]),
+            (2, vec!["\\Seen".to_owned()])
+        ]
+    );
+    assert_eq!(written.gone, [nm_core::Uid::new(3).unwrap()]);
+    assert_eq!(commands[3], "UID FETCH 2,3 (UID FLAGS)");
+    assert_never_removes(&commands);
 }

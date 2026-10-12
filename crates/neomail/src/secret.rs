@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::PasswordSource;
 use crate::keyring::Keyring;
-use crate::oauth::Secret;
+use crate::oauth::{MailGrant, Secret};
 
 /// A password. `Debug` is redacted so it cannot leak through `{:?}`.
 pub struct Password(String);
@@ -70,12 +70,17 @@ pub fn account_password(
     }
 }
 
-/// An OAuth account's client secret (`None` for a public client's entry) and refresh token from
-/// the keyring, opened on first use like [`account_password`]. Blocking, like it.
-pub fn oauth_secrets(
-    account: &str,
-    keyring: &mut Option<Keyring>,
-) -> Result<(Option<Secret>, Secret)> {
+/// An OAuth account's saved sign-in, from its keyring entry.
+pub struct SavedSignIn {
+    /// `None` for a public client's entry.
+    pub client_secret: Option<Secret>,
+    pub refresh_token: Secret,
+    pub grant: MailGrant,
+}
+
+/// An OAuth account's saved sign-in from the keyring, opened on first use like
+/// [`account_password`]. Blocking, like it.
+pub fn oauth_secrets(account: &str, keyring: &mut Option<Keyring>) -> Result<SavedSignIn> {
     let keyring = match keyring {
         Some(k) => k,
         None => keyring.insert(Keyring::open_for_oauth()?),
@@ -88,15 +93,19 @@ pub fn oauth_secrets(
     };
     let entry = keyring.get_oauth(account)?.ok_or_else(not_signed_in)?;
     let refresh_token = entry.refresh_token().ok_or_else(not_signed_in)?;
-    Ok((entry.client_secret(), refresh_token))
+    Ok(SavedSignIn {
+        client_secret: entry.client_secret(),
+        refresh_token,
+        grant: entry.grant(),
+    })
 }
 
 /// Writes a rotated refresh token back to the account's keyring entry, keeping its client
-/// secret. Blocking, like [`oauth_secrets`].
+/// secret and grant. Blocking, like [`oauth_secrets`].
 pub fn save_refresh_token(
     account: &str,
     keyring: &mut Option<Keyring>,
-    client_secret: Option<&Secret>,
+    saved: &SavedSignIn,
     refresh_token: &Secret,
 ) -> Result<()> {
     let keyring = match keyring {
@@ -104,8 +113,9 @@ pub fn save_refresh_token(
         None => keyring.insert(Keyring::open_for_oauth()?),
     };
     let entry = crate::keyring::OAuthEntry {
-        client_secret: client_secret.map(|s| s.expose().to_owned()),
+        client_secret: saved.client_secret.as_ref().map(|s| s.expose().to_owned()),
         refresh_token: Some(refresh_token.expose().to_owned()),
+        mail_grant: Some(saved.grant),
     };
     keyring.set_oauth(account, &entry)
 }

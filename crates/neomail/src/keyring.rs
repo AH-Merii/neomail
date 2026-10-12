@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow};
 use keyring_core::{CredentialStore, Entry, Error};
 use serde::{Deserialize, Serialize};
 
-use crate::oauth::Secret;
+use crate::oauth::{MailGrant, Secret};
 use crate::secret::Password;
 
 /// The keyring service passwords are stored under.
@@ -22,13 +22,20 @@ pub const SERVICE: &str = "neomail";
 pub const OAUTH_SERVICE: &str = "neomail-oauth";
 
 /// An OAuth account's keyring entry: the user's client secret (a public client has none) and,
-/// once signed in, the refresh token. Stored as JSON; `Debug` is redacted. A Gmail entry written
-/// before the secret became optional parses and is written back unchanged.
+/// once signed in, the refresh token and what the sign-in grants. Stored as JSON; `Debug` is
+/// redacted. A Gmail entry written before the secret became optional parses and is written back
+/// unchanged.
+///
+/// `mail_grant` came with marking mail. An entry without it is from an earlier sign-in, which
+/// asked Microsoft only for Mail.Read, so it reads as [`MailGrant::Read`]. An earlier neomail
+/// ignores the field (serde skips unknown fields), so it still reads a newer entry.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
     pub refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail_grant: Option<MailGrant>,
 }
 
 impl std::fmt::Debug for OAuthEntry {
@@ -40,6 +47,11 @@ impl std::fmt::Debug for OAuthEntry {
 impl OAuthEntry {
     pub fn client_secret(&self) -> Option<Secret> {
         self.client_secret.clone().map(Secret::new)
+    }
+
+    /// What the sign-in grants: [`MailGrant::Read`] for an entry from before it was kept.
+    pub fn grant(&self) -> MailGrant {
+        self.mail_grant.unwrap_or(MailGrant::Read)
     }
 
     pub fn refresh_token(&self) -> Option<Secret> {
@@ -323,6 +335,7 @@ mod tests {
         let entry = OAuthEntry {
             client_secret: Some(SECRET.into()),
             refresh_token: Some("1//refresh-not-real".into()),
+            mail_grant: None,
         };
         k.set_oauth("gmail", &entry).unwrap();
         let back = k.get_oauth("gmail").unwrap().unwrap();
@@ -374,11 +387,42 @@ mod tests {
         let public = OAuthEntry {
             client_secret: None,
             refresh_token: Some("M.r".into()),
+            mail_grant: None,
         };
         let json = serde_json::to_string(&public).unwrap();
         assert_eq!(json, r#"{"refresh_token":"M.r"}"#);
         let back: OAuthEntry = serde_json::from_str(&json).unwrap();
         assert!(back.client_secret().is_none());
+    }
+
+    #[test]
+    fn an_entry_from_before_the_grant_reads_as_mail_read_and_an_older_neomail_reads_a_new_one() {
+        // An Outlook entry from before neomail could change mail: it signed in for Mail.Read.
+        let old: OAuthEntry = serde_json::from_str(r#"{"refresh_token":"M.r"}"#).unwrap();
+        assert_eq!(old.grant(), MailGrant::Read);
+        let new = OAuthEntry {
+            client_secret: None,
+            refresh_token: Some("M.r".into()),
+            mail_grant: Some(MailGrant::ReadWrite),
+        };
+        let json = serde_json::to_string(&new).unwrap();
+        assert_eq!(json, r#"{"refresh_token":"M.r","mail_grant":"read-write"}"#);
+        assert_eq!(
+            serde_json::from_str::<OAuthEntry>(&json).unwrap().grant(),
+            MailGrant::ReadWrite
+        );
+        // The entry as the previous release declared it, without `deny_unknown_fields`.
+        #[derive(Deserialize)]
+        struct Previous {
+            #[serde(default)]
+            client_secret: Option<String>,
+            refresh_token: Option<String>,
+        }
+        let previous: Previous = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            (previous.client_secret, previous.refresh_token.as_deref()),
+            (None, Some("M.r"))
+        );
     }
 
     #[test]

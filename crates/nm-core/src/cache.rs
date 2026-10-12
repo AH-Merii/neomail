@@ -161,6 +161,23 @@ pub struct StoredMessage {
     pub raw: Vec<u8>,
 }
 
+/// Where a cached message lives, for an action to reach it on its server: [`Cache::locate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Located {
+    pub id: MessageId,
+    pub account: String,
+    pub flags: Flags,
+    pub key: MessageKey,
+}
+
+/// How a message is named on its server. A UID is only meaningful with its mailbox's
+/// UIDVALIDITY, so the two travel together; a by-id message has neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageKey {
+    Uid { uid_validity: UidValidity, uid: Uid },
+    Remote(RemoteId),
+}
+
 pub struct Cache {
     conn: Connection,
 }
@@ -664,6 +681,66 @@ impl Cache {
             .prepare("SELECT DISTINCT account FROM mailbox ORDER BY account")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Where each of `ids` lives, for the cached ones, in the order asked. Ids that are not
+    /// cached are left out.
+    pub fn locate(&self, ids: &[MessageId]) -> Result<Vec<Located>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT b.account, b.uid_validity, m.uid, m.remote_id, m.flags
+             FROM message m JOIN mailbox b ON b.id = m.mailbox_id WHERE m.id = ?1",
+        )?;
+        let mut found = Vec::new();
+        for &id in ids {
+            let row = stmt
+                .query_row([id.get()], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })
+                .optional()?;
+            let Some((account, validity, uid, remote_id, flags)) = row else {
+                continue;
+            };
+            let key = match (validity, uid, remote_id) {
+                (Some(validity), Some(uid), None) => MessageKey::Uid {
+                    uid_validity: u32::try_from(validity)
+                        .ok()
+                        .and_then(UidValidity::new)
+                        .ok_or(CacheError::Corrupt("uid_validity"))?,
+                    uid: uid_from_db(uid)?,
+                },
+                (None, None, Some(remote_id)) => MessageKey::Remote(
+                    RemoteId::new(remote_id).ok_or(CacheError::Corrupt("remote_id"))?,
+                ),
+                _ => return Err(CacheError::Corrupt("a message's key")),
+            };
+            found.push(Located {
+                id,
+                account,
+                flags: Flags::from_storage(&flags),
+                key,
+            });
+        }
+        Ok(found)
+    }
+
+    /// Sets the flags of cached messages by id, in one transaction. Ids that are not cached are
+    /// skipped.
+    pub fn set_flags(&mut self, updates: &[(MessageId, Flags)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut update = tx.prepare("UPDATE message SET flags = ?2 WHERE id = ?1")?;
+            for (id, flags) in updates {
+                update.execute(params![id.get(), flags.to_storage()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get(&self, id: MessageId) -> Result<Option<StoredMessage>> {

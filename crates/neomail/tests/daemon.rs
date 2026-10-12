@@ -1,4 +1,5 @@
-//! `neomail daemon` and the account locks it shares with `neomail sync`, end to end. The only
+//! `neomail daemon` and the account locks it shares with `neomail sync` and `neomail mark`, end
+//! to end. The only
 //! server is a closed port on 127.0.0.1, and only the children spawned here are signalled.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
@@ -176,6 +177,50 @@ fn sync_waits_for_an_account_the_daemon_is_syncing_then_runs() {
     assert_eq!(status.code(), Some(1), "{rest:?}");
     assert_eq!(rest.len(), 1, "{rest:?}");
     assert!(rest[0].starts_with("neomail: work: "), "{rest:?}");
+}
+
+/// `mark` takes the account's lock as `sync` does: it says so once, waits, then runs.
+#[test]
+fn mark_waits_for_an_account_the_daemon_is_syncing_then_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    closed_port_config(data);
+    let id = {
+        let mut cache = nm_core::Cache::open(&data.join("cache.sqlite3")).unwrap();
+        let mailbox = cache
+            .reset_mailbox("work", "INBOX", nm_core::UidValidity::new(1).unwrap())
+            .unwrap();
+        let message = nm_core::FetchedMessage {
+            uid: nm_core::Uid::new(1).unwrap(),
+            flags: nm_core::Flags::default(),
+            received: None,
+            raw: b"Subject: hi\r\n\r\nBody\r\n".to_vec(),
+        };
+        cache.insert_messages(mailbox.id, &[message]).unwrap();
+        cache.list(None, 1).unwrap()[0].id.to_string()
+    };
+    std::fs::create_dir(data.join("locks")).unwrap();
+    let lock = std::fs::File::create(data.join("locks/work.lock")).unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+    let (mut mark, lines) = spawn(command(data, &["mark", "read", &id]));
+    assert_eq!(
+        next_line(&mut mark, &lines),
+        "neomail: waiting for neomail daemon to finish syncing work"
+    );
+    assert!(mark.try_wait().unwrap().is_none(), "it waits");
+    drop(lock);
+    let status = mark.wait().unwrap();
+    let rest: Vec<String> = lines.iter().collect();
+    // It ran: the closed port is the failure.
+    assert_eq!(status.code(), Some(1), "{rest:?}");
+    assert_eq!(rest.len(), 1, "{rest:?}");
+    assert!(
+        rest[0].starts_with(&format!(
+            "neomail: work: message {id} may not be marked read: "
+        )),
+        "{rest:?}"
+    );
 }
 
 #[test]

@@ -7,11 +7,11 @@
 
 A fast, modal terminal email client for Outlook, Gmail and Proton Mail.
 
-> **Status:** early development. What works today: a read-only INBOX in the command line
+> **Status:** early development. What works today: the INBOX in the command line
 > (`neomail sync`, `neomail list`, `neomail show`): over IMAP with passwords (an app password,
 > Proton Mail Bridge) or, for Gmail, OAuth sign-in through your own Google client; and Outlook or
-> Hotmail through Microsoft Graph, signed in through your own Microsoft Entra app. Nothing changes
-> on the server. There is no TUI yet.
+> Hotmail through Microsoft Graph, signed in through your own Microsoft Entra app. `neomail mark`
+> marks mail read or unread; otherwise nothing changes on the server. There is no TUI yet.
 
 ## Try it
 
@@ -190,6 +190,7 @@ The cache lives in `~/.local/share/neomail/` (`$XDG_DATA_HOME/neomail/`, or `NEO
 neomail sync                 # fetch new mail for every account: "work: 12 new, 1 updated, 0 removed"
 neomail list                 # newest first; * marks unread
 neomail show 42              # headers, body, attachments
+neomail mark read 42 43      # mark read on the server, then in the cache
 ```
 
 - `neomail sync --account work --limit 100`: the first sync takes the 500 messages that arrived
@@ -199,14 +200,22 @@ neomail show 42              # headers, body, attachments
   or `all` on `list` and `sync`.
 - `neomail show 42 43` shows several messages; `neomail show 42 --raw` prints one message's source.
   On a terminal `show` goes through `$NEOMAIL_PAGER`, `$PAGER` or `less`; `--no-pager` turns it off.
+- `neomail mark read ID...` and `neomail mark unread ID...` change the read state on the server
+  first, then in the cache, so `neomail list` shows it at once. Ids may be of several accounts.
+  It needs the server: nothing is queued, and an account that cannot be reached keeps its
+  messages as they were. It waits for a sync of the same account (`neomail daemon`'s) to finish.
+  An Outlook account added before neomail could change mail needs `neomail account login NAME`
+  once ([docs/outlook.md](docs/outlook.md)).
 - `--json` and `--jsonl` print JSON for scripts; see [docs/json.md](docs/json.md) for the shapes,
   the plain columns and the exit codes.
 
 On a terminal, listings are aligned columns. In a pipe, or with `--plain`, they are tab-separated:
-one message per line, the id first, nothing cut off. `show -` reads ids from standard input:
+one message per line, the id first, nothing cut off. `show -` and `mark read|unread -` read ids
+from standard input:
 
 ```sh
 neomail list | fzf -m | neomail show -                          # pick messages, read them
+neomail list | fzf -m | neomail mark read -                     # pick messages, mark them read
 neomail list --color always | fzf --ansi -m | neomail show -    # the same, in colour
 neomail list | cut -f1,6                                        # id and subject
 neomail list --jsonl | jq -ac 'select(.unread) | .subject'      # unread subjects, ASCII-escaped

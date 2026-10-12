@@ -34,7 +34,10 @@ struct Message {
 /// One request as the fake saw it.
 #[derive(Debug)]
 struct Seen {
+    method: &'static str,
     url: String,
+    /// A PATCH's JSON body.
+    body: Option<Value>,
     headers: Vec<(String, String)>,
     max_body: usize,
 }
@@ -159,21 +162,70 @@ impl Transport for FakeGraph {
         headers: &[(&str, &str)],
         max_body: usize,
     ) -> Result<Reply, TransportError> {
-        self.seen.borrow_mut().push(Seen {
+        let seen = Seen {
+            method: "GET",
             url: url.to_owned(),
-            headers: headers
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                .collect(),
+            body: None,
+            headers: owned(headers),
             max_body,
-        });
+        };
+        Ok(self.answer(seen, || self.serve(url)).await)
+    }
+
+    async fn patch_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> Result<Reply, TransportError> {
+        let body: Value = serde_json::from_slice(body).unwrap();
+        let seen = Seen {
+            method: "PATCH",
+            url: url.to_owned(),
+            body: Some(body.clone()),
+            headers: owned(headers),
+            max_body,
+        };
+        Ok(self.answer(seen, || self.serve_patch(url, &body)).await)
+    }
+}
+
+fn owned(headers: &[(&str, &str)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
+}
+
+impl FakeGraph {
+    /// Records `seen`, counts it in flight across one yield, then answers with the next
+    /// scripted reply or `serve`.
+    async fn answer(&self, seen: Seen, serve: impl FnOnce() -> Reply) -> Reply {
+        self.seen.borrow_mut().push(seen);
         self.in_flight.set(self.in_flight.get() + 1);
         self.max_in_flight
             .set(self.max_in_flight.get().max(self.in_flight.get()));
         tokio::task::yield_now().await;
         self.in_flight.set(self.in_flight.get() - 1);
         let scripted = self.script.borrow_mut().pop_front();
-        Ok(scripted.unwrap_or_else(|| self.serve(url)))
+        scripted.unwrap_or_else(serve)
+    }
+}
+
+impl FakeGraph {
+    /// A PATCH of a message's read state: the updated message, or 404 for an id it lacks.
+    fn serve_patch(&self, url: &str, body: &Value) -> Reply {
+        let segment = url.strip_prefix(&format!("{API}/me/messages/")).unwrap();
+        assert!(!segment.contains(['/', '?']), "{url}");
+        let wanted = decode(segment);
+        match self.messages.iter().find(|m| m.id == wanted) {
+            Some(m) => json_reply(
+                200,
+                &json!({"id": m.id, "isRead": body["isRead"], "subject": "s", "body": {"content": "x"}}),
+            ),
+            None => json_reply(404, &json!({"error": {"code": "ErrorItemNotFound"}})),
+        }
     }
 }
 
@@ -767,4 +819,125 @@ async fn a_link_off_graph_is_refused() {
     let stored = cursor("https://evil.example/v1.0/me/mailFolders/inbox/messages/delta");
     assert!(s.changes_since(&stored).await.unwrap().is_none());
     assert!(transport(&s).urls().is_empty());
+}
+
+fn ids(ns: impl IntoIterator<Item = u32>) -> Vec<RemoteId> {
+    ns.into_iter()
+        .map(|n| RemoteId::new(id(n)).unwrap())
+        .collect()
+}
+
+fn read_flags(read: bool) -> Option<Flags> {
+    Some(if read {
+        Flags::new([Flags::SEEN])
+    } else {
+        Flags::default()
+    })
+}
+
+#[tokio::test]
+async fn set_read_patches_each_message_with_is_read_and_immutable_ids() {
+    for read in [true, false] {
+        let fake = FakeGraph::new(1..=6);
+        let s = source(fake);
+        let written = s.set_read(&ids(1..=6), read).await.unwrap();
+        assert_eq!(
+            written.done,
+            ids(1..=6)
+                .into_iter()
+                .map(|i| (i, read_flags(read)))
+                .collect::<Vec<_>>()
+        );
+        assert!(written.gone.is_empty());
+        let fake = transport(&s);
+        assert_eq!(fake.max_in_flight.get(), 4);
+        let seen = fake.seen.borrow();
+        assert_eq!(seen.len(), 6);
+        let mut urls: Vec<&str> = seen.iter().map(|s| s.url.as_str()).collect();
+        urls.sort_unstable();
+        let mut want: Vec<String> = (1..=6)
+            .map(|n| format!("{API}/me/messages/AAMkAGI2%2FTg%2B{n}%3D"))
+            .collect();
+        want.sort_unstable();
+        assert_eq!(urls, want);
+        for request in seen.iter() {
+            assert_eq!(request.method, "PATCH");
+            assert_eq!(request.body, Some(json!({ "isRead": read })));
+            assert_eq!(
+                request.headers,
+                [
+                    ("Authorization".to_owned(), format!("Bearer {TOKEN}")),
+                    ("Prefer".to_owned(), "IdType=\"ImmutableId\"".to_owned()),
+                    ("Accept".to_owned(), "application/json".to_owned()),
+                ]
+            );
+            // The answer is the whole message, its body included.
+            assert_eq!(request.max_body, MAX_MIME);
+        }
+    }
+}
+
+#[tokio::test]
+async fn set_read_reports_a_404_as_gone_and_flags_from_the_answer() {
+    // The fake has no message 2, so its PATCH answers 404.
+    let s = source(FakeGraph::new([1, 3]));
+    let written = s.set_read(&ids([1, 2, 3]), true).await.unwrap();
+    assert_eq!(
+        written.done,
+        [
+            (ids([1]).remove(0), read_flags(true)),
+            (ids([3]).remove(0), read_flags(true))
+        ]
+    );
+    assert_eq!(written.gone, ids([2]));
+    {
+        let seen = transport(&s).seen.borrow();
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|s| s.method == "PATCH"), "{seen:?}");
+    }
+
+    // Graph's answer, not the request, sets the flags; an answer without isRead sets none.
+    for (answer, flags) in [
+        (
+            json_reply(200, &json!({"id": id(1), "isRead": false})),
+            read_flags(false),
+        ),
+        (reply(200, b"{}".to_vec()), None),
+        (reply(204, Vec::new()), None),
+    ] {
+        let s = source(FakeGraph::new([1]).script([answer]));
+        let written = s.set_read(&ids([1]), true).await.unwrap();
+        assert_eq!(written.done, [(ids([1]).remove(0), flags)]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn set_read_retries_throttling_and_fails_on_403_without_other_requests() {
+    let s = source(FakeGraph::new([1]).script([throttled(429, Some(3)), throttled(503, None)]));
+    let start = tokio::time::Instant::now();
+    let written = s.set_read(&ids([1]), true).await.unwrap();
+    // Retry-After first, then the backoff, which doubled from 1 s after the first try.
+    assert_eq!(start.elapsed(), Duration::from_secs(3 + 2));
+    assert_eq!(written.done, [(ids([1]).remove(0), read_flags(true))]);
+    {
+        let seen = transport(&s).seen.borrow();
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.iter()
+                .all(|s| s.method == "PATCH" && s.url.ends_with("Tg%2B1%3D"))
+        );
+    }
+
+    let s = source(FakeGraph::new([1]).script([json_reply(
+        403,
+        &json!({"error": {"code": "ErrorAccessDenied", "message": TOKEN}}),
+    )]));
+    let e = s.set_read(&ids([1]), false).await.unwrap_err();
+    assert!(matches!(e, GraphError::Forbidden), "{e:?}");
+    assert!(!format!("{e:?} {e}").contains("not-a-real-token"));
+    assert_eq!(transport(&s).seen.borrow().len(), 1);
+
+    let s = source(FakeGraph::new([1]).script([reply(500, Vec::new())]));
+    let e = s.set_read(&ids([1]), true).await.unwrap_err();
+    assert_eq!(e.to_string(), "Microsoft Graph answered HTTP 500");
 }

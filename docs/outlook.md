@@ -1,6 +1,7 @@
 # Outlook with your own Entra app
 
-neomail reads Outlook, Outlook.com and Hotmail mail through Microsoft Graph and signs in with
+neomail reads Outlook, Outlook.com and Hotmail mail through Microsoft Graph, marks it read or
+unread there, and signs in with
 OAuth, through a Microsoft Entra app registration that **you** create. It ships with no app of its
 own ([decisions](decisions.md#accounts-and-providers)): an app registration is what Microsoft
 grants access to, so with your own, no one else's app ever holds access to your mail.
@@ -77,8 +78,27 @@ neomail reads the INBOX's message count through Graph, once, to check the sign-i
 `--no-check` skips that. A failed sign-in or check saves nothing.
 
 The browser opens on Microsoft's sign-in page; `--no-browser` only prints the URL. neomail asks
-for `Mail.Read` (read-only), `offline_access` (a refresh token), and `openid profile email` (your
-address).
+for `Mail.ReadWrite` (to read your mail and change it), `Mail.Read` (so an earlier version can
+still refresh this sign-in; see [Where things are kept](#where-things-are-kept)),
+`offline_access` (a refresh token), and `openid profile email` (your address). The consent screen
+therefore asks to read and change your mail ("Read and write access to your mail"). neomail needs
+the change part to mark messages read or unread (`neomail mark`): Graph allows that only with
+`Mail.ReadWrite` ([update message](https://learn.microsoft.com/en-us/graph/api/message-update)).
+neomail never deletes or moves a message.
+
+### Accounts added before neomail could mark mail
+
+Earlier versions asked for `Mail.Read` only. Such an account keeps syncing exactly as before:
+neomail keeps asking Microsoft for `Mail.Read` when it refreshes that sign-in, because a refresh
+may ask only for the scopes the sign-in asked for or fewer
+([authorization code flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow)).
+`neomail mark` on it fails without changing anything and says to run `neomail account login NAME`.
+Do that once, accept the new permission, and the account can mark mail.
+
+neomail tells the two apart by the `mail_grant` it keeps with the refresh token in the keyring
+(below): `read-write` for a sign-in that granted `Mail.ReadWrite`, `read` for one that granted only
+`Mail.Read`, and no `mail_grant` at all for a sign-in saved by an earlier version, which counts as
+`read`.
 
 ### Device code sign-in
 
@@ -105,12 +125,32 @@ that neomail itself just printed.
   ```
 
 - The refresh token is in the OS keyring only (service `neomail-oauth`, the account name as its
-  `username` attribute). Microsoft sends a new refresh token with each refresh; neomail saves it
-  back.
+  `username` attribute), with `mail_grant`, which says whether the sign-in lets neomail change mail.
+  Microsoft sends a new refresh token with each refresh; neomail saves it back with the same
+  `mail_grant`.
+- Going back to an earlier version: it still reads the entry, since it ignores `mail_grant`. It
+  refreshes with `offline_access` and `Mail.Read`, a subset of what a sign-in made by this
+  version asked for, which Microsoft allows: a refresh's scopes "must be equivalent to or a
+  subset of the scopes requested" at sign-in
+  ([authorization code flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow);
+  not checked live). When the earlier version saves a new refresh token, the entry loses
+  `mail_grant`, and this version then treats it as `read`: `neomail mark` says to run
+  `neomail account login NAME`, which lets it mark mail again.
 - `neomail account login NAME` signs in again. `neomail account logout NAME` deletes the sign-in
   from the keyring: Microsoft's v2 endpoints list no token revocation endpoint
   ([OpenID Connect metadata](https://learn.microsoft.com/en-us/entra/identity-platform/v2-protocols-oidc)),
   so the sign-in is only deleted here.
+
+## How mail is marked
+
+`neomail mark read ID...` and `neomail mark unread ID...` send
+`PATCH /me/messages/{id}` with `{"isRead": true}` or `{"isRead": false}` for each message, with the
+same immutable ids sync uses, at most four at once, and wait out throttling as reads do
+([update message](https://learn.microsoft.com/en-us/graph/api/message-update)). The cache changes
+only for the messages Graph confirmed. A message Graph no longer has (404) fails, and the next sync
+removes it. Any other error stops the writes, and `mark` says the account's messages may not be
+marked: Graph keeps the changes it already made, the cache is left alone for all of them, and the
+next sync reads their state. There is no queue: run the command again.
 
 ## How mail is read
 
@@ -160,9 +200,12 @@ and leave it out.
 - **"Microsoft Graph refused access to the mailbox (HTTP 403)":** Graph answers 403 when the
   sign-in lacks the permission, the account has no mailbox or licence, or a Conditional Access
   policy blocks the app ([Graph errors](https://learn.microsoft.com/en-us/graph/errors)). During
-  `account add`, the sign-in has already granted `Mail.Read`, so it is one of the others; nothing
+  `account add`, the sign-in has already granted mail access, so it is one of the others; nothing
   was saved. For a saved account, run `neomail account login NAME` and accept the permission to
-  read your email first.
+  read (and, for `neomail mark`, change) your email first.
+- **"this account's sign-in lets neomail read mail but not change it":** the account was added
+  before neomail could mark mail, or the consent granted only `Mail.Read`. Run
+  `neomail account login NAME`; nothing was changed.
 - **"the app registration is not multitenant" or "is for Microsoft Entra accounts only":** the
   supported account types in step 2 are wrong. Register the app again with the right type, and
   use its client ID.

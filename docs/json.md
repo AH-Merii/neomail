@@ -1,9 +1,10 @@
 # Output for scripts
 
-`neomail list`, `neomail account list` and `neomail show` print JSON for scripts and agents with
-`--json`, and JSON Lines (one compact object per line, the same objects as `--json`'s array) with
-`--jsonl`. The shapes below are stable: later versions may add fields but will not rename, remove
-or retype these ones, and a field that can be `null` says so. Ignore fields you do not know.
+`neomail list`, `neomail account list`, `neomail show` and `neomail mark` print JSON for scripts
+and agents with `--json`, and JSON Lines (one compact object per line, the same objects as
+`--json`'s array) with `--jsonl`. The shapes below are stable: later versions may add fields but
+will not rename, remove or retype these ones, and a field that can be `null` says so. Ignore
+fields you do not know.
 Listings also have a plain format, below.
 
 Common rules:
@@ -125,6 +126,44 @@ works. A line's id is its first field: after leading whitespace and colour codes
 the first tab or space. Blank lines are skipped; a line without an id is a usage error (exit 2)
 naming its line number, and nothing is shown. `--raw` takes exactly one id.
 
+## `neomail mark read|unread ID...`
+
+`mark` takes ids as `show` does: on the command line, or `-` for standard input with the same
+rules as `show -` (`neomail list | fzf -m | neomail mark read -`). It changes the read state on
+the server first, then in the cache. Standard output carries only the messages now in the asked
+state, a message already in it included, in the order asked:
+
+- on a terminal, one line: `Marked 2 messages read.`;
+- plain (in a pipe, or `--plain`): their ids, one per line, so the output pipes into another
+  command;
+- `--json`: an array of objects, `[]` when none was marked; `--jsonl`: one object per line.
+
+```json
+[
+  { "id": 42, "account": "work", "unread": false, "flags": ["\\Flagged", "\\Seen"] }
+]
+```
+
+`id`, `account`, `unread` and `flags` mean what they mean in `list --json`. `flags` are as now
+cached: the flags the server reported after the change (for Outlook, `\Seen` from Graph's
+`isRead`) or, when the server confirmed the change without them, the cached flags with `\Seen`
+set or cleared.
+
+Each failure is one `neomail:` line on standard error:
+
+- an unknown id;
+- a message gone from the server: the next sync removes it from the cache;
+- a message the server did not confirm in the asked state: run `neomail sync` to see its state,
+  then try again;
+- an account that failed, in one line naming all its ids, which "may not be marked": the server
+  may have changed some of them before the error, and the next sync reads their state. For
+  example, its server could not be reached or refused the login, its INBOX's UIDVALIDITY changed
+  (run `neomail sync`), or an Outlook sign-in may only read mail (run
+  `neomail account login NAME`, see [outlook.md](outlook.md)).
+
+Nothing is queued. The cache keeps a failed message's flags, unless the server reported other
+ones for it.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -132,20 +171,21 @@ naming its line number, and nothing is shown. `--raw` takes exactly one id.
 | 0 | Success. `list` with nothing cached also succeeds, printing `[]` with `--json`. |
 | 0 | Also when the reader of standard output goes away early (`neomail list \| head -1`, quitting the pager): neomail stops quietly. |
 | 0 | `daemon` stopped by SIGINT or SIGTERM. A failing account does not stop it. |
-| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others. A second `daemon` for the same data directory exits 1. |
-| 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s input without an id; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help; `daemon` without a config file or accounts (the start lines) or with an invalid config. |
+| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others. `mark` exits 1 if any id was unknown, gone from the server, not confirmed or of an account that failed, after marking the others. A second `daemon` for the same data directory exits 1. |
+| 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s or `mark -`'s input without an id; `-` mixed with ids (`show`, `mark`); a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help; `daemon` without a config file or accounts (the start lines) or with an invalid config. |
 
 Errors go to standard error, in these forms:
 
 - An error from the argument parser (exit 2: an unknown option, an invalid value, conflicting
   output flags) starts with `error:` and may be followed by a usage hint on further lines.
 - neomail's own usage errors (exit 2) are one line starting with `neomail:`: a value that cannot
-  be asked for (standard input is not a terminal, or `--no-input`), a line of `show -`'s input
-  without an id, `--raw` with several ids, `-` mixed with ids, an option that does not apply to
-  the provider. They look like failures; only the exit code tells them apart.
+  be asked for (standard input is not a terminal, or `--no-input`), a line of `show -`'s or
+  `mark -`'s input without an id, `--raw` with several ids, `-` mixed with ids, an option that
+  does not apply to the provider. They look like failures; only the exit code tells them apart.
 - Bare `neomail` (exit 2) prints the start lines (`neomail: no accounts yet. Start with:` and the
   commands) without a config, or the help with one.
-- A failure (exit 1) prints a line starting with `neomail:`; `sync` prints one per failed account.
+- A failure (exit 1) prints a line starting with `neomail:`; `sync` prints one per failed account,
+  and `mark` one per unknown, gone or unconfirmed id and one per failed account, naming its ids.
   A failed `config check` prints `PATH:LINE:COL: message` for a syntax error or `PATH: message`
   for an invalid value, without the `neomail:` prefix; a missing config file is an ordinary
   `neomail:` failure.

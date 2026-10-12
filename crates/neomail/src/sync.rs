@@ -14,7 +14,7 @@ use tokio::runtime::Runtime;
 
 use crate::config::{Account, Login, OAuthSettings, Server};
 use crate::keyring::Keyring;
-use crate::oauth::{Refreshed, Secret};
+use crate::oauth::{MailGrant, Refreshed, Secret};
 use crate::push::WatchLogin;
 use crate::{account, graph, output, secret};
 
@@ -25,14 +25,11 @@ pub const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
 pub const PASSWORD_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What syncing accounts needs between accounts and, in the daemon, between rounds: the
-/// runtime, the keyring (opened on first use), the access tokens in memory, the first sync's
-/// limit and the progress line.
+/// runtime, the logins, the first sync's limit and the progress line.
 pub struct Syncer<'a> {
     runtime: &'a Runtime,
-    keyring: Option<Keyring>,
-    tokens: Tokens,
+    logins: Logins,
     limit: NonZeroU32,
-    password_mode: secret::CommandMode,
     push_logins: bool,
     pub progress: output::ProgressLine,
 }
@@ -41,10 +38,8 @@ impl<'a> Syncer<'a> {
     pub fn new(runtime: &'a Runtime, limit: NonZeroU32, progress: output::ProgressLine) -> Self {
         Self {
             runtime,
-            keyring: None,
-            tokens: Tokens::default(),
+            logins: Logins::default(),
             limit,
-            password_mode: secret::CommandMode::Interactive,
             push_logins: false,
             progress,
         }
@@ -54,7 +49,7 @@ impl<'a> Syncer<'a> {
     /// after `limit` ([`PASSWORD_COMMAND_TIMEOUT`]), so one stuck command (gpg waiting for
     /// pinentry) fails its account instead of stalling every account while holding its lock.
     pub fn unattended(mut self, limit: Duration) -> Self {
-        self.password_mode = secret::CommandMode::Unattended(limit);
+        self.logins.password_mode = secret::CommandMode::Unattended(limit);
         self
     }
 
@@ -79,11 +74,7 @@ impl<'a> Syncer<'a> {
                 watch,
             },
             Err(e) => {
-                // The token may be what failed (revoked, or refused by the server): ask for a new
-                // one next time. A keyring that failed is opened again, in case its service
-                // restarted.
-                self.tokens.forget(&account.name);
-                self.keyring = None;
+                self.logins.forget(&account.name);
                 Synced {
                     report: Err(e),
                     partial: stored,
@@ -96,7 +87,7 @@ impl<'a> Syncer<'a> {
 
     /// Drops what is kept for accounts no longer in `accounts`.
     pub fn retain(&mut self, accounts: &[Account]) {
-        self.tokens.retain(accounts);
+        self.logins.tokens.retain(accounts);
     }
 
     fn sync_inner(
@@ -113,18 +104,10 @@ impl<'a> Syncer<'a> {
         let hand_over = |imap: &ImapConfig, login| push.then(|| WatchLogin::new(imap, login));
         let limit = self.limit;
         let progress = &mut self.progress;
-        match &account.login {
-            Login::Password(source) => {
-                let password = secret::account_password(
-                    &account.name,
-                    source,
-                    &mut self.keyring,
-                    self.password_mode,
-                )?;
-                let Server::Imap(imap) = &account.server else {
-                    bail!("a password account reads mail over IMAP");
-                };
-                let login = nm_imap::Login::Password(password.expose());
+        let credential = self.logins.credential(runtime, account, warnings)?;
+        match (&account.server, credential) {
+            (Server::Imap(imap), credential) => {
+                let login = credential.imap();
                 runtime.block_on(sync_imap(
                     imap,
                     &account.name,
@@ -137,40 +120,104 @@ impl<'a> Syncer<'a> {
                 *watch = hand_over(imap, login);
                 Ok(())
             }
+            (Server::Graph { .. }, Credential::AccessToken(token)) => runtime.block_on(
+                graph::sync(&account.name, &token.secret, cache, limit, report, progress),
+            ),
+            (Server::Graph { .. }, Credential::Password(_)) => {
+                bail!("a Microsoft Graph account signs in with OAuth, not a password")
+            }
+        }
+    }
+}
+
+/// The secret an account logs in with: a password, or an OAuth access token, which reaches IMAP
+/// (XOAUTH2) or Microsoft Graph.
+pub enum Credential<'a> {
+    Password(secret::Password),
+    AccessToken(&'a AccessToken),
+}
+
+/// An OAuth access token, and what the sign-in it came from lets neomail do with mail.
+#[derive(Debug)]
+pub struct AccessToken {
+    pub secret: Secret,
+    pub grant: MailGrant,
+}
+
+impl AccessToken {
+    pub fn expose(&self) -> &str {
+        self.secret.expose()
+    }
+}
+
+impl Credential<'_> {
+    /// The IMAP login for this credential.
+    pub fn imap(&self) -> nm_imap::Login<'_> {
+        match self {
+            Self::Password(password) => nm_imap::Login::Password(password.expose()),
+            Self::AccessToken(token) => nm_imap::Login::XOAuth2 {
+                access_token: token.expose(),
+            },
+        }
+    }
+}
+
+/// How accounts log in, the one owner of it for `neomail sync`, `neomail daemon` and `neomail
+/// mark`: a password (`password_command` or the keyring), or an OAuth access token kept in memory
+/// until it is about to expire. The keyring is opened on first use.
+pub struct Logins {
+    keyring: Option<Keyring>,
+    tokens: Tokens,
+    password_mode: secret::CommandMode,
+}
+
+impl Default for Logins {
+    fn default() -> Self {
+        Self {
+            keyring: None,
+            tokens: Tokens::default(),
+            password_mode: secret::CommandMode::Interactive,
+        }
+    }
+}
+
+impl Logins {
+    /// The account's credential. Keyring calls stay outside `block_on`: their blocking calls
+    /// start a runtime of their own, which panics inside another.
+    pub fn credential(
+        &mut self,
+        runtime: &Runtime,
+        account: &Account,
+        warnings: &mut Vec<String>,
+    ) -> Result<Credential<'_>> {
+        match &account.login {
+            Login::Password(source) => {
+                if matches!(account.server, Server::Graph { .. }) {
+                    bail!("a password account reads mail over IMAP");
+                }
+                Ok(Credential::Password(secret::account_password(
+                    &account.name,
+                    source,
+                    &mut self.keyring,
+                    self.password_mode,
+                )?))
+            }
             Login::OAuth(settings) => {
                 let keyring = &mut self.keyring;
                 let token = self.tokens.get_or_refresh(account, SystemTime::now(), || {
                     refresh(runtime, keyring, account, settings, warnings)
                 })?;
-                // The same token reaches IMAP (XOAUTH2) or Microsoft Graph.
-                match &account.server {
-                    Server::Imap(imap) => {
-                        let login = nm_imap::Login::XOAuth2 {
-                            access_token: token.expose(),
-                        };
-                        runtime.block_on(sync_imap(
-                            imap,
-                            &account.name,
-                            login,
-                            cache,
-                            limit,
-                            report,
-                            progress,
-                        ))?;
-                        *watch = hand_over(imap, login);
-                        Ok(())
-                    }
-                    Server::Graph { .. } => runtime.block_on(graph::sync(
-                        &account.name,
-                        token,
-                        cache,
-                        limit,
-                        report,
-                        progress,
-                    )),
-                }
+                Ok(Credential::AccessToken(token))
             }
         }
+    }
+
+    /// After a failure: the token may be what failed (revoked, or refused by the server), so the
+    /// next login asks for a new one. A keyring that failed is opened again, in case its service
+    /// restarted.
+    pub fn forget(&mut self, account: &str) {
+        self.tokens.forget(account);
+        self.keyring = None;
     }
 }
 
@@ -198,16 +245,10 @@ fn refresh(
     settings: &OAuthSettings,
     warnings: &mut Vec<String>,
 ) -> Result<Refreshed> {
-    let (client_secret, refresh_token) = secret::oauth_secrets(&account.name, keyring)?;
-    let refreshed = runtime.block_on(account::refresh(
-        account,
-        settings,
-        client_secret.clone(),
-        &refresh_token,
-    ))?;
-    if let Some(rotated) = refreshed.rotated(&refresh_token)
-        && let Err(e) =
-            secret::save_refresh_token(&account.name, keyring, client_secret.as_ref(), rotated)
+    let saved = secret::oauth_secrets(&account.name, keyring)?;
+    let refreshed = runtime.block_on(account::refresh(account, settings, &saved))?;
+    if let Some(rotated) = refreshed.rotated(&saved.refresh_token)
+        && let Err(e) = secret::save_refresh_token(&account.name, keyring, &saved, rotated)
     {
         warnings.push(format!(
             "warning: {} sent a new refresh token, but it could not be saved ({e:#}); the saved \
@@ -234,7 +275,7 @@ pub struct Tokens {
 
 struct Cached {
     account: Account,
-    token: Secret,
+    token: AccessToken,
     issued_at: SystemTime,
     refresh_at: SystemTime,
 }
@@ -248,7 +289,7 @@ impl Tokens {
         account: &Account,
         now: SystemTime,
         refresh: impl FnOnce() -> Result<Refreshed>,
-    ) -> Result<&Secret> {
+    ) -> Result<&AccessToken> {
         let fresh = self
             .by_account
             .get(&account.name)
@@ -266,7 +307,10 @@ impl Tokens {
                 account.name.clone(),
                 Cached {
                     account: account.clone(),
-                    token: refreshed.access_token,
+                    token: AccessToken {
+                        secret: refreshed.access_token,
+                        grant: refreshed.grant,
+                    },
                     issued_at: now,
                     refresh_at,
                 },
@@ -346,6 +390,7 @@ mod tests {
     fn answer(n: u32, expires_in: Option<u64>) -> Result<Refreshed> {
         Ok(Refreshed {
             access_token: Secret::new(format!("token-{n}")),
+            grant: MailGrant::ReadWrite,
             refresh_token: None,
             expires_in: expires_in.map(Duration::from_secs),
         })
