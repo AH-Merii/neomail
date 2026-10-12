@@ -24,7 +24,8 @@ cargo install --locked --git https://github.com/AH-Merii/neomail nmail
 
 Or download a build of the latest `main` from the
 [edge pre-release](https://github.com/AH-Merii/neomail/releases/tag/edge) (Linux x86_64, a
-static binary that needs no particular glibc, and macOS on Apple silicon), unpack it, and put
+static binary that needs no particular glibc, and, when its build passed, macOS on Apple
+silicon), unpack it, and put
 `nmail` on your `PATH`. Edge is rebuilt on every merge, so expect changes. Each tarball carries
 the licences of the crates built into it in `THIRD-PARTY-LICENSES`.
 

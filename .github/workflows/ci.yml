@@ -27,7 +27,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Linux first (DEC-2026-10-12-linux-first): a macOS failure shows on its own job, but the run
     # stays green and the jobs that need this one still run.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    continue-on-error: ${{ startsWith(matrix.os, 'macos') }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -52,8 +52,8 @@ jobs:
 
   # Runs on pull requests too, so a dependency that breaks the static musl link fails before it
   # merges. The macOS build may fail without blocking anything (Linux first), and a failing leg
-  # with continue-on-error does not cancel the other. Only publish-edge, on main, uploads to the
-  # release.
+  # with continue-on-error does not cancel the other. The macOS build is published even when the
+  # macOS check failed: edge only, Linux first. Only publish-edge, on main, uploads to the release.
   build-edge:
     name: Build edge (${{ matrix.target }})
     needs: [check, msrv]
@@ -66,7 +66,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    continue-on-error: ${{ startsWith(matrix.os, 'macos') }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -140,8 +140,14 @@ jobs:
       # asset before it uploads the new one. The first publish must push the tag before creating
       # the release; if it is cancelled, the next run takes whichever branch applies.
       - name: Publish the edge pre-release
+        # bash -eo pipefail, so a failing `gh release view` in the asset loop fails the step.
+        shell: bash
         run: |
           notes="Rolling build of main at ${GITHUB_SHA} ($(date -u +%Y-%m-%dT%H:%MZ)). Replaced on every push to main; expect breaking changes."
+          if [ ! -e dist/nmail-aarch64-apple-darwin.tar.gz ]; then
+            notes="$notes No macOS build for this commit: it failed, which does not block Linux (Linux first)."
+            echo "::warning::the macOS edge build is missing; publishing Linux only"
+          fi
           if gh release view edge >/dev/null 2>&1; then
             gh release upload edge dist/*.tar.gz --clobber
             # --clobber only replaces assets of the same name, so drop any this build did not
