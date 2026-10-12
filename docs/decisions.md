@@ -181,6 +181,20 @@ the new entry.
   TUI keys, CLI commands, scripts and agents; `--json` everywhere; documented exit codes; an event
   stream.
 - **Easy scripting and scheduled tasks.**
+- **The CLI for people and pipes** ([DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux)):
+  - First run: bare `neomail` with no config prints a few start lines and a guide URL, and never
+    prompts. Every "no config" message names the next command.
+  - Setup is `neomail account add`, the in-app wizard: a provider menu on a terminal, a flag for
+    every prompt, `--no-input` for scripts, and a read-only login before the config is written
+    (`--no-check` skips it). `neomail account list` and `neomail config path|check` show and check
+    the config. No server autodiscovery for now.
+  - Output: human on a terminal; plain TSV (one record per line, id first, no truncation or
+    colour) when stdout is not a terminal or with `--plain`; `--json` and `--jsonl` for data.
+    stdout carries only results; prompts, progress and errors go to stderr. A broken pipe exits 0
+    silently.
+  - Colour only on a terminal, from the 16 ANSI colours so the terminal theme picks the shades,
+    following `--color auto|always|never`, NO_COLOR (which removes all styling) and CLICOLOR.
+    Colour never carries meaning alone and never reaches `--json`, `--jsonl` or plain output.
 - **Easy to extend** with new functionality and UI later.
 - **Agentically customizable, like Pi** (Mario Zechner's agent harness): agents can extend and
   customize neomail themselves (extensions, docs written for agents, hot reload).
@@ -583,3 +597,19 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Ruling:** the "Clear, simple installation" bullet under
   [Project and delivery](#project-and-delivery). Edge gets a `SHA256SUMS` asset, which the
   installer checks. Homebrew and the AUR wait.
+
+### <a id="dec-2026-10-12-cli-ux"></a>DEC-2026-10-12-cli-ux: first run, setup and output for people and pipes
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-12 (f679d889:1537).
+- **Context:** the owner asked how a new user configures neomail, where colour makes sense, and
+  whether output can be piped to tools like fzf. A review found no onboarding, CLI colour or
+  piping contract in the decisions or the roadmap: a new user gets help text and exit 2, accounts
+  other than Gmail are written by hand, and `list` is an 80-column format that hides text past
+  column 80 from fzf.
+- **Owner's words:** chose "New slices 4 and 5 (Recommended)", "Print start lines only
+  (Recommended)", "Auto plain TSV in pipes (Recommended)" and, for the rest of the
+  recommendations, "Accept all (Recommended)".
+- **Ruling:** "The CLI for people and pipes" under
+  [CLI, scripting, agents, extensibility](#cli-scripting-agents-extensibility). The roadmap gets
+  two CLI slices before Outlook: 4, "First run and setup", and 5, "Output for people and pipes".
+  The TUI (slice 19) opens its add-account screen when there are no accounts.
