@@ -666,14 +666,24 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 
 ### <a id="dec-2026-10-12-daemon-notifications"></a>DEC-2026-10-12-daemon-notifications: desktop notifications and more of Linux
 
-- **Status:** recorded. **Source:** owner, chat, 2026-10-12 (f679d889:4275, answers at
-  f679d889:4334).
+- **Status:** recorded. **Source:** owner, chat, 2026-10-12 (f679d889:4275 and f679d889:4278,
+  answers at f679d889:4334).
 - **Context:** the owner asked how `neomail daemon` handles notifications, whether it can use
   system notifications, and whether it works on different Linux systems, Linux mattering more.
   Part 1 of slice 7 only logs. Edge builds are x86_64 Linux and Apple Silicon only, and
   docs/daemon.md covers systemd only.
-- **Owner's words:** chose "Right after 7a (Recommended)" for when the daemon gets desktop
-  notifications, "Sender and subject (Recommended)" for what a notification shows, and "ARM64
-  build + non-systemd docs (Recommended)" for broadening Linux coverage.
+- **Owner's words:**
+  - To "When should the daemon get desktop notifications for new mail?" chose "Right after 7a
+    (Recommended)": "A small part of its own next: freedesktop notifications over D-Bus (zbus is
+    already in the tree), on when a notification service exists, with a flag to turn them off.
+    Push (IDLE) then makes them near-instant."
+  - To "What should a new-mail notification show?" chose "Sender and subject (Recommended)": "One
+    notification per account per round: up to 3 messages as 'Sender: Subject', then 'and N
+    more'. Most useful, but visible on a lock screen or a shared screen."
+  - To "Broaden Linux coverage now?" chose "ARM64 build + non-systemd docs (Recommended)": "Add an
+    aarch64-unknown-linux-musl edge build (Raspberry Pi, ARM laptops) and OpenRC/runit examples
+    in docs/daemon.md."
 - **Ruling:** "Desktop notifications for new mail" under [UX](#ux), built as the next part of
-  slice 7, before push. "More of Linux" under [Platforms](#platforms).
+  slice 7, before push. "More of Linux" under [Platforms](#platforms), done now, alongside that
+  part. Claude's reading: the WSL bullet under Platforms still holds on WSL, where notifications
+  go through Windows interop; this ruling covers Linux desktops.
