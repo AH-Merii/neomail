@@ -230,8 +230,9 @@ neomail completions fish > ~/.config/fish/completions/neomail.fish
 changed. `neomail sync` still works alongside it. On Linux it shows a desktop notification when
 new mail arrives, naming the sender and subject (`--no-notify` turns them off). IMAP accounts
 (Gmail and Proton included) get push through IDLE: their new mail is synced seconds after it
-arrives. To run it as a systemd, OpenRC or runit user service, and for what its output means, see
-[docs/daemon.md](docs/daemon.md).
+arrives. Outlook accounts are checked every minute through Graph's delta query, since Graph has no
+push for a program on your computer. To run it as a systemd, OpenRC or runit user service, and for
+what its output means, see [docs/daemon.md](docs/daemon.md).
 
 How it fits together: [docs/architecture.md](docs/architecture.md).
 

@@ -1,6 +1,6 @@
 //! Push in the daemon: account wakes and their settle time, the watchers' start limit and push
-//! lines, a resume and a stop. The watchers are fakes that send scripted events; time runs on
-//! tokio's paused clock.
+//! lines, a resume and a stop; and the Outlook accounts' checks between the rounds. The watchers
+//! are fakes that send scripted events; time runs on tokio's paused clock.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -98,10 +98,11 @@ fn fakes(
     }
 }
 
-/// A successful sync that got `new_ids` and hands over its login.
+/// A successful sync that got `new_ids` and, over IMAP, hands over its login.
 fn synced(account: &Account, new_ids: &[i64]) -> Synced {
-    let Server::Imap(imap) = &account.server else {
-        unreachable!("the test accounts are IMAP accounts");
+    let watch = match &account.server {
+        Server::Imap(imap) => Some(WatchLogin::new(imap, Login::Password("secret"))),
+        Server::Graph { .. } => None,
     };
     Synced {
         report: Ok(SyncReport {
@@ -111,7 +112,7 @@ fn synced(account: &Account, new_ids: &[i64]) -> Synced {
         }),
         partial: SyncReport::default(),
         warnings: Vec::new(),
-        watch: Some(WatchLogin::new(imap, Login::Password("secret"))),
+        watch,
     }
 }
 
@@ -121,6 +122,7 @@ struct Run {
     syncs: Vec<(u64, String)>,
     /// Each notification as (second, summary).
     notified: Vec<(u64, String)>,
+    out: String,
     err: String,
     log: Log,
     /// The watchers alive at the stop, before it ended them.
@@ -141,6 +143,19 @@ fn daemon(
     until: u64,
     jump: impl Fn(Duration) -> Duration,
     script: impl Fn(&str, usize) -> Vec<Step>,
+    sync: impl FnMut(&Runtime, u64, &Account, &Log) -> Synced,
+) -> Run {
+    let all = accounts(&["work", "home"]);
+    daemon_with(&all, 300, until, jump, script, sync)
+}
+
+/// [`daemon`] for `all`, with rounds every `interval` seconds.
+fn daemon_with(
+    all: &[Account],
+    interval: u64,
+    until: u64,
+    jump: impl Fn(Duration) -> Duration,
+    script: impl Fn(&str, usize) -> Vec<Step>,
     mut sync: impl FnMut(&Runtime, u64, &Account, &Log) -> Synced,
 ) -> Run {
     let runtime = paused_runtime();
@@ -148,18 +163,18 @@ fn daemon(
     let t0 = now(&runtime);
     let log = Log::default();
     let (mut push, events) = Push::new(runtime.handle().clone(), fakes(log.clone(), t0, script));
+    let interval = Duration::from_secs(interval);
+    push.check_between(interval);
     let mut wakes = Wakes::new(events);
-    let all = accounts(&["work", "home"]);
     let mut reports = Reports::default();
     let mut p = printer();
     let (mut syncs, mut notified) = (Vec::new(), Vec::new());
-    let interval = Duration::from_secs(300);
     let wall = wall_clock(t0, jump);
     run_rounds(&runtime, interval, &stop, wall, &mut wakes, |wake| {
         let secs = (now(&runtime) - t0).as_secs();
         let new_mail = on_wake(
             wake,
-            &all,
+            all,
             unlocked,
             &stop,
             &mut push,
@@ -196,6 +211,7 @@ fn daemon(
     Run {
         syncs,
         notified,
+        out: String::from_utf8(p.out).unwrap(),
         err: String::from_utf8(p.err).unwrap(),
         log,
         alive,
@@ -342,4 +358,126 @@ fn a_resumed_round_replaces_every_watcher() {
     assert_eq!(run.syncs("work"), [0, 30]);
     assert_eq!(run.log.starts("work"), [0, 30]);
     assert_eq!(run.alive, 1, "the replaced watcher ended");
+}
+
+/// "work" over IMAP and "mail", an Outlook account.
+fn work_and_outlook() -> Vec<Account> {
+    let mut all = accounts(&["work"]);
+    let outlook = "[[accounts]]\nname = \"mail\"\nusername = \"you@outlook.example\"\n\
+                   oauth = { provider = \"microsoft\", \
+                   client_id = \"00000000-0000-0000-0000-000000000000\" }\n";
+    all.extend(Config::parse(outlook).unwrap().accounts);
+    all
+}
+
+/// "work"'s server has no IDLE, so only the rounds sync it.
+fn no_idle(_: &str, _: usize) -> Vec<Step> {
+    vec![Send(Kind::NoIdle), Send(Kind::Ended)]
+}
+
+/// The check at 120 s takes 10 s, so the next ones come a minute after it ends; the check at
+/// 190 s finds new mail. The round at 300 s keeps its time.
+#[test]
+fn an_outlook_account_is_checked_a_minute_after_each_sync_between_rounds_and_notifies() {
+    let all = work_and_outlook();
+    let run = daemon_with(&all, 300, 300, no_jump, no_idle, |runtime, secs, a, _| {
+        if a.name == "mail" && secs == 120 {
+            runtime.block_on(async { tokio::time::sleep(Duration::from_secs(10)).await });
+        }
+        let new: &[i64] = if a.name == "mail" && secs == 190 {
+            &[7]
+        } else {
+            &[]
+        };
+        synced(a, new)
+    });
+    assert_eq!(run.syncs("mail"), [0, 60, 120, 190, 250, 300]);
+    // An IMAP account without push keeps to the rounds.
+    assert_eq!(run.syncs("work"), [0, 300]);
+    assert_eq!(run.notified, [(190, "mail: 1 new message".to_owned())]);
+    // Said once, after the first sync; "work"'s watcher answers after the round.
+    assert_eq!(
+        run.err,
+        "12:00:00 neomail daemon: mail: checked every minute (Outlook can't push to this computer)\n\
+         12:00:00 neomail daemon: work: push off (the server has no IDLE)\n"
+    );
+}
+
+/// A failing check is said once, and the account is still checked every minute after it.
+#[test]
+fn a_failing_check_follows_the_repeated_error_rule_and_never_stacks() {
+    let all = work_and_outlook();
+    let run = daemon_with(&all, 300, 240, no_jump, no_idle, |runtime, secs, a, _| {
+        if a.name != "mail" || !(60..=150).contains(&secs) {
+            return synced(a, &[]);
+        }
+        // Graph answers after 30 s, with an error, at 60 s and 150 s.
+        runtime.block_on(async { tokio::time::sleep(Duration::from_secs(30)).await });
+        Synced {
+            report: Err(anyhow::anyhow!("Graph said no")),
+            partial: SyncReport::default(),
+            warnings: Vec::new(),
+            watch: None,
+        }
+    });
+    assert_eq!(run.syncs("mail"), [0, 60, 150, 240]);
+    let mail: Vec<_> = run.err.lines().filter(|l| l.contains("Graph")).collect();
+    assert_eq!(mail, ["12:00:00 neomail: mail: Graph said no"]);
+    // The success after the failures is printed even with nothing new.
+    assert_eq!(run.out.matches("mail: 0 new").count(), 2, "{}", run.out);
+}
+
+#[test]
+fn with_rounds_a_minute_or_less_apart_the_rounds_alone_check_outlook() {
+    let all = work_and_outlook();
+    let run = daemon_with(&all, 30, 90, no_jump, no_idle, |_, _, a, _| synced(a, &[]));
+    assert_eq!(run.syncs("mail"), [0, 30, 60, 90]);
+    assert!(!run.err.contains("checked"), "{}", run.err);
+}
+
+/// A stop after the check at 60 s ends the daemon: nothing is checked after it.
+#[test]
+fn a_stop_ends_the_checks() {
+    let all = work_and_outlook();
+    let run = daemon_with(&all, 300, 60, no_jump, no_idle, |_, _, a, _| synced(a, &[]));
+    assert_eq!(run.syncs("mail"), [0, 60]);
+    assert_eq!(run.syncs("work"), [0]);
+}
+
+/// The machine sleeps for two hours at 20 s. The round at 30 s, due on the wall clock, syncs
+/// the Outlook account, and its next check is a minute after that round.
+#[test]
+fn a_resumed_round_checks_outlook_and_the_next_check_follows_it() {
+    let suspended = |elapsed: Duration| {
+        if elapsed >= Duration::from_secs(20) {
+            Duration::from_secs(2 * 3600)
+        } else {
+            Duration::ZERO
+        }
+    };
+    let all = work_and_outlook();
+    let run = daemon_with(&all, 300, 90, suspended, no_idle, |_, _, a, _| {
+        synced(a, &[])
+    });
+    assert_eq!(run.syncs("mail"), [0, 30, 90]);
+    assert_eq!(run.syncs("work"), [0, 30]);
+}
+
+/// The check at 240 s takes 70 s, past the round's time: the round starts when it ends, and
+/// "work" takes 20 s in it. The next check is a minute after the round synced "mail" (390 s), not
+/// a minute after the long check (370 s), whose schedule was still unread.
+#[test]
+fn a_check_that_runs_into_a_round_is_followed_a_minute_after_the_rounds_sync() {
+    let all = work_and_outlook();
+    let run = daemon_with(&all, 300, 390, no_jump, no_idle, |runtime, secs, a, _| {
+        let long = match (a.name.as_str(), secs) {
+            ("mail", 240) => 70,
+            ("work", 300..) => 20,
+            _ => 0,
+        };
+        runtime.block_on(async { tokio::time::sleep(Duration::from_secs(long)).await });
+        synced(a, &[])
+    });
+    assert_eq!(run.syncs("mail"), [0, 60, 120, 180, 240, 310, 390]);
+    assert_eq!(run.syncs("work"), [0, 310]);
 }

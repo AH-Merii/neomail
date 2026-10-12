@@ -5,6 +5,11 @@
 //! A watcher runs as a task on the daemon's runtime. It logs in with what the account's last
 //! successful sync used ([`WatchLogin`], handed over outside the runtime, so it never reads the
 //! keyring or runs a `password_command`) and drops that secret once it has logged in.
+//!
+//! Outlook (Graph) accounts get no watcher: Graph sends change notifications only to a public
+//! HTTPS endpoint, Azure Event Hubs or Event Grid, none of which a local daemon has.
+//! [`Push::checked`] schedules them a check ([`Kind::CheckAt`]) a minute after each sync instead,
+//! which the delta query makes one request when nothing changed.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -16,13 +21,16 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
-use crate::config::Account;
+use crate::config::{Account, Server};
 use crate::daemon::Line;
 use crate::oauth::Secret;
 
 /// The shortest time between two watcher starts for one account, so a server that drops every
 /// IDLE connection cannot make a loop of connections and syncs.
 pub const START_EVERY: Duration = Duration::from_secs(60);
+
+/// How long after an Outlook account's sync its next check is due, between the rounds.
+pub const CHECK_EVERY: Duration = Duration::from_secs(60);
 
 /// What an account's last successful sync logged in with: where, and the password or access token.
 /// `Debug` is redacted.
@@ -79,6 +87,9 @@ pub enum Kind {
     /// Sync the account at this time, without a settle time: sent by [`Push::start`] itself when
     /// [`START_EVERY`] held a watcher back, so that sync starts it once the minute is up.
     WakeAt(Instant),
+    /// Check the account (sync it) at this time, without a settle time: sent by [`Push::checked`]
+    /// after each sync of an account without push. It replaces the account's earlier check.
+    CheckAt(Instant),
     /// The first IDLE was accepted: push is on.
     On,
     /// The server has no IDLE in its CAPABILITY: the account keeps polling.
@@ -160,6 +171,24 @@ enum State {
     /// With the server that has no IDLE: another server gets a watcher again.
     NoIdle(ImapConfig),
     Failing(String),
+    /// An Outlook account, checked every [`CHECK_EVERY`].
+    Checked,
+}
+
+impl State {
+    /// What is printed when an account's push state becomes this one.
+    fn line(&self, account: &str) -> Line {
+        match self {
+            State::On => Line::Error(format!("neomail daemon: {account}: push on")),
+            State::NoIdle(_) => Line::Error(format!(
+                "neomail daemon: {account}: push off (the server has no IDLE)"
+            )),
+            State::Failing(why) => Line::Error(format!("neomail: {account}: push failing: {why}")),
+            State::Checked => Line::Error(format!(
+                "neomail daemon: {account}: checked every minute (Outlook can't push to this computer)"
+            )),
+        }
+    }
 }
 
 struct Running {
@@ -178,6 +207,8 @@ pub struct Push<W> {
     started: HashMap<String, Instant>,
     state: HashMap<String, State>,
     generation: u64,
+    /// Whether accounts without push are checked between the rounds.
+    checking: bool,
 }
 
 impl<W, F> Push<W>
@@ -196,6 +227,7 @@ where
             started: HashMap::new(),
             state: HashMap::new(),
             generation: 0,
+            checking: false,
         };
         (push, rx)
     }
@@ -249,15 +281,41 @@ where
             },
         );
     }
+}
+
+impl<W> Push<W> {
+    /// Checks accounts without push every [`CHECK_EVERY`] between rounds `interval` apart, unless
+    /// the rounds come at least that often anyway.
+    pub fn check_between(&mut self, interval: Duration) {
+        self.checking = interval > CHECK_EVERY;
+    }
+
+    /// After an Outlook account's sync, failed or skipped included: its next check, [`CHECK_EVERY`]
+    /// from now, so a slow or failing Graph never stacks checks. The first time, the line that
+    /// says the account is checked. Nothing for an IMAP account, or when the rounds are enough.
+    pub fn checked(&mut self, account: &Account) -> Option<Line> {
+        if !self.checking || !matches!(account.server, Server::Graph { .. }) {
+            return None;
+        }
+        // The daemon is gone when this fails: nobody is left to sync.
+        let _ = self.tx.send(Event {
+            account: account.name.clone(),
+            generation: self.generation,
+            kind: Kind::CheckAt(self.now() + CHECK_EVERY),
+        });
+        if self.state.get(&account.name) == Some(&State::Checked) {
+            return None;
+        }
+        self.state.insert(account.name.clone(), State::Checked);
+        Some(State::Checked.line(&account.name))
+    }
 
     /// The runtime's clock (paused in the tests), read outside `block_on`.
     fn now(&self) -> Instant {
         let _entered = self.runtime.enter();
         Instant::now()
     }
-}
 
-impl<W> Push<W> {
     /// A watcher's event other than [`Kind::Wake`]: the line to print when the account's push
     /// state changed. A failure is said again only when it differs from the last one. Events of
     /// a watcher that was replaced or ended are ignored.
@@ -271,7 +329,7 @@ impl<W> Push<W> {
             return None;
         }
         let state = match event.kind {
-            Kind::Wake | Kind::WakeAt(_) => return None,
+            Kind::Wake | Kind::WakeAt(_) | Kind::CheckAt(_) => return None,
             Kind::Ended => {
                 self.running.remove(&account);
                 return None;
@@ -283,13 +341,7 @@ impl<W> Push<W> {
         if self.state.get(&account) == Some(&state) {
             return None;
         }
-        let line = match &state {
-            State::On => Line::Error(format!("neomail daemon: {account}: push on")),
-            State::NoIdle(_) => Line::Error(format!(
-                "neomail daemon: {account}: push off (the server has no IDLE)"
-            )),
-            State::Failing(why) => Line::Error(format!("neomail: {account}: push failing: {why}")),
-        };
+        let line = state.line(&account);
         self.state.insert(account, state);
         Some(line)
     }

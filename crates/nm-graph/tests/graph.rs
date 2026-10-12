@@ -8,7 +8,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use nm_core::{Flags, IdSource, RemoteId};
+use nm_core::{Cache, Cursor, Flags, IdChange, IdSource, RemoteId, sync_inbox_by_id};
 use nm_graph::{GraphError, GraphSource, MAX_JSON, MAX_MIME, Reply, Transport, TransportError};
 use serde_json::{Value, json};
 
@@ -96,7 +96,6 @@ impl FakeGraph {
                 &json!({"id": "inbox", "totalItemCount": self.messages.len()}),
             );
         }
-        assert_eq!(path, "/me/mailFolders/inbox/messages", "{url}");
         let param = |name: &str| {
             query
                 .split('&')
@@ -107,6 +106,25 @@ impl FakeGraph {
             let t = f.strip_prefix("receivedDateTime ge ").unwrap();
             DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc)
         });
+        if path == "/me/mailFolders/inbox/messages/delta" {
+            // A new round holds every message its filter does; one from a stored link, nothing
+            // changed. Each delta link is new.
+            let value: Vec<Value> = if query.starts_with("$deltatoken=") {
+                Vec::new()
+            } else {
+                self.messages
+                    .iter()
+                    .filter(|m| since.is_none_or(|s| m.received.is_some_and(|r| r >= s)))
+                    .map(|m| json!({"id": m.id, "isRead": m.read, "receivedDateTime": m.received}))
+                    .collect()
+            };
+            let token = self.seen.borrow().len();
+            return json_reply(
+                200,
+                &json!({"@odata.deltaLink": format!("{API}{path}?$deltatoken=t{token}"), "value": value}),
+            );
+        }
+        assert_eq!(path, "/me/mailFolders/inbox/messages", "{url}");
         assert_eq!(param("$orderby").as_deref(), Some("receivedDateTime desc"));
         let top: usize = param("$top").unwrap().parse().unwrap();
         assert!((1..=1000).contains(&top), "$top {top}");
@@ -427,4 +445,326 @@ async fn the_fake_graph_conforms() {
     fake.page_size = 4;
     let mut s = source(fake);
     nm_core::conformance::id_source(&mut s).await.unwrap();
+}
+
+// Delta rounds (https://learn.microsoft.com/en-us/graph/api/message-delta), from scripted pages.
+
+const DELTA: &str = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta";
+
+fn cursor(link: &str) -> Cursor {
+    Cursor::new(link).unwrap()
+}
+
+fn present(n: u32, read: Option<bool>, received: Option<DateTime<Utc>>) -> IdChange {
+    IdChange::Present {
+        id: RemoteId::new(id(n)).unwrap(),
+        flags: read.map(|r| {
+            if r {
+                Flags::new([Flags::SEEN])
+            } else {
+                Flags::default()
+            }
+        }),
+        received,
+    }
+}
+
+fn assert_prefer_on_every_request(fake: &FakeGraph) {
+    let seen = fake.seen.borrow();
+    assert!(!seen.is_empty());
+    for s in seen.iter() {
+        assert!(
+            s.headers
+                .contains(&("Prefer".to_owned(), "IdType=\"ImmutableId\"".to_owned())),
+            "{}",
+            s.url
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_first_round_follows_next_links_to_the_delta_link() {
+    let next = format!("{DELTA}?$skiptoken=page2");
+    let done = format!("{DELTA}?$deltatoken=round1");
+    let fake = FakeGraph::new([]).script([
+        json_reply(
+            200,
+            &json!({"@odata.nextLink": next, "value": [
+                {"id": id(1), "isRead": true, "receivedDateTime": "2026-09-21T13:47:00Z"},
+                {"id": id(2), "isRead": false, "receivedDateTime": "2026-09-21T13:48:00Z"},
+            ]}),
+        ),
+        json_reply(
+            200,
+            &json!({"@odata.deltaLink": done, "value": [
+                {"id": id(3), "isRead": false, "receivedDateTime": "2026-09-21T13:49:00Z"},
+            ]}),
+        ),
+    ]);
+    let mut s = source(fake);
+    let from = DateTime::parse_from_rfc3339("2026-09-21T13:46:40Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let round = s.start_changes(from).await.unwrap().unwrap();
+    let t = |m: u32| {
+        DateTime::parse_from_rfc3339(&format!("2026-09-21T13:{m}:00Z"))
+            .unwrap()
+            .with_timezone(&Utc)
+    };
+    assert_eq!(
+        round.changes,
+        [
+            present(1, Some(true), Some(t(47))),
+            present(2, Some(false), Some(t(48))),
+            present(3, Some(false), Some(t(49))),
+        ]
+    );
+    assert_eq!(round.cursor, cursor(&done));
+    // Query options only in the first request; the next link is followed verbatim.
+    assert_eq!(
+        transport(&s).urls(),
+        [
+            format!(
+                "{DELTA}?$filter=receivedDateTime%20ge%202026-09-21T13:46:40Z\
+                 &$select=id,isRead,receivedDateTime"
+            ),
+            next
+        ]
+    );
+    assert_prefer_on_every_request(transport(&s));
+}
+
+#[tokio::test]
+async fn a_later_round_reports_new_read_removed_and_replayed_changes_in_one_request() {
+    let start = format!("{DELTA}?$deltatoken=round1");
+    let done = format!("{DELTA}?$deltatoken=round2");
+    let fake = FakeGraph::new([]).script([json_reply(
+        200,
+        &json!({"@odata.deltaLink": done, "value": [
+            {"id": id(4), "isRead": false, "receivedDateTime": "2026-09-21T13:50:00Z"},
+            // A read change names only what changed; Graph's own example sends a string.
+            {"id": id(1), "isRead": "false"},
+            {"id": id(2), "@removed": {"reason": "deleted"}},
+            {"id": id(4), "isRead": false, "receivedDateTime": "2026-09-21T13:50:00Z"},
+        ]}),
+    )]);
+    let mut s = source(fake);
+    let round = s.changes_since(&cursor(&start)).await.unwrap().unwrap();
+    let t4 = DateTime::parse_from_rfc3339("2026-09-21T13:50:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(
+        round.changes,
+        [
+            present(4, Some(false), Some(t4)),
+            present(1, Some(false), None),
+            IdChange::Removed(RemoteId::new(id(2)).unwrap()),
+            present(4, Some(false), Some(t4)),
+        ]
+    );
+    assert_eq!(round.cursor, cursor(&done));
+    assert_eq!(transport(&s).urls(), [start]);
+    assert_prefer_on_every_request(transport(&s));
+}
+
+#[tokio::test]
+async fn a_reset_or_expired_round_starts_over() {
+    let start = format!("{DELTA}?$deltatoken=old");
+    let next = format!("{DELTA}?$skiptoken=page2");
+    let first_page = || json_reply(200, &json!({"@odata.nextLink": next, "value": []}));
+    let gone = || json_reply(410, &json!({"error": {"code": "resyncRequired"}}));
+    let expired = |status| json_reply(status, &json!({"error": {"code": "SyncStateNotFound"}}));
+    // Graph answered a garbage $deltatoken so in the live check.
+    let bad = || json_reply(400, &json!({"error": {"code": "BadRequest"}}));
+    for (name, script) in [
+        ("410 Gone", vec![gone()]),
+        ("syncStateNotFound 400", vec![expired(400)]),
+        ("syncStateNotFound 404", vec![expired(404)]),
+        ("410 on a later page", vec![first_page(), gone()]),
+        ("400 BadRequest on a stored link", vec![bad()]),
+        ("400 on a later page", vec![first_page(), bad()]),
+    ] {
+        let requests = script.len();
+        let mut s = source(FakeGraph::new([]).script(script));
+        let round = s.changes_since(&cursor(&start)).await.unwrap();
+        assert!(round.is_none(), "{name}");
+        assert_eq!(
+            transport(&s).urls().len(),
+            requests,
+            "{name}: nothing more sent"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_400_on_a_new_round_is_an_error_not_a_start_over() {
+    // Starting over would send the same request again.
+    let mut s = source(
+        FakeGraph::new([]).script([json_reply(400, &json!({"error": {"code": "BadRequest"}}))]),
+    );
+    let e = s.start_changes(at(0)).await.unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "Microsoft Graph answered HTTP 400 (BadRequest)"
+    );
+}
+
+#[tokio::test]
+async fn a_new_round_that_reaches_graphs_5000_cap_is_not_used() {
+    // With $filter Graph returns at most 5,000 messages: such a round may have left cached
+    // ones out, and their changes would never come.
+    let round_of = |count: u32| {
+        let value: Vec<Value> = (0..count)
+            .map(|n| json!({"id": id(n), "isRead": false, "receivedDateTime": at(n)}))
+            .collect();
+        json_reply(
+            200,
+            &json!({"@odata.deltaLink": format!("{DELTA}?$deltatoken=r"), "value": value}),
+        )
+    };
+    let mut s = source(FakeGraph::new([]).script([round_of(5000)]));
+    assert!(s.start_changes(at(0)).await.unwrap().is_none());
+    let mut s = source(FakeGraph::new([]).script([round_of(4999)]));
+    let round = s.start_changes(at(0)).await.unwrap().unwrap();
+    assert_eq!(round.changes.len(), 4999);
+
+    // The round stops at the page that reaches the cap, without paging through the rest.
+    let page = |from: u32, count: u32, next: &str| {
+        let value: Vec<Value> = (from..from + count)
+            .map(|n| json!({"id": id(n), "isRead": false, "receivedDateTime": at(n)}))
+            .collect();
+        json_reply(200, &json!({"@odata.nextLink": next, "value": value}))
+    };
+    let (page2, page3) = (
+        format!("{DELTA}?$skiptoken=p2"),
+        format!("{DELTA}?$skiptoken=p3"),
+    );
+    let mut s =
+        source(FakeGraph::new([]).script([page(0, 3000, &page2), page(3000, 2000, &page3)]));
+    assert!(s.start_changes(at(0)).await.unwrap().is_none());
+    assert_eq!(transport(&s).urls().len(), 2);
+    assert_eq!(transport(&s).urls()[1], page2);
+
+    // A stored link carries the same filter: a later round that reaches the cap starts over.
+    let stored = format!("{DELTA}?$deltatoken=old");
+    let mut s =
+        source(FakeGraph::new([]).script([page(0, 3000, &page2), page(3000, 2000, &page3)]));
+    assert!(s.changes_since(&cursor(&stored)).await.unwrap().is_none());
+    assert_eq!(transport(&s).urls(), [stored, page2]);
+}
+
+#[tokio::test]
+async fn a_sync_whose_listing_reaches_the_cap_asks_for_no_round() {
+    // The round would reach Graph's 5,000 and be refused: the listing alone shows that.
+    let mut s = source(FakeGraph::new(0..5000));
+    let mut cache = Cache::open_in_memory().unwrap();
+    let r = sync_inbox_by_id(&mut s, &mut cache, "outlook", n(5000))
+        .await
+        .unwrap();
+    assert_eq!(r.new, 5000);
+    assert!(!transport(&s).urls().iter().any(|u| u.contains("/delta")));
+    let mailbox = cache.mailbox("outlook", "INBOX").unwrap().unwrap().id;
+    assert!(cache.cursor(mailbox).unwrap().is_none());
+    let mut s = source(FakeGraph::new(0..4999));
+    let mut cache = Cache::open_in_memory().unwrap();
+    sync_inbox_by_id(&mut s, &mut cache, "outlook", n(5000))
+        .await
+        .unwrap();
+    assert!(transport(&s).urls().iter().any(|u| u.contains("/delta")));
+}
+
+#[tokio::test]
+async fn after_graph_refuses_a_stored_link_with_400_the_sync_lists_and_stores_a_new_one() {
+    let mut s = source(FakeGraph::new(1..=3));
+    let mut cache = Cache::open_in_memory().unwrap();
+    sync_inbox_by_id(&mut s, &mut cache, "outlook", n(10))
+        .await
+        .unwrap();
+    let mailbox = cache.mailbox("outlook", "INBOX").unwrap().unwrap().id;
+    let old = cache.cursor(mailbox).unwrap().unwrap();
+
+    transport(&s)
+        .script
+        .borrow_mut()
+        .push_back(json_reply(400, &json!({"error": {"code": "BadRequest"}})));
+    let before = transport(&s).urls().len();
+    let r = sync_inbox_by_id(&mut s, &mut cache, "outlook", n(10))
+        .await
+        .unwrap();
+    assert_eq!((r.new, r.updated, r.removed), (0, 0, 0));
+    let urls = transport(&s).urls()[before..].to_vec();
+    let since = "$filter=receivedDateTime%20ge%202026-09-21T14:14:20Z";
+    assert_eq!(
+        urls,
+        [
+            old.as_str().to_owned(),
+            format!("{API}/me/mailFolders/inbox/messages?{since}&{SELECT}&$top=1000"),
+            format!("{DELTA}?{since}&$select=id,isRead,receivedDateTime"),
+        ]
+    );
+    let new = cache.cursor(mailbox).unwrap().unwrap();
+    assert_ne!(new, old);
+
+    // The new link is used: one request.
+    sync_inbox_by_id(&mut s, &mut cache, "outlook", n(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        transport(&s).urls()[before + 3..],
+        [new.as_str().to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn other_errors_fail_without_the_body_or_the_link() {
+    let start = format!("{DELTA}?$deltatoken=s3cretish");
+    for (reply, want) in [
+        (
+            json_reply(
+                500,
+                &json!({"error": {"code": "ErrorInternal", "message": "s3cret"}}),
+            ),
+            "Microsoft Graph answered HTTP 500 (ErrorInternal)",
+        ),
+        (
+            json_reply(200, &json!({"value": []})),
+            "Microsoft Graph's answer is not the expected JSON",
+        ),
+    ] {
+        let mut s = source(FakeGraph::new([]).script([reply]));
+        let e = s.changes_since(&cursor(&start)).await.unwrap_err();
+        assert_eq!(e.to_string(), want);
+    }
+}
+
+#[tokio::test]
+async fn a_link_off_graph_is_refused() {
+    let start = format!("{DELTA}?$deltatoken=round1");
+    for (key, link) in [
+        (
+            "@odata.nextLink",
+            "https://graph.microsoft.com.evil.example/v1.0/x",
+        ),
+        (
+            "@odata.deltaLink",
+            "https://evil.example/https://graph.microsoft.com/",
+        ),
+        ("@odata.deltaLink", "http://graph.microsoft.com/v1.0/x"),
+    ] {
+        let mut page = json!({"value": []});
+        page[key] = json!(link);
+        let mut s = source(FakeGraph::new([]).script([json_reply(200, &page)]));
+        let e = s.changes_since(&cursor(&start)).await.unwrap_err();
+        assert!(matches!(e, GraphError::ForeignLink), "{key} {link}: {e}");
+        assert_eq!(
+            transport(&s).urls(),
+            std::slice::from_ref(&start),
+            "{link} is never fetched"
+        );
+    }
+    // A stored link off Graph is never sent: the round starts over instead.
+    let mut s = source(FakeGraph::new([]));
+    let stored = cursor("https://evil.example/v1.0/me/mailFolders/inbox/messages/delta");
+    assert!(s.changes_since(&stored).await.unwrap().is_none());
+    assert!(transport(&s).urls().is_empty());
 }

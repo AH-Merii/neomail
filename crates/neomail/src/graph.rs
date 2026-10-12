@@ -54,7 +54,9 @@ fn check_failed(e: GraphError) -> anyhow::Error {
     }
 }
 
-/// Syncs a Graph account's INBOX with `access_token`, filling `report` as it goes.
+/// Syncs a Graph account's INBOX with `access_token`, filling `report` as it goes. Once the
+/// cache holds a delta link, the sync asks Graph only for what changed since it
+/// (`nm_core::sync_inbox_by_id`).
 pub async fn sync(
     account: &str,
     access_token: &Secret,

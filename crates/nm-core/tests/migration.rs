@@ -289,3 +289,61 @@ fn a_v2_cache_is_migrated_with_its_mailboxes_synced() {
     // Reopening a migrated cache changes nothing.
     assert!(Cache::open(&path).is_ok());
 }
+
+/// The schema 3 tables, exactly as nm-core wrote them. Never edit: they stand for caches on disk.
+const V3_MAILBOX: &str = "
+CREATE TABLE mailbox (
+    id           INTEGER PRIMARY KEY,
+    account      TEXT    NOT NULL,
+    name         TEXT    NOT NULL,
+    -- NULL for a by-id mailbox, whose messages are keyed by remote_id instead of uid.
+    uid_validity INTEGER,
+    highest_uid  INTEGER NOT NULL DEFAULT 0,
+    -- By-id mailboxes only: the arrival time the next sync's window must reach back to.
+    seen_until   INTEGER,
+    -- 1 once a sync of this mailbox has completed. Until then its new messages are old mail of a
+    -- first sync (or a rebuild) that has not finished, not new mail.
+    synced       INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (account, name),
+    CHECK (uid_validity IS NULL OR seen_until IS NULL)
+);
+";
+
+#[test]
+fn a_v3_cache_is_migrated_without_cursors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.sqlite3");
+    let conn = Connection::open(&path).unwrap();
+    // Schema 3's message table and index are schema 2's.
+    let message = &V2_SCHEMA[V2_SCHEMA.find("CREATE TABLE message").unwrap()..];
+    conn.execute_batch(V3_MAILBOX).unwrap();
+    conn.execute_batch(message).unwrap();
+    conn.pragma_update(None, "user_version", 3).unwrap();
+    conn.execute_batch(
+        "INSERT INTO mailbox (id, account, name, uid_validity, highest_uid, seen_until, synced)
+             VALUES (1, 'work', 'INBOX', 7, 3, NULL, 1), (2, 'home', 'INBOX', NULL, 0, 1000, 1);
+         INSERT INTO message (mailbox_id, remote_id, flags, received, subject, raw)
+             VALUES (2, 'AAMk1=', '', 1000, 'one', x'00');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut cache = Cache::open(&path).unwrap();
+    let home = cache.mailbox("home", "INBOX").unwrap().unwrap();
+    assert!(home.synced);
+    assert_eq!(cache.cursor(home.id).unwrap(), None, "the next sync lists");
+    assert_eq!(cache.list(Some("home"), 10).unwrap().len(), 1);
+    let cursor = nm_core::Cursor::new("https://graph.microsoft.com/v1.0/x?$deltatoken=a").unwrap();
+    cache.set_cursor(home.id, Some(&cursor)).unwrap();
+    assert_eq!(cache.cursor(home.id).unwrap(), Some(cursor));
+    drop(cache);
+
+    assert_eq!(
+        user_version(&Connection::open(&path).unwrap()),
+        SCHEMA_VERSION
+    );
+    assert_eq!(SCHEMA_VERSION, 4);
+    // Reopening keeps the cursor.
+    let cache = Cache::open(&path).unwrap();
+    assert!(cache.cursor(home.id).unwrap().is_some());
+}

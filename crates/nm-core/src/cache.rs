@@ -8,14 +8,14 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::parse::{self, EmailAddress};
 use crate::types::{
-    FetchedMessage, Flags, IdListed, MessageId, RemoteId, Uid, UidFlags, UidValidity,
+    Cursor, FetchedMessage, Flags, IdListed, MessageId, RemoteId, Uid, UidFlags, UidValidity,
 };
 
 /// The schema this build writes. A cache with a newer version is refused, not guessed at; an
 /// older one is migrated by [`Cache::open`].
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
-/// The tables of schema 3, named `mailbox{suffix}` and `message{suffix}`: the migration from 1
+/// The tables of schema 4, named `mailbox{suffix}` and `message{suffix}`: the migration from 1
 /// creates them under temporary names first. `message` refers to `mailbox` by its final name.
 fn tables(suffix: &str) -> String {
     format!(
@@ -32,6 +32,9 @@ CREATE TABLE mailbox{suffix} (
     -- 1 once a sync of this mailbox has completed. Until then its new messages are old mail of a
     -- first sync (or a rebuild) that has not finished, not new mail.
     synced       INTEGER NOT NULL DEFAULT 0,
+    -- By-id mailboxes only: where the source's changes stopped (Graph's delta link); NULL until
+    -- a sync stores one, and whenever the next sync must list instead.
+    cursor       TEXT CHECK (cursor <> ''),
     UNIQUE (account, name),
     CHECK (uid_validity IS NULL OR seen_until IS NULL)
 );
@@ -62,7 +65,7 @@ CREATE TABLE message{suffix} (
 const INDEX: &str =
     "CREATE INDEX message_order ON message (COALESCE(received, date, 0) DESC, id DESC);";
 
-/// Schema 1 to 3, after the tables of 3 exist as `mailbox_v2` and `message_v2`: copy every row
+/// Schema 1 to 4, after the tables of 4 exist as `mailbox_v2` and `message_v2`: copy every row
 /// with its id (a mailbox as synced, as [`MIGRATE_V2`] does), drop the old tables, rename the new
 /// ones and recreate the index (which went with the old `message`).
 /// <https://www.sqlite.org/lang_altertable.html#otheralter>
@@ -86,6 +89,10 @@ const MIGRATE_V2: &str = "
 ALTER TABLE mailbox ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
 UPDATE mailbox SET synced = 1;
 ";
+
+/// Schema 3 to 4: `mailbox.cursor`. Every mailbox starts without one, so its next sync lists as
+/// before and stores one.
+const MIGRATE_V3: &str = "ALTER TABLE mailbox ADD COLUMN cursor TEXT CHECK (cursor <> '');";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
@@ -187,7 +194,10 @@ impl Cache {
             migrate_v1(&mut conn)?;
         }
         if schema_version(&conn)? == 2 {
-            migrate_v2(&mut conn)?;
+            migrate_step(&mut conn, 2, MIGRATE_V2)?;
+        }
+        if schema_version(&conn)? == 3 {
+            migrate_step(&mut conn, 3, MIGRATE_V3)?;
         }
         conn.pragma_update(None, "foreign_keys", true)?;
         match schema_version(&conn)? {
@@ -439,14 +449,16 @@ impl Cache {
         .collect()
     }
 
-    /// Applies flag changes and removals to a by-id mailbox in one transaction.
+    /// Applies flag changes and removals to a by-id mailbox in one transaction. Returns the ids of
+    /// the rows it removed.
     pub fn apply_id_changes(
         &mut self,
         mailbox_id: i64,
         flag_updates: &[(RemoteId, Flags)],
         removed: &[RemoteId],
-    ) -> Result<()> {
+    ) -> Result<Vec<MessageId>> {
         let tx = self.conn.transaction()?;
+        let mut gone = Vec::new();
         {
             let mut update = tx.prepare(
                 "UPDATE message SET flags = ?3 WHERE mailbox_id = ?1 AND remote_id = ?2",
@@ -454,14 +466,18 @@ impl Cache {
             for (id, flags) in flag_updates {
                 update.execute(params![mailbox_id, id.as_str(), flags.to_storage()])?;
             }
-            let mut delete =
-                tx.prepare("DELETE FROM message WHERE mailbox_id = ?1 AND remote_id = ?2")?;
+            let mut delete = tx.prepare(
+                "DELETE FROM message WHERE mailbox_id = ?1 AND remote_id = ?2 RETURNING id",
+            )?;
             for id in removed {
-                delete.execute(params![mailbox_id, id.as_str()])?;
+                let mut rows = delete.query(params![mailbox_id, id.as_str()])?;
+                while let Some(row) = rows.next()? {
+                    gone.push(MessageId::new(row.get(0)?));
+                }
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(gone)
     }
 
     /// Stores fetched messages in a by-id mailbox in one transaction, each with its flags and
@@ -536,6 +552,31 @@ impl Cache {
     pub fn mark_synced(&mut self, mailbox_id: i64) -> Result<()> {
         self.conn
             .execute("UPDATE mailbox SET synced = 1 WHERE id = ?1", [mailbox_id])?;
+        Ok(())
+    }
+
+    /// A by-id mailbox's stored [`Cursor`], if any.
+    pub fn cursor(&self, mailbox_id: i64) -> Result<Option<Cursor>> {
+        let cursor: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT cursor FROM mailbox WHERE id = ?1 AND uid_validity IS NULL",
+                [mailbox_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        cursor
+            .map(|c| Cursor::new(c).ok_or(CacheError::Corrupt("cursor")))
+            .transpose()
+    }
+
+    /// Stores a by-id mailbox's [`Cursor`], or clears it so the next sync lists instead.
+    pub fn set_cursor(&mut self, mailbox_id: i64, cursor: Option<&Cursor>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE mailbox SET cursor = ?2 WHERE id = ?1 AND uid_validity IS NULL",
+            params![mailbox_id, cursor.map(Cursor::as_str)],
+        )?;
         Ok(())
     }
 
@@ -662,8 +703,8 @@ fn schema_version(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
 }
 
-/// Schema 1 to 3, in one `BEGIN IMMEDIATE` transaction: any failure rolls back and leaves
-/// schema 1 as it was.
+/// Schema 1 to the current one, in one `BEGIN IMMEDIATE` transaction: any failure rolls back
+/// and leaves schema 1 as it was.
 fn migrate_v1(conn: &mut Connection) -> Result<()> {
     // Outside the transaction, where it takes effect
     // (https://www.sqlite.org/pragma.html#pragma_foreign_keys): with foreign keys on, dropping
@@ -711,15 +752,15 @@ fn migrate_v1(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Schema 2 to 3, in one `BEGIN IMMEDIATE` transaction that reads the version again: any failure
-/// leaves schema 2 as it was.
-fn migrate_v2(conn: &mut Connection) -> Result<()> {
+/// Schema `from` to `from + 1` with `sql`, in one `BEGIN IMMEDIATE` transaction that reads the
+/// version again: any failure leaves schema `from` as it was.
+fn migrate_step(conn: &mut Connection, from: i64, sql: &str) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if schema_version(&tx)? != 2 {
+    if schema_version(&tx)? != from {
         return Ok(());
     }
-    tx.execute_batch(MIGRATE_V2)?;
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.execute_batch(sql)?;
+    tx.pragma_update(None, "user_version", from + 1)?;
     tx.commit()?;
     Ok(())
 }

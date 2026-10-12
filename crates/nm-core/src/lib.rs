@@ -16,6 +16,6 @@ pub use id_source::{IdSource, sync_inbox_by_id, sync_inbox_by_id_with_progress};
 pub use source::MailSource;
 pub use sync::{Progress, SyncError, SyncReport, sync_inbox, sync_inbox_with_progress};
 pub use types::{
-    FetchedMessage, Flags, IdFetched, IdListed, ListedMessage, MailboxStatus, MessageId, RemoteId,
-    Uid, UidFlags, UidValidity,
+    Cursor, FetchedMessage, Flags, IdChange, IdChanges, IdFetched, IdListed, ListedMessage,
+    MailboxStatus, MessageId, RemoteId, Uid, UidFlags, UidValidity,
 };
