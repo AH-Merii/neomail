@@ -67,7 +67,7 @@ reason from decisions.md.
 
 - Getting started and setup, then output for people and pipes, come right after Gmail
   ([DEC-2026-10-12-cli-ux](decisions.md#dec-2026-10-12-cli-ux)): every merge publishes a build to
-  try, so edge users meet the first run now, and triage, search and attachments then use the
+  try, so edge users meet getting started now, and triage, search and attachments then use the
   output contract instead of retrofitting it.
 - The CLI comes first because the owner chose to finish every CLI feature before starting the TUI
   ([DEC-2026-10-11-cli-first](decisions.md#dec-2026-10-11-cli-first)). The CLI can do everything

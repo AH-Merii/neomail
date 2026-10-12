@@ -605,7 +605,7 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   [Project and delivery](#project-and-delivery). Homebrew and the AUR wait. The `SHA256SUMS` asset
   on edge, which the installer checks, is Claude's call.
 
-### <a id="dec-2026-10-12-cli-ux"></a>DEC-2026-10-12-cli-ux: first run, setup and output for people and pipes
+### <a id="dec-2026-10-12-cli-ux"></a>DEC-2026-10-12-cli-ux: getting started, setup and output for people and pipes
 
 - **Status:** recorded. **Source:** owner, chat, 2026-10-12 (f679d889:1537).
 - **Context:** the owner asked how a new user configures neomail, where colour makes sense, and
@@ -623,4 +623,5 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   two CLI slices before Outlook: "Getting started and setup", then "Output for people and pipes".
   The rest of the bullet is Claude's, from the recommendation shown with the questions: the
   provider menu, flags and `--no-input`, `account list` and `config path|check`, the stdout and
-  stderr split, `--color` and CLICOLOR, and the TUI's add-account screen.
+  stderr split, `--color` and CLICOLOR, every "no config" message naming the next command, and
+  colour never carrying meaning alone.
