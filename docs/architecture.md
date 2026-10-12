@@ -178,9 +178,30 @@ A second sync with no changes on the server fetches no message bodies and prints
 
 ## Output
 
-`list` prints one line per message within 80 display columns, measured per grapheme cluster
-(unicode-segmentation and unicode-width), so emoji sequences count as the two columns a terminal
-gives them. `show` prints the headers, then the text/plain part, or the HTML part converted to
+Two choices, each made once in `main.rs` and passed down, decide how anything is printed:
+
+- **The mode** (`output::Mode`): human on a terminal, plain TSV off one or with `--plain`, or
+  `--json` or `--jsonl`. `output::write_listing` turns one list of serialisable items into any of
+  the four, so `list` and `account list` share the rule. JSON writers take no `Paint`, so they
+  cannot colour.
+- **The colour** (`style::decide`, a pure function of `--color`, NO_COLOR, CLICOLOR_FORCE,
+  CLICOLOR, TERM and whether the stream is a terminal), decided separately for standard output
+  and standard error and handed down as `style::Colors`. Plain output is coloured only when
+  colour is forced, so `--plain` on a terminal stays plain. clap's help and usage errors are
+  rendered with the same decision.
+
+Results go to standard output; prompts, progress, notes and errors go to standard error. Every
+writer returns `io::Result`, so a closed pipe reaches `main` as `BrokenPipe` and exits 0 quietly;
+completions are generated into memory first, because clap_complete panics on a failed write.
+`show`'s human output on a terminal goes through the pager (`pager.rs`: `$NEOMAIL_PAGER`,
+`$PAGER`, then `less` with LESS=FRX), falling back to printing directly when the pager cannot
+start. While the pager runs, neomail holds Ctrl-C off (signal-hook, Unix only) and waits for it,
+as git does; it dies of SIGINT afterwards only if the pager did. These are plain functions over `Write` and environment lookups, not traits: there is one
+implementation of each, and the tests drive them with in-memory writers and fake environments.
+
+`list` prints one line per message within the terminal's width (80 when unknown), measured per
+grapheme cluster (unicode-segmentation and unicode-width), so emoji sequences count as the two
+columns a terminal gives them. `show` prints the headers, then the text/plain part, or the HTML part converted to
 text (html2text), then the attachments. HTML over 1 MiB, or whose parsed tree nests more than
 100 elements deep, is only stripped of its tags, with a note saying so, because html5ever's and
 html2text's work grows faster than linearly with nesting. The depth is measured on html5ever's

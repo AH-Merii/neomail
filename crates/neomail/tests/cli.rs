@@ -9,7 +9,6 @@ use std::process::{Command, Output, Stdio};
 use chrono::DateTime;
 use nm_core::{Cache, FetchedMessage, Flags, Uid, UidValidity};
 use serde_json::Value;
-use unicode_width::UnicodeWidthStr;
 
 const LONG_SUBJECT: &str =
     "A rather long subject line that will certainly not fit in eighty columns at all";
@@ -59,17 +58,39 @@ fn seeded() -> tempfile::TempDir {
     dir
 }
 
-fn neomail(data: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_neomail"))
-        .args(args)
-        .env("NEOMAIL_DATA_DIR", data)
+/// The binary with its data and config in `data`, no keyring, and none of the caller's colour
+/// or pager settings.
+fn command(data: &Path, args: &[&str]) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_neomail"));
+    c.args(args);
+    isolate(&mut c, data);
+    c
+}
+
+/// Gives `c` the environment `command` gives the binary.
+fn isolate(c: &mut Command, data: &Path) {
+    c.env("NEOMAIL_DATA_DIR", data)
         .env("NEOMAIL_CONFIG", data.join("config.toml"))
         .env("HOME", data)
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_DATA_HOME")
-        .env_remove("NEOMAIL_NO_INPUT")
-        .output()
-        .unwrap()
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .env("TERM", "xterm-256color");
+    for var in [
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "NEOMAIL_NO_INPUT",
+        "NO_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "PAGER",
+        "NEOMAIL_PAGER",
+        "LESS",
+    ] {
+        c.env_remove(var);
+    }
+}
+
+fn neomail(data: &Path, args: &[&str]) -> Output {
+    command(data, args).output().unwrap()
 }
 
 fn stdout(o: &Output) -> String {
@@ -86,35 +107,87 @@ fn json(o: &Output) -> Value {
 }
 
 #[test]
-fn list_prints_newest_first_within_80_columns() {
+fn list_off_a_terminal_is_tsv_newest_first() {
     let dir = seeded();
     let o = neomail(dir.path(), &["list"]);
     assert!(o.status.success(), "{}", stderr(&o));
     let out = stdout(&o);
-    let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 4, "{out}");
-    assert!(
-        lines[0].contains("bob@mail.example") && lines[0].contains('…'),
-        "{out}"
-    );
-    assert!(
-        lines[1].contains("Carol") && !lines[1].contains('\x1b'),
-        "{out}"
-    );
-    assert!(
-        lines[2].contains("Ada Lovelace") && lines[2].contains("Oldest"),
-        "{out}"
-    );
-    assert!(lines[3].contains("Home"), "{out}");
-    for line in &lines {
-        assert!(line.width() <= 80, "too wide: {line:?}");
+    let rows: Vec<Vec<&str>> = out.lines().map(|l| l.split('\t').collect()).collect();
+    assert_eq!(rows.len(), 4, "{out}");
+    for row in &rows {
+        assert_eq!(row.len(), 6, "{row:?}");
     }
-    // Unread mark after the id.
-    assert_eq!(lines[0].split_whitespace().nth(1), Some("*"));
-    assert_ne!(lines[2].split_whitespace().nth(1), Some("*"));
+    // Nothing is truncated, and the escape in Carol's subject became a space.
+    assert_eq!(
+        rows[0][1..],
+        [
+            "*",
+            "2026-10-10T09:30:00Z",
+            "work",
+            "bob@mail.example",
+            LONG_SUBJECT
+        ]
+    );
+    assert_eq!(
+        rows[1][4..],
+        ["Carol <carol@mail.example>", "Escape  [31m here"]
+    );
+    assert_eq!(rows[2][1], "");
+    assert_eq!(rows[3][3..], ["home", "dan@mail.example", "Home"]);
+    // The ids are the JSON ids.
+    let v = json(&neomail(dir.path(), &["list", "--json"]));
+    for (row, item) in rows.iter().zip(v.as_array().unwrap()) {
+        assert_eq!(row[0], item["id"].to_string());
+        assert_eq!(row[2], item["date"].as_str().unwrap());
+    }
+    assert_eq!(stdout(&neomail(dir.path(), &["list", "--plain"])), out);
 
     let o = neomail(dir.path(), &["list", "--account", "work", "--limit", "2"]);
     assert_eq!(stdout(&o).lines().count(), 2);
+    let o = neomail(dir.path(), &["list", "--limit", "all"]);
+    assert_eq!(stdout(&o), out);
+    let o = neomail(dir.path(), &["list", "--limit", "1"]);
+    assert_eq!(stdout(&o).lines().count(), 1);
+    for bad in ["0", "-3", "every"] {
+        let o = neomail(dir.path(), &["list", "--limit", bad]);
+        assert_eq!(o.status.code(), Some(2), "{bad}");
+    }
+    let o = neomail(dir.path(), &["sync", "--limit", "all"]);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "parsed, then fails for want of a config"
+    );
+}
+
+#[test]
+fn output_flags_conflict() {
+    let dir = seeded();
+    for args in [
+        &["list", "--plain", "--json"][..],
+        &["list", "--json", "--jsonl"],
+        &["list", "--plain", "--jsonl"],
+        &["account", "list", "--json", "--plain"],
+        &["show", "1", "--json", "--raw"],
+        &["show", "1", "--jsonl", "--json"],
+    ] {
+        let o = neomail(dir.path(), args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert!(o.stdout.is_empty(), "{args:?}");
+    }
+}
+
+/// `ARGS --jsonl` prints one line per element of `ARGS --json`'s array.
+fn assert_jsonl_matches_json(data: &Path, args: &[&str]) {
+    let array = json(&neomail(data, &[args, &["--json"]].concat()));
+    let o = neomail(data, &[args, &["--jsonl"]].concat());
+    assert!(o.status.success(), "{}", stderr(&o));
+    let lines: Vec<Value> = stdout(&o)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(!lines.is_empty());
+    assert_eq!(Value::Array(lines), array, "{args:?}");
 }
 
 #[test]
@@ -165,35 +238,6 @@ fn show_human_json_and_raw() {
 
     let o = neomail(dir.path(), &["show", &id, "--raw"]);
     assert!(o.stdout.starts_with(b"From: Ada Lovelace"));
-}
-
-#[test]
-fn list_counts_emoji_sequences_as_two_columns() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut cache = Cache::open(&dir.path().join("cache.sqlite3")).unwrap();
-    let work = cache
-        .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
-        .unwrap();
-    // U+2764 U+FE0F is one character wide on its own, two as an emoji sequence.
-    let hearts = "\u{2764}\u{FE0F}".repeat(40);
-    cache
-        .insert_messages(
-            work.id,
-            &[message(
-                1,
-                100,
-                "\u{2764}\u{FE0F} <a@mail.example>",
-                &hearts,
-                false,
-            )],
-        )
-        .unwrap();
-    let o = neomail(dir.path(), &["list"]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    let out = stdout(&o);
-    let line = out.lines().next().unwrap();
-    assert!(line.width() <= 80, "too wide ({}): {line:?}", line.width());
-    assert!(line.contains('…'), "{line:?}");
 }
 
 #[cfg(unix)]
@@ -383,15 +427,7 @@ const FAKE_PASSWORD: &str = "s3cret-fake-password";
 /// Runs `neomail` with `input` on standard input and a D-Bus session bus that does not exist, so
 /// nothing reaches a real keyring.
 fn neomail_stdin(data: &Path, args: &[&str], input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_neomail"))
-        .args(args)
-        .env("NEOMAIL_DATA_DIR", data)
-        .env("NEOMAIL_CONFIG", data.join("config.toml"))
-        .env("HOME", data)
-        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_DATA_HOME")
-        .env_remove("NEOMAIL_NO_INPUT")
+    let mut child = command(data, args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -656,49 +692,24 @@ fn add_proton_without_a_check_then_list_and_check_the_config() {
     )
     .unwrap();
 
+    // Off a terminal: TSV, name first, `pinned` or empty.
     let o = neomail_stdin(dir.path(), &["account", "list"], "");
     assert!(o.status.success(), "{}", stderr(&o));
-    let out = stdout(&o);
-    let rows: Vec<Vec<&str>> = out
-        .lines()
-        .map(|l| l.split_whitespace().collect())
-        .collect();
     assert_eq!(
-        rows,
-        [
-            vec![
-                "proton",
-                "password_command",
-                "you@example.com",
-                "127.0.0.1",
-                "1143",
-                "starttls",
-                "pinned"
-            ],
-            vec![
-                "work",
-                "password",
-                "user@mail.example",
-                "imap.mail.example",
-                "993",
-                "tls",
-                "-"
-            ],
-            vec![
-                "gmail",
-                "oauth",
-                "you@example.com",
-                "imap.gmail.com",
-                "993",
-                "tls",
-                "-"
-            ],
-        ]
+        stdout(&o),
+        "proton\tpassword_command\tyou@example.com\t127.0.0.1\t1143\tstarttls\tpinned\n\
+         work\tpassword\tuser@mail.example\timap.mail.example\t993\ttls\t\n\
+         gmail\toauth\tyou@example.com\timap.gmail.com\t993\ttls\t\n"
     );
-    // Aligned: every column starts at the same place on each line.
-    let starts = |line: &str| line.find("you@").or_else(|| line.find("user@"));
-    let first = starts(out.lines().next().unwrap());
-    assert!(out.lines().all(|l| starts(l) == first), "{out}");
+    let v = json(&neomail(dir.path(), &["account", "list", "--json"]));
+    assert_eq!(
+        v[0],
+        serde_json::json!({
+            "name": "proton", "login": "password_command", "username": "you@example.com",
+            "host": "127.0.0.1", "port": 1143, "security": "starttls", "cert_pinned": true
+        })
+    );
+    assert_jsonl_matches_json(dir.path(), &["account", "list"]);
 
     let o = neomail_stdin(dir.path(), &["config", "check"], "");
     assert!(o.status.success(), "{}", stderr(&o));
@@ -729,6 +740,8 @@ fn config_path_and_check() {
         stderr(&o),
         "neomail: no accounts yet; add one with `neomail account add`\n"
     );
+    let o = neomail(dir.path(), &["account", "list", "--json"]);
+    assert_eq!(stdout(&o), "[]\n");
 
     // A secret pasted without quotes on line 3.
     std::fs::write(
@@ -750,4 +763,389 @@ fn config_path_and_check() {
     std::fs::write(&path, KEYRING_CONFIG).unwrap();
     let o = neomail(dir.path(), &["config", "check"]);
     assert_eq!(stdout(&o), "ok: 1 account\n");
+}
+
+/// The ids of `list --json`, newest first: bob's, Carol's, Ada's, then Home.
+fn ids(data: &Path) -> Vec<String> {
+    json(&neomail(data, &["list", "--json"]))
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].to_string())
+        .collect()
+}
+
+#[test]
+fn list_jsonl_lines_are_the_json_elements() {
+    let dir = seeded();
+    assert_jsonl_matches_json(dir.path(), &["list"]);
+    assert_jsonl_matches_json(dir.path(), &["list", "--account", "work", "--limit", "all"]);
+}
+
+#[test]
+fn show_several_ids() {
+    let dir = seeded();
+    let ids = ids(dir.path());
+    let o = neomail(dir.path(), &["show", &ids[2], &ids[3]]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = stdout(&o);
+    let first = out.find("Subject: Oldest").unwrap();
+    let separator = out.find(&format!("── message {} ──", ids[3])).unwrap();
+    let second = out.find("Subject: Home").unwrap();
+    assert!(first < separator && separator < second, "{out}");
+    assert_eq!(out.matches("── message").count(), 1, "{out}");
+
+    // JSON: one literal id is an object, several are an array, JSONL is one line each.
+    let v = json(&neomail(dir.path(), &["show", &ids[2], "--json"]));
+    assert_eq!(v["subject"], "Oldest");
+    let v = json(&neomail(dir.path(), &["show", &ids[2], &ids[3], "--json"]));
+    assert_eq!(v[0]["subject"], "Oldest");
+    assert_eq!(v[1]["subject"], "Home");
+    let o = neomail(dir.path(), &["show", &ids[2], &ids[3], "--jsonl"]);
+    let lines: Vec<Value> = stdout(&o)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(Value::Array(lines), v);
+    let o = neomail(dir.path(), &["show", &ids[2], "--jsonl"]);
+    assert_eq!(stdout(&o).lines().count(), 1);
+
+    // --raw takes exactly one id.
+    let o = neomail(dir.path(), &["show", &ids[2], &ids[3], "--raw"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(o.stdout.is_empty());
+    assert!(
+        stderr(&o).contains("--raw takes exactly one id"),
+        "{}",
+        stderr(&o)
+    );
+    let o = neomail_stdin(
+        dir.path(),
+        &["show", "-", "--raw"],
+        &format!("{}\n", ids[2]),
+    );
+    assert!(o.stdout.starts_with(b"From: Ada Lovelace"));
+}
+
+#[test]
+fn show_reports_missing_ids_after_showing_the_rest() {
+    let dir = seeded();
+    let ids = ids(dir.path());
+    let o = neomail(dir.path(), &["show", "998", &ids[2], "999"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).contains("Subject: Oldest"), "{}", stdout(&o));
+    assert_eq!(
+        stderr(&o),
+        "neomail: no cached message with id 998; see `neomail list`\n\
+         neomail: no cached message with id 999; see `neomail list`\n"
+    );
+    let o = neomail(dir.path(), &["show", "999", &ids[2], "--json"]);
+    assert_eq!(o.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    // One literal missing id prints nothing on stdout.
+    let o = neomail(dir.path(), &["show", "999", "--json"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(o.stdout.is_empty());
+}
+
+/// On a terminal stdout and stderr interleave: the missing-id report must come after the
+/// messages, or several messages (or the pager) push it off screen.
+#[test]
+fn show_reports_missing_ids_after_the_output_on_a_shared_stream() {
+    let dir = seeded();
+    let ids = ids(dir.path());
+    let (mut reader, writer) = std::io::pipe().unwrap();
+    let mut c = command(dir.path(), &["show", &ids[2], "999"]);
+    c.stdout(writer.try_clone().unwrap()).stderr(writer);
+    let mut child = c.spawn().unwrap();
+    // Drop the parent's write ends, or the read below never sees end of file.
+    drop(c);
+    let mut merged = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut merged).unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(1));
+    let message = merged.find("Subject: Oldest").expect(&merged);
+    let error = merged
+        .find("neomail: no cached message with id 999")
+        .expect(&merged);
+    assert!(message < error, "{merged}");
+}
+
+#[test]
+fn show_reads_ids_from_standard_input() {
+    let dir = seeded();
+    let ids = ids(dir.path());
+    // TSV lines, as `neomail list | fzf -m` passes them, with a blank line.
+    let tsv = stdout(&neomail(dir.path(), &["list"]));
+    let picked: String = tsv.lines().skip(2).map(|l| format!("{l}\n\n")).collect();
+    let o = neomail_stdin(dir.path(), &["show", "-", "--json"], &picked);
+    let v = json(&o);
+    let subjects: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(subjects, ["Oldest", "Home"]);
+
+    // Coloured lines, as `neomail list --color always | fzf --ansi -m` passes them.
+    let coloured = stdout(&neomail(dir.path(), &["list", "--color", "always"]));
+    assert!(coloured.contains('\x1b'), "{coloured:?}");
+    let o = neomail_stdin(dir.path(), &["show", "-", "--jsonl"], &coloured);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let got: Vec<String> = stdout(&o)
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].to_string())
+        .collect();
+    assert_eq!(got, ids);
+
+    // One id from stdin is still an array: the shape never depends on the count.
+    let o = neomail_stdin(
+        dir.path(),
+        &["show", "-", "--json"],
+        &format!("{}\n", ids[0]),
+    );
+    assert!(json(&o).is_array());
+
+    // A line without an id is a usage error naming it, and nothing is shown.
+    let o = neomail_stdin(
+        dir.path(),
+        &["show", "-"],
+        &format!("{}\n\nnot an id\n", ids[0]),
+    );
+    assert_eq!(o.status.code(), Some(2));
+    assert!(o.stdout.is_empty());
+    assert!(
+        stderr(&o).contains("standard input line 3"),
+        "{}",
+        stderr(&o)
+    );
+    let o = neomail_stdin(dir.path(), &["show", "-", &ids[0]], "");
+    assert_eq!(o.status.code(), Some(2));
+}
+
+#[test]
+fn color_follows_the_flag_and_the_environment() {
+    let dir = seeded();
+    let id = &ids(dir.path())[2];
+    // Off a terminal: no colour unless forced.
+    let plain = stdout(&neomail(dir.path(), &["list"]));
+    assert!(!plain.contains('\x1b'));
+    let forced = command(dir.path(), &["list"])
+        .env("CLICOLOR_FORCE", "1")
+        .output()
+        .unwrap();
+    assert!(stdout(&forced).contains("\x1b[33m"), "{}", stdout(&forced));
+    let never = command(dir.path(), &["list", "--color", "never"])
+        .env("CLICOLOR_FORCE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&never), plain);
+    // NO_COLOR removes all styling, bold too.
+    let o = command(dir.path(), &["show", id])
+        .env("CLICOLOR_FORCE", "1")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(!o.stdout.contains(&0x1b), "{}", stdout(&o));
+    let o = neomail(dir.path(), &["show", id, "--color", "always"]);
+    assert!(
+        stdout(&o).contains("\x1b[1mSubject:\x1b[0m"),
+        "{}",
+        stdout(&o)
+    );
+    // Never in JSON, JSONL or raw output.
+    for args in [
+        &["list", "--json"][..],
+        &["list", "--jsonl"],
+        &["account", "list", "--json"],
+        &["show", id, "--json"],
+        &["show", id, "--jsonl"],
+        &["show", id, "--raw"],
+    ] {
+        let o = command(dir.path(), &[args, &["--color", "always"]].concat())
+            .env("CLICOLOR_FORCE", "1")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{args:?}: {}", stderr(&o));
+        assert!(!o.stdout.contains(&0x1b), "{args:?}: {}", stdout(&o));
+    }
+    // Usage errors and help follow the choice too.
+    let o = neomail(dir.path(), &["list", "--bogus", "--color", "always"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stderr(&o).contains('\x1b'), "{}", stderr(&o));
+    let o = neomail(dir.path(), &["list", "--bogus"]);
+    assert!(!stderr(&o).contains('\x1b'), "{}", stderr(&o));
+    let o = command(dir.path(), &["--help", "--color", "always"])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(stdout(&o).contains('\x1b'));
+    let o = command(dir.path(), &["--help"])
+        .env("CLICOLOR_FORCE", "1")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(!stdout(&o).contains('\x1b'));
+}
+
+#[test]
+fn show_never_pages_off_a_terminal() {
+    let dir = seeded();
+    let id = &ids(dir.path())[2];
+    let marker = dir.path().join("paged");
+    let pager = format!("touch '{}'; cat", marker.display());
+    let o = command(dir.path(), &["show", id])
+        .env("NEOMAIL_PAGER", &pager)
+        .env("PAGER", &pager)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stdout(&o).contains("Subject: Oldest"));
+    assert!(!marker.exists(), "the pager ran off a terminal");
+}
+
+/// A pager that catches Ctrl-C as less does, then reports whether neomail, its parent, was still
+/// alive half a second after the Ctrl-C.
+const PAGER_CATCHING_CTRL_C: &str = r#"trap 'touch "DIR/got-int"' INT
+cat >/dev/null
+touch "DIR/ready"
+i=0
+while [ ! -e "DIR/got-int" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
+sleep 0.5
+read -r _ _ _ ppid _ < /proc/$$/stat
+if [ "$ppid" = "$PPID" ]; then echo alive; else echo orphaned; fi > "DIR/result"
+"#;
+
+/// A pager that dies of Ctrl-C.
+const PAGER_DYING_OF_CTRL_C: &str = r#"cat >/dev/null
+touch "DIR/ready"
+exec sleep 20
+"#;
+
+/// Runs `show` on a terminal (`script` gives it one) with `pager`, an sh script in which DIR is
+/// the data directory, presses Ctrl-C once the pager has written DIR/ready, and returns how
+/// neomail exited, with the data directory.
+#[cfg(target_os = "linux")]
+fn ctrl_c_while_paging(pager: &str) -> (std::process::ExitStatus, tempfile::TempDir) {
+    let dir = seeded();
+    let data = dir.path();
+    let id = &ids(data)[2];
+    let script = data.join("pager.sh");
+    std::fs::write(&script, pager.replace("DIR", data.to_str().unwrap())).unwrap();
+    // `exec` keeps neomail the terminal's foreground process group, with the pager in it.
+    let run = format!("exec '{}' show {id}", env!("CARGO_BIN_EXE_neomail"));
+    let mut c = Command::new("script");
+    c.args(["-qec", &run, "/dev/null"]);
+    isolate(&mut c, data);
+    let mut child = c
+        .env("SHELL", "/bin/sh")
+        .env("NEOMAIL_PAGER", format!("sh '{}'", script.display()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = data.join("ready");
+    let start = std::time::Instant::now();
+    while !ready.exists() {
+        if start.elapsed() > std::time::Duration::from_secs(20) {
+            child.kill().unwrap();
+            panic!("the pager never started");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // ^C on the terminal: SIGINT to the foreground process group, neomail and the pager.
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"\x03").unwrap();
+    stdin.flush().unwrap();
+    let status = child.wait().unwrap();
+    drop(stdin);
+    (status, dir)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ctrl_c_in_the_pager_waits_for_the_pager() {
+    let (status, dir) = ctrl_c_while_paging(PAGER_CATCHING_CTRL_C);
+    // The pager writes its result as it exits, so it is there once neomail has exited.
+    let result = std::fs::read_to_string(dir.path().join("result"));
+    assert!(result.is_ok(), "neomail exited before its pager");
+    assert_eq!(result.unwrap(), "alive\n", "neomail died before its pager");
+    assert!(
+        dir.path().join("got-int").exists(),
+        "the pager never saw the Ctrl-C"
+    );
+    assert!(status.success(), "{status:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pager_dying_of_ctrl_c_takes_neomail_with_it() {
+    let (status, _dir) = ctrl_c_while_paging(PAGER_DYING_OF_CTRL_C);
+    // script -e reports a child killed by a signal as 128 + its number.
+    assert_eq!(status.code(), Some(130), "{status:?}");
+}
+
+#[test]
+fn completions_for_every_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    for (shell, needle) in [
+        ("bash", "complete -F"),
+        ("zsh", "#compdef neomail"),
+        ("fish", "complete -c neomail"),
+        ("elvish", "edit:completion:arg-completer[neomail]"),
+        ("powershell", "Register-ArgumentCompleter"),
+    ] {
+        let o = neomail(dir.path(), &["completions", shell]);
+        assert!(o.status.success(), "{shell}: {}", stderr(&o));
+        let out = stdout(&o);
+        assert!(out.contains(needle), "{shell}: {out}");
+        assert!(out.contains("account"), "{shell}");
+    }
+    assert_eq!(
+        neomail(dir.path(), &["completions", "tcsh"]).status.code(),
+        Some(2)
+    );
+}
+
+/// Runs the binary with its stdout's reader closed before it writes: it must exit 0 silently.
+fn closed_reader(data: &Path, args: &[&str], input: &str) {
+    let mut child = command(data, args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{args:?}: {}", stderr(&o));
+    assert_eq!(stderr(&o), "", "{args:?}");
+}
+
+#[test]
+fn a_broken_pipe_exits_0_silently() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache = Cache::open(&dir.path().join("cache.sqlite3")).unwrap();
+    let work = cache
+        .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
+        .unwrap();
+    // More than a pipe's buffer (64 KiB on Linux), so a write must fail.
+    let messages: Vec<_> = (1..=1500)
+        .map(|uid| message(uid, i64::from(uid), "a@mail.example", LONG_SUBJECT, false))
+        .collect();
+    cache.insert_messages(work.id, &messages).unwrap();
+    drop(cache);
+    let all: String = (1..=1500).map(|id| format!("{id}\n")).collect();
+    for args in [
+        &["list", "--limit", "all"][..],
+        &["list", "--limit", "all", "--json"],
+        &["list", "--limit", "all", "--jsonl"],
+        &["show", "-"],
+        &["show", "-", "--json"],
+        &["completions", "bash"],
+    ] {
+        closed_reader(dir.path(), args, &all);
+    }
 }

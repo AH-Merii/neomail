@@ -8,10 +8,13 @@ mod config;
 mod keyring;
 mod oauth;
 mod output;
+mod pager;
 mod secret;
 mod setup;
+mod style;
 
-use std::io::{self, BufWriter, IsTerminal, Write};
+use std::ffi::OsString;
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -23,7 +26,9 @@ use nm_imap::{CertPin, ImapSource, Security};
 
 use crate::config::{Account, Config, Login, PasswordSource};
 use crate::keyring::Keyring;
+use crate::output::Mode;
 use crate::secret::{Input, Password};
+use crate::style::{ColorWhen, Colors};
 
 /// Exit status for a failure other than bad usage (clap exits with 2 for that).
 const EXIT_FAILURE: u8 = 1;
@@ -37,6 +42,8 @@ Examples:
   neomail account add proton        Add Proton Mail through Proton Mail Bridge
   neomail sync && neomail list      Fetch new mail, then list it
   neomail show 42                   Read message 42
+  neomail list | fzf -m | neomail show -
+                                    Pick messages with fzf, then read them
   neomail config check              Check the config file
 
 Guide: https://github.com/AH-Merii/neomail#try-it";
@@ -69,8 +76,96 @@ struct Cli {
     /// Never prompt, even on a terminal; a value that would be asked for is a usage error [env: NEOMAIL_NO_INPUT=1]
     #[arg(long, global = true)]
     no_input: bool,
+    /// When to colour output [default: auto; NO_COLOR, CLICOLOR_FORCE and CLICOLOR are followed]
+    #[arg(long, global = true, value_name = "WHEN", value_enum)]
+    color: Option<ColorWhen>,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// How a listing prints: human on a terminal, plain TSV off one.
+#[derive(clap::Args)]
+#[group(multiple = false)]
+struct ListingFormat {
+    /// Print TSV: one record per line, id first, no header (the default when stdout is not a terminal)
+    #[arg(long)]
+    plain: bool,
+    /// Print a JSON array (https://github.com/AH-Merii/neomail/blob/main/docs/json.md)
+    #[arg(long)]
+    json: bool,
+    /// Print JSON Lines: one object per line, the same objects as --json
+    #[arg(long)]
+    jsonl: bool,
+}
+
+impl ListingFormat {
+    fn mode(&self, terminal: bool) -> Mode {
+        Mode::choose(self.plain, self.json, self.jsonl, terminal)
+    }
+}
+
+#[derive(clap::Args)]
+#[group(multiple = false)]
+struct ShowFormat {
+    /// Print JSON: one object for one id, an array for several or - (https://github.com/AH-Merii/neomail/blob/main/docs/json.md)
+    #[arg(long)]
+    json: bool,
+    /// Print JSON Lines: one object per message
+    #[arg(long)]
+    jsonl: bool,
+    /// Print the RFC 822 source of exactly one message
+    #[arg(long)]
+    raw: bool,
+}
+
+/// `--limit`: a positive number, or `all`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Limit {
+    All,
+    Count(NonZeroU32),
+}
+
+impl Limit {
+    fn get(self) -> NonZeroU32 {
+        match self {
+            Self::All => NonZeroU32::MAX,
+            Self::Count(n) => n,
+        }
+    }
+}
+
+impl std::fmt::Display for Limit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::All => f.write_str("all"),
+            Self::Count(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+fn parse_limit(s: &str) -> Result<Limit, String> {
+    if s == "all" {
+        return Ok(Limit::All);
+    }
+    s.parse()
+        .map(Limit::Count)
+        .map_err(|_| "expected a positive number or `all`".to_owned())
+}
+
+/// An id argument of `show`: a message id, or `-` for ids on standard input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdArg {
+    Id(i64),
+    Stdin,
+}
+
+fn parse_id_arg(s: &str) -> Result<IdArg, String> {
+    if s == "-" {
+        return Ok(IdArg::Stdin);
+    }
+    s.parse()
+        .map(IdArg::Id)
+        .map_err(|_| "expected a message id (the first column of `neomail list`) or -".to_owned())
 }
 
 #[derive(Subcommand)]
@@ -80,32 +175,37 @@ enum Command {
         /// Sync only this account
         #[arg(long, value_name = "NAME")]
         account: Option<String>,
-        /// How many of the newest messages the first sync takes per account (later syncs fetch all new mail)
-        #[arg(long, value_name = "N", default_value_t = nm_core::sync::DEFAULT_LIMIT)]
-        limit: NonZeroU32,
+        /// How many of the newest messages the first sync takes per account, or all (later syncs fetch all new mail)
+        #[arg(long, value_name = "N|all", value_parser = parse_limit, default_value_t = Limit::Count(nm_core::sync::DEFAULT_LIMIT))]
+        limit: Limit,
     },
     /// List cached messages, newest first ('*' marks unread)
     List {
         /// List only this account
         #[arg(long, value_name = "NAME")]
         account: Option<String>,
-        /// The most messages to list
-        #[arg(long, value_name = "N", default_value_t = NonZeroU32::MIN.saturating_add(49))]
-        limit: NonZeroU32,
-        /// Print JSON (https://github.com/AH-Merii/neomail/blob/main/docs/json.md)
-        #[arg(long)]
-        json: bool,
+        /// The most messages to list, or all
+        #[arg(long, value_name = "N|all", value_parser = parse_limit, default_value_t = Limit::Count(NonZeroU32::MIN.saturating_add(49)))]
+        limit: Limit,
+        #[command(flatten)]
+        format: ListingFormat,
     },
-    /// Show one cached message by the id from `neomail list`
+    /// Show cached messages by the ids from `neomail list`, through a pager on a terminal
     Show {
-        /// The message's id, the first column of `neomail list`
-        id: i64,
-        /// Print JSON (https://github.com/AH-Merii/neomail/blob/main/docs/json.md)
-        #[arg(long, conflicts_with = "raw")]
-        json: bool,
-        /// Print the RFC 822 source
+        /// Message ids, the first column of `neomail list`, or - to read them from standard input, one per line
+        #[arg(value_name = "ID", required = true, value_parser = parse_id_arg)]
+        ids: Vec<IdArg>,
+        #[command(flatten)]
+        format: ShowFormat,
+        /// Print directly instead of through the pager ($NEOMAIL_PAGER, $PAGER or less)
         #[arg(long)]
-        raw: bool,
+        no_pager: bool,
+    },
+    /// Print a shell completion script to standard output
+    Completions {
+        /// The shell
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
     /// Add, list and sign in accounts, and manage passwords in the OS keyring
     Account {
@@ -133,7 +233,10 @@ enum AccountCommand {
     #[command(after_help = ADD_EXAMPLES)]
     Add(AddCommand),
     /// List the configured accounts (reads only the config: no keyring, no network)
-    List,
+    List {
+        #[command(flatten)]
+        format: ListingFormat,
+    },
     /// Sign an OAuth account in again, replacing its saved sign-in
     Login {
         /// The account's name in the config
@@ -271,12 +374,21 @@ pub fn usage(message: impl Into<String>) -> anyhow::Error {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match run(cli) {
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(e) => return clap_exit(&e, color_flag(&args)),
+    };
+    // The one colour choice per stream, passed down from here.
+    let colors = Colors::new(
+        style::decide(cli.color, style::env_var, io::stdout().is_terminal()),
+        style::decide(cli.color, style::env_var, io::stderr().is_terminal()),
+    );
+    match run(cli, colors) {
         Ok(code) => code,
         Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("neomail: {e:#}");
+            eprintln!("{}: {e:#}", colors.stderr.error("neomail"));
             if e.chain().any(|c| c.is::<UsageError>()) {
                 ExitCode::from(EXIT_USAGE)
             } else {
@@ -284,6 +396,47 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// Prints clap's help, version or usage error, coloured by the same rules as everything else
+/// (`--color` read from the raw arguments, since they did not parse).
+fn clap_exit(e: &clap::Error, flag: Option<ColorWhen>) -> ExitCode {
+    let to_stdout = !e.use_stderr();
+    let terminal = if to_stdout {
+        io::stdout().is_terminal()
+    } else {
+        io::stderr().is_terminal()
+    };
+    let styled = e.render();
+    let text = if style::decide(flag, style::env_var, terminal) == style::Decision::Off {
+        styled.to_string()
+    } else {
+        styled.ansi().to_string()
+    };
+    // A closed pipe (`neomail --help | head -1`) is not an error.
+    let _ = if to_stdout {
+        io::stdout().lock().write_all(text.as_bytes())
+    } else {
+        io::stderr().lock().write_all(text.as_bytes())
+    };
+    ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(EXIT_USAGE))
+}
+
+/// The last `--color WHEN` or `--color=WHEN` before `--`, for arguments that did not parse.
+fn color_flag(args: &[OsString]) -> Option<ColorWhen> {
+    let mut found = None;
+    let mut args = args.iter().skip(1).map(|a| a.to_string_lossy());
+    while let Some(a) = args.next() {
+        let value = match a.as_ref() {
+            "--" => break,
+            "--color" => args.next().map(|v| v.into_owned()),
+            a => a.strip_prefix("--color=").map(str::to_owned),
+        };
+        if let Some(v) = value {
+            found = ColorWhen::from_str(&v, true).ok().or(found);
+        }
+    }
+    found
 }
 
 /// `NEOMAIL_NO_INPUT` set to anything but empty or `0`.
@@ -315,21 +468,28 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
         .any(|io| io.kind() == io::ErrorKind::BrokenPipe)
 }
 
-fn run(cli: Cli) -> Result<ExitCode> {
+fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
     let input = Input::detect(cli.no_input || no_input_env());
     let Some(command) = cli.command else {
         let path = config::config_path(cli.config)?;
         if config::exists(&path) {
-            eprint!("{}", Cli::command().render_help());
+            let help = Cli::command().render_help();
+            if colors.stderr.is_on() {
+                eprint!("{}", help.ansi());
+            } else {
+                eprint!("{help}");
+            }
         } else {
             eprint!("{}", start_text());
         }
         return Ok(ExitCode::from(EXIT_USAGE));
     };
     let stdout = io::stdout();
+    let terminal = stdout.is_terminal();
     let mut out = BufWriter::new(stdout.lock());
     let code = match command {
         Command::Sync { account, limit } => {
+            let limit = limit.get();
             let config = Config::load(&config::config_path(cli.config)?)?;
             let accounts = config.select(account.as_deref())?;
             let mut cache = open_cache(true)?.context("the cache could not be created")?;
@@ -391,22 +551,20 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::List {
             account,
             limit,
-            json,
+            format,
         } => {
             let entries = match open_cache(false)? {
                 Some(cache) => {
                     if let Some(name) = account.as_deref() {
                         check_cached_account(&cache, name)?;
                     }
-                    cache.list(account.as_deref(), limit.get())?
+                    cache.list(account.as_deref(), limit.get().get())?
                 }
                 None if account.is_some() => bail!("{}", no_cache_hint(cli.config)),
                 None => Vec::new(),
             };
-            if json {
-                let items: Vec<_> = entries.iter().map(output::ListItem::from).collect();
-                output::write_json(&mut out, &items)?;
-            } else if entries.is_empty() {
+            let mode = format.mode(terminal);
+            if entries.is_empty() && matches!(mode, Mode::Human | Mode::Plain) {
                 let hint = match no_cache_hint(cli.config) {
                     h if h.starts_with("nothing") => {
                         "no cached messages; run `neomail sync` first".to_owned()
@@ -414,30 +572,29 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     h => h,
                 };
                 eprintln!("neomail: {hint}");
-            } else {
-                output::write_list(&mut out, &entries)?;
             }
+            let items: Vec<_> = entries.iter().map(output::ListItem::from).collect();
+            output::write_listing(
+                &mut out,
+                mode,
+                &items,
+                |out| output::write_list(out, &entries, terminal_width(), colors.stdout),
+                |out| output::write_list_plain(out, &entries, colors.plain),
+            )?;
             ExitCode::SUCCESS
         }
-        Command::Show { id, json, raw } => {
-            let Some(cache) = open_cache(false)? else {
-                bail!("{}", no_cache_hint(cli.config));
-            };
-            let stored = cache
-                .get(MessageId::new(id))?
-                .with_context(|| format!("no cached message with id {id}; see `neomail list`"))?;
-            if raw {
-                out.write_all(&stored.raw)?;
-            } else {
-                let parsed = nm_core::parse::parse(&stored.raw)
-                    .with_context(|| format!("message {id} cannot be read; try --raw"))?;
-                let item = output::ShowItem::new(&stored, &parsed);
-                if json {
-                    output::write_json(&mut out, &item)?;
-                } else {
-                    output::write_show(&mut out, &item)?;
-                }
-            }
+        Command::Show {
+            ids,
+            format,
+            no_pager,
+        } => show(
+            &ids, &format, no_pager, cli.config, terminal, colors, &mut out,
+        )?,
+        Command::Completions { shell } => {
+            // Into memory first: clap_complete panics when a write fails.
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "neomail", &mut script);
+            out.write_all(&script)?;
             ExitCode::SUCCESS
         }
         Command::Config {
@@ -470,24 +627,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
             ExitCode::SUCCESS
         }
         Command::Account {
-            command: AccountCommand::List,
+            command: AccountCommand::List { format },
         } => {
             let path = config::config_path(cli.config)?;
-            if !config::exists(&path) {
+            let accounts = if config::exists(&path) {
+                Config::load(&path)?.accounts
+            } else {
+                Vec::new()
+            };
+            if accounts.is_empty() {
                 eprintln!("neomail: no accounts yet; {}", config::ADD_HINT);
-                return Ok(ExitCode::SUCCESS);
             }
-            let config = Config::load(&path)?;
-            if config.accounts.is_empty() {
-                eprintln!("neomail: no accounts yet; {}", config::ADD_HINT);
-            }
-            output::write_accounts(&mut out, &config.accounts)?;
+            let items: Vec<_> = accounts.iter().map(output::AccountItem::from).collect();
+            output::write_listing(
+                &mut out,
+                format.mode(terminal),
+                &items,
+                |out| output::write_accounts(out, &items, colors.stdout),
+                |out| output::write_accounts_plain(out, &items, colors.plain),
+            )?;
             ExitCode::SUCCESS
         }
         Command::Account { command } => {
             let config = Config::load(&config::config_path(cli.config)?)?;
             match command {
-                AccountCommand::Add(_) | AccountCommand::List => unreachable!("handled above"),
+                AccountCommand::Add(_) | AccountCommand::List { .. } => {
+                    unreachable!("handled above")
+                }
                 AccountCommand::Login { name, no_browser } => {
                     account::login(config.select(Some(&name))?[0], no_browser, input, &mut out)?;
                 }
@@ -525,6 +691,162 @@ fn run(cli: Cli) -> Result<ExitCode> {
     };
     out.flush()?;
     Ok(code)
+}
+
+/// The terminal's width for the human list, 80 when unknown.
+fn terminal_width() -> usize {
+    terminal_size::terminal_size_of(io::stdout()).map_or(output::WIDTH, |(w, _)| usize::from(w.0))
+}
+
+/// `neomail show`: one or more ids, or `-` for ids on standard input. Missing or unreadable
+/// messages are reported on standard error after the others are shown, and exit 1.
+fn show(
+    ids: &[IdArg],
+    format: &ShowFormat,
+    no_pager: bool,
+    config: Option<PathBuf>,
+    terminal: bool,
+    colors: Colors,
+    out: &mut dyn Write,
+) -> Result<ExitCode> {
+    let one_literal = matches!(ids, [IdArg::Id(_)]);
+    let ids = if ids.contains(&IdArg::Stdin) {
+        if ids.len() > 1 {
+            return Err(usage(
+                "`-` reads the ids from standard input; give no other ids",
+            ));
+        }
+        let mut input = Vec::new();
+        io::stdin()
+            .lock()
+            .read_to_end(&mut input)
+            .context("cannot read standard input")?;
+        ids_from_lines(&String::from_utf8_lossy(&input))?
+    } else {
+        ids.iter()
+            .filter_map(|id| match id {
+                IdArg::Id(id) => Some(*id),
+                IdArg::Stdin => None,
+            })
+            .collect()
+    };
+    if format.raw && ids.len() != 1 {
+        return Err(usage(format!(
+            "--raw takes exactly one id, not {}",
+            ids.len()
+        )));
+    }
+    let Some(cache) = open_cache(false)? else {
+        bail!("{}", no_cache_hint(config));
+    };
+    // Reported after the output is written or paged, so the reason for exit 1 is the last
+    // thing on the terminal rather than scrolled away above the messages.
+    let mut failures = Vec::new();
+    let mut messages = Vec::new();
+    for id in ids {
+        let Some(stored) = cache.get(MessageId::new(id))? else {
+            failures.push(format!(
+                "no cached message with id {id}; see `neomail list`"
+            ));
+            continue;
+        };
+        if format.raw {
+            out.write_all(&stored.raw)?;
+            continue;
+        }
+        match nm_core::parse::parse(&stored.raw) {
+            Ok(parsed) => messages.push((stored, parsed)),
+            Err(_) => failures.push(format!("message {id} cannot be read; try --raw")),
+        }
+    }
+    let items = messages
+        .iter()
+        .map(|(stored, parsed)| output::ShowItem::new(stored, parsed));
+    if format.jsonl {
+        output::write_jsonl(out, items)?;
+    } else if format.json {
+        let items: Vec<_> = items.collect();
+        match items.as_slice() {
+            [item] if one_literal => output::write_json(out, item)?,
+            // One literal id that is missing prints nothing, as before.
+            [] if one_literal => {}
+            items => output::write_json(out, items)?,
+        }
+    } else if !format.raw {
+        let pager = pager::choose(no_pager, terminal, style::env_var);
+        let mut text = Vec::new();
+        for (i, item) in items.enumerate() {
+            if i > 0 {
+                output::write_separator(&mut text, item.id, colors.stdout)?;
+            }
+            output::write_show(&mut text, &item, colors.stdout)?;
+        }
+        match pager {
+            Some(pager) if !text.is_empty() => {
+                out.flush()?;
+                pager::page(&pager, &text, out)?;
+            }
+            _ => out.write_all(&text)?,
+        }
+    }
+    out.flush()?;
+    for message in &failures {
+        eprintln!("{}: {message}", colors.stderr.error("neomail"));
+    }
+    Ok(if failures.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(EXIT_FAILURE)
+    })
+}
+
+/// The ids on standard input, one per line, in order. Blank lines are skipped; a line without
+/// an id is a usage error naming its line number.
+fn ids_from_lines(input: &str) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    for (n, line) in input.lines().enumerate() {
+        match id_from_line(line) {
+            Ok(Some(id)) => ids.push(id),
+            Ok(None) => {}
+            Err(()) => {
+                return Err(usage(format!(
+                    "standard input line {}: no message id at its start (the first column of `neomail list`)",
+                    n + 1
+                )));
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// A line's id: after leading whitespace and ANSI SGR codes, the digits up to the first tab or
+/// space (SGR codes may follow the digits). `Ok(None)` for a blank line.
+fn id_from_line(line: &str) -> std::result::Result<Option<i64>, ()> {
+    let mut rest = line.trim_start();
+    while let Some(after) = strip_sgr(rest) {
+        rest = after.trim_start();
+    }
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let (digits, mut tail) = rest.split_at(end);
+    while let Some(after) = strip_sgr(tail) {
+        tail = after;
+    }
+    if !(tail.is_empty() || tail.starts_with(['\t', ' '])) {
+        return Err(());
+    }
+    digits.parse().map(Some).map_err(|_| ())
+}
+
+/// `s` without one leading SGR code (`ESC [ digits;... m`).
+fn strip_sgr(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix("\x1b[")?;
+    let end = rest.find(|c: char| !(c.is_ascii_digit() || c == ';'))?;
+    rest[end..].strip_prefix('m')
 }
 
 /// `neomail config check`: the number of accounts, or the message to print ("PATH:LINE:COL:
@@ -789,6 +1111,64 @@ mod tests {
         for bad in ["", "0", "5", "outlook"] {
             assert!(parse_choice(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_stdin_line_s_id_is_its_first_field() {
+        let ok = |line: &str| id_from_line(line).unwrap();
+        assert_eq!(ok("42\t*\t2026-10-10T09:30:00Z\twork\tAda\tHi"), Some(42));
+        assert_eq!(ok("  7 * 2026-10-10  Ada  Hi"), Some(7));
+        assert_eq!(ok("\x1b[33m42\x1b[0m\t\x1b[1m*\x1b[0m\tx"), Some(42));
+        assert_eq!(ok("\x1b[33m  42\x1b[0m \x1b[1m*\x1b[0m"), Some(42));
+        assert_eq!(ok("42"), Some(42));
+        assert_eq!(ok(""), None);
+        assert_eq!(ok(" \t "), None);
+        for bad in [
+            "abc",
+            "42abc",
+            "-1",
+            "x 42",
+            "\x1b[31",
+            "99999999999999999999",
+        ] {
+            assert!(id_from_line(bad).is_err(), "{bad:?}");
+        }
+        let ids = ids_from_lines("1\tx\n\n  2 y\r\n").unwrap();
+        assert_eq!(ids, [1, 2]);
+        let e = ids_from_lines("1\n\nnope\n").unwrap_err();
+        assert!(e.to_string().contains("line 3"), "{e}");
+        assert!(e.is::<UsageError>());
+    }
+
+    #[test]
+    fn limit_is_a_positive_number_or_all() {
+        assert_eq!(parse_limit("all"), Ok(Limit::All));
+        assert_eq!(Limit::All.get(), NonZeroU32::MAX);
+        assert_eq!(
+            parse_limit("3").map(Limit::get),
+            Ok(NonZeroU32::MIN.saturating_add(2))
+        );
+        for bad in ["0", "-1", "ALL", ""] {
+            assert!(parse_limit(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn color_flag_is_found_in_arguments_that_did_not_parse() {
+        let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(color_flag(&args(&["neomail", "--bogus"])), None);
+        assert_eq!(
+            color_flag(&args(&["neomail", "--color", "never", "list", "--bogus"])),
+            Some(ColorWhen::Never)
+        );
+        assert_eq!(
+            color_flag(&args(&["neomail", "--color=always", "--color=never"])),
+            Some(ColorWhen::Never)
+        );
+        assert_eq!(
+            color_flag(&args(&["neomail", "--", "--color=always"])),
+            None
+        );
     }
 
     #[test]
