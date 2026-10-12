@@ -148,3 +148,42 @@ pub struct FetchedMessage {
     /// The RFC 822 source.
     pub raw: Vec<u8>,
 }
+
+/// A message's id at a provider that names messages with opaque strings instead of UIDs
+/// (Microsoft Graph). Never empty. Compared byte for byte: Graph ids are case-sensitive.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RemoteId(Box<str>);
+
+impl RemoteId {
+    /// Returns `None` for an empty id.
+    pub fn new(id: impl Into<Box<str>>) -> Option<Self> {
+        let id = id.into();
+        (!id.is_empty()).then_some(Self(id))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RemoteId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A message's id, flags and arrival time at an [`IdSource`](crate::IdSource), without its
+/// content. The arrival time is required: the by-id sync engine windows on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdListed {
+    pub id: RemoteId,
+    pub flags: Flags,
+    pub received: DateTime<Utc>,
+}
+
+/// A message's RFC 822 source, as fetched from an [`IdSource`](crate::IdSource).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdFetched {
+    pub id: RemoteId,
+    pub raw: Vec<u8>,
+}

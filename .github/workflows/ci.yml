@@ -35,8 +35,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      # --all-features also builds nm-core's `conformance` checks and runs their tests.
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --locked --all-features
 
   # install.sh runs under any POSIX sh, so shellcheck checks it as sh (its shebang).
   shellcheck:
@@ -58,7 +59,7 @@ jobs:
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --all-targets
+      - run: cargo check --locked --all-targets --all-features
 
   # Runs on pull requests too, so a dependency that breaks the static musl link fails before it
   # merges. The macOS build may fail without blocking anything (Linux first), and a failing leg

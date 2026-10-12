@@ -23,7 +23,9 @@ const FROM_WIDTH: usize = 20;
 pub struct ListItem<'a> {
     pub id: MessageId,
     pub account: &'a str,
-    pub uid: Uid,
+    /// Always set for IMAP mail, the only kind cached so far. A message with no UID (by-id
+    /// mailboxes) would print `null`; slice 6 part 3 settles that shape before one can exist.
+    pub uid: Option<Uid>,
     pub date: Option<DateTime<Utc>>,
     pub from: Option<&'a EmailAddress>,
     pub subject: Option<&'a str>,
@@ -50,7 +52,8 @@ impl<'a> From<&'a ListEntry> for ListItem<'a> {
 pub struct ShowItem<'a> {
     pub id: MessageId,
     pub account: &'a str,
-    pub uid: Uid,
+    /// As [`ListItem::uid`].
+    pub uid: Option<Uid>,
     pub date: Option<DateTime<Utc>>,
     pub received: Option<DateTime<Utc>>,
     pub from: &'a [EmailAddress],
@@ -528,7 +531,7 @@ mod tests {
         ListEntry {
             id: MessageId::new(id),
             account: "wo\trk".to_owned(),
-            uid: Uid::new(1).unwrap(),
+            uid: Uid::new(1),
             date: DateTime::from_timestamp(1_791_624_600, 0),
             from: from.map(|(n, a)| EmailAddress {
                 name: (!n.is_empty()).then(|| n.to_owned()),

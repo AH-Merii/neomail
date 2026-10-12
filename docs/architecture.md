@@ -11,7 +11,7 @@ client (slice 3) and getting started and setup (slice 4).
 | Crate | What it holds | Why it is a crate |
 | ----- | ------------- | ----------------- |
 | `crates/neomail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, output, wiring. | The composition root. Nothing depends on it. |
-| `crates/nm-core` | Domain types, the `MailSource` trait, the SQLite cache, the sync engine, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
+| `crates/nm-core` | Domain types, the `MailSource` and `IdSource` traits, the SQLite cache, the sync engines, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
 | `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap). | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; Graph and the Gmail API become sibling crates. |
 
 A new crate needs a reason of the same kind: a second implementation of a seam, or a heavy
@@ -32,6 +32,19 @@ and sorts whatever comes back. The sync tests drive the engine through a fake so
 a scripted IMAP server over an in-memory pipe and checks the commands on the wire: `EXAMINE`,
 `BODY.PEEK[]`, and never `SELECT`, `STORE`, `COPY`, `MOVE`, `EXPUNGE` or `APPEND`. The IMAP
 source is also checked live against Proton Bridge.
+
+**`IdSource`** (`nm-core/src/id_source.rs`) is the same read-only view for providers whose
+messages have opaque, case-sensitive string ids and no UIDs or UIDVALIDITY (Microsoft Graph,
+slice 6): `newest(limit)` and `arrived_since(time)` list ids with their flags and required arrival
+time, and `fetch(ids)` returns RFC 822 sources without marking them read. It sits beside
+`MailSource` rather than widening it, because no UID-based rule (watermark, UIDVALIDITY reset)
+carries over; the cache's `MailboxKind` (`Imap` or `ById`) is the only other place the two meet.
+`nm_core::conformance::id_source`, behind the `conformance` feature, checks a source against the
+contract, including that `newest` returns the latest arrivals; it needs two messages of different
+arrival times and fails rather than pass vacuously. The in-memory reference source in
+`nm-core/tests/id_sync.rs` passes it; sources that ignore `since`, list the oldest or list nothing
+fail it. No other trait is needed: the cache stays a concrete type with by-id
+methods, and the engine reuses `SyncReport`, `SyncError` and `Progress`.
 
 **The password** comes from one of two sources, fixed per account when the config is parsed
 (`PasswordSource` in `neomail/src/config.rs`): the account's `password_command`, run with `sh -c`,
@@ -132,9 +145,21 @@ directory (created with mode 0700). On Unix, `neomail` makes the file and SQLite
 `-shm` files mode 0600 each time it opens the cache, even in a directory that already existed
 with looser modes (`neomail/src/main.rs`, `restrict_cache_files`). Tables:
 
-- `mailbox (account, name, uid_validity, highest_uid)`: the sync state;
-- `message (mailbox_id, uid, flags, received, date, from_*, subject, raw)`: the message source
-  plus the few fields `list` needs, so listing never parses mail.
+- `mailbox (account, name, uid_validity, highest_uid, seen_until)`: the sync state. A NULL
+  `uid_validity` marks a by-id mailbox, whose state is `seen_until` instead;
+- `message (mailbox_id, uid, remote_id, flags, received, date, from_*, subject, raw)`: the
+  message source plus the few fields `list` needs, so listing never parses mail. Exactly one of
+  `uid` and `remote_id` is set (a `CHECK`), each unique per mailbox.
+
+Schema 2 added the by-id columns. A schema 1 cache is migrated when it is opened, following
+SQLite's procedure for other table changes: foreign keys off outside any transaction (inside one
+the pragma does nothing, and with them on, dropping the old `mailbox` would delete every message),
+then one `BEGIN IMMEDIATE` transaction that reads the version again, creates the new tables, copies
+every row with its id, drops the old tables, renames the new ones, restores the `message` id
+counter (copying would otherwise lower it to the highest id left, and a deleted newest id would be
+handed out again), recreates the index, requires an empty `PRAGMA foreign_key_check` and sets the
+version. Foreign keys go back on afterwards. Any failure rolls back to the untouched schema 1
+(`nm-core/tests/migration.rs`).
 
 `PRAGMA user_version` holds the schema version. A new cache gets its schema and version in one
 `BEGIN IMMEDIATE` transaction that reads the version again, so two first syncs at once or a
@@ -153,8 +178,9 @@ off.
 
 `sync_inbox` (`nm-core/src/sync.rs`) runs once per account:
 
-1. `EXAMINE INBOX` (read-only). If UIDVALIDITY differs from the cached one, the mailbox's cache
-   is dropped and the sync starts as a first sync; the summary says so.
+1. `EXAMINE INBOX` (read-only). If UIDVALIDITY differs from the cached one, or the cached mailbox
+   is a by-id one, the mailbox's cache is dropped and the sync starts as a first sync; the summary
+   says so.
 2. List the server's UIDs and flags:
    - first sync (no `highest_uid` yet): every message (`FETCH 1:* (UID FLAGS INTERNALDATE)`, no
      bodies), keeping the `--limit` with the latest INTERNALDATE. Not the highest UIDs: Proton
@@ -178,6 +204,17 @@ off.
 
 A second sync with no changes on the server fetches no message bodies and prints `0 new, 0 updated,
 0 removed`.
+
+`sync_inbox_by_id` (`nm-core/src/id_source.rs`) syncs an `IdSource` into a by-id mailbox; a
+missing or IMAP mailbox is reset to one first. With nothing cached and no `seen_until` it lists
+the `--limit` newest; otherwise everything that arrived since the oldest cached message or
+`seen_until`, whichever is earlier, so the window covers every cached row: cached ids not listed
+are dropped and changed flags updated. Listed ids not cached are fetched oldest arrival first, 50
+per request and transaction. With nothing missing, `seen_until` becomes the newest listed arrival,
+else the oldest missing one, saved with the batch it was missing from, so a missing body is asked
+for again even if a later batch fails, and an interrupted first sync is finished by the next run.
+Known limit: mail moved into the inbox with an arrival time older than the window is not seen
+until Graph's delta query (roadmap row 7).
 
 ## Output
 
@@ -259,8 +296,8 @@ nothing. mise reads the same release through its GitHub backend.
 
 The order of the slices is in [roadmap.md](roadmap.md). What they change in the code:
 
-- **More providers:** Microsoft Graph and the Gmail API become new `MailSource` crates; Graph's
-  delta sync may widen the trait (a sync token next to UIDs).
+- **More providers:** Microsoft Graph becomes an `IdSource` crate (slice 6), and its delta query
+  may add a sync token to that trait; the Gmail API becomes another source crate.
 - **More mail:** folders beyond INBOX, CONDSTORE/QRESYNC to refresh flags cheaply, and IDLE.
 - **Actions:** flags, moves and deletes need a write side on the source and a way to record
   pending changes in the cache.

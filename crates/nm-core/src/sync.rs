@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
-use crate::cache::{Cache, CacheError};
+use crate::cache::{Cache, CacheError, MailboxKind, MailboxRecord};
 use crate::source::MailSource;
 use crate::types::{Flags, ListedMessage, Uid, UidFlags};
 
@@ -13,8 +13,8 @@ pub const INBOX: &str = "INBOX";
 /// How many of the newest messages the first sync takes, unless told otherwise.
 pub const DEFAULT_LIMIT: NonZeroU32 = NonZeroU32::MIN.saturating_add(499);
 
-/// Messages fetched per request.
-const FETCH_BATCH: usize = 50;
+/// Messages fetched per request, and stored per transaction.
+pub(crate) const FETCH_BATCH: usize = 50;
 
 /// What one sync changed in the cache.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -82,66 +82,75 @@ pub async fn sync_inbox_with_progress<S: MailSource>(
     let status = source.examine_inbox().await.map_err(SyncError::Source)?;
     let mut report = SyncReport::default();
 
-    let mailbox = match cache.mailbox(account, INBOX)? {
-        Some(m) if m.uid_validity == status.uid_validity => m,
+    // A by-id mailbox is reset too: its messages have no UIDs.
+    let (mailbox_id, highest_uid) = match cache.mailbox(account, INBOX)? {
+        Some(MailboxRecord {
+            id,
+            kind:
+                MailboxKind::Imap {
+                    uid_validity,
+                    highest_uid,
+                },
+        }) if uid_validity == status.uid_validity => (id, highest_uid),
         previous => {
             if let Some(old) = previous {
                 report.reset = true;
-                report.removed = cache.cached_flags(old.id)?.len();
+                report.removed = cache.message_count(old.id)?;
             }
-            cache.reset_mailbox(account, INBOX, status.uid_validity)?
+            let reset = cache.reset_mailbox(account, INBOX, status.uid_validity)?;
+            (reset.id, None)
         }
     };
 
-    let cached = cache.cached_flags(mailbox.id)?;
-    let (server, new, watermark): (BTreeMap<Uid, Flags>, Vec<Uid>, Option<Uid>) =
-        match mailbox.highest_uid {
-            None => {
-                let listing = if status.exists == 0 {
-                    Vec::new()
-                } else {
-                    source.list_all().await.map_err(SyncError::Source)?
-                };
-                let (chosen, watermark) = newest_arrivals(&listing, limit);
-                let new = chosen
-                    .into_iter()
-                    .filter(|uid| cached.binary_search_by_key(uid, |c| c.uid).is_err())
-                    .collect();
-                // The whole listing, so a first sync that runs again keeps the messages it
-                // cached before, even once newer mail pushes them out of the chosen set.
-                let server = listing.into_iter().map(|m| (m.uid, m.flags)).collect();
-                (server, new, watermark)
-            }
-            Some(highest) => {
-                // The listing must cover the oldest cached message, else the first UID after the
-                // highest one seen.
-                let from = match cached.first() {
-                    Some(first) => first.uid,
-                    None => match highest.get().checked_add(1).and_then(Uid::new) {
-                        Some(next) => next,
-                        None => return Ok(report), // UID space exhausted: nothing can be new.
-                    },
-                };
-                let listing = if status.exists == 0 {
-                    Vec::new()
-                } else {
-                    source.flags_from(from).await.map_err(SyncError::Source)?
-                };
-                let server: BTreeMap<Uid, Flags> = listing
-                    .into_iter()
-                    .filter(|m| m.uid >= from)
-                    .map(|m| (m.uid, m.flags))
-                    .collect();
-                let new = server
-                    .keys()
-                    .copied()
-                    .filter(|uid| *uid > highest)
-                    // Already cached: stored above a message that came back without a body.
-                    .filter(|uid| cached.binary_search_by_key(uid, |c| c.uid).is_err())
-                    .collect();
-                (server, new, None)
-            }
-        };
+    let cached = cache.cached_flags(mailbox_id)?;
+    let (server, new, watermark): (BTreeMap<Uid, Flags>, Vec<Uid>, Option<Uid>) = match highest_uid
+    {
+        None => {
+            let listing = if status.exists == 0 {
+                Vec::new()
+            } else {
+                source.list_all().await.map_err(SyncError::Source)?
+            };
+            let (chosen, watermark) = newest_arrivals(&listing, limit);
+            let new = chosen
+                .into_iter()
+                .filter(|uid| cached.binary_search_by_key(uid, |c| c.uid).is_err())
+                .collect();
+            // The whole listing, so a first sync that runs again keeps the messages it
+            // cached before, even once newer mail pushes them out of the chosen set.
+            let server = listing.into_iter().map(|m| (m.uid, m.flags)).collect();
+            (server, new, watermark)
+        }
+        Some(highest) => {
+            // The listing must cover the oldest cached message, else the first UID after the
+            // highest one seen.
+            let from = match cached.first() {
+                Some(first) => first.uid,
+                None => match highest.get().checked_add(1).and_then(Uid::new) {
+                    Some(next) => next,
+                    None => return Ok(report), // UID space exhausted: nothing can be new.
+                },
+            };
+            let listing = if status.exists == 0 {
+                Vec::new()
+            } else {
+                source.flags_from(from).await.map_err(SyncError::Source)?
+            };
+            let server: BTreeMap<Uid, Flags> = listing
+                .into_iter()
+                .filter(|m| m.uid >= from)
+                .map(|m| (m.uid, m.flags))
+                .collect();
+            let new = server
+                .keys()
+                .copied()
+                .filter(|uid| *uid > highest)
+                // Already cached: stored above a message that came back without a body.
+                .filter(|uid| cached.binary_search_by_key(uid, |c| c.uid).is_err())
+                .collect();
+            (server, new, None)
+        }
+    };
 
     let mut updates = Vec::new();
     let mut removed = Vec::new();
@@ -155,11 +164,11 @@ pub async fn sync_inbox_with_progress<S: MailSource>(
             None => removed.push(c.uid),
         }
     }
-    cache.apply_changes(mailbox.id, &updates, &removed)?;
+    cache.apply_changes(mailbox_id, &updates, &removed)?;
     report.updated = updates.len();
     report.removed += removed.len();
 
-    let first_sync = mailbox.highest_uid.is_none();
+    let first_sync = highest_uid.is_none();
     // The lowest UID that was asked for but came back without a body. The watermark never passes
     // it, so the next sync asks for it again.
     let mut lowest_missing: Option<Uid> = None;
@@ -191,13 +200,13 @@ pub async fn sync_inbox_with_progress<S: MailSource>(
                 .filter(|uid| lowest_missing.is_none_or(|lowest| *uid < lowest))
                 .max()
         };
-        cache.store_messages(mailbox.id, &fetched, raise_to)?;
+        cache.store_messages(mailbox_id, &fetched, raise_to)?;
         report.new += fetched.len();
         done.done += batch.len();
         progress(done);
     }
     if let Some(watermark) = watermark.filter(|_| lowest_missing.is_none()) {
-        cache.raise_highest_uid(mailbox.id, watermark)?;
+        cache.raise_highest_uid(mailbox_id, watermark)?;
     }
     Ok(report)
 }

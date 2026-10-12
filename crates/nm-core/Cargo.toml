@@ -23,3 +23,7 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# `nm_core::conformance`: the contract checks every IdSource implementation runs in its tests.
+conformance = []
