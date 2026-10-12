@@ -262,13 +262,47 @@ default action, as in the pager. A signal ignored at start stays ignored. The te
 `neomail sync` and the daemon hold `DATA_DIR/locks/ACCOUNT.lock` while they sync that account
 (the name with bytes other than letters, digits, `_`, `-` and a non-leading `.` as `%XX`). `sync`
 waits for it and says so once; the daemon skips the account for that round. A lock dies with its
-process, so a crash leaves nothing to clean up, and lock files are never deleted.
+process, so a crash leaves nothing to clean up, and lock files are never deleted. `round` and
+`on_wake` take the lock as a closure (`lock::try_account` in `run`), so the tests sync without a
+real one: a process that a concurrent test forks can keep a lock held until its exec.
 
-**Where push plugs in:** what starts a round is a `daemon::Wake`, only the timer or a stop so
-far. IMAP IDLE, Graph's delta query and Gmail's history will add a wake that names one account,
-synced by the same `Syncer` under the same account lock. No trait is needed for this part: the
-sources, the cache and the OAuth data are unchanged, and the scheduler, the reports and the locks
-have one implementation each, tested through plain values and in-memory writers.
+**Where push plugs in:** what the daemon does next is a `daemon::Wake`: a round (`Timer`, or
+`Resumed` when only the wall clock says it is due, after a suspend), `Account(name)`, a watcher's
+other news (`Watch`), or `Stop`. `daemon::on_wake` handles each, outside the runtime as before.
+
+- **The watcher** (`nm_imap::Watcher`, `nm-imap/src/watch.rs`) is one extra connection per IMAP
+  account. It connects as the sync does (TLS or STARTTLS, the certificate pin), logs in, and gives
+  up with `Ok(None)` when CAPABILITY has no IDLE. Otherwise it runs `EXAMINE INBOX` and IDLE (RFC
+  2177), and calls back on the first IDLE and on every untagged EXISTS, EXPUNGE or FETCH. It sends
+  DONE and IDLE again every 29 minutes on the same connection. Every wait has a deadline, DONE's
+  reply included, so a connection that died silently ends it within 30 minutes. The wire tests
+  hold it to the sync's read-only command list.
+- **The login hand-over:** a `Syncer` built with `push_logins` returns, in `Synced::watch`, the
+  `WatchLogin` of each successful IMAP sync (a copy of its password or access token). The watcher
+  never touches the keyring or a `password_command`, which cannot run inside `block_on`, and drops
+  the secret once logged in.
+- **`push::Push`** owns the watchers, as tasks on the daemon's runtime. They run while the daemon
+  waits or syncs inside `block_on`. `Push::start` runs after each sync that handed over a login. It
+  starts a watcher only when none runs, the server was not found without IDLE, and the last start
+  was at least a minute ago (`START_EVERY`), so a server that drops every connection cannot make a
+  loop. A start held back by that limit sends the account a `push::Kind::WakeAt` for when the
+  minute is up, on the watchers' channel, so that sync starts the watcher then rather than at
+  the next round. A resumed round ends every watcher and lifts that limit (`replace_all`), and a
+  stop ends them all (`stop_all`). Each start gets a generation, so a replaced watcher's late news
+  is ignored. `Push::event` turns news into the `push on`, `push off` and `push failing` lines,
+  printed when the account's state changes.
+- **The account wake:** a watcher sends `push::Kind::Wake` on the first IDLE, which covers mail
+  that came in between the sync and the IDLE. It sends one on each change, and one when it ends
+  after idling, so that sync catches up and starts the next watcher. `Stop::wait_until` keeps
+  woken accounts in `Wakes` for `SETTLE` (2 s), so a burst makes one sync. Wakes that arrive
+  during the account's sync are read after it, so they make one more. A round drops the waiting
+  wakes, since it syncs every account, and an account wake never moves the next round. The sync
+  goes through `round`'s per-account path, so the account lock, `Reports` and the notifications
+  are the same.
+
+No trait: there is one watcher, and the tests give `Push` a closure that plays scripted events on
+tokio's paused clock, as `round` and `notify_round` take closures. Graph's delta query and Gmail's
+history will be other watchers that send the same events.
 
 **Notifications** (`neomail/src/notify.rs`) come after a round, never inside a sync. Which mail is
 new comes from the sync: `SyncReport::new_ids` holds the cache ids of the rows it added (the cache's

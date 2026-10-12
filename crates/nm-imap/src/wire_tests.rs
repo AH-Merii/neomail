@@ -1,17 +1,19 @@
 //! The read-only guarantee on the wire: `ImapSource` driven by the sync engine against a scripted
 //! IMAP server over an in-memory pipe. It must open INBOX with EXAMINE and fetch with
-//! BODY.PEEK[], and never send a command that can change the server.
+//! BODY.PEEK[], and never send a command that can change the server. The push [`Watcher`] keeps
+//! the same guarantee.
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
 
 use std::num::NonZeroU32;
+use std::time::Duration;
 
 use async_imap::Client;
 use nm_core::{Cache, sync_inbox};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
 use super::{
-    ImapConfig, ImapError, ImapSource, Login, Security, check_on, greeting, log_in,
-    server_certificate, xoauth2_response,
+    ImapConfig, ImapError, ImapSource, Login, Security, WatchEvent, Watcher, check_on, greeting,
+    log_in, server_certificate, xoauth2_response,
 };
 
 /// The FETCH response for one whole, unread message.
@@ -113,7 +115,14 @@ async fn sync_sends_only_read_only_commands() {
         upper.iter().any(|c| c.contains("BODY.PEEK[]")),
         "{commands:?}"
     );
-    for c in &upper {
+    assert_read_only(&commands);
+}
+
+/// No command in `commands` can change the server: no SELECT (which can clear \Recent), STORE,
+/// COPY, MOVE, EXPUNGE or APPEND, and no fetch that would set \Seen.
+fn assert_read_only(commands: &[String]) {
+    assert!(!commands.is_empty());
+    for c in commands.iter().map(|c| c.to_ascii_uppercase()) {
         let verb = c.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
         for forbidden in ["SELECT", "STORE", "COPY", "MOVE", "EXPUNGE", "APPEND"] {
             assert!(
@@ -258,4 +267,238 @@ async fn reading_the_certificate_of_a_closed_port_fails_to_connect() {
     };
     let e = server_certificate(&config).await.unwrap_err();
     assert!(matches!(e, ImapError::Connect { .. }), "{e:?}");
+}
+
+/// What the scripted IDLE server does once the watcher's first IDLE runs, after it sent the
+/// script's untagged lines.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AfterIdle {
+    /// Closes the connection without a word.
+    Close,
+    /// Says BYE, then closes.
+    Bye,
+    /// Answers DONE (with an EXISTS before the tagged OK), then closes after the next IDLE.
+    Renew,
+    /// Never answers DONE: a connection that died while idling.
+    IgnoreDone,
+}
+
+struct IdleScript {
+    /// Whether CAPABILITY lists IDLE.
+    idle: bool,
+    /// Untagged lines sent once the first IDLE is accepted.
+    during: &'static [&'static str],
+    after: AfterIdle,
+}
+
+/// A server with IDLE, scripted by `script`. Returns each command line (without its tag) and when
+/// it arrived on the paused clock, counted from the greeting.
+async fn idle_server(stream: DuplexStream, script: IdleScript) -> Vec<(String, Duration)> {
+    let start = tokio::time::Instant::now();
+    let (read, mut write) = tokio::io::split(stream);
+    let mut lines = BufReader::new(read).lines();
+    let mut seen = Vec::new();
+    let mut idle_tag = String::new();
+    let mut idles = 0;
+    write
+        .write_all(b"* OK scripted IMAP ready\r\n")
+        .await
+        .unwrap();
+    while let Ok(Some(line)) = lines.next_line().await {
+        // DONE is the one line without a tag.
+        let (tag, command) = line.split_once(' ').unwrap_or(("", &line));
+        seen.push((command.to_owned(), start.elapsed()));
+        let upper = command.to_ascii_uppercase();
+        let reply = if upper == "DONE" {
+            if script.after == AfterIdle::IgnoreDone {
+                continue;
+            }
+            format!("* 4 EXISTS\r\n{idle_tag} OK IDLE terminated\r\n")
+        } else if upper == "IDLE" {
+            idles += 1;
+            idle_tag = tag.to_owned();
+            write.write_all(b"+ idling\r\n").await.unwrap();
+            if idles > 1 {
+                break;
+            }
+            for untagged in script.during {
+                write
+                    .write_all(format!("{untagged}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            match script.after {
+                AfterIdle::Close => break,
+                AfterIdle::Bye => {
+                    write.write_all(b"* BYE shutting down\r\n").await.unwrap();
+                    break;
+                }
+                AfterIdle::Renew | AfterIdle::IgnoreDone => continue,
+            }
+        } else if upper.starts_with("LOGIN") {
+            format!("{tag} OK logged in\r\n")
+        } else if upper == "CAPABILITY" {
+            let idle = if script.idle { " IDLE" } else { "" };
+            format!("* CAPABILITY IMAP4rev1{idle}\r\n{tag} OK done\r\n")
+        } else if upper.starts_with("EXAMINE") {
+            format!("* 2 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n{tag} OK [READ-ONLY] done\r\n")
+        } else if upper == "LOGOUT" {
+            write
+                .write_all(format!("* BYE bye\r\n{tag} OK done\r\n").as_bytes())
+                .await
+                .unwrap();
+            break;
+        } else {
+            format!("{tag} BAD not scripted\r\n")
+        };
+        write.write_all(reply.as_bytes()).await.unwrap();
+    }
+    seen
+}
+
+struct Watched {
+    /// Why the watcher ended; `None` when there was no watcher.
+    ended: Option<ImapError>,
+    events: Vec<WatchEvent>,
+    /// Each command's verb, uppercased, and when it arrived.
+    commands: Vec<(String, Duration)>,
+    /// How long the watcher ran, on the paused clock.
+    ran: Duration,
+}
+
+/// Starts a watcher against [`idle_server`] and runs it until it ends. Every command it sent must
+/// be read-only.
+async fn watch(script: IdleScript) -> Watched {
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(idle_server(server_end, script));
+    let mut client = Client::new(client_end);
+    greeting(&mut client).await.unwrap();
+    let watcher = Watcher::start(client, "user", Login::Password("password"))
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    let started = tokio::time::Instant::now();
+    let ended = match watcher {
+        Some(watcher) => Some(watcher.run(|e| events.push(e)).await),
+        None => None,
+    };
+    let ran = started.elapsed();
+    let seen = server.await.unwrap();
+    assert_read_only(&seen.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>());
+    let examines_inbox = |c: &String| c.starts_with("EXAMINE") && c.contains("INBOX");
+    assert!(
+        ended.is_none() || seen.iter().any(|(c, _)| examines_inbox(c)),
+        "{seen:?}"
+    );
+    let commands = seen
+        .into_iter()
+        .map(|(c, at)| (c.split(' ').next().unwrap_or("").to_ascii_uppercase(), at))
+        .collect();
+    Watched {
+        ended,
+        events,
+        commands,
+        ran,
+    }
+}
+
+fn verbs(watched: &Watched) -> Vec<&str> {
+    watched.commands.iter().map(|(c, _)| c.as_str()).collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn watcher_examines_inbox_then_idles_and_wakes_on_each_change() {
+    let watched = watch(IdleScript {
+        idle: true,
+        // A keep-alive and RECENT are not changes; EXISTS, EXPUNGE and FETCH are.
+        during: &[
+            "* OK still here",
+            "* 3 EXISTS",
+            "* 1 RECENT",
+            "* 1 EXPUNGE",
+            "* 2 FETCH (FLAGS (\\Seen))",
+        ],
+        after: AfterIdle::Close,
+    })
+    .await;
+    assert_eq!(verbs(&watched), ["LOGIN", "CAPABILITY", "EXAMINE", "IDLE"]);
+    use WatchEvent::{Changed, Idling};
+    assert_eq!(watched.events, [Idling, Changed, Changed, Changed]);
+    let ended = watched.ended.unwrap();
+    assert!(matches!(ended, ImapError::Closed), "{ended:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn watcher_renews_idle_after_29_minutes_on_the_same_connection() {
+    let watched = watch(IdleScript {
+        idle: true,
+        during: &[],
+        after: AfterIdle::Renew,
+    })
+    .await;
+    assert_eq!(
+        verbs(&watched),
+        ["LOGIN", "CAPABILITY", "EXAMINE", "IDLE", "DONE", "IDLE"]
+    );
+    let at = |i: usize| watched.commands[i].1;
+    assert_eq!(at(4) - at(3), Duration::from_secs(29 * 60), "IDLE to DONE");
+    assert_eq!(at(5), at(4), "IDLE again at once");
+    // The EXISTS the server sent before DONE's OK wakes too.
+    assert_eq!(watched.events, [WatchEvent::Idling, WatchEvent::Changed]);
+    assert!(
+        matches!(watched.ended, Some(ImapError::Closed)),
+        "{:?}",
+        watched.ended
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_server_that_never_answers_done_ends_the_watcher_by_its_deadline() {
+    let watched = watch(IdleScript {
+        idle: true,
+        during: &[],
+        after: AfterIdle::IgnoreDone,
+    })
+    .await;
+    assert_eq!(verbs(&watched).last(), Some(&"DONE"));
+    assert!(
+        matches!(watched.ended, Some(ImapError::Timeout("DONE"))),
+        "{:?}",
+        watched.ended
+    );
+    // 29 minutes of IDLE, then at most a minute for DONE's reply: not TCP's own timeout.
+    assert!(
+        watched.ran <= Duration::from_secs(30 * 60),
+        "{:?}",
+        watched.ran
+    );
+    assert_eq!(watched.events, [WatchEvent::Idling]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn bye_ends_the_watcher() {
+    let watched = watch(IdleScript {
+        idle: true,
+        during: &[],
+        after: AfterIdle::Bye,
+    })
+    .await;
+    let ended = watched.ended.unwrap();
+    assert!(
+        matches!(&ended, ImapError::Bye(text) if text == "shutting down"),
+        "{ended:?}"
+    );
+    assert_eq!(watched.ran, Duration::ZERO, "no wait for a deadline");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_server_without_idle_gets_no_watcher() {
+    let watched = watch(IdleScript {
+        idle: false,
+        during: &[],
+        after: AfterIdle::Close,
+    })
+    .await;
+    assert!(watched.ended.is_none());
+    assert_eq!(verbs(&watched), ["LOGIN", "CAPABILITY", "LOGOUT"]);
 }
