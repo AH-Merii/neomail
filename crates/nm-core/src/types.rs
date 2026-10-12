@@ -188,9 +188,8 @@ pub struct IdFetched {
     pub raw: Vec<u8>,
 }
 
-/// Where an [`IdSource`](crate::IdSource)'s changes stopped: Graph's `@odata.deltaLink`, later
-/// Gmail's `historyId`. Opaque, never empty. Not a secret, but `Debug` leaves it out so it is
-/// never printed or logged.
+/// Where an [`IdSource`](crate::IdSource)'s changes stopped: Graph's `@odata.deltaLink`. Opaque,
+/// never empty. Not a secret, but `Debug` leaves it out so it is never printed or logged.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Cursor(Box<str>);
 

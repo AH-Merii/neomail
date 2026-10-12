@@ -329,9 +329,9 @@ when `neomail sync` holds an account, the daemon skips it for that round.
 
 ## Why Gmail stays on IMAP
 
-Gmail syncs and pushes over IMAP. The Gmail API allows about 300 message downloads a minute per
-user ([usage limits](https://developers.google.com/workspace/gmail/api/reference/quota)), and
-its own push needs a Google Cloud Pub/Sub topic
-([push notifications](https://developers.google.com/workspace/gmail/api/guides/push)), so IMAP
-is faster and needs nothing more from you
-([DEC-2026-10-12-gmail-imap](decisions.md#dec-2026-10-12-gmail-imap)).
+Gmail syncs and pushes over IMAP, which needs nothing more from you. The Gmail API allows about
+300 message downloads a minute per user
+([usage limits](https://developers.google.com/workspace/gmail/api/reference/quota)), and its own
+push needs a Google Cloud Pub/Sub topic
+([push notifications](https://developers.google.com/workspace/gmail/api/guides/push)), so Gmail
+stays on IMAP ([DEC-2026-10-12-gmail-imap](decisions.md#dec-2026-10-12-gmail-imap)).

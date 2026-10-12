@@ -30,9 +30,9 @@ the new entry.
   guided by an in-app wizard (`neomail account add`) and step-by-step docs that explain *why* each
   step exists. Never embed or borrow another application's client ID (e.g. Thunderbird's).
 - **Gmail sign-in modes:** (1) the user's own Google OAuth client, (2) app password over
-  IMAP/SMTP (requires Google 2-Step Verification). Both read mail over IMAP, with IDLE push; a
-  later slice adds the Gmail API only for what IMAP can't do, and says so
-  ([DEC-2026-10-12-gmail-imap](#dec-2026-10-12-gmail-imap)).
+  IMAP/SMTP (requires Google 2-Step Verification). Both read mail over IMAP, with IDLE push. A
+  slice that needs what IMAP can't do adds the Gmail API for that part only, in an entry of its
+  own ([DEC-2026-10-12-gmail-imap](#dec-2026-10-12-gmail-imap)).
 - **Outlook:** the user's own Microsoft Entra app registration (multi-tenant + personal accounts,
   public client, `http://localhost` redirect, public client flows enabled for device code).
   Microsoft Graph is the primary API (categories, delta sync, send). IMAP/SMTP is an optional
@@ -713,6 +713,11 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   in decisions.md and the roadmap. Later slices would use the Gmail API only for what IMAP can't
   do, such as labels, decided slice by slice."
 - **Ruling:** "Gmail sign-in modes" under [Accounts and providers](#accounts-and-providers). Slice
-  7 ends with Graph's delta query for Outlook (#45), and its roadmap row no longer lists Gmail
+  7 ends with Graph's delta query for Outlook (PR #45), and its roadmap row no longer lists Gmail
   history. A slice that needs what IMAP can't do adds the Gmail API for that part only, in an
-  entry of its own.
+  entry of its own. Claude's reading: Gmail's IMAP fetches, adds and searches labels through
+  `X-GM-LABELS`
+  ([IMAP extensions](https://developers.google.com/workspace/gmail/imap/imap-extensions)), so
+  labels alone do not call for the API.
+- **Supersedes:** the "Gmail API, with IMAP as a fallback" part of the "Gmail sign-in modes"
+  bullet under [Accounts and providers](#accounts-and-providers).

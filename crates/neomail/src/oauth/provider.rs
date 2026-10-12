@@ -115,7 +115,7 @@ GUIDE):
  1. Create a Google Cloud project: https://console.cloud.google.com/projectcreate
     Why: a client belongs to a project; its own keeps it apart from anything else. No billing.
  2. Enable the Gmail API: https://console.cloud.google.com/apis/library/gmail.googleapis.com
-    Why: so the Gmail scope is offered in step 4 (a later neomail also uses the API).
+    Why: so the Gmail scope is offered in step 4; neomail reads your mail over IMAP with it.
  3. Google Auth Platform > Branding > Get started: an app name, your address, Audience
     External, then Create. Then Audience > Test users: add your Gmail address.
     Why: External lets a personal Gmail account sign in; in Testing only test users can.

@@ -5,7 +5,8 @@ use std::future::Future;
 use crate::types::{FetchedMessage, ListedMessage, MailboxStatus, Uid, UidFlags};
 
 /// A read-only view of one account's INBOX. `nm-imap` implements it over IMAP; the tests use a
-/// fake. Later providers (Microsoft Graph, the Gmail API) implement the same trait.
+/// fake. Microsoft Graph, whose messages have opaque ids, uses [`IdSource`](crate::IdSource)
+/// instead.
 ///
 /// Contract:
 /// - [`examine_inbox`](Self::examine_inbox) is called first and opens the inbox read-only.
