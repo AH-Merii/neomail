@@ -29,8 +29,10 @@ the new entry.
   Microsoft client registrations. Each user registers their own OAuth app ("bring your own client"),
   guided by an in-app wizard (`neomail account add`) and step-by-step docs that explain *why* each
   step exists. Never embed or borrow another application's client ID (e.g. Thunderbird's).
-- **Gmail sign-in modes:** (1) the user's own Google OAuth client (Gmail API, with IMAP as a
-  fallback), (2) app password over IMAP/SMTP (requires Google 2-Step Verification).
+- **Gmail sign-in modes:** (1) the user's own Google OAuth client, (2) app password over
+  IMAP/SMTP (requires Google 2-Step Verification). Both read mail over IMAP, with IDLE push; a
+  later slice adds the Gmail API only for what IMAP can't do, and says so
+  ([DEC-2026-10-12-gmail-imap](#dec-2026-10-12-gmail-imap)).
 - **Outlook:** the user's own Microsoft Entra app registration (multi-tenant + personal accounts,
   public client, `http://localhost` redirect, public client flows enabled for device code).
   Microsoft Graph is the primary API (categories, delta sync, send). IMAP/SMTP is an optional
@@ -687,3 +689,30 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   slice 7, before push. "More of Linux" under [Platforms](#platforms), done now, alongside that
   part. Claude's reading: the WSL bullet under Platforms still holds on WSL, where notifications
   go through Windows interop; this ruling covers Linux desktops.
+
+### <a id="dec-2026-10-12-gmail-imap"></a>DEC-2026-10-12-gmail-imap: Gmail stays on IMAP
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-12 (question at f679d889:6872, answer at
+  f679d889:6874).
+- **Context:** "Gmail sign-in modes" under [Accounts and providers](#accounts-and-providers) put an
+  OAuth Gmail account on the Gmail API, with IMAP as a fallback, and roadmap slice 7 listed Gmail
+  history. Gmail syncs over IMAP with XOAUTH2 and has had IDLE push since part 3 of slice 7.
+  - The Gmail API allows 6,000 quota units per user per minute, and `messages.get` costs 20, so
+    at most 300 message downloads a minute
+    ([usage limits](https://developers.google.com/workspace/gmail/api/reference/quota), last
+    updated 2026-09-10).
+  - `messages.list` returns only each message's `id` and `threadId`
+    ([messages.list](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/list)),
+    so labels and arrival times cost a `messages.get` per message too. A first sync of 500
+    messages takes about 1,000 calls: over 3 minutes.
+  - The API's own push goes through Cloud Pub/Sub
+    ([push notifications](https://developers.google.com/workspace/gmail/api/guides/push)), so
+    push would have stayed on IMAP IDLE either way.
+- **Owner's words:** chose "Stay on IMAP (Recommended)": "Gmail keeps syncing over IMAP, with the
+  IDLE push it already has, and slice 7 ends once Outlook (PR #45) merges. I'd record the change
+  in decisions.md and the roadmap. Later slices would use the Gmail API only for what IMAP can't
+  do, such as labels, decided slice by slice."
+- **Ruling:** "Gmail sign-in modes" under [Accounts and providers](#accounts-and-providers). Slice
+  7 ends with Graph's delta query for Outlook (#45), and its roadmap row no longer lists Gmail
+  history. A slice that needs what IMAP can't do adds the Gmail API for that part only, in an
+  entry of its own.

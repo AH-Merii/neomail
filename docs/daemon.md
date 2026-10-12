@@ -327,8 +327,11 @@ when the daemon is syncing an account, `neomail sync` prints
 `neomail: waiting for neomail daemon to finish syncing ACCOUNT` once and goes on when it is done;
 when `neomail sync` holds an account, the daemon skips it for that round.
 
-## Coming next
+## Why Gmail stays on IMAP
 
-Push for IMAP accounts, Gmail included, and the one-minute checks of Outlook accounts through
-Graph's delta query are here. The next part of the same slice moves Gmail from IMAP IDLE to the
-Gmail API's history.
+Gmail syncs and pushes over IMAP. The Gmail API allows about 300 message downloads a minute per
+user ([usage limits](https://developers.google.com/workspace/gmail/api/reference/quota)), and
+its own push needs a Google Cloud Pub/Sub topic
+([push notifications](https://developers.google.com/workspace/gmail/api/guides/push)), so IMAP
+is faster and needs nothing more from you
+([DEC-2026-10-12-gmail-imap](decisions.md#dec-2026-10-12-gmail-imap)).
