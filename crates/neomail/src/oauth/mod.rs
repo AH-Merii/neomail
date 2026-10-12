@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use self::loopback::Listener;
@@ -159,12 +159,25 @@ pub fn auth_url(
     format!("{}?{}", provider.auth_url, form_encode(&pairs))
 }
 
-/// What a sign-in leaves: the account's address, a refresh token, and the access token that came
-/// with it (for a check before anything is saved; never stored).
+/// What a sign-in lets neomail do with mail, from the scopes the provider granted. Kept with the
+/// refresh token in the keyring entry; an entry without it is [`MailGrant::Read`], since neomail
+/// asked Microsoft only for Mail.Read before it could change mail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MailGrant {
+    /// Read only: Microsoft's Mail.Read.
+    Read,
+    /// Read and change: Microsoft's Mail.ReadWrite, Google's full mail scope.
+    ReadWrite,
+}
+
+/// What a sign-in leaves: the account's address, a refresh token, what it grants, and the access
+/// token that came with it (for a check before anything is saved; never stored).
 #[derive(Debug)]
 pub struct SignedIn {
     pub email: String,
     pub refresh_token: Secret,
+    pub grant: MailGrant,
     pub access_token: Option<Secret>,
 }
 
@@ -266,9 +279,15 @@ fn check_sign_in(provider: &Provider, tokens: TokenResponse) -> Result<SignedIn>
     let id_token = tokens
         .id_token
         .with_context(|| format!("{} returned no ID token", provider.name))?;
+    let grant = if grants_any(provider, tokens.scope.as_deref(), provider.write_scopes) {
+        MailGrant::ReadWrite
+    } else {
+        MailGrant::Read
+    };
     Ok(SignedIn {
         email: id_token_email(&id_token)?,
         refresh_token: Secret(refresh_token),
+        grant,
         access_token: tokens.access_token.filter(|t| !t.is_empty()).map(Secret),
     })
 }
@@ -278,6 +297,11 @@ fn check_sign_in(provider: &Provider, tokens: TokenResponse) -> Result<SignedIn>
 /// leg", <https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow>).
 /// Microsoft returns full URLs in any case, so the prefix is stripped and case is ignored.
 pub fn grants_mail(provider: &Provider, granted: Option<&str>) -> bool {
+    grants_any(provider, granted, provider.mail_scopes)
+}
+
+/// Whether the granted scopes include one of `wanted`, read as [`grants_mail`] reads them.
+fn grants_any(provider: &Provider, granted: Option<&str>, wanted: &[&str]) -> bool {
     let prefix = provider.scope_prefix;
     granted
         .unwrap_or(provider.scope)
@@ -287,10 +311,7 @@ pub fn grants_mail(provider: &Provider, granted: Option<&str>) -> bool {
                 Some(head) if head.eq_ignore_ascii_case(prefix) => &scope[prefix.len()..],
                 _ => scope,
             };
-            provider
-                .mail_scopes
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(bare))
+            wanted.iter().any(|m| m.eq_ignore_ascii_case(bare))
         })
 }
 
@@ -299,6 +320,8 @@ pub fn grants_mail(provider: &Provider, granted: Option<&str>) -> bool {
 #[derive(Debug)]
 pub struct Refreshed {
     pub access_token: Secret,
+    /// The grant the access token was asked for.
+    pub grant: MailGrant,
     pub refresh_token: Option<Secret>,
     /// How long the access token lives from when the answer arrived, when the provider said
     /// (`expires_in`, RFC 6749 section 5.1, RECOMMENDED rather than required).
@@ -314,13 +337,14 @@ impl Refreshed {
     }
 }
 
-/// A fresh access token from the refresh token. `account` names the account in the hint for an
-/// expired or revoked sign-in.
+/// A fresh access token from the refresh token, for no more than the sign-in's `grant`.
+/// `account` names the account in the hint for an expired or revoked sign-in.
 pub async fn refresh<H: Http>(
     http: &H,
     provider: &Provider,
     client: &Client,
     refresh_token: &Secret,
+    grant: MailGrant,
     account: &str,
 ) -> Result<Refreshed> {
     let mut form = vec![
@@ -328,8 +352,8 @@ pub async fn refresh<H: Http>(
         ("refresh_token", refresh_token.expose()),
     ];
     form.extend(client.credentials(provider)?);
-    if let Some(scope) = provider.refresh_scope {
-        form.push(("scope", scope));
+    if let Some(scope) = &provider.refresh_scope {
+        form.push(("scope", scope.for_grant(grant)));
     }
     let tokens = match token_request(http, provider, &form).await {
         Ok(tokens) => tokens,
@@ -357,6 +381,7 @@ pub async fn refresh<H: Http>(
         .with_context(|| format!("{} returned no access token", provider.name))?;
     Ok(Refreshed {
         access_token,
+        grant,
         refresh_token: tokens.refresh_token.filter(|t| !t.is_empty()).map(Secret),
         expires_in: tokens.expires_in.as_ref().and_then(seconds),
     })

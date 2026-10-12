@@ -97,6 +97,25 @@ impl Https {
         .await
     }
 
+    /// PATCHes `url` with the JSON `body` and `headers`, refusing an answer larger than
+    /// `max_body`.
+    pub async fn patch_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> Result<Response> {
+        self.send(Request {
+            method: "PATCH",
+            url,
+            headers,
+            body: Some(("application/json", body)),
+            max_body,
+        })
+        .await
+    }
+
     async fn send(&self, request: Request<'_>) -> Result<Response> {
         let (host, _) = split_https_url(request.url)?;
         let connect = async {

@@ -1,16 +1,18 @@
 //! Microsoft Graph wiring: `nm_graph`'s [`Transport`] over neomail's [`Https`], the read-only
-//! check `account add outlook` runs before anything is saved, and the sync of a Graph account.
+//! check `account add outlook` runs before anything is saved, the sync of a Graph account, and
+//! marking its messages read or unread.
 
 use std::io;
 use std::num::NonZeroU32;
 
 use anyhow::{Result, anyhow};
-use nm_core::{Cache, SyncError, SyncReport, sync_inbox_by_id_with_progress};
+use nm_core::{Cache, RemoteId, SyncError, SyncReport, Written, sync_inbox_by_id_with_progress};
 use nm_graph::{GraphError, GraphSource, Reply, Transport, TransportError};
 
 use crate::http::Https;
-use crate::oauth::Secret;
+use crate::oauth::{MailGrant, Secret};
 use crate::output;
+use crate::sync::AccessToken;
 
 impl Transport for Https {
     async fn get(
@@ -20,6 +22,21 @@ impl Transport for Https {
         max_body: usize,
     ) -> Result<Reply, TransportError> {
         let r = Https::get(self, url, headers, max_body).await?;
+        Ok(Reply {
+            status: r.status,
+            retry_after: r.retry_after,
+            body: r.body,
+        })
+    }
+
+    async fn patch_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> Result<Reply, TransportError> {
+        let r = Https::patch_json(self, url, headers, body, max_body).await?;
         Ok(Reply {
             status: r.status,
             retry_after: r.retry_after,
@@ -38,7 +55,8 @@ pub async fn check(access_token: &Secret) -> Result<u64> {
 }
 
 /// A failed check with what to do next. Nothing is saved yet, and the sign-in has already
-/// shown it grants Mail.Read, so a 403 here is the mailbox, not the grant.
+/// shown it grants mail access (Mail.ReadWrite or Mail.Read), so a 403 here is the mailbox, not
+/// the grant.
 fn check_failed(e: GraphError) -> anyhow::Error {
     const CHECK: &str = "the read-only check of the INBOX through Microsoft Graph failed";
     match e {
@@ -46,9 +64,9 @@ fn check_failed(e: GraphError) -> anyhow::Error {
             anyhow!("{CHECK} ({e}); nothing was saved; run `neomail account add outlook` again")
         }
         GraphError::Forbidden => anyhow!(
-            "{CHECK}: {e}, although the sign-in granted Mail.Read; nothing was saved. The \
-             account may have no Outlook mailbox or licence, or a policy of its organisation \
-             blocks the app"
+            "{CHECK}: {e}, although the sign-in granted mail access; nothing was saved. \
+             The account may have no Outlook mailbox or licence, or a policy of its \
+             organisation blocks the app"
         ),
         other => anyhow::Error::new(other).context(format!("{CHECK}; nothing was saved")),
     }
@@ -74,6 +92,40 @@ pub async fn sync(
         SyncError::Source(e) => explain(e, account),
         other => anyhow::Error::new(other),
     })
+}
+
+/// Sets the read state of the messages `ids` of a Graph account. A sign-in that grants only
+/// Mail.Read fails before any request: changing mail needs Mail.ReadWrite, which only a new
+/// sign-in can grant.
+pub async fn set_read(
+    account: &str,
+    token: &AccessToken,
+    ids: &[RemoteId],
+    read: bool,
+) -> Result<Written<RemoteId>> {
+    if token.grant != MailGrant::ReadWrite {
+        return Err(anyhow!(
+            "this account's sign-in lets neomail read mail but not change it; run `neomail \
+             account login {account}` to let neomail change mail"
+        ));
+    }
+    GraphSource::new(Https::new()?, token.expose())
+        .set_read(ids, read)
+        .await
+        .map_err(|e| explain_write(e, account))
+}
+
+/// A Graph error from a write, with what to do next.
+fn explain_write(e: GraphError, account: &str) -> anyhow::Error {
+    match e {
+        GraphError::Unauthorized => anyhow!("access token refused; run the command again"),
+        GraphError::Forbidden => anyhow!(
+            "{e}; run `neomail account login {account}` and accept the permission to read and \
+             change your email; if it persists, a policy of the account's organisation may block \
+             the app"
+        ),
+        other => anyhow::Error::new(other),
+    }
 }
 
 /// A Graph error with what to do next.
@@ -103,7 +155,7 @@ mod tests {
         assert_eq!(
             check_failed(GraphError::Forbidden).to_string(),
             "the read-only check of the INBOX through Microsoft Graph failed: Microsoft Graph \
-             refused access to the mailbox (HTTP 403), although the sign-in granted Mail.Read; \
+             refused access to the mailbox (HTTP 403), although the sign-in granted mail access; \
              nothing was saved. The account may have no Outlook mailbox or licence, or a policy \
              of its organisation blocks the app"
         );
@@ -120,6 +172,36 @@ mod tests {
             format!("{e:#}")
                 .ends_with("nothing was saved: cannot reach Microsoft Graph: tls handshake failed"),
             "{e:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_sign_in_cannot_change_mail_and_sends_nothing() {
+        // `Https` is never built: the grant is checked first, so no request can be made.
+        let token = AccessToken {
+            secret: Secret::new("not-a-real-token".into()),
+            grant: MailGrant::Read,
+        };
+        let id = RemoteId::new("AAMk1".to_owned()).unwrap();
+        let e = set_read("outlook", &token, &[id], true).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "this account's sign-in lets neomail read mail but not change it; run `neomail \
+             account login outlook` to let neomail change mail"
+        );
+    }
+
+    #[test]
+    fn a_refused_write_says_what_to_do() {
+        assert_eq!(
+            explain_write(GraphError::Forbidden, "outlook").to_string(),
+            "Microsoft Graph refused access to the mailbox (HTTP 403); run `neomail account \
+             login outlook` and accept the permission to read and change your email; if it \
+             persists, a policy of the account's organisation may block the app"
+        );
+        assert_eq!(
+            explain_write(GraphError::Unauthorized, "outlook").to_string(),
+            "access token refused; run the command again"
         );
     }
 

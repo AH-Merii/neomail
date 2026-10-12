@@ -1371,3 +1371,144 @@ fn a_broken_pipe_exits_0_silently() {
         closed_reader(dir.path(), args, &all);
     }
 }
+
+/// A config with "work" on a port of 127.0.0.1 that nothing listens on, and no "home".
+fn closed_port_work(data: &Path) {
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    std::fs::write(
+        data.join("config.toml"),
+        format!(
+            "[[accounts]]\nname = \"work\"\nusername = \"you@example.com\"\n\
+             password_command = \"echo not-a-secret\"\n\
+             imap = {{ host = \"127.0.0.1\", port = {port} }}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Each failure is one `neomail:` line (one id each here), the others go on, nothing changes in
+/// the cache, and the exit status is 1.
+#[test]
+fn mark_reports_each_failure_and_changes_nothing() {
+    let dir = seeded();
+    let data = dir.path();
+    closed_port_work(data);
+    let [bob, _, _, home] = <[String; 4]>::try_from(ids(data)).unwrap();
+    let before = stdout(&neomail(data, &["list", "--json"]));
+    let o = neomail(data, &["mark", "read", "--json", &bob, "999", &home]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&o.stdout).unwrap(),
+        Value::Array(vec![])
+    );
+    let err = stderr(&o);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 3, "{err}");
+    assert_eq!(
+        lines[0],
+        "neomail: no cached message with id 999; see `neomail list`"
+    );
+    assert!(
+        lines[1].starts_with(&format!(
+            "neomail: work: message {bob} may not be marked read: could not connect to 127.0.0.1:"
+        )),
+        "{err}"
+    );
+    assert!(
+        lines[2].starts_with(&format!(
+            "neomail: home: message {home} may not be marked read: no account named \"home\" in the config"
+        )),
+        "{err}"
+    );
+    assert_eq!(stdout(&neomail(data, &["list", "--json"])), before);
+}
+
+#[test]
+fn mark_usage_errors_exit_2_and_change_nothing() {
+    let dir = seeded();
+    let data = dir.path();
+    closed_port_work(data);
+    let o = neomail_stdin(data, &["mark", "read", "1", "-"], "2\n");
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(
+        stderr(&o),
+        "neomail: `-` reads the ids from standard input; give no other ids\n"
+    );
+    let o = neomail_stdin(data, &["mark", "unread", "-"], "2\nnot an id\n");
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        stderr(&o).contains("standard input line 2"),
+        "{}",
+        stderr(&o)
+    );
+    for args in [
+        &["mark", "read"][..],
+        &["mark", "seen", "1"],
+        &["mark", "read", "x"],
+    ] {
+        let o = neomail(data, args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert!(o.stdout.is_empty());
+    }
+}
+
+/// Ids from standard input reach the same path: an unknown one fails alone with exit 1, and
+/// plain output (off a terminal) prints only the marked ids, so here nothing.
+#[test]
+fn mark_reads_ids_from_standard_input() {
+    let dir = seeded();
+    let data = dir.path();
+    closed_port_work(data);
+    let o = neomail_stdin(data, &["mark", "read", "-"], "998\tx\n\n999\n");
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(stdout(&o), "");
+    assert_eq!(
+        stderr(&o),
+        "neomail: no cached message with id 998; see `neomail list`\n\
+         neomail: no cached message with id 999; see `neomail list`\n"
+    );
+}
+
+#[test]
+fn mark_on_outlook_without_its_sign_in_fails_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    std::fs::write(data.join("config.toml"), OUTLOOK_CONFIG).unwrap();
+    let id = {
+        let mut cache = Cache::open(&data.join("cache.sqlite3")).unwrap();
+        let mailbox = cache.reset_id_mailbox("outlook", "INBOX").unwrap();
+        let listed = nm_core::IdListed {
+            id: nm_core::RemoteId::new("AAA").unwrap(),
+            flags: Flags::default(),
+            received: DateTime::from_timestamp(50, 0).unwrap(),
+        };
+        let raw: &[u8] = b"Subject: o\r\n\r\nx\r\n";
+        cache
+            .store_id_messages(mailbox.id, &[(&listed, raw)], None)
+            .unwrap()[0]
+    };
+    let o = neomail(data, &["mark", "read", &id.to_string()]);
+    assert_eq!(o.status.code(), Some(1));
+    // The tests have no keyring, so the sign-in cannot be read and Graph is never reached.
+    let err = stderr(&o);
+    assert!(
+        err.starts_with(&format!(
+            "neomail: outlook: message {id} may not be marked read: "
+        )) && err.contains("keyring"),
+        "{err}"
+    );
+    assert_eq!(err.lines().count(), 1, "{err}");
+    let list = json(&neomail(data, &["list", "--json"]));
+    assert_eq!(list[0]["unread"], true);
+}
+
+#[test]
+fn mark_without_a_config_names_the_next_command() {
+    let dir = seeded();
+    let o = neomail(dir.path(), &["mark", "read", "1"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("neomail account add"), "{}", stderr(&o));
+}

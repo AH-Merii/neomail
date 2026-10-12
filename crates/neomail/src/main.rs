@@ -1,4 +1,4 @@
-//! `neomail`: the neomail command line: a read-only INBOX (sync, list, show), passwords in the OS
+//! `neomail`: the neomail command line: the INBOX (sync, list, show, mark), passwords in the OS
 //! keyring, Gmail and Outlook through the user's own OAuth client (Outlook read through Microsoft
 //! Graph), and setup (`account add`, `account list`, `config path|check`).
 
@@ -11,6 +11,7 @@ mod graph;
 mod http;
 mod keyring;
 mod lock;
+mod mark;
 #[cfg(unix)]
 mod notify;
 mod oauth;
@@ -53,9 +54,23 @@ Examples:
   neomail show 42                   Read message 42
   neomail list | fzf -m | neomail show -
                                     Pick messages with fzf, then read them
+  neomail mark read 42 43           Mark messages 42 and 43 read, on the server too
   neomail config check              Check the config file
 
 Guide: https://github.com/AH-Merii/neomail#try-it";
+
+const MARK_EXAMPLES: &str = "\
+Examples:
+  neomail mark read 42              Mark message 42 read
+  neomail mark unread 42 57         Mark two messages unread
+  neomail list | fzf -m | neomail mark read -
+                                    Pick messages with fzf, then mark them read
+  neomail mark read --json 42       Print the marked messages as JSON
+
+The change is made on the server first, then in the cache, so `neomail list` shows it at once.
+It needs the server: nothing is queued. Exit 1 when any id was unknown, gone or not confirmed.
+An Outlook account added before neomail could change mail needs `neomail account login NAME`
+once.";
 
 const ADD_EXAMPLES: &str = "\
 Examples:
@@ -77,7 +92,7 @@ or come from --password-command.";
 #[command(
     name = "neomail",
     version,
-    about = "neomail: a terminal email client (read-only INBOX for now)",
+    about = "neomail: a terminal email client",
     after_help = TOP_EXAMPLES
 )]
 struct Cli {
@@ -223,6 +238,18 @@ enum Command {
         #[arg(long)]
         no_pager: bool,
     },
+    /// Mark messages read or unread, on the server and in the cache, by the ids from `neomail list`
+    #[command(after_help = MARK_EXAMPLES)]
+    Mark {
+        /// The state to put the messages in
+        #[arg(value_enum)]
+        state: MarkState,
+        /// Message ids, the first column of `neomail list`, or - to read them from standard input, one per line
+        #[arg(value_name = "ID", required = true, value_parser = parse_id_arg)]
+        ids: Vec<IdArg>,
+        #[command(flatten)]
+        format: ListingFormat,
+    },
     /// Print a shell completion script to standard output
     Completions {
         /// The shell
@@ -239,6 +266,23 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum MarkState {
+    /// Read (the \Seen flag set)
+    Read,
+    /// Unread (the \Seen flag cleared)
+    Unread,
+}
+
+impl MarkState {
+    fn action(self) -> nm_core::Action {
+        match self {
+            Self::Read => nm_core::Action::MarkRead,
+            Self::Unread => nm_core::Action::MarkUnread,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -614,6 +658,33 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
         } => show(
             &ids, &format, no_pager, cli.config, terminal, colors, &mut out,
         )?,
+        Command::Mark { state, ids, format } => {
+            let ids = read_ids(&ids)?;
+            let config = Config::load(&config::config_path(cli.config.clone())?)?;
+            let Some(mut cache) = open_cache(false)? else {
+                bail!("{}", no_cache_hint(cli.config));
+            };
+            let runtime = account::runtime()?;
+            let data_dir = config::data_dir()?;
+            let mut marker = mark::Marker {
+                runtime: &runtime,
+                config: &config,
+                data_dir: &data_dir,
+                logins: sync::Logins::default(),
+            };
+            let ids: Vec<MessageId> = ids.into_iter().map(MessageId::new).collect();
+            let action = state.action();
+            let report = nm_core::action::apply(action, &ids, &mut cache, &mut marker)?;
+            let code = mark::finish(
+                action,
+                &report,
+                format.mode(terminal),
+                &mut out,
+                &mut io::stderr().lock(),
+                colors.stderr,
+            )?;
+            ExitCode::from(code)
+        }
         Command::Completions { shell } => {
             // Into memory first: clap_complete panics when a write fails.
             let mut script = Vec::new();
@@ -739,26 +810,7 @@ fn show(
     out: &mut dyn Write,
 ) -> Result<ExitCode> {
     let one_literal = matches!(ids, [IdArg::Id(_)]);
-    let ids = if ids.contains(&IdArg::Stdin) {
-        if ids.len() > 1 {
-            return Err(usage(
-                "`-` reads the ids from standard input; give no other ids",
-            ));
-        }
-        let mut input = Vec::new();
-        io::stdin()
-            .lock()
-            .read_to_end(&mut input)
-            .context("cannot read standard input")?;
-        ids_from_lines(&String::from_utf8_lossy(&input))?
-    } else {
-        ids.iter()
-            .filter_map(|id| match id {
-                IdArg::Id(id) => Some(*id),
-                IdArg::Stdin => None,
-            })
-            .collect()
-    };
+    let ids = read_ids(ids)?;
     if format.raw && ids.len() != 1 {
         return Err(usage(format!(
             "--raw takes exactly one id, not {}",
@@ -827,6 +879,31 @@ fn show(
     } else {
         ExitCode::from(EXIT_FAILURE)
     })
+}
+
+/// The ids of `show` and `mark`: the ones given, or with `-` the ones on standard input. `-` with
+/// other ids is a usage error.
+fn read_ids(ids: &[IdArg]) -> Result<Vec<i64>> {
+    if !ids.contains(&IdArg::Stdin) {
+        return Ok(ids
+            .iter()
+            .filter_map(|id| match id {
+                IdArg::Id(id) => Some(*id),
+                IdArg::Stdin => None,
+            })
+            .collect());
+    }
+    if ids.len() > 1 {
+        return Err(usage(
+            "`-` reads the ids from standard input; give no other ids",
+        ));
+    }
+    let mut input = Vec::new();
+    io::stdin()
+        .lock()
+        .read_to_end(&mut input)
+        .context("cannot read standard input")?;
+    ids_from_lines(&String::from_utf8_lossy(&input))
 }
 
 /// The ids on standard input, one per line, in order. Blank lines are skipped; a line without
@@ -1187,5 +1264,51 @@ mod tests {
     #[test]
     fn the_cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `mark`'s state and ids, or clap's usage error (exit 2).
+    fn parse_mark(args: &[&str]) -> Result<(nm_core::Action, Vec<IdArg>), i32> {
+        let argv = ["neomail", "mark"].iter().chain(args);
+        match Cli::try_parse_from(argv) {
+            Ok(Cli {
+                command: Some(Command::Mark { state, ids, .. }),
+                ..
+            }) => Ok((state.action(), ids)),
+            Ok(_) => panic!("not mark"),
+            Err(e) => Err(e.exit_code()),
+        }
+    }
+
+    #[test]
+    fn mark_takes_a_state_then_ids_or_a_dash() {
+        use nm_core::Action::{MarkRead, MarkUnread};
+        assert_eq!(
+            parse_mark(&["read", "4", "2"]),
+            Ok((MarkRead, vec![IdArg::Id(4), IdArg::Id(2)]))
+        );
+        assert_eq!(
+            parse_mark(&["unread", "-"]),
+            Ok((MarkUnread, vec![IdArg::Stdin]))
+        );
+        for bad in [
+            &["read"][..],
+            &["seen", "4"],
+            &["read", "abc"],
+            &["read", "4", "--json", "--plain"],
+        ] {
+            assert_eq!(parse_mark(bad), Err(2), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_dash_with_other_ids_is_a_usage_error() {
+        for ids in [
+            &[IdArg::Id(1), IdArg::Stdin][..],
+            &[IdArg::Stdin, IdArg::Stdin],
+        ] {
+            let e = read_ids(ids).unwrap_err();
+            assert!(e.is::<UsageError>(), "{e}");
+        }
+        assert_eq!(read_ids(&[IdArg::Id(3), IdArg::Id(1)]).unwrap(), [3, 1]);
     }
 }

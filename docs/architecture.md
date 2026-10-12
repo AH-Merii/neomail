@@ -4,17 +4,19 @@ This page follows the code: it describes what exists, not what is planned. Produ
 in [decisions.md](decisions.md). The slices so far follow
 [DEC-2026-10-11-build-first](decisions.md#dec-2026-10-11-build-first): a read-only INBOX in the
 CLI (slice 1), IMAP passwords in the OS keyring (slice 2), Gmail through the user's own OAuth
-client (slice 3), getting started and setup (slice 4), output for people and pipes (slice 5) and
-Outlook through Microsoft Graph with the user's own Entra app (slice 6), and the first part of
-background sync (slice 7): `neomail daemon`, which polls.
+client (slice 3), getting started and setup (slice 4), output for people and pipes (slice 5),
+Outlook through Microsoft Graph with the user's own Entra app (slice 6) and background sync
+(slice 7): `neomail daemon`, with desktop notifications, IMAP IDLE push and a one-minute Outlook
+check through Graph's delta query. Triage in the CLI (slice 8) has begun with its first part:
+`neomail mark read|unread`, the first actions.
 
 ## Crates
 
 | Crate | What it holds | Why it is a crate |
 | ----- | ------------- | ----------------- |
 | `crates/neomail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, the daemon and its locks, output, wiring. | The composition root. Nothing depends on it. |
-| `crates/nm-core` | Domain types, the `MailSource` and `IdSource` traits, the SQLite cache, the sync engines, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
-| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap). | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
+| `crates/nm-core` | Domain types, the `MailSource`, `IdSource` and `MailWriter` traits, the SQLite cache, the sync engines, the actions, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
+| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap); `store_seen`, its one write. | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
 | `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
 
 A new crate needs a reason of the same kind: a second implementation of a seam, or a heavy
@@ -62,23 +64,28 @@ defaults rather than a second trait, because the engine is one engine either way
 source that implements it also implements `IdSource`. `Cursor`'s `Debug` is redacted, so it is
 never printed.
 
-**`Transport`** (`nm-graph/src/lib.rs`) is the port `GraphSource` reads Graph through: one HTTPS
-GET with request headers and a body cap, answered with the status, `Retry-After` and the body.
-`neomail/src/graph.rs` implements it with neomail's HTTP client, and `nm-graph/tests/graph.rs`
-with a fake Graph: a mailbox model that pages with next page links, plus scripted replies. That
-fake passes `nm_core::conformance::id_source`. `GraphSource` sends `Authorization: Bearer`,
-`Prefer: IdType="ImmutableId"` (it applies only to the request that carries it) and, for JSON,
-`Accept: application/json` on every request. `newest` and `arrived_since` list
-`/me/mailFolders/inbox/messages` (`$select=id,isRead,receivedDateTime`,
-`$orderby=receivedDateTime desc`, `$top` up to 1000, and for `arrived_since` a
-`$filter=receivedDateTime ge …` that names the ordered property first, as Graph requires), and
-follow `@odata.nextLink` verbatim, but only to `https://graph.microsoft.com/`, so the token never
-leaves Graph. `fetch` downloads `/me/messages/{id}/$value` (the id percent-encoded), four at once
-(Outlook's limit per app and mailbox), and leaves out a 404. `isRead` maps to `\Seen`; an item
-without `receivedDateTime` is skipped. 429 and 503 wait `Retry-After` (at most 5 minutes), else 1,
-2, 4 and 8 s, for at most five tries; 401 and 403 become "access token refused" and "Mail.Read not
-granted"; any other status gives Graph's `error.code`, cleaned, never the body or the token. JSON
-is capped at 8 MiB, a message at 160 MiB.
+**`Transport`** (`nm-graph/src/lib.rs`) is the port `GraphSource` reads Graph through: one HTTPS GET
+with request headers and a body cap, answered with the status, `Retry-After` and the body.
+`neomail/src/graph.rs` implements it with neomail's HTTP client, and `nm-graph/tests/graph.rs` with
+a fake Graph: a mailbox model that pages with next page links, plus scripted replies. That fake
+passes `nm_core::conformance::id_source`. `GraphSource` sends `Authorization: Bearer`, `Prefer:
+IdType="ImmutableId"` (it applies only to the request that carries it) and, for JSON, `Accept:
+application/json` on every request. `newest` and `arrived_since` list
+`/me/mailFolders/inbox/messages` (`$select=id,isRead,receivedDateTime`, `$orderby=receivedDateTime
+desc`, `$top` up to 1000, and for `arrived_since` a `$filter=receivedDateTime ge …` that names the
+ordered property first, as Graph requires), and follow `@odata.nextLink` verbatim, but only to
+`https://graph.microsoft.com/`, so the token never leaves Graph. `fetch` downloads
+`/me/messages/{id}/$value` (the id percent-encoded), four at once (Outlook's limit per app and
+mailbox), and leaves out a 404. `isRead` maps to `\Seen`; an item without `receivedDateTime` is
+skipped. 429 and 503 wait `Retry-After` (at most 5 minutes), else 1, 2, 4 and 8 s, for at most five
+tries; 401 and 403 become "access token refused" and "Microsoft Graph refused access to the
+mailbox"; any other status gives Graph's `error.code`, cleaned, never the body or the token. JSON is
+capped at 8 MiB, a message at 160 MiB.
+
+The one write, `set_read`, sends `PATCH /me/messages/{id}` with `{"isRead": …}` through the same
+`Transport`, which has a `patch_json` beside `get` rather than a second client. It sends the same
+headers, at most four at once, and retries throttling as reads do. A 404 is gone; the flags come
+from the `isRead` of Graph's answer, which is the whole message, so it is capped at 160 MiB.
 
 `start_changes` and `changes_since` run Graph's delta query
 ([message: delta](https://learn.microsoft.com/en-us/graph/api/message-delta)). A round's first
@@ -268,19 +275,73 @@ network step has a 60-second timeout: connecting, the handshake, each command's 
 response of a FETCH. A FETCH as a whole is not bounded, so a slow transfer of large mail is not cut
 off.
 
+**The action registry** (`nm-core/src/action.rs`) is how mail is changed. It is the typed set of
+actions that the TUI's keys, the CLI, scripts and agents share (the first bullet of
+[CLI, scripting, agents, extensibility](decisions.md#cli-scripting-agents-extensibility)). It
+starts small: `Action` is `MarkRead` or `MarkUnread`, each with a stable name (`mark-read`,
+`mark-unread`). `action::apply(action, ids, cache, writer)` is the one way to apply an action to
+cache ids; `neomail mark` calls it. For each account of the ids, in the order first asked, it:
+
+1. takes the account's lock (`MailWriter::lock`);
+2. reads the ids' locations again under the lock;
+3. writes to the server;
+4. updates the cache with what the server confirmed, then releases the lock.
+
+An unknown id, a message gone from the server, a change the server did not confirm, and an
+account that cannot be locked or written are each a `Failure` in the report. One account's
+failure never stops the others, and nothing is queued. There is no Lua, string lookup or plugin
+machinery yet.
+
+**`MailWriter`** is the write port that `apply` drives. `Cache::locate` returns each message's
+`MessageKey`: `Uid { uid_validity, uid }` or `Remote(RemoteId)`. `apply` hands UIDs, with their
+UIDVALIDITY, to `set_seen_by_uid` and Graph ids to `set_seen_by_id`, so a UID never reaches Graph
+and a Graph id never reaches IMAP. A writer answers with `Written { done, gone }`. Flags in `done`
+are the server's, and replace the cached ones. A confirmation without flags sets or clears
+`\Seen` in the cached flags. A key in neither list is not confirmed, and its row is left alone.
+An `Err` confirms none of the call's messages: the server may still have changed some of them
+(Graph writes one message per request), so the cache is left alone for all of them and the next
+sync reads their state. neomail's writer (`neomail/src/mark.rs`) does three things:
+
+- it takes the same per-account `flock` as `sync` (`neomail/src/lock.rs`), printing once that it
+  waits for the daemon;
+- it logs in through `sync::Logins`, which owns the logins of `sync`, `daemon` and `mark`;
+- it reaches IMAP through `nm_imap::store_seen`.
+
+`store_seen` selects INBOX read-write (every other path keeps `EXAMINE`) and refuses to store when
+UIDVALIDITY changed. It sends `UID STORE +FLAGS (\Seen)` or `-FLAGS (\Seen)` (RFC 3501, section
+6.4.6) and takes each UID's flags from the server's FETCH responses. A UID that got no FETCH
+response is fetched with `UID FETCH (UID FLAGS)`, and a UID in neither is gone. The session ends
+with LOGOUT, never CLOSE, which expunges (RFC 3501, section 6.4.2). The wire tests check that no
+`EXPUNGE`, `CLOSE`, `MOVE`, `COPY` or `\Deleted` is ever sent.
+
+For Outlook, the writer calls `graph::set_read`, which calls `GraphSource::set_read`. Changing mail
+needs Mail.ReadWrite, which new sign-ins ask for along with Mail.Read. A sign-in records what it was
+granted as `oauth::MailGrant` (`Read` or `ReadWrite`) in its keyring entry (`mail_grant`). An entry
+without it comes from an earlier version, which asked only for Mail.Read, and counts as `Read`. The
+grant travels with the access token (`sync::AccessToken`), so two things follow from it:
+
+- The refresh asks for no more than the sign-in granted: `Provider::refresh_scope` holds one
+  scope per grant, since Microsoft's refresh scope must be the original's or a subset.
+- `set_read` refuses a `Read` sign-in before any request, and says to run `neomail account login
+  NAME`.
+
+The action tests (`nm-core/tests/action.rs`) drive `apply` with a
+fake writer.
+
 ## How sync works
 
-`neomail sync` and `neomail daemon` sync an account through one function,
-`sync::Syncer::sync` (`neomail/src/sync.rs`), which picks the engine from the account's server (`config::Server`, fixed at parse: a
-password account is always IMAP, an OAuth account's provider decides): `Imap` runs `sync_inbox`
-over `ImapSource`, `Graph` runs `sync_inbox_by_id` over `GraphSource`. An OAuth account's access
-token comes from the same refresh and rotated-token write-back either way, and both print the same
-line and progress. `Syncer` keeps each access token in memory (`sync::Tokens`) until 5 minutes
-before the `expires_in` of the token answer (RFC 6749, section 5.1), for the account settings it
-was issued under; a token without a lifetime is used once, and any failure drops the account's
-token. The times are wall-clock (`SystemTime`): Linux's `Instant` is `CLOCK_MONOTONIC`, which stops
-during suspend, so a token would outlive its expiry across a laptop's sleep; a clock set back
-before the token's issue drops it. `neomail sync` starts with none, so it refreshes every run, as before.
+`neomail sync` and `neomail daemon` sync an account through one function, `sync::Syncer::sync`
+(`neomail/src/sync.rs`), which picks the engine from the account's server (`config::Server`, fixed
+at parse: a password account is always IMAP, an OAuth account's provider decides): `Imap` runs
+`sync_inbox` over `ImapSource`, `Graph` runs `sync_inbox_by_id` over `GraphSource`. An OAuth
+account's access token comes from the same refresh and rotated-token write-back either way, and both
+print the same line and progress. `sync::Logins`, which `neomail mark` shares, keeps each access
+token in memory (`sync::Tokens`) until 5 minutes before the `expires_in` of the token answer (RFC
+6749, section 5.1), for the account settings it was issued under; a token without a lifetime is used
+once, and any failure drops the account's token. The times are wall-clock (`SystemTime`): Linux's
+`Instant` is `CLOCK_MONOTONIC`, which stops during suspend, so a token would outlive its expiry
+across a laptop's sleep; a clock set back before the token's issue drops it. `neomail sync` starts
+with none, so it refreshes every run, as before.
 
 ## The daemon
 
@@ -522,12 +583,11 @@ nothing. mise reads the same release through its GitHub backend.
 
 The order of the slices is in [roadmap.md](roadmap.md). What they change in the code:
 
-- **More providers:** another provider's API becomes a source crate behind `IdSource`. Gmail stays
-  on IMAP; a slice that needs what IMAP can't do adds the Gmail API for that part only
+- **More providers:** none planned. Gmail stays on IMAP; a slice that needs what IMAP can't do
+  adds the Gmail API for that part only
   ([DEC-2026-10-12-gmail-imap](decisions.md#dec-2026-10-12-gmail-imap)).
 - **More mail:** folders beyond INBOX, and CONDSTORE/QRESYNC to refresh flags cheaply.
-- **Push:** IMAP IDLE, Gmail included, and the one-minute Outlook check (Graph's delta query) are
-  wakes of the daemon.
-- **Actions:** flags, moves and deletes need a write side on the source and a way to record
-  pending changes in the cache.
+- **Actions:** marking read and unread works for IMAP and Outlook through `MailWriter`. Archive,
+  delete and move come next, as more `Action`s and `MailWriter` methods. Everything is online
+  only: an offline queue would record pending changes in the cache.
 - **The TUI** builds on the same cache and actions as the CLI.

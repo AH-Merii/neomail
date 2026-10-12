@@ -1,8 +1,9 @@
 //! Microsoft Graph as an [`IdSource`]: the INBOX of an Outlook, Hotmail or Microsoft 365 mailbox,
-//! read-only, through Graph's REST API (<https://learn.microsoft.com/en-us/graph/api/user-list-messages>).
+//! read through Graph's REST API (<https://learn.microsoft.com/en-us/graph/api/user-list-messages>).
+//! The one write is a message's read state ([`GraphSource::set_read`]).
 //!
-//! [`Transport`] is the seam: one HTTPS GET. neomail implements it with its own HTTP client; the
-//! tests give a scripted fake, so nothing here opens a connection.
+//! [`Transport`] is the seam: one HTTPS GET, or one PATCH with a JSON body. neomail implements it
+//! with its own HTTP client; the tests give a scripted fake, so nothing here opens a connection.
 //!
 //! - Every request carries the access token and `Prefer: IdType="ImmutableId"`, which applies only
 //!   to the request that carries it, so ids stay the same when a message moves
@@ -29,7 +30,10 @@
 //!   loop.
 //! - 429 and 503 are retried after `Retry-After`, else after 1, 2, 4 and 8 s, for at most
 //!   [`MAX_TRIES`] tries (<https://learn.microsoft.com/en-us/graph/throttling>).
-//! - At most [`CONCURRENT_FETCHES`] message downloads run at once: Outlook allows four concurrent
+//! - A read state is written with `PATCH /me/messages/{id}` and `{"isRead": ...}`, which needs
+//!   Mail.ReadWrite (<https://learn.microsoft.com/en-us/graph/api/message-update>). Nothing here
+//!   deletes or moves a message.
+//! - At most [`CONCURRENT_FETCHES`] message downloads or writes run at once: Outlook allows four concurrent
 //!   requests per app and mailbox (<https://learn.microsoft.com/en-us/graph/throttling-limits>).
 //! - Errors never quote a response body or the token.
 
@@ -41,7 +45,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
-use nm_core::{Cursor, Flags, IdChange, IdChanges, IdFetched, IdListed, IdSource, RemoteId};
+use nm_core::{
+    Cursor, Flags, IdChange, IdChanges, IdFetched, IdListed, IdSource, RemoteId, Written,
+};
 use serde::Deserialize;
 
 /// Where every request goes, and the only place a next page link may point.
@@ -91,13 +97,24 @@ impl fmt::Debug for Reply {
     }
 }
 
-/// One HTTPS GET of `url` with `headers`, failing when the body is larger than `max_body`.
-/// Any status is a [`Reply`]; only a failure to get one is an error.
+/// One HTTPS request to `url` with `headers`, failing when the answer's body is larger than
+/// `max_body`. Any status is a [`Reply`]; only a failure to get one is an error.
 pub trait Transport {
+    /// A GET.
     fn get(
         &self,
         url: &str,
         headers: &[(&str, &str)],
+        max_body: usize,
+    ) -> impl Future<Output = Result<Reply, TransportError>>;
+
+    /// A PATCH with `body`, sent as `Content-Type: application/json`: the transport sets that
+    /// header, so `headers` never holds it.
+    fn patch_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
         max_body: usize,
     ) -> impl Future<Output = Result<Reply, TransportError>>;
 }
@@ -109,9 +126,9 @@ pub enum GraphError {
     /// 401: the access token expired or was revoked since it was fetched.
     #[error("access token refused")]
     Unauthorized,
-    /// 403: Graph refuses the mailbox. The sign-in may lack Mail.Read, the account may have no
-    /// mailbox or licence, or a Conditional Access policy may block the app
-    /// (<https://learn.microsoft.com/en-us/graph/errors>).
+    /// 403: Graph refuses the mailbox. The sign-in may lack Mail.Read (or Mail.ReadWrite for a
+    /// write), the account may have no mailbox or licence, or a Conditional Access policy may
+    /// block the app (<https://learn.microsoft.com/en-us/graph/errors>).
     #[error("Microsoft Graph refused access to the mailbox (HTTP 403)")]
     Forbidden,
     #[error(
@@ -317,27 +334,14 @@ impl<T: Transport> GraphSource<T> {
         } else {
             &[auth, PREFER]
         };
-        let mut backoff = FIRST_BACKOFF;
-        let mut tries = 1;
-        loop {
-            let reply = self
-                .transport
-                .get(url, headers, max_body)
-                .await
-                .map_err(GraphError::Transport)?;
-            match reply.status {
-                429 | 503 if tries < MAX_TRIES => {
-                    let wait = reply.retry_after.unwrap_or(backoff).min(MAX_RETRY_AFTER);
-                    tokio::time::sleep(wait).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                    tries += 1;
-                }
-                status @ (429 | 503) => return Err(GraphError::Throttled { status }),
-                401 => return Err(GraphError::Unauthorized),
-                403 => return Err(GraphError::Forbidden),
-                _ => return Ok(reply),
-            }
-        }
+        retrying(|| self.transport.get(url, headers, max_body)).await
+    }
+
+    /// PATCHes `url` with the JSON `body`, under the same rules as [`Self::get`].
+    async fn patch(&self, url: &str, body: &[u8], max_body: usize) -> Result<Reply, GraphError> {
+        let auth = ("Authorization", self.authorization.as_str());
+        let headers = [auth, PREFER, ACCEPT_JSON];
+        retrying(|| self.transport.patch_json(url, &headers, body, max_body)).await
     }
 
     async fn get_json<D: serde::de::DeserializeOwned>(&self, url: &str) -> Result<D, GraphError> {
@@ -426,6 +430,95 @@ impl<T: Transport> GraphSource<T> {
             })),
             404 => Ok(None),
             _ => Err(status_error(&reply)),
+        }
+    }
+}
+
+/// What one PATCH answered: the message's read state when the answer holds it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Patched {
+    is_read: Option<bool>,
+}
+
+impl<T: Transport> GraphSource<T> {
+    /// Sets the read state of the messages `ids` with `PATCH /me/messages/{id}` and
+    /// `{"isRead": read}` (<https://learn.microsoft.com/en-us/graph/api/message-update>), at most
+    /// [`CONCURRENT_FETCHES`] at once. A message Graph no longer has (404) is gone; the rest are
+    /// done, with the flags Graph's answer shows. Needs Mail.ReadWrite: without it Graph answers
+    /// 403, [`GraphError::Forbidden`]. On an error some messages may have changed already; the
+    /// next sync reads their state.
+    pub async fn set_read(
+        &self,
+        ids: &[RemoteId],
+        read: bool,
+    ) -> Result<Written<RemoteId>, GraphError> {
+        let body = serde_json::json!({ "isRead": read }).to_string();
+        let answers: Vec<(RemoteId, Option<Option<Flags>>)> = stream::iter(ids)
+            .map(|id| async {
+                let answer = self.set_read_one(id, body.as_bytes()).await?;
+                Ok::<_, GraphError>((id.clone(), answer))
+            })
+            .buffer_unordered(CONCURRENT_FETCHES)
+            .try_collect()
+            .await?;
+        let mut written = Written::default();
+        for id in ids {
+            match answers.iter().find(|(a, _)| a == id) {
+                Some((_, Some(flags))) => written.done.push((id.clone(), flags.clone())),
+                Some((_, None)) => written.gone.push(id.clone()),
+                None => {}
+            }
+        }
+        Ok(written)
+    }
+
+    /// One PATCH: `None` when the message is gone (404), else its flags when the answer holds
+    /// `isRead`. The answer is the whole message, its body included, so it gets
+    /// [`MAX_MIME`] rather than [`MAX_JSON`].
+    async fn set_read_one(
+        &self,
+        id: &RemoteId,
+        body: &[u8],
+    ) -> Result<Option<Option<Flags>>, GraphError> {
+        let url = format!("{API}/me/messages/{}", encode_segment(id.as_str()));
+        let reply = self.patch(&url, body, MAX_MIME).await?;
+        match reply.status {
+            200 | 204 => Ok(Some(
+                serde_json::from_slice::<Patched>(&reply.body)
+                    .ok()
+                    .and_then(|p| p.is_read)
+                    .map(seen_flags),
+            )),
+            404 => Ok(None),
+            _ => Err(status_error(&reply)),
+        }
+    }
+}
+
+/// Sends with `send` until the answer is not throttled: 429 and 503 are sent again after
+/// `Retry-After`, else after a doubling backoff, for at most [`MAX_TRIES`] tries. 401 and 403
+/// are errors; any other status is the caller's.
+async fn retrying<F, Fut>(mut send: F) -> Result<Reply, GraphError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Reply, TransportError>>,
+{
+    let mut backoff = FIRST_BACKOFF;
+    let mut tries = 1;
+    loop {
+        let reply = send().await.map_err(GraphError::Transport)?;
+        match reply.status {
+            429 | 503 if tries < MAX_TRIES => {
+                let wait = reply.retry_after.unwrap_or(backoff).min(MAX_RETRY_AFTER);
+                tokio::time::sleep(wait).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                tries += 1;
+            }
+            status @ (429 | 503) => return Err(GraphError::Throttled { status }),
+            401 => return Err(GraphError::Unauthorized),
+            403 => return Err(GraphError::Forbidden),
+            _ => return Ok(reply),
         }
     }
 }

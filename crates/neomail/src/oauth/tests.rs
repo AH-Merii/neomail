@@ -453,9 +453,16 @@ async fn refresh_gets_an_access_token_and_explains_invalid_grant_and_invalid_cli
         ),
     ]);
     let refresh_token = Secret::new(REFRESH.into());
-    let refreshed = refresh(&http, &GOOGLE, &client(), &refresh_token, "gmail")
-        .await
-        .unwrap();
+    let refreshed = refresh(
+        &http,
+        &GOOGLE,
+        &client(),
+        &refresh_token,
+        MailGrant::ReadWrite,
+        "gmail",
+    )
+    .await
+    .unwrap();
     assert_eq!(refreshed.access_token.expose(), ACCESS);
     assert_eq!(refreshed.expires_in, Some(Duration::from_secs(3599)));
     assert!(refreshed.refresh_token.is_none(), "Google does not rotate");
@@ -467,9 +474,16 @@ async fn refresh_gets_an_access_token_and_explains_invalid_grant_and_invalid_cli
         "Gmail's form still sends the secret"
     );
     assert!(!form.contains_key("scope"));
-    let e = refresh(&http, &GOOGLE, &client(), &refresh_token, "gmail")
-        .await
-        .unwrap_err();
+    let e = refresh(
+        &http,
+        &GOOGLE,
+        &client(),
+        &refresh_token,
+        MailGrant::ReadWrite,
+        "gmail",
+    )
+    .await
+    .unwrap_err();
     let message = format!("{e:#}");
     assert!(message.contains("expired or was revoked"), "{message}");
     assert!(message.contains("7 days"), "{message}");
@@ -477,9 +491,16 @@ async fn refresh_gets_an_access_token_and_explains_invalid_grant_and_invalid_cli
         message.ends_with("run `neomail account login gmail`"),
         "{message}"
     );
-    let e = refresh(&http, &GOOGLE, &client(), &refresh_token, "gmail")
-        .await
-        .unwrap_err();
+    let e = refresh(
+        &http,
+        &GOOGLE,
+        &client(),
+        &refresh_token,
+        MailGrant::ReadWrite,
+        "gmail",
+    )
+    .await
+    .unwrap_err();
     let message = format!("{e:#}");
     assert!(
         message.contains("check the client ID and secret"),
@@ -790,10 +811,18 @@ async fn microsoft_refresh_asks_for_the_refresh_scope_and_returns_the_rotated_to
         ),
     ]);
     let saved = Secret::new(REFRESH.into());
-    let refreshed = refresh(&http, &MICROSOFT, &public_client(), &saved, "outlook")
-        .await
-        .unwrap();
+    let refreshed = refresh(
+        &http,
+        &MICROSOFT,
+        &public_client(),
+        &saved,
+        MailGrant::Read,
+        "outlook",
+    )
+    .await
+    .unwrap();
     assert_eq!(refreshed.access_token.expose(), ACCESS);
+    assert_eq!(refreshed.grant, MailGrant::Read);
     assert_eq!(refreshed.rotated(&saved).unwrap().expose(), MS_REFRESH);
     let debug = format!("{refreshed:?}");
     assert!(
@@ -806,9 +835,16 @@ async fn microsoft_refresh_asks_for_the_refresh_scope_and_returns_the_rotated_to
         "offline_access https://graph.microsoft.com/Mail.Read"
     );
     assert!(!form.contains_key("client_secret"));
-    let e = refresh(&http, &MICROSOFT, &public_client(), &saved, "outlook")
-        .await
-        .unwrap_err();
+    let e = refresh(
+        &http,
+        &MICROSOFT,
+        &public_client(),
+        &saved,
+        MailGrant::Read,
+        "outlook",
+    )
+    .await
+    .unwrap_err();
     let message = format!("{e:#}");
     assert!(message.contains("unused for 90 days"), "{message}");
     assert!(
@@ -833,9 +869,16 @@ async fn expires_in_is_read_as_a_number_or_a_string_and_may_be_missing() {
     let refresh_token = Secret::new(REFRESH.into());
     let mut got = Vec::new();
     for _ in 0..3 {
-        let r = refresh(&http, &GOOGLE, &client(), &refresh_token, "gmail")
-            .await
-            .unwrap();
+        let r = refresh(
+            &http,
+            &GOOGLE,
+            &client(),
+            &refresh_token,
+            MailGrant::ReadWrite,
+            "gmail",
+        )
+        .await
+        .unwrap();
         got.push(r.expires_in);
     }
     assert_eq!(got, [Some(Duration::from_secs(3600)), None, None]);
@@ -846,6 +889,7 @@ fn a_refresh_token_is_written_back_only_when_it_changed() {
     let saved = Secret::new(REFRESH.into());
     let with = |token: Option<&str>| Refreshed {
         access_token: Secret::new(ACCESS.into()),
+        grant: MailGrant::Read,
         refresh_token: token.map(|t| Secret::new(t.into())),
         expires_in: None,
     };
@@ -918,4 +962,92 @@ fn the_client_id_prompt_points_at_the_step_that_shows_the_id() {
         );
         assert!(p.setup.steps.contains("GUIDE"), "{}", p.id);
     }
+}
+
+/// Microsoft's refresh scope must be the original's or a subset
+/// (<https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow>): a
+/// sign-in that granted Mail.Read is never refreshed with Mail.ReadWrite, and one that granted
+/// Mail.ReadWrite keeps it.
+#[tokio::test]
+async fn microsoft_refreshes_each_sign_in_for_no_more_than_it_granted() {
+    let saved = Secret::new(REFRESH.into());
+    for (grant, want) in [
+        (
+            MailGrant::Read,
+            "offline_access https://graph.microsoft.com/Mail.Read",
+        ),
+        (
+            MailGrant::ReadWrite,
+            "offline_access https://graph.microsoft.com/Mail.ReadWrite",
+        ),
+    ] {
+        let http = FakeHttp::new(&[(200, &ms_token(None, MS_REFRESH))]);
+        let refreshed = refresh(
+            &http,
+            &MICROSOFT,
+            &public_client(),
+            &saved,
+            grant,
+            "outlook",
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.grant, grant);
+        assert_eq!(http.forms.borrow()[0].1["scope"], want);
+    }
+    // Google sends no scope with a refresh, whatever the grant.
+    for grant in [MailGrant::Read, MailGrant::ReadWrite] {
+        let http = FakeHttp::new(&[(200, &format!(r#"{{"access_token":"{ACCESS}"}}"#))]);
+        refresh(&http, &GOOGLE, &client(), &saved, grant, "gmail")
+            .await
+            .unwrap();
+        assert!(!http.forms.borrow()[0].1.contains_key("scope"));
+    }
+}
+
+/// A new sign-in asks for Mail.ReadWrite and Mail.Read, and what it records follows what
+/// Microsoft granted. A refresh may ask only for what the sign-in asked for or a subset
+/// (<https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow>), so
+/// this version's refreshes and the previous release's (`offline_access` and Mail.Read) all stay
+/// inside what a new sign-in asks for.
+#[test]
+fn a_sign_in_records_whether_it_may_change_mail() {
+    let asked: Vec<&str> = MICROSOFT.scope.split_ascii_whitespace().collect();
+    for scope in [
+        "https://graph.microsoft.com/Mail.ReadWrite",
+        "https://graph.microsoft.com/Mail.Read",
+    ] {
+        assert!(asked.contains(&scope), "{asked:?}");
+    }
+    let refresh = MICROSOFT.refresh_scope.as_ref().unwrap();
+    for refreshed in [
+        "offline_access https://graph.microsoft.com/Mail.Read",
+        refresh.for_grant(MailGrant::Read),
+        refresh.for_grant(MailGrant::ReadWrite),
+    ] {
+        assert!(
+            refreshed
+                .split_ascii_whitespace()
+                .all(|s| asked.contains(&s)),
+            "{refreshed:?} asks for more than {asked:?}"
+        );
+    }
+    let grant = |provider: &Provider, answer: String| {
+        check_sign_in(provider, serde_json::from_str(&answer).unwrap())
+            .unwrap()
+            .grant
+    };
+    let ms = |scope| grant(&MICROSOFT, ms_token(scope, REFRESH));
+    assert_eq!(
+        ms(Some("https://graph.microsoft.com/Mail.ReadWrite openid")),
+        MailGrant::ReadWrite
+    );
+    assert_eq!(
+        ms(Some("https://graph.microsoft.com/Mail.Read openid")),
+        MailGrant::Read
+    );
+    // No scope in the answer means the scopes asked for.
+    assert_eq!(ms(None), MailGrant::ReadWrite);
+    let google = token_json(FULL_SCOPE, Some(REFRESH), "you@example.com");
+    assert_eq!(grant(&GOOGLE, google), MailGrant::ReadWrite);
 }
