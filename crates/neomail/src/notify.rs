@@ -120,6 +120,7 @@ fn escape(s: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     On,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     NoService,
     Disabled,
     #[cfg_attr(target_os = "linux", allow(dead_code))]
