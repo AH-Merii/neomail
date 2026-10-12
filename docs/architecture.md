@@ -1,15 +1,15 @@
 # Architecture
 
 This page follows the code: it describes what exists, not what is planned. Product decisions live
-in [decisions.md](decisions.md); this slice is the first one from
+in [decisions.md](decisions.md). The slices so far follow
 [DEC-2026-10-11-build-first](decisions.md#dec-2026-10-11-build-first): a read-only INBOX in the
-CLI.
+CLI (slice 1) and IMAP passwords in the OS keyring (slice 2).
 
 ## Crates
 
 | Crate | What it holds | Why it is a crate |
 | ----- | ------------- | ----------------- |
-| `crates/nmail` | The binary: CLI (clap), config, the password command, output, wiring. | The composition root. Nothing depends on it. |
+| `crates/nmail` | The binary: CLI (clap), config, passwords (command or OS keyring), output, wiring. | The composition root. Nothing depends on it. |
 | `crates/nm-core` | Domain types, the `MailSource` trait, the SQLite cache, the sync engine, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
 | `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap). | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; Graph and the Gmail API become sibling crates. |
 
@@ -32,12 +32,33 @@ a scripted IMAP server over an in-memory pipe and checks the commands on the wir
 `BODY.PEEK[]`, and never `SELECT`, `STORE`, `COPY`, `MOVE`, `EXPUNGE` or `APPEND`. The IMAP
 source is also checked live against Proton Bridge.
 
-**The secret** comes from the account's `password_command`, run with `sh -c`
-(`nmail/src/secret.rs`). The password lives in a `Password` value whose `Debug` is redacted, is
-passed to `ImapSource::connect` and dropped after login. Errors never quote the command's output
-or the command. Nor do config errors quote the file: a syntax error gives its message, line
-and column, never the offending line, which could hold a pasted secret. The OS keyring and OAuth (slices 2 to 4) add other ways to get a credential; they replace
-this function, not the source.
+**The password** comes from one of two sources, fixed per account when the config is parsed
+(`PasswordSource` in `nmail/src/config.rs`): the account's `password_command`, run with `sh -c`,
+or, without one, the OS keyring entry with service `neomail` and the account name as the user.
+An account with a command never opens the keyring. `secret::account_password`
+(`nmail/src/secret.rs`) resolves it into a `Password` whose `Debug` is redacted; it is passed to
+`ImapSource::connect` and dropped after login. `nmail account set-password` and
+`delete-password` write and remove the keyring entry; the new password is prompted for without
+echo (rpassword) or read as one line of standard input.
+
+`Keyring` (`nmail/src/keyring.rs`) holds the platform's store, chosen when it is opened: the
+Secret Service over the D-Bus session bus on Linux, through zbus (pure Rust, so the static musl
+build needs no libdbus), and the login keychain on macOS. Both come from keyring-core's store
+crates; the tests give `Keyring` keyring-core's in-memory mock store instead, so no test writes to
+a real keyring, and the CLI tests point D-Bus at a socket that does not exist. zbus runs its
+blocking calls on a tokio runtime of its own, which panics inside another runtime, so `nmail
+sync` reads each account's password before it enters `block_on`. When the keyring cannot be
+reached the error says so and suggests `password_command`, adding a WSL note when
+`WSL_DISTRO_NAME` is set or `/proc/sys/fs/binfmt_misc/WSLInterop` exists.
+
+Neither source is a trait: `PasswordSource` is a closed enum matched in one function, and
+keyring-core's `CredentialStore` already is the seam between platforms and the mock. OAuth
+(slices 3 and 4) adds a token source next to these two, not a change to `MailSource`.
+
+Errors never quote a password, the command's output or the command, and keyring errors are
+rewritten so the stored bytes keyring-core carries in some of them are never printed. Nor do
+config errors quote the file: a syntax error gives its message, line and column, never the
+offending line, which could hold a pasted secret.
 
 **The cache** (`nm-core/src/cache.rs`) is one SQLite file, `cache.sqlite3`, in the data
 directory (created with mode 0700). On Unix, `nmail` makes the file and SQLite's `-wal` and
@@ -108,9 +129,10 @@ characters and bidirectional overrides in mail are neutralised before they reach
 
 `.github/workflows/ci.yml` runs `cargo fmt --check`, clippy with `-D warnings` and the tests on
 Linux and macOS for every pull request and push to `main`, and `cargo check` on Rust 1.88, the
-`rust-version` in `Cargo.toml`. Each push to `main` then builds `nmail` for x86_64 Linux (musl,
-statically linked, so it does not depend on the system's glibc) and Apple-silicon macOS, and
-publishes them as the rolling `edge` pre-release
+`rust-version` in `Cargo.toml`. Every pull request and push to `main` then builds and packages
+`nmail` for x86_64 Linux (musl, statically linked, so it does not depend on the system's glibc)
+and Apple-silicon macOS, so a dependency that breaks either release build fails before it
+merges. Only a push to `main` publishes them as the rolling `edge` pre-release
 ([DEC-2026-10-11-main-usable](decisions.md#dec-2026-10-11-main-usable)). Each tarball holds a
 `THIRD-PARTY-LICENSES` file that cargo-about generates from the dependency tree (`about.toml`
 lists the accepted licences; a crate under any other fails the build). Once the release exists,

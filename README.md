@@ -31,14 +31,13 @@ or `NMAIL_CONFIG` point elsewhere, and an empty `NMAIL_CONFIG` counts as unset):
 [[accounts]]
 name = "work"
 username = "user@mail.example"
-# Run through `sh -c`; it prints the password. One trailing newline is removed.
-password_command = "pass show mail/work"
 imap = { host = "imap.mail.example", port = 993, security = "tls" }
 
 [[accounts]]
 name = "proton"
 username = "user@proton.example"
-password_command = "secret-tool lookup service proton-bridge"
+# Optional: run through `sh -c`; it prints the password. One trailing newline is removed.
+password_command = "pass show mail/proton-bridge"
 [accounts.imap]
 host = "127.0.0.1"
 port = 1143
@@ -52,7 +51,26 @@ cert_sha256 = "AB:CD:…"   # 64 hex digits
 - Without `cert_sha256` the certificate is verified against the system's trust store. With it,
   only that exact certificate is accepted. Get it with
   `openssl s_client -connect 127.0.0.1:1143 -starttls imap </dev/null | openssl x509 -noout -fingerprint -sha256`.
-- The password is never written to disk, logged or printed.
+
+### Passwords
+
+An account without `password_command` reads its password from the OS keyring: the Secret Service
+on Linux (GNOME Keyring, KeePassXC and others), the login keychain on macOS. Store it once:
+
+```sh
+nmail account set-password work      # prompts without echo
+pass show mail/work | nmail account set-password work   # or one line on stdin
+nmail account delete-password work
+```
+
+The entry has the service `neomail` and the account name as the user. An account with
+`password_command` runs the command instead and never touches the keyring. Either way the password
+is never written to the config, the cache or a log, and never printed.
+
+- **WSL** often has no Secret Service. Use `password_command` (for example with `pass`), or run a
+  Secret Service such as gnome-keyring.
+- **Proton Mail:** store the password Bridge shows for the account, never your Proton account
+  password.
 
 The cache lives in `~/.local/share/neomail/` (`$XDG_DATA_HOME/neomail/`, or `NMAIL_DATA_DIR`).
 
@@ -76,7 +94,7 @@ How it fits together: [docs/architecture.md](docs/architecture.md).
 ## Planned features
 
 - **Modal, vim-style UI** with mouse support and on-screen keybinding hints.
-- **Outlook, Gmail and Proton Mail**, with secure OAuth sign-in and secrets kept in the OS keyring.
+- **Outlook, Gmail and Proton Mail**, with secure OAuth sign-in and tokens kept in the OS keyring.
 - **Local SQLite cache** for instant search, sorting and offline reading.
 - **AI classification into groups**, stored as Outlook categories, Gmail labels or Proton labels.
 - **Full-featured CLI and scripting**, so agents and scripts can do anything the TUI can.

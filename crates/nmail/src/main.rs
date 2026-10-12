@@ -1,6 +1,8 @@
-//! `nmail`: the neomail command line. Slice 1 is a read-only INBOX: sync, list, show.
+//! `nmail`: the neomail command line: a read-only INBOX (sync, list, show) and passwords in the
+//! OS keyring.
 
 mod config;
+mod keyring;
 mod output;
 mod secret;
 
@@ -14,7 +16,9 @@ use clap::{Parser, Subcommand};
 use nm_core::{Cache, MessageId, sync_inbox};
 use nm_imap::ImapSource;
 
-use crate::config::{Account, Config};
+use crate::config::{Account, Config, PasswordSource};
+use crate::keyring::Keyring;
+use crate::secret::Password;
 
 /// Exit status for a failure other than bad usage (clap exits with 2 for that).
 const EXIT_FAILURE: u8 = 1;
@@ -67,6 +71,27 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// Manage accounts' passwords in the OS keyring
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AccountCommand {
+    /// Store an account's password in the OS keyring: prompts on a terminal, else reads one line of stdin
+    SetPassword {
+        /// The account's name in the config
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Delete an account's password from the OS keyring
+    DeletePassword {
+        /// The account's name in the config
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -100,8 +125,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 .build()
                 .context("cannot start the async runtime")?;
             let mut failed = false;
+            let mut keyring = None;
             for account in accounts {
-                match runtime.block_on(sync_account(account, &mut cache, limit)) {
+                // Outside block_on: the keyring's blocking calls start a runtime of their own.
+                let result = secret::account_password(account, &mut keyring).and_then(|password| {
+                    runtime.block_on(sync_account(account, password, &mut cache, limit))
+                });
+                match result {
                     Ok(line) => {
                         writeln!(out, "{line}")?;
                         out.flush()?;
@@ -141,6 +171,32 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 eprintln!("nmail: no cached messages; run `nmail sync` first");
             } else {
                 output::write_list(&mut out, &entries)?;
+            }
+            ExitCode::SUCCESS
+        }
+        Command::Account { command } => {
+            let config = Config::load(&config::config_path(cli.config)?)?;
+            match command {
+                AccountCommand::SetPassword { name } => {
+                    let account = config.select(Some(&name))?[0];
+                    let password = secret::read_new_password(&account.name)?;
+                    writeln!(out, "{}", set_password(account, &password)?)?;
+                }
+                AccountCommand::DeletePassword { name } => {
+                    let account = config.select(Some(&name))?[0];
+                    let keyring = Keyring::open()?;
+                    let (done, prep) = if keyring.delete(&account.name)? {
+                        ("Deleted the", "from")
+                    } else {
+                        ("There was no", "in")
+                    };
+                    writeln!(
+                        out,
+                        "{done} password for {:?} {prep} {}.",
+                        account.name,
+                        keyring.name()
+                    )?;
+                }
             }
             ExitCode::SUCCESS
         }
@@ -238,8 +294,29 @@ fn check_cached_account(cache: &Cache, name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn sync_account(account: &Account, cache: &mut Cache, limit: NonZeroU32) -> Result<String> {
-    let password = secret::run_password_command(&account.name, &account.password_command)?;
+/// Stores the password and says where, in one line.
+fn set_password(account: &Account, password: &Password) -> Result<String> {
+    let keyring = Keyring::open()?;
+    keyring.set(&account.name, password)?;
+    let mut line = format!(
+        "Stored the password for {:?} in {} (service {:?}, user {:?}).",
+        account.name,
+        keyring.name(),
+        keyring::SERVICE,
+        account.name
+    );
+    if matches!(account.password, PasswordSource::Command(_)) {
+        line.push_str(" The account's password_command takes precedence while it is set.");
+    }
+    Ok(line)
+}
+
+async fn sync_account(
+    account: &Account,
+    password: Password,
+    cache: &mut Cache,
+    limit: NonZeroU32,
+) -> Result<String> {
     let mut source = ImapSource::connect(&account.imap, password.expose()).await?;
     drop(password);
     let result = sync_inbox(&mut source, cache, &account.name, limit).await;

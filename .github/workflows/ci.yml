@@ -47,9 +47,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --all-targets
 
+  # Runs on pull requests too, so a dependency that breaks the static musl link or the macOS
+  # release build fails before it merges. Only publish-edge, on main, uploads to the release.
   build-edge:
     name: Build edge (${{ matrix.target }})
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [check, msrv]
     strategy:
       matrix:
@@ -105,6 +106,7 @@ jobs:
 
   publish-edge:
     name: Publish edge
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build-edge
     runs-on: ubuntu-latest
     permissions:
