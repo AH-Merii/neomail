@@ -66,8 +66,17 @@ fn xdg_dir(var: &str, fallback: &str) -> Result<PathBuf> {
 pub struct Account {
     pub name: String,
     pub imap: ImapConfig,
+    pub password: PasswordSource,
+}
+
+/// Where an account's password comes from. Exactly one source per account: with
+/// `password_command` set the keyring is never touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordSource {
     /// Run through `sh -c`; its output is the password. The command is not secret, its output is.
-    pub password_command: String,
+    Command(String),
+    /// The OS keyring entry with service `neomail` and the account name as the user.
+    Keyring,
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +96,7 @@ struct RawConfig {
 struct RawAccount {
     name: String,
     username: String,
-    password_command: String,
+    password_command: Option<String>,
     imap: RawImap,
 }
 
@@ -137,9 +146,13 @@ impl Config {
             if a.imap.host.trim().is_empty() {
                 bail!("account {name:?}: imap.host is empty");
             }
-            if a.password_command.trim().is_empty() {
-                bail!("account {name:?}: password_command is empty");
-            }
+            let password = match a.password_command {
+                Some(command) if command.trim().is_empty() => bail!(
+                    "account {name:?}: password_command is empty; remove it to use the OS keyring"
+                ),
+                Some(command) => PasswordSource::Command(command),
+                None => PasswordSource::Keyring,
+            };
             let security = match a.imap.security {
                 RawSecurity::Tls => Security::Tls,
                 RawSecurity::Starttls => Security::StartTls,
@@ -163,7 +176,7 @@ impl Config {
                     username: a.username,
                     cert_pin,
                 },
-                password_command: a.password_command,
+                password,
                 name,
             });
         }
@@ -227,6 +240,10 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             (1143, Security::StartTls)
         );
         assert!(bridge.imap.cert_pin.is_some());
+        assert_eq!(
+            work.password,
+            PasswordSource::Command("pass show mail/work".into())
+        );
         assert_eq!(c.select(Some("bridge")).unwrap()[0].name, "bridge");
         assert_eq!(c.select(None).unwrap().len(), 2);
         assert!(c.select(Some("nope")).is_err());
@@ -242,10 +259,23 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             format!("{base}imap = {{ host = \"h\" }}\n{base}imap = {{ host = \"h\" }}"),
             format!("{base}imap = {{ host = \"\" }}"),
             base.to_owned(),
+            format!(
+                "{}imap = {{ host = \"h\" }}",
+                base.replace("\"true\"", "\" \"")
+            ),
         ] {
             assert!(Config::parse(&bad).is_err(), "{bad}");
         }
         assert!(Config::parse("").unwrap().select(None).is_err());
+    }
+
+    #[test]
+    fn no_password_command_means_the_keyring() {
+        let c = Config::parse(
+            "[[accounts]]\nname = \"a\"\nusername = \"u\"\nimap = { host = \"h\" }\n",
+        )
+        .unwrap();
+        assert_eq!(c.accounts[0].password, PasswordSource::Keyring);
     }
 
     #[test]

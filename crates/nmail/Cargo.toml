@@ -18,12 +18,20 @@ nm-imap.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+keyring-core.workspace = true
+rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

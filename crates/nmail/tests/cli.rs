@@ -2,8 +2,9 @@
 //! directory. No network.
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
 
+use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use chrono::DateTime;
 use nm_core::{Cache, FetchedMessage, Flags, Uid, UidValidity};
@@ -310,4 +311,87 @@ fn password_command_output_never_appears_in_errors() {
     let all = format!("{}{}", stdout(&o), stderr(&o));
     assert!(all.contains("password_command failed"), "{all}");
     assert!(!all.contains("hunter2"), "{all}");
+}
+
+const KEYRING_CONFIG: &str = "[[accounts]]\nname = \"work\"\nusername = \"user@mail.example\"\n\
+                              imap = { host = \"imap.mail.example\" }\n";
+const FAKE_PASSWORD: &str = "s3cret-fake-password";
+
+/// Runs `nmail` with `input` on standard input and a D-Bus session bus that does not exist, so
+/// nothing reaches a real keyring.
+fn nmail_stdin(data: &Path, args: &[&str], input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nmail"))
+        .args(args)
+        .env("NMAIL_DATA_DIR", data)
+        .env("NMAIL_CONFIG", data.join("config.toml"))
+        .env("HOME", data)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // nmail may exit before it reads, closing the pipe.
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn set_password_checks_the_account_and_refuses_an_empty_password() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), KEYRING_CONFIG).unwrap();
+
+    let input = format!("{FAKE_PASSWORD}\n");
+    let o = nmail_stdin(dir.path(), &["account", "set-password", "nope"], &input);
+    assert_eq!(o.status.code(), Some(1));
+    let all = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        all.contains("no account named \"nope\"; configured: work"),
+        "{all}"
+    );
+    assert!(!all.contains(FAKE_PASSWORD), "{all}");
+
+    // The config has no password_command and loads: the empty password is what fails.
+    for input in ["", "\n", "\r\n"] {
+        let o = nmail_stdin(dir.path(), &["account", "set-password", "work"], input);
+        assert_eq!(o.status.code(), Some(1), "{input:?}");
+        assert!(
+            stderr(&o).contains("the password is empty"),
+            "{}",
+            stderr(&o)
+        );
+    }
+
+    let o = nmail_stdin(dir.path(), &["account", "delete-password", "nope"], "");
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("configured: work"), "{}", stderr(&o));
+}
+
+/// No Secret Service on the bus: every keyring command fails in one line with the hint, and the
+/// password given on stdin is never echoed. Linux only: on macOS this would reach the keychain.
+#[cfg(target_os = "linux")]
+#[test]
+fn keyring_unavailable_is_one_line_with_a_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), KEYRING_CONFIG).unwrap();
+    let input = format!("{FAKE_PASSWORD}\n");
+    for args in [
+        &["account", "set-password", "work"][..],
+        &["account", "delete-password", "work"],
+        &["sync"],
+    ] {
+        let o = nmail_stdin(dir.path(), args, &input);
+        assert_eq!(o.status.code(), Some(1), "{args:?}");
+        let (out, err) = (stdout(&o), stderr(&o));
+        assert!(out.is_empty(), "{args:?}: {out}");
+        assert!(err.contains("the OS keyring is unavailable ("), "{err}");
+        assert!(
+            err.contains("set password_command in the config instead"),
+            "{err}"
+        );
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(!err.contains(FAKE_PASSWORD), "{err}");
+    }
 }
