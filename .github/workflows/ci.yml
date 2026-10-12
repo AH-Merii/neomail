@@ -25,6 +25,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # Linux first (DEC-2026-10-12-linux-first): a macOS failure shows on its own job, but the run
+    # stays green and the jobs that need this one still run.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -47,8 +50,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --all-targets
 
-  # Runs on pull requests too, so a dependency that breaks the static musl link or the macOS
-  # release build fails before it merges. Only publish-edge, on main, uploads to the release.
+  # Runs on pull requests too, so a dependency that breaks the static musl link fails before it
+  # merges. The macOS build may fail without blocking anything (Linux first), and a failing leg
+  # with continue-on-error does not cancel the other. Only publish-edge, on main, uploads to the
+  # release.
   build-edge:
     name: Build edge (${{ matrix.target }})
     needs: [check, msrv]
@@ -61,6 +66,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -123,6 +129,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # download-artifact succeeds with whatever exists, so check that the Linux build is there.
+      # The macOS one may be missing after an allowed failure; the loop below then drops its old
+      # asset rather than leave it frozen at an older commit.
+      - name: Require the Linux build
+        run: test -s dist/nmail-x86_64-unknown-linux-musl.tar.gz
       # A newer push can cancel this job at any step. Once the release exists the tag moves
       # last, so it never runs ahead of the uploaded assets. A cancel during the upload can still
       # leave a tarball missing until the next publishing run, because --clobber deletes the old
