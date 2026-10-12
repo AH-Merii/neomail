@@ -36,7 +36,8 @@ the new entry.
   Microsoft Graph is the primary API (categories, delta sync, send). IMAP/SMTP is an optional
   fallback. Note for docs: personal Microsoft accounts cannot register apps without a directory —
   the user must sign up for an Azure (free) account to get one (card required for identity
-  verification only). The registration survives cancelling the Azure subscription.
+  verification only). The registration survives cancelling the Azure subscription
+  ([DEC-2026-10-12-outlook-defaults](#dec-2026-10-12-outlook-defaults), proposed).
 - **Proton:** via Proton Mail Bridge (local IMAP/SMTP; paid Proton plans only). Never ask for or
   store the Proton account password. No native Proton API client in v1.
 - **Authentication must be OAuth where the provider supports it, and very secure:** PKCE + loopback
@@ -629,7 +630,8 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 ### <a id="dec-2026-10-12-outlook-defaults"></a>DEC-2026-10-12-outlook-defaults: Outlook's open questions
 
 - **Status:** proposed by Claude on 2026-10-12. The owner was shown these questions with defaults
-  before slice 6 was built and has not answered yet; slice 6 follows the defaults.
+  in chat before slice 6 was built (f679d889:2426) and has not answered yet; slice 6 follows the
+  defaults.
 - **Proposal:**
   - `--json` and `--jsonl` give `uid: null` for a message read through Microsoft Graph, which has
     no UIDs ([json.md](json.md)). `account list` keeps its field types: a Graph account shows
@@ -638,11 +640,18 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
     `SSH_TTY` set and not empty, and `DISPLAY` and `WAYLAND_DISPLAY` unset or empty. neomail says
     so, and `--device-code` asks for it anywhere.
   - Outlook asks for `Mail.Read` only, until triage (roadmap slice 8) needs to write.
-  - The setup docs say an app registration needs a directory, and only what Microsoft documents
-    about getting one; they make no claim about what happens when an Azure subscription ends.
+  - The setup docs say an app registration needs a directory, and what Microsoft documents about
+    getting one: a free Azure account, with a phone number and a card for identity verification.
+    They make no claim about what happens to the registration when the subscription ends.
   - Logout deletes the sign-in from the keyring and says Microsoft has no revocation endpoint; it
     prints no link to the consent page.
   - A tenant override, for an app registered in one organisation only, is a follow-up
     ([#32](https://github.com/AH-Merii/neomail/issues/32)), not part of slice 6.
+- **Open question for the owner:** the "Outlook" bullet's note for docs says the registration
+  survives cancelling the Azure subscription. Microsoft documents only that "when a subscription
+  expires, the trusted instance remains"
+  ([Microsoft Entra](https://learn.microsoft.com/en-us/entra/fundamentals/how-subscriptions-associated-directory)),
+  which is the directory, not the registration in it. If accepted, this proposal supersedes that
+  sentence; Claude follows "no claim" until the owner says otherwise.
 - **Builds on:** "Outlook" in [Accounts and providers](#accounts-and-providers) and
   [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).
