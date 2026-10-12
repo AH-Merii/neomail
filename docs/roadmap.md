@@ -23,7 +23,7 @@ reason from decisions.md.
 | 1 | Read-only CLI inbox | sync the inboxes of your IMAP accounts (Proton via Bridge, or any server with a password command), list the messages and show one, from an edge pre-release that CI builds on every merge. | [Build first](decisions.md#dec-2026-10-11-build-first), [`main` is always usable](decisions.md#dec-2026-10-11-main-usable), Proton in [Accounts](decisions.md#accounts-and-providers), the SQLite cache in [Data and storage](decisions.md#data-and-storage), CI/CD in [Project and delivery](decisions.md#project-and-delivery) |
 | 2 | OS keyring | keep the IMAP password in the OS keyring instead of behind a password command, on Linux, macOS and WSL. | Secrets in [Accounts](decisions.md#accounts-and-providers), the WSL secret fallback in [Platforms](decisions.md#platforms) |
 | 3 | Gmail with your own OAuth app | add a Gmail account with `neomail account add`, which guides you through registering your own Google client and signs in with PKCE in the browser. | Gmail and "no built-in client IDs" in [Accounts](decisions.md#accounts-and-providers), the WSL browser in [Platforms](decisions.md#platforms) |
-| 4 | First run and setup | see where to start from bare `neomail` and every "no config" message, and add Proton (with Bridge's certificate pinned), any IMAP server or Gmail with an app password through `neomail account add`, interactively or from flags, with a read-only login before anything is written; list accounts and check the config with `neomail account list` and `neomail config path\|check`; see sync progress on a terminal. | [The CLI for people and pipes](decisions.md#dec-2026-10-12-cli-ux), the wizard and app passwords in [Accounts](decisions.md#accounts-and-providers), Proton without its password |
+| 4 | Getting started and setup | see where to start from bare `neomail` and every "no config" message, and add Proton (with Bridge's certificate pinned), any IMAP server or Gmail with an app password through `neomail account add`, interactively or from flags, with a read-only login before anything is written; list accounts and check the config with `neomail account list` and `neomail config path\|check`; see sync progress on a terminal. | [The CLI for people and pipes](decisions.md#dec-2026-10-12-cli-ux), the wizard, app passwords and Proton without its password in [Accounts](decisions.md#accounts-and-providers) |
 | 5 | Output for people and pipes | pipe any listing into fzf, cut or awk (plain TSV when stdout is not a terminal, or `--plain`) or jq (`--json`, `--jsonl`), pass several ids or `-` to `show`, use `--limit all`, get colour on a terminal that follows `--color`, NO_COLOR and CLICOLOR, page long messages, and generate shell completions. | [The CLI for people and pipes](decisions.md#dec-2026-10-12-cli-ux), `--json` everywhere and easy scripting in [CLI, scripting, agents, extensibility](decisions.md#cli-scripting-agents-extensibility) |
 | 6 | Outlook with your own Entra app | add an Outlook or Hotmail account the same way, reading through Microsoft Graph, with device code sign-in over SSH. | Outlook in [Accounts](decisions.md#accounts-and-providers) |
 | 7 | Background sync | see new mail without running `neomail sync`: a background process keeps every account's cache current (IMAP IDLE, Gmail history, Graph delta), and the CLI reads from it. | The SQLite cache with sync in [Data and storage](decisions.md#data-and-storage), multiple accounts in [Accounts](decisions.md#accounts-and-providers) |
@@ -43,7 +43,7 @@ reason from decisions.md.
 
 | # | Slice | Once it lands, you can… | Delivers |
 |---|---|---|---|
-| 19 | Read-only TUI | run `neomail` with no arguments to browse the inbox and read messages with vim keys, the mouse and on-screen key hints. | Modal controls, key hints and mouse in [UX](decisions.md#ux) |
+| 19 | Read-only TUI | run `neomail` with no arguments to browse the inbox (or set up an account when there is none) and read messages with vim keys, the mouse and on-screen key hints. | Modal controls, key hints and mouse in [UX](decisions.md#ux), the add-account screen in [The CLI for people and pipes](decisions.md#dec-2026-10-12-cli-ux) |
 | 20 | Triage in the TUI | do the same four actions with a key from the message list or the reader, through the same actions as the CLI. | "The CLI can do everything the TUI can" in [CLI, scripting, agents, extensibility](decisions.md#cli-scripting-agents-extensibility), configurable keys in [UX](decisions.md#ux) |
 | 21 | Groups in the TUI | browse mail by group, across all accounts or one. | Unified views in [Accounts](decisions.md#accounts-and-providers), "Each email belongs to exactly one group" in [Classification](decisions.md#classification-jev) |
 | 22 | Compose in the TUI | write, reply and forward in a modal, Neovim-like editor with relative line numbers and live Markdown highlighting, or in `$EDITOR`. | "Drafting feels like Neovim" and Markdown drafts in [UX](decisions.md#ux) |
@@ -65,19 +65,20 @@ reason from decisions.md.
 
 ## Why this order
 
-- First run and setup, then output for people and pipes, come right after Gmail
+- Getting started and setup, then output for people and pipes, come right after Gmail
   ([DEC-2026-10-12-cli-ux](decisions.md#dec-2026-10-12-cli-ux)): every merge publishes a build to
   try, so edge users meet the first run now, and triage, search and attachments then use the
   output contract instead of retrofitting it.
-
 - The CLI comes first because the owner chose to finish every CLI feature before starting the TUI
   ([DEC-2026-10-11-cli-first](decisions.md#dec-2026-10-11-cli-first)). The CLI can do everything
   the TUI can, through one action registry
   ([CLI, scripting, agents, extensibility](decisions.md#cli-scripting-agents-extensibility)), so
   each TUI slice puts keys and screens on actions that already work.
-- Sign-in comes right after the inbox because Gmail and Outlook are providers "from day one" and
-  secrets belong only in the keyring or a password command
-  ([Accounts and providers](decisions.md#accounts-and-providers)).
+- Gmail sign-in comes right after the inbox because Gmail and Outlook are providers "from day one"
+  and secrets belong only in the keyring or a password command
+  ([Accounts and providers](decisions.md#accounts-and-providers)). Outlook follows getting started
+  and output, so `neomail account add outlook` uses their conventions
+  ([DEC-2026-10-12-cli-ux](decisions.md#dec-2026-10-12-cli-ux)).
 - Triage comes before jev because jev's groups are written as provider tags and confident spam is
   moved to Junk, both of which use the write path triage builds
   ([Classification](decisions.md#classification-jev)). Redaction comes before the first call,

@@ -102,7 +102,8 @@ the new entry.
 - **Keybinding hints** on screen without taking much space; each mode shows only its own bindings.
 - **Keybindings are configurable and easy to learn**, with a quick way to look them up and change
   them.
-- **Theming.**
+- **Theming** (the TUI; CLI output follows the terminal's own palette:
+  [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux)).
 - **Live sorting animation:** when jev sorts/tags mail in real time, the TUI plays a really cool
   animation that shows each message being sorted into its group. On by default; can be turned off
   in the configuration. It must degrade gracefully (reduced motion, slow terminals or SSH, small
@@ -182,19 +183,22 @@ the new entry.
   stream.
 - **Easy scripting and scheduled tasks.**
 - **The CLI for people and pipes** ([DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux)):
-  - First run: bare `neomail` with no config prints a few start lines and a guide URL, and never
-    prompts. Every "no config" message names the next command.
+  - Getting started: bare `neomail` with no config prints a few start lines and a guide URL, and
+    never prompts; the TUI, once it lands, opens its add-account screen instead. Every "no config"
+    message names the next command.
   - Setup is `neomail account add`, the in-app wizard: a provider menu on a terminal, a flag for
-    every prompt, `--no-input` for scripts, and a read-only login before the config is written
+    every prompt except secrets (they come from a prompt without echo, stdin or a password
+    command), `--no-input` for scripts, and a read-only login before the config is written
     (`--no-check` skips it). `neomail account list` and `neomail config path|check` show and check
-    the config. No server autodiscovery for now.
-  - Output: human on a terminal; plain TSV (one record per line, id first, no truncation or
-    colour) when stdout is not a terminal or with `--plain`; `--json` and `--jsonl` for data.
-    stdout carries only results; prompts, progress and errors go to stderr. A broken pipe exits 0
-    silently.
-  - Colour only on a terminal, from the 16 ANSI colours so the terminal theme picks the shades,
-    following `--color auto|always|never`, NO_COLOR (which removes all styling) and CLICOLOR.
-    Colour never carries meaning alone and never reaches `--json`, `--jsonl` or plain output.
+    the config. No server autodiscovery for IMAP for now.
+  - Listings: human on a terminal; plain TSV (one record per line, id first, no truncation) when
+    stdout is not a terminal or with `--plain`; `--json` and `--jsonl` for data. stdout carries
+    only results; prompts, progress and errors go to stderr. A broken pipe exits 0 silently.
+  - Colour from the 16 ANSI colours, so the terminal theme picks the shades: on a terminal by
+    default, following `--color auto|always|never`, NO_COLOR and CLICOLOR. `--color always` also
+    colours plain output, for `fzf --ansi`; nothing ever colours `--json`, `--jsonl` or `--raw`.
+    NO_COLOR removes all styling, bold and underline included: stricter than no-color.org, which
+    covers colour only, so one rule holds. Colour never carries meaning alone.
 - **Easy to extend** with new functionality and UI later.
 - **Agentically customizable, like Pi** (Mario Zechner's agent harness): agents can extend and
   customize neomail themselves (extensions, docs written for agents, hot reload).
@@ -582,9 +586,12 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   on Homebrew, the AUR and crates.io when checked.
 - **Owner's words:** chose "Rename to `neomail` (Recommended)" when asked what the binary should be
   called.
-- **Ruling:** the binary, the Cargo package and the release assets are `neomail`; environment
-  variables are `NEOMAIL_*`. Supersedes the "Binary" part of the Name bullet under
-  [Identity](#identity). Log entries keep `nmail` where they quote or describe the past.
+- **Ruling:** the binary, the Cargo package and the release assets are `neomail`, and neomail's own
+  variables `NMAIL_CONFIG` and `NMAIL_DATA_DIR` become `NEOMAIL_CONFIG` and `NEOMAIL_DATA_DIR`
+  (d99kris/nmail's installer also reads `NMAIL_*` variables); `JEV_API_KEY` keeps its name. The
+  asset and variable names are Claude's call. Bullets that name the command now say `neomail`; log
+  entries keep `nmail` where they quote or describe the past.
+- **Supersedes:** the "Binary" part of the Name bullet under [Identity](#identity).
 
 ### <a id="dec-2026-10-12-install-channels"></a>DEC-2026-10-12-install-channels: install.sh and mise first
 
@@ -595,8 +602,8 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Owner's words:** "install.sh and mise, without the rest for now." and, on the AUR, "no need for
   aur for now"
 - **Ruling:** the "Clear, simple installation" bullet under
-  [Project and delivery](#project-and-delivery). Edge gets a `SHA256SUMS` asset, which the
-  installer checks. Homebrew and the AUR wait.
+  [Project and delivery](#project-and-delivery). Homebrew and the AUR wait. The `SHA256SUMS` asset
+  on edge, which the installer checks, is Claude's call.
 
 ### <a id="dec-2026-10-12-cli-ux"></a>DEC-2026-10-12-cli-ux: first run, setup and output for people and pipes
 
@@ -607,9 +614,13 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   other than Gmail are written by hand, and `list` is an 80-column format that hides text past
   column 80 from fzf.
 - **Owner's words:** chose "New slices 4 and 5 (Recommended)", "Print start lines only
-  (Recommended)", "Auto plain TSV in pipes (Recommended)" and, for the rest of the
-  recommendations, "Accept all (Recommended)".
+  (Recommended)", "Auto plain TSV in pipes (Recommended)", and "Accept all (Recommended)" for
+  "--jsonl next to --json; `account add` checks the login before writing the config, with
+  --no-check; CLI colours are the 16 ANSI colours following your terminal theme; NO_COLOR strips
+  all styling; a broken pipe exits 0 silently; no server autodiscovery for IMAP for now".
 - **Ruling:** "The CLI for people and pipes" under
   [CLI, scripting, agents, extensibility](#cli-scripting-agents-extensibility). The roadmap gets
-  two CLI slices before Outlook: 4, "First run and setup", and 5, "Output for people and pipes".
-  The TUI (slice 19) opens its add-account screen when there are no accounts.
+  two CLI slices before Outlook: "Getting started and setup", then "Output for people and pipes".
+  The rest of the bullet is Claude's, from the recommendation shown with the questions: the
+  provider menu, flags and `--no-input`, `account list` and `config path|check`, the stdout and
+  stderr split, `--color` and CLICOLOR, and the TUI's add-account screen.
