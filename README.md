@@ -8,8 +8,9 @@
 A fast, modal terminal email client for Outlook, Gmail and Proton Mail.
 
 > **Status:** early development. What works today: a read-only INBOX over IMAP in the command
-> line (`nmail sync`, `nmail list`, `nmail show`). Nothing changes on the server. There is no TUI
-> yet, and no OAuth sign-in: use an app password or Proton Mail Bridge.
+> line (`nmail sync`, `nmail list`, `nmail show`), with passwords (an app password, Proton Mail
+> Bridge) or, for Gmail, OAuth sign-in through your own Google client. Nothing changes on the
+> server. There is no TUI yet, and no Outlook sign-in.
 
 ## Try it
 
@@ -76,6 +77,23 @@ is never written to the config, the cache or a log, and never printed.
   Secret Service such as gnome-keyring.
 - **Proton Mail:** store the password Bridge shows for the account, never your Proton account
   password.
+
+### Gmail
+
+Gmail signs in with OAuth through a Google OAuth client you create yourself; neomail ships none.
+[docs/gmail.md](docs/gmail.md) walks through the five console steps and why each exists, and the
+wizard prints them too:
+
+```sh
+nmail account add gmail          # asks for the address, client ID and secret, then opens the browser
+nmail sync --account gmail
+nmail account login gmail        # sign in again (needed every 7 days while the app is in Testing)
+nmail account logout gmail       # revoke the sign-in and delete it from the keyring
+```
+
+The account is added to the config file without secrets; the client secret and refresh token stay
+in the OS keyring (service `neomail-oauth`). `--no-browser` only prints the sign-in URL. On WSL the
+Windows browser opens (`wslview` or `explorer.exe`), or the one in `$BROWSER`.
 
 The cache lives in `~/.local/share/neomail/` (`$XDG_DATA_HOME/neomail/`, or `NMAIL_DATA_DIR`).
 

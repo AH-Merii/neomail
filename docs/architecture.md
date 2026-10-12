@@ -3,13 +3,14 @@
 This page follows the code: it describes what exists, not what is planned. Product decisions live
 in [decisions.md](decisions.md). The slices so far follow
 [DEC-2026-10-11-build-first](decisions.md#dec-2026-10-11-build-first): a read-only INBOX in the
-CLI (slice 1) and IMAP passwords in the OS keyring (slice 2).
+CLI (slice 1), IMAP passwords in the OS keyring (slice 2) and Gmail through the user's own OAuth
+client (slice 3).
 
 ## Crates
 
 | Crate | What it holds | Why it is a crate |
 | ----- | ------------- | ----------------- |
-| `crates/nmail` | The binary: CLI (clap), config, passwords (command or OS keyring), output, wiring. | The composition root. Nothing depends on it. |
+| `crates/nmail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, output, wiring. | The composition root. Nothing depends on it. |
 | `crates/nm-core` | Domain types, the `MailSource` trait, the SQLite cache, the sync engine, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
 | `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap). | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; Graph and the Gmail API become sibling crates. |
 
@@ -52,10 +53,46 @@ reached the error says so and suggests `password_command`, adding a WSL note whe
 `WSL_DISTRO_NAME` is set or `/proc/sys/fs/binfmt_misc/WSLInterop` exists.
 
 Neither source is a trait: `PasswordSource` is a closed enum matched in one function, and
-keyring-core's `CredentialStore` already is the seam between platforms and the mock. OAuth
-(slices 3 and 4) adds a token source next to these two, not a change to `MailSource`.
+keyring-core's `CredentialStore` already is the seam between platforms and the mock.
 
-Errors never quote a password, the command's output or the command, and keyring errors are
+**The login method** is fixed per account when the config is parsed (`Login` in
+`nmail/src/config.rs`): a password from a `PasswordSource`, or OAuth with a provider and the
+user's client ID (`oauth = { provider = "google", client_id = "…" }`; both at once is an error).
+`nm_imap::Login` carries the credential into `ImapSource::connect`: `LOGIN` with a password, or
+`AUTHENTICATE XOAUTH2` with an access token. A failed XOAUTH2 login gets Gmail's base64 JSON
+challenge, which is answered with an empty response so the server ends with `NO`; the whole
+exchange has one 60-second bound. `MailSource` does not change.
+
+**OAuth** (`nmail/src/oauth/`) is the authorization code flow for installed apps with PKCE
+(S256, a verifier from the OS CSPRNG via ring) and a loopback redirect: `loopback.rs` listens on
+127.0.0.1 on a port the OS picks, answers anything but the redirect with 404, ignores a wrong
+`state`, bounds each request (16 KiB, 10 s) and the whole wait (5 minutes), and never echoes the
+code. The code is exchanged at the token endpoint; the sign-in is refused without the mail scope
+(Google's consent screen lets it be unticked) or a refresh token, and the address comes from the
+ID token's `email` claim, with no signature check because it arrives straight from the token endpoint
+over TLS (OpenID Connect Core 1.0, 3.1.3.7 step 6). A **provider is data** (`Provider`:
+endpoints, scopes, IMAP host), so Microsoft becomes a second value, not a trait. **HTTP** is one
+seam, `oauth::http::Http` (a form POST): `Https` writes HTTP/1.1 over the same rustls, ring and
+platform verifier as IMAP, so no HTTP client crate is needed, and the tests give a scripted fake.
+**The browser** is opened by `browser.rs` (`$BROWSER`, else `wslview` or `explorer.exe` on WSL,
+else `xdg-open`, never with `--no-browser`); the URL is always printed, and choosing the command
+is a pure function, so no test launches anything.
+
+**Where OAuth secrets live:** the client secret and refresh token are one OS keyring entry, JSON,
+with the service `neomail-oauth` and the account name as the user, so it can never collide with a
+password entry (`neomail`). Access tokens are never stored: `nmail sync` reads the entry before it
+enters `block_on`, then refreshes the access token and logs in inside it. An `invalid_grant`
+says the sign-in expired or was revoked (7 days while the app is in Testing) and to run
+`nmail account login NAME`. Every type holding a token or secret (`Secret`, `OAuthEntry`, `Pkce`,
+`Login`, the HTTP `Response`) has a redacted `Debug`, and errors never quote a response body.
+
+**The config writer** (`config::append_account`, used by `nmail account add`) appends one
+`[[accounts]]` table to the file as text, so existing text and comments stay. It refuses a taken
+name, parses the result before writing, and writes atomically (a temporary file in the same
+directory, then a rename). A new file gets mode 0600 in a directory created with mode 0700; an
+existing one keeps its mode.
+
+Errors never quote a password, a token, the command's output or the command, and keyring errors are
 rewritten so the stored bytes keyring-core carries in some of them are never printed. Nor do
 config errors quote the file: a syntax error gives its message, line and column, never the
 offending line, which could hold a pasted secret.

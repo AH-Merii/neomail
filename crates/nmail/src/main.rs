@@ -1,8 +1,11 @@
-//! `nmail`: the neomail command line: a read-only INBOX (sync, list, show) and passwords in the
-//! OS keyring.
+//! `nmail`: the neomail command line: a read-only INBOX (sync, list, show), passwords in the OS
+//! keyring, and Gmail through the user's own OAuth client.
 
+mod account;
+mod browser;
 mod config;
 mod keyring;
+mod oauth;
 mod output;
 mod secret;
 
@@ -12,11 +15,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use nm_core::{Cache, MessageId, sync_inbox};
 use nm_imap::ImapSource;
 
-use crate::config::{Account, Config, PasswordSource};
+use crate::config::{Account, Config, Login, PasswordSource};
 use crate::keyring::Keyring;
 use crate::secret::Password;
 
@@ -71,7 +74,7 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
-    /// Manage accounts' passwords in the OS keyring
+    /// Add accounts, sign in and out, and manage passwords in the OS keyring
     Account {
         #[command(subcommand)]
         command: AccountCommand,
@@ -80,6 +83,38 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AccountCommand {
+    /// Add an account: guides you through creating your own OAuth client, then signs in
+    Add {
+        /// The provider
+        provider: AddProvider,
+        /// The account's name in neomail [default: gmail]
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// The address to sign in with
+        #[arg(long, value_name = "ADDR")]
+        email: Option<String>,
+        /// Your OAuth client's ID (the secret is prompted for, or read from stdin)
+        #[arg(long, value_name = "ID")]
+        client_id: Option<String>,
+        /// Print the sign-in URL without opening a browser
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Sign an OAuth account in again, replacing its saved sign-in
+    Login {
+        /// The account's name in the config
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Print the sign-in URL without opening a browser
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Revoke an OAuth account's sign-in and delete it from the OS keyring
+    Logout {
+        /// The account's name in the config
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
     /// Store an account's password in the OS keyring: prompts on a terminal, else reads one line of stdin
     SetPassword {
         /// The account's name in the config
@@ -92,6 +127,12 @@ enum AccountCommand {
         #[arg(value_name = "NAME")]
         name: String,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AddProvider {
+    /// Gmail, through your own Google OAuth client (see docs/gmail.md)
+    Gmail,
 }
 
 fn main() -> ExitCode {
@@ -120,17 +161,38 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let config = Config::load(&config::config_path(cli.config)?)?;
             let accounts = config.select(account.as_deref())?;
             let mut cache = open_cache(true)?.context("the cache could not be created")?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("cannot start the async runtime")?;
+            let runtime = account::runtime()?;
             let mut failed = false;
             let mut keyring = None;
             for account in accounts {
-                // Outside block_on: the keyring's blocking calls start a runtime of their own.
-                let result = secret::account_password(account, &mut keyring).and_then(|password| {
-                    runtime.block_on(sync_account(account, password, &mut cache, limit))
-                });
+                // Keyring reads stay outside block_on: their blocking calls start a runtime of
+                // their own.
+                let result = match &account.login {
+                    Login::Password(source) => {
+                        secret::account_password(&account.name, source, &mut keyring).and_then(
+                            |password| {
+                                let login = nm_imap::Login::Password(password.expose());
+                                runtime.block_on(sync_account(account, login, &mut cache, limit))
+                            },
+                        )
+                    }
+                    Login::OAuth(settings) => secret::oauth_secrets(&account.name, &mut keyring)
+                        .and_then(|(client_secret, refresh_token)| {
+                            runtime.block_on(async {
+                                let token = account::access_token(
+                                    account,
+                                    settings,
+                                    client_secret,
+                                    &refresh_token,
+                                )
+                                .await?;
+                                let login = nm_imap::Login::XOAuth2 {
+                                    access_token: token.expose(),
+                                };
+                                sync_account(account, login, &mut cache, limit).await
+                            })
+                        }),
+                };
                 match result {
                     Ok(line) => {
                         writeln!(out, "{line}")?;
@@ -174,16 +236,45 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             ExitCode::SUCCESS
         }
+        Command::Account {
+            command:
+                AccountCommand::Add {
+                    provider: AddProvider::Gmail,
+                    name,
+                    email,
+                    client_id,
+                    no_browser,
+                },
+        } => {
+            let args = account::AddArgs {
+                name,
+                email,
+                client_id,
+                no_browser,
+            };
+            let path = config::config_path(cli.config)?;
+            account::add(&oauth::GOOGLE, &path, args, &mut out)?;
+            ExitCode::SUCCESS
+        }
         Command::Account { command } => {
             let config = Config::load(&config::config_path(cli.config)?)?;
             match command {
+                AccountCommand::Add { .. } => unreachable!("handled above"),
+                AccountCommand::Login { name, no_browser } => {
+                    account::login(config.select(Some(&name))?[0], no_browser, &mut out)?;
+                }
+                AccountCommand::Logout { name } => {
+                    account::logout(config.select(Some(&name))?[0], &mut out)?;
+                }
                 AccountCommand::SetPassword { name } => {
                     let account = config.select(Some(&name))?[0];
+                    refuse_oauth(account, "login")?;
                     let password = secret::read_new_password(&account.name)?;
                     writeln!(out, "{}", set_password(account, &password)?)?;
                 }
                 AccountCommand::DeletePassword { name } => {
                     let account = config.select(Some(&name))?[0];
+                    refuse_oauth(account, "logout")?;
                     let keyring = Keyring::open()?;
                     let (done, prep) = if keyring.delete(&account.name)? {
                         ("Deleted the", "from")
@@ -294,6 +385,19 @@ fn check_cached_account(cache: &Cache, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fails for an OAuth account, which has no password: `instead` is the account command to use.
+fn refuse_oauth(account: &Account, instead: &str) -> Result<()> {
+    if let Login::OAuth(settings) = &account.login {
+        bail!(
+            "account {:?} signs in with {} (OAuth) and has no password; use `nmail account {instead} {}`",
+            account.name,
+            settings.provider.name,
+            account.name
+        );
+    }
+    Ok(())
+}
+
 /// Stores the password and says where, in one line.
 fn set_password(account: &Account, password: &Password) -> Result<String> {
     let keyring = Keyring::open()?;
@@ -305,7 +409,7 @@ fn set_password(account: &Account, password: &Password) -> Result<String> {
         keyring::SERVICE,
         account.name
     );
-    if matches!(account.password, PasswordSource::Command(_)) {
+    if matches!(account.login, Login::Password(PasswordSource::Command(_))) {
         line.push_str(" The account's password_command takes precedence while it is set.");
     }
     Ok(line)
@@ -313,12 +417,11 @@ fn set_password(account: &Account, password: &Password) -> Result<String> {
 
 async fn sync_account(
     account: &Account,
-    password: Password,
+    login: nm_imap::Login<'_>,
     cache: &mut Cache,
     limit: NonZeroU32,
 ) -> Result<String> {
-    let mut source = ImapSource::connect(&account.imap, password.expose()).await?;
-    drop(password);
+    let mut source = ImapSource::connect(&account.imap, login).await?;
     let result = sync_inbox(&mut source, cache, &account.name, limit).await;
     source.logout().await;
     let r = result?;

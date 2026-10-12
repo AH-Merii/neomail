@@ -35,7 +35,8 @@ pub enum Security {
     StartTls,
 }
 
-/// Where and how to connect. The password is passed separately and never stored here.
+/// Where and how to connect. The credential is passed separately as a [`Login`] and never stored
+/// here.
 #[derive(Debug, Clone)]
 pub struct ImapConfig {
     pub host: String,
@@ -43,6 +44,64 @@ pub struct ImapConfig {
     pub security: Security,
     pub username: String,
     pub cert_pin: Option<CertPin>,
+}
+
+/// How to log in: `LOGIN` with a password, or `AUTHENTICATE XOAUTH2` with an OAuth access token
+/// (Gmail). The secret is borrowed for the login only; `Debug` never shows it.
+#[derive(Clone, Copy)]
+pub enum Login<'a> {
+    Password(&'a str),
+    XOAuth2 { access_token: &'a str },
+}
+
+impl std::fmt::Debug for Login<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Login::Password(_) => "Login::Password(<redacted>)",
+            Login::XOAuth2 { .. } => "Login::XOAuth2(<redacted>)",
+        })
+    }
+}
+
+/// The SASL XOAUTH2 initial response before base64 (async-imap encodes it):
+/// `user=ADDR^Aauth=Bearer TOKEN^A^A`, per
+/// <https://developers.google.com/workspace/gmail/imap/xoauth2-protocol>.
+pub fn xoauth2_response(user: &str, access_token: &str) -> String {
+    format!("user={user}\x01auth=Bearer {access_token}\x01\x01")
+}
+
+/// Answers the server's first (empty) challenge with the XOAUTH2 string and any later one with an
+/// empty response. A failed XOAUTH2 login sends a base64 JSON challenge, and SASL requires an
+/// empty answer to it, after which the server ends the exchange with `NO`.
+struct XOAuth2(Option<String>);
+
+impl async_imap::Authenticator for XOAuth2 {
+    type Response = String;
+
+    fn process(&mut self, _challenge: &[u8]) -> String {
+        self.0.take().unwrap_or_default()
+    }
+}
+
+/// Logs in on a greeted connection with `login`. Shared by [`ImapSource::connect`] and the wire
+/// tests.
+async fn log_in<T: Transport>(
+    client: Client<T>,
+    user: &str,
+    login: Login<'_>,
+) -> Result<Session<T>, ImapError> {
+    let result = match login {
+        Login::Password(password) => step("login", client.login(user, password)).await?,
+        Login::XOAuth2 { access_token } => {
+            let auth = XOAuth2(Some(xoauth2_response(user, access_token)));
+            // One bound for the whole exchange, so a server that keeps challenging cannot hang.
+            step("login", client.authenticate("XOAUTH2", auth)).await?
+        }
+    };
+    result.map_err(|(source, _)| ImapError::Login {
+        user: user.to_owned(),
+        source,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,8 +165,8 @@ pub struct ImapSource<T: Transport = Stream> {
 }
 
 impl ImapSource {
-    /// Connects, secures the connection, and logs in.
-    pub async fn connect(config: &ImapConfig, password: &str) -> Result<Self, ImapError> {
+    /// Connects, secures the connection, and logs in with `login`.
+    pub async fn connect(config: &ImapConfig, login: Login<'_>) -> Result<Self, ImapError> {
         let tls = tls::client_config(config.cert_pin).map_err(ImapError::TlsConfig)?;
         let connector = TlsConnector::from(tls);
         let server_name = ServerName::try_from(config.host.clone())
@@ -144,12 +203,7 @@ impl ImapSource {
             }
         };
 
-        let session = step("login", client.login(&config.username, password))
-            .await?
-            .map_err(|(source, _)| ImapError::Login {
-                user: config.username.clone(),
-                source,
-            })?;
+        let session = log_in(client, &config.username, login).await?;
         Ok(Self { session, exists: 0 })
     }
 }
