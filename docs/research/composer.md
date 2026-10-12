@@ -231,7 +231,7 @@
   - some packages still use the legacy `/usr/share/myspell/dicts/`;
   - LibreOffice bundles its own under `/usr/lib/libreoffice/share/extensions/dict-*`.
 
-  Search order: `$NMAIL_DICT_PATH`, then `$XDG_DATA_HOME/nmail/dict`, `/usr/share/hunspell`, `/usr/share/myspell/dicts`, `/usr/local/share/hunspell`, `/opt/homebrew/share/hunspell`. Source: Debian/Fedora package file lists, Hunspell man page <https://man.archlinux.org/man/hunspell.1>
+  Search order: `$NEOMAIL_DICT_PATH`, then `$XDG_DATA_HOME/neomail/dict`, `/usr/share/hunspell`, `/usr/share/myspell/dicts`, `/usr/local/share/hunspell`, `/opt/homebrew/share/hunspell`. Source: Debian/Fedora package file lists, Hunspell man page <https://man.archlinux.org/man/hunspell.1>
 - [medium] macOS ships no Hunspell dictionaries. Its system spellchecker (NSSpellChecker) uses its own format, and Homebrew's `hunspell` formula installs no dictionaries. Use `~/Library/Spelling` (user Hunspell files, which LibreOffice and Firefox also read) when present; otherwise download. Source: <https://formulae.brew.sh/formula/hunspell>
 - [medium] WSL distros are minimal images with no dictionaries. Install with `apt install hunspell-en-us`, or download. Source: judgement and Ubuntu WSL image contents
 - [high] **Download source: wooorm/dictionaries.** 92 dictionaries, all converted to UTF-8 (`de.aff` has `SET UTF-8`), at `dictionaries/<lang>/index.{aff,dic}`. Licences are per language:
@@ -247,16 +247,16 @@
   | ru | BSD-3-Clause |
   | pl | GPL-3.0 OR LGPL-3.0 OR MPL-2.0 |
 
-  So neomail must **not bundle** GPL dictionaries in its MIT/Apache binary. `nmail spell install <lang>` downloads at runtime, pins a commit, checks SHA-256, shows the licence, and stores the files in `$XDG_DATA_HOME/nmail/dict/`. Bundling en_US (MIT AND BSD) is legally fine, and costs about 0.55 MB uncompressed. Source: `package.json` per dictionary in <https://github.com/wooorm/dictionaries>
+  So neomail must **not bundle** GPL dictionaries in its MIT/Apache binary. `neomail spell install <lang>` downloads at runtime, pins a commit, checks SHA-256, shows the licence, and stores the files in `$XDG_DATA_HOME/neomail/dict/`. Bundling en_US (MIT AND BSD) is legally fine, and costs about 0.55 MB uncompressed. Source: `package.json` per dictionary in <https://github.com/wooorm/dictionaries>
 - [high] This is like Neovim's spellfile download: on `SpellFileMissing` it asks whether to download the missing `.spl` file. Current Neovim does this in Lua (`runtime/lua/nvim/spellfile.lua`, `:help package-spellfile`) from `g:spellfile_URL` or `https://ftp.nluug.nl/pub/vim/runtime/spell`, configurable with `require('nvim.spellfile').config({ url = … })`. Source: <https://github.com/neovim/neovim/blob/master/runtime/lua/nvim/spellfile.lua>, <https://neovim.io/doc/user/spell/>
 
 **Personal word lists (`zg`)**
 - [medium] Neovim keeps the format simple: `zg` appends to a plain-text `spellfile` (`~/.config/nvim/spell/en.utf-8.add`), `zw` marks a word as bad, `zug`/`zuw` undo, and `zG` is session-only. harper-ls does the same with a plain `dictionary.txt` per user, per workspace and per file. Source: <https://neovim.io/doc/user/spell.html>, <https://writewithharper.com/docs/integrations/language-server>
 - [medium] Recommended:
-  - files: `$XDG_DATA_HOME/nmail/spell/<lang>.add` and a global `all.add`, one word per line, with an optional Hunspell `/FLAGS` suffix;
+  - files: `$XDG_DATA_HOME/neomail/spell/<lang>.add` and a global `all.add`, one word per line, with an optional Hunspell `/FLAGS` suffix;
   - load: `Dictionary::add` for each line, with no rebuild needed;
   - the same words also go into harper's `MutableDictionary`, so grammar doesn't flag them;
-  - CLI: `nmail spell add <word>`;
+  - CLI: `neomail spell add <word>`;
   - an event: `SpellWordAdded`, so other buffers re-check.
 
   Source: spellbook `add` API, harper `MergedDictionary`
@@ -343,18 +343,18 @@
 ### 7. Recommended design for neomail's composer
 
 **Crates and pins**: ropey 1.6.1 · Helix `transaction.rs`, `selection.rs`, `history.rs`, `textobject.rs`
-(minus tree-sitter) and `graphemes.rs`, vendored into an MPL-2.0 crate `nmail-text` · pulldown-cmark
+(minus tree-sitter) and `graphemes.rs`, vendored into an MPL-2.0 crate `neomail-text` · pulldown-cmark
 0.13.4 (highlighting, shared with harper) · comrak 0.56.0 (`default-features = false`, plus `shortcodes`)
 · ammonia 4.2.1 · mail-builder 1.0.0 · linkify 0.11.0 · spellbook 0.4.2 · harper-core =2.11.0
 (feature `grammar`) · emojis 0.9.0 · the matcher shared with pickers (nucleo-matcher, or frizbee for
 typo tolerance) · ratatui-textarea 0.9.3 only for single-line prompts.
 
 **Layering, using only the shared primitives**
-1. **Text core (`nmail-text`)**:
+1. **Text core (`neomail-text`)**:
    - `Rope`, `Selection` (the Vim cursor is a single range; visual mode is one range or a block);
    - `Transaction` is the only way to change a buffer, and every change emits a `BufferChanged { rev, changes }` event;
    - `History` gives the undo tree: `u`, `<C-r>`, `g-`/`g+`, `:earlier 5m`. Cap the revisions, for example by size, to fix Helix's unbounded vector.
-2. **Vim grammar (`nmail-vim`)**:
+2. **Vim grammar (`neomail-vim`)**:
    - a pending-operator state machine fed by the keymap trie: `[count]["x][count]operator(motion|textobject)`, plus dot-repeat recorded as the last `Transaction`-producing action;
    - registers: unnamed, `0`–`9`, `a`–`z` (append with `A`–`Z`), `_`, `+`/`*` via the clipboard, `/`, and macros later;
    - motions and text objects are **registered actions** (`motion.word_forward`, `textobject.inner_paragraph`), so Lua and extensions add new ones the same way.
@@ -399,7 +399,7 @@ typo tolerance) · ratatui-textarea 0.9.3 only for single-line prompts.
 - When replying to an HTML message, should neomail append the original HTML (sanitised) below the rendered Markdown, or send only the Markdown-quoted text?
 - Which fuzzy matcher should completion share with the pickers: nucleo-matcher (no typo tolerance) or frizbee (typo-resistant)? Run a benchmark on 100k contacts.
 - Should spellbook's lack of phonetic suggestions and its weaker compound support (de, nl, hu, fi) be compensated, for example by optional hunspell-rs FFI on Linux?
-- Can harper-core's size be reduced further? `default-features = false` (no thesaurus) already gets it to about +11.2 MB; a smaller dictionary would need upstream work. Is a separate `nmail-grammar` helper process worth it for minimal builds?
+- Can harper-core's size be reduced further? `default-features = false` (no thesaurus) already gets it to about +11.2 MB; a smaller dictionary would need upstream work. Is a separate `neomail-grammar` helper process worth it for minimal builds?
 - What is the undo-tree memory cap, and should history persist across composer sessions (Neovim `undofile`) for long-lived drafts?
 
 ## Fact-check (independent)

@@ -3,7 +3,7 @@
 > Collected 2026-10-09 by research agents for neomail's design. Facts carry a confidence
 > level and a source; re-verify anything time-sensitive before relying on it.
 
-## Recommended stack for neomail (`nmail`)
+## Recommended stack for neomail
 Versions are the latest stable releases on crates.io as of 2026-10-09. The current Rust stable is 1.99.0.
 
 **Runtime and app**
@@ -116,7 +116,7 @@ Versions are the latest stable releases on crates.io as of 2026-10-09. The curre
 
 ## Recommendations
 
-- Use a daemon plus clients: an `nmail` daemon owns sync, SQLite, search, rules and AI, and the TUI, CLI, MCP server and scripts all talk to it over JSON-RPC 2.0 on a Unix socket (interprocess). One Command enum backs the keymaps, the `:` prompt, CLI subcommands and MCP tools.
+- Use a daemon plus clients: an `neomail` daemon owns sync, SQLite, search, rules and AI, and the TUI, CLI, MCP server and scripts all talk to it over JSON-RPC 2.0 on a Unix socket (interprocess). One Command enum backs the keymaps, the `:` prompt, CLI subcommands and MCP tools.
 - Build the TUI on ratatui 0.30.2 + crossterm 0.29 (EventStream) with Elm-style state. Write your own modal keymap trie (crokey for parsing keys from config), and evaluate modalkit before you adopt it. Make $EDITOR handoff the main compose path, with edtui 0.11.7 for inline editing.
 - Use a native API for each provider. For Gmail, call the REST API with history.list for incremental sync and labels; IMAP with X-GM-EXT-1 is the fallback. For Outlook.com, use Graph delta queries plus categories and masterCategories, since IMAP can't store categories. For Proton, use Bridge IMAP/SMTP with Labels/ COPY semantics. Write thin reqwest/serde clients rather than heavy generated SDKs.
 - Use async-imap 0.12.0 for the IMAP path (Proton Bridge and generic servers) behind your own trait. Plan for no CONDSTORE: run UID SEARCH ALL / UID FETCH FLAGS diffs, keep (UIDVALIDITY, UIDNEXT, HIGHESTMODSEQ) per mailbox, discard the cache when UIDVALIDITY changes, and run IDLE on a dedicated connection renewed every 29 minutes or less. Look at io-imap or imap-codec later for QRESYNC on generic servers.
@@ -125,7 +125,7 @@ Versions are the latest stable releases on crates.io as of 2026-10-09. The curre
 - Keep secrets in keyring-core plus per-platform stores (zbus Secret Service on Linux, Keychain on macOS, Credential Manager on Windows), with a `*_command` fallback (pass, secret-tool, op), and hold them in secrecy/zeroize types. Consider SQLCipher (rusqlite bundled-sqlcipher) for the cache, with its key kept in the keyring.
 - Treat all mail content as hostile. Strip ANSI, OSC and DCS sequences, C0/C1 control characters and bidi controls before rendering or CLI output. Never use server-supplied names as filesystem paths. Set image decode limits and restrict decoders. Block remote content by default, and use ammonia/lol_html before opening anything in a browser. In agent and MCP contexts, treat mail as data, never as instructions.
 - Pick one rustls crypto provider for the whole build (aws-lc-rs, the reqwest 0.13 default, or ring) and use rustls-platform-verifier. Turn off native-tls defaults in lettre, ratatui-image and similar crates.
-- Ship an rmcp 3.5.1 stdio server (`nmail mcp serve`) with the version pinned and wrapped behind your own types. Add dry-run, allowlists and send gates for agents, as mxr does. Leave the embedded scripting VM until later: start with CLI + JSON + shell hooks, then add mlua (sandboxed Luau) for configuration logic and possibly WASM via extism or wasmi for third-party plugins.
+- Ship an rmcp 3.5.1 stdio server (`neomail mcp serve`) with the version pinned and wrapped behind your own types. Add dry-run, allowlists and send gates for agents, as mxr does. Leave the embedded scripting VM until later: start with CLI + JSON + shell hooks, then add mlua (sandboxed Luau) for configuration logic and possibly WASM via extism or wasmi for third-party plugins.
 - Use toml + toml_edit (preserves comments when the CLI or agents edit config) plus schemars-generated JSON Schema for config and IPC. Use etcetera so paths follow XDG on Linux and macOS.
 - Use provider thread IDs (Gmail threadId, Graph conversationId) with your own JWZ fallback that produces a tree, using mail-threading 0.1.3 as a reference or a conformance corpus.
 - Test with insta snapshots of the ratatui TestBackend, a fake provider with a conformance suite (as in mxr), and integration tests against Dovecot/GreenMail and a Proton Bridge instance.

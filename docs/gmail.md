@@ -6,7 +6,7 @@ create. It ships with no client of its own
 to, so with your own, no one else's app ever holds access to your mail, and no shared client can
 be blocked or abused for everyone at once.
 
-The setup takes about five minutes, once. `nmail account add gmail` prints the same steps in
+The setup takes about five minutes, once. `neomail account add gmail` prints the same steps in
 short.
 
 ## 1. Create a Google Cloud project
@@ -61,12 +61,12 @@ it, open the client and click **Add secret** to get a new one.
 
 *Why:* a *Desktop app* client may redirect the browser back to `http://127.0.0.1` on any port
 ([OAuth for desktop apps](https://developers.google.com/identity/protocols/oauth2/native-app)).
-That is where `nmail` listens for the sign-in to come back.
+That is where `neomail` listens for the sign-in to come back.
 
 ## 6. Add the account
 
 ```sh
-nmail account add gmail
+neomail account add gmail
 ```
 
 It asks for a name for the account (default `gmail`), your address, the client ID and the client
@@ -77,21 +77,21 @@ the app, in Testing mode too
 app, so click **Continue**. Then:
 
 ```sh
-nmail sync --account gmail
+neomail sync --account gmail
 ```
 
 Off a terminal, pass everything as flags and the client secret as one line of standard input:
 
 ```sh
 secret-tool lookup service my-google-client | \
-  nmail account add gmail --email you@example.com --client-id 1234-abc.apps.googleusercontent.com
+  neomail account add gmail --email you@example.com --client-id 1234-abc.apps.googleusercontent.com
 ```
 
 ## Testing mode: sign-ins that last 7 days
 
 While the app's publishing status is *Testing*, Google gives it refresh tokens that expire after
 7 days ([Google: refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration)).
-`nmail sync` then says the sign-in expired; run `nmail account login gmail` to sign in again.
+`neomail sync` then says the sign-in expired; run `neomail account login gmail` to sign in again.
 
 To avoid that, publish the app: **Audience > Publish app**. The unverified-app warning stays,
 now behind **Advanced**, then **Go to** your app's name
@@ -114,8 +114,8 @@ and an app for your own use (fewer than 100 users) needs no verification
   service `neomail-oauth` and the account name as the user. They are never written to the config,
   the cache or a log, and never printed. Without a keyring (often on WSL) OAuth accounts cannot
   be used yet.
-- `nmail account login NAME` signs in again and replaces the refresh token.
-  `nmail account logout NAME` revokes it at Google and deletes the entry.
+- `neomail account login NAME` signs in again and replaces the refresh token.
+  `neomail account logout NAME` revokes it at Google and deletes the entry.
 
 ## When something goes wrong
 
@@ -125,8 +125,8 @@ and an app for your own use (fewer than 100 users) needs no verification
   not a test user (step 3), or you signed in with another account.
 - **"you signed in as …, not …":** the browser used another Google account. Sign in with the
   address you gave, or add the other one as its own account.
-- **"invalid_client":** the client ID or secret is wrong. During `nmail account add`, run it
-  again with the right ones. For an account already added, run `nmail account logout NAME`, then
-  `nmail account login NAME`, which asks for the secret again (a wrong client ID is fixed in the
+- **"invalid_client":** the client ID or secret is wrong. During `neomail account add`, run it
+  again with the right ones. For an account already added, run `neomail account logout NAME`, then
+  `neomail account login NAME`, which asks for the secret again (a wrong client ID is fixed in the
   config file). Google shows a secret only when it is created; if you no longer have it, open the
   client under **Clients** and click **Add secret** (step 5).

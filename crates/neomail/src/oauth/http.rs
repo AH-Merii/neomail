@@ -100,7 +100,7 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<Response> {
     let body = form_encode(form);
     let head = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: nmail/{}\r\n\
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: neomail/{}\r\n\
          Accept: application/json\r\nContent-Type: application/x-www-form-urlencoded\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         env!("CARGO_PKG_VERSION"),

@@ -38,6 +38,16 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  # install.sh runs under any POSIX sh, so shellcheck checks it as sh (its shebang).
+  shellcheck:
+    name: Shellcheck install.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Preinstalled on the Ubuntu 24.04 image; installed here if a newer image drops it.
+      - run: command -v shellcheck || { sudo apt-get update && sudo apt-get install -y shellcheck; }
+      - run: shellcheck install.sh
+
   # The oldest Rust that Cargo.toml's rust-version claims. Keep the two in step.
   msrv:
     name: Check on Rust 1.88
@@ -78,12 +88,12 @@ jobs:
       - name: Install the musl C toolchain (ring and the bundled SQLite are C)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --locked --target ${{ matrix.target }} -p nmail
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p neomail
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about
       # The licence notices of the statically linked crates; about.toml lists the accepted ones.
-      - run: cargo about generate --locked --fail -c about.toml -m crates/nmail/Cargo.toml --target ${{ matrix.target }} -o THIRD-PARTY-LICENSES about.hbs
+      - run: cargo about generate --locked --fail -c about.toml -m crates/neomail/Cargo.toml --target ${{ matrix.target }} -o THIRD-PARTY-LICENSES about.hbs
       # The musl target also links musl libc statically (MIT, some files BSD, ISC or public domain);
       # cargo-about only sees crates. With crt-static, rustc links the musl that ships with the
       # toolchain (lib/rustlib/<target>/lib/self-contained), not Ubuntu's: musl-tools only
@@ -105,16 +115,16 @@ jobs:
       # `rustc` component ships its notices as share/doc/rust/COPYRIGHT-library.html.
       - name: Package
         run: |
-          name="nmail-${{ matrix.target }}"
+          name="neomail-${{ matrix.target }}"
           mkdir "$name"
           std_notice="$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html"
           test -s "$std_notice"
-          cp "target/${{ matrix.target }}/release/nmail" README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES "$std_notice" "$name/"
+          cp "target/${{ matrix.target }}/release/neomail" README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES "$std_notice" "$name/"
           tar -czf "$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v7
         with:
-          name: nmail-${{ matrix.target }}
-          path: nmail-${{ matrix.target }}.tar.gz
+          name: neomail-${{ matrix.target }}
+          path: neomail-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
   publish-edge:
@@ -140,7 +150,12 @@ jobs:
       # The macOS one may be missing after an allowed failure; the loop below then drops its old
       # asset rather than leave it frozen at an older commit.
       - name: Require the Linux build
-        run: test -s dist/nmail-x86_64-unknown-linux-musl.tar.gz
+        run: test -s dist/neomail-x86_64-unknown-linux-musl.tar.gz
+      # install.sh and mise check the tarballs against this file. It is written into dist/ so the
+      # loop below, which drops assets that are not in dist/, keeps it.
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS
       # A newer push can cancel this job at any step. Once the release exists the tag moves
       # last, so it never runs ahead of the uploaded assets. A cancel during the upload can still
       # leave a tarball missing until the next publishing run, because --clobber deletes the old
@@ -154,14 +169,14 @@ jobs:
         shell: bash
         run: |
           notes="Rolling build of main at ${GITHUB_SHA} ($(date -u +%Y-%m-%dT%H:%MZ)). Replaced on every push to main; expect breaking changes."
-          if [ ! -e dist/nmail-aarch64-apple-darwin.tar.gz ]; then
+          if [ ! -e dist/neomail-aarch64-apple-darwin.tar.gz ]; then
             notes="$notes No macOS build for this commit: it failed, which does not block Linux (Linux first)."
             echo "::warning::the macOS edge build is missing; publishing Linux only"
           fi
           # Only "release not found" means a first publish; any other error (an API hiccup) must
           # not reach the else branch, which deletes the edge tag.
           if view_err=$(gh release view edge 2>&1 >/dev/null); then
-            gh release upload edge dist/*.tar.gz --clobber
+            gh release upload edge dist/*.tar.gz dist/SHA256SUMS --clobber
             # --clobber only replaces assets of the same name, so drop any this build did not
             # produce (such as a renamed target), or they would linger frozen at an old commit.
             gh release view edge --json assets --jq '.assets[].name' | while read -r asset; do
@@ -175,9 +190,48 @@ jobs:
             if git ls-remote --exit-code origin refs/tags/edge >/dev/null; then
               git push origin :refs/tags/edge
             fi
-            gh release create edge dist/*.tar.gz --prerelease --title "edge" --notes "$notes" \
+            gh release create edge dist/*.tar.gz dist/SHA256SUMS --prerelease --title "edge" --notes "$notes" \
               --target "$GITHUB_SHA"
           else
             echo "::error::cannot read the edge release: $view_err"
             exit 1
           fi
+
+  # install.sh against the edge that publish-edge just uploaded, on a fresh container of each
+  # distribution: a full install, then half of the script piped into sh, which must install
+  # nothing (all of its code runs from main on the last line).
+  install-edge:
+    name: Install edge (${{ matrix.image }})
+    needs: publish-edge
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The images lack what a desktop has; Alpine keeps BusyBox wget to test that path.
+          - image: ubuntu:latest
+            setup: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
+          - image: alpine:latest
+            setup: "true"
+          - image: fedora:latest
+            setup: dnf install -y tar gzip
+          - image: archlinux:latest
+            setup: "true"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install and run neomail
+        env:
+          IMAGE: ${{ matrix.image }}
+          SETUP: ${{ matrix.setup }}
+        run: |
+          docker run --rm -e SETUP -v "$PWD:/src:ro" -w /src "$IMAGE" sh -euc '
+            sh -c "$SETUP"
+            half=$(( $(wc -c < install.sh) / 2 ))
+            head -c "$half" install.sh | NEOMAIL_INSTALL_DIR=/opt/truncated sh || true
+            if [ -e /opt/truncated ]; then
+              echo "half of install.sh changed something"; exit 1
+            fi
+            sh < install.sh
+            export PATH="$HOME/.local/bin:$PATH"
+            neomail --version | grep "^neomail "
+          '

@@ -1,4 +1,4 @@
-//! `nmail account add`, `login` and `logout`: OAuth accounts through the user's own client.
+//! `neomail account add`, `login` and `logout`: OAuth accounts through the user's own client.
 //!
 //! Keyring calls stay outside the async runtime (zbus starts one of its own); only the sign-in,
 //! the token refresh and the revocation run inside it.
@@ -36,11 +36,11 @@ GUIDE):
     client secret now: Google shows the secret only once. Lost it? Open the client and click
     Add secret.
     Why: a Desktop app client may send the sign-in back to http://127.0.0.1 on any port,
-    which is where nmail waits for it.
+    which is where neomail waits for it.
 
 At sign-in Google warns that it hasn't verified the app: it is yours, so click Continue.
 While the app's publishing status is Testing, Google ends the sign-in after 7 days and you
-run `nmail account login NAME` again. To avoid that, publish it (Audience > Publish app): an
+run `neomail account login NAME` again. To avoid that, publish it (Audience > Publish app): an
 app for your own use (under 100 users) needs no verification.
 ";
 
@@ -51,7 +51,7 @@ pub struct AddArgs {
     pub no_browser: bool,
 }
 
-/// `nmail account add gmail`: asks for what is missing, signs in, stores the sign-in in the
+/// `neomail account add gmail`: asks for what is missing, signs in, stores the sign-in in the
 /// keyring, then appends the account to the config file.
 pub fn add(
     provider: &'static Provider,
@@ -141,7 +141,7 @@ pub fn add(
     writeln!(
         out,
         "Added {name:?} ({}) to {}. Its sign-in is in {} (service {:?}, user {name:?}).\n\
-         Next: nmail sync --account {name}",
+         Next: neomail sync --account {name}",
         signed_in.email,
         config_path.display(),
         keyring.name(),
@@ -165,21 +165,21 @@ fn revoke_leftover(
             .and_then(|http| runtime()?.block_on(oauth::revoke(&http, provider, &token)));
         if let Err(e) = result {
             eprintln!(
-                "nmail: warning: {} did not revoke the earlier sign-in for {name:?} ({e:#})",
+                "neomail: warning: {} did not revoke the earlier sign-in for {name:?} ({e:#})",
                 provider.name
             );
         }
     }
     keyring.delete_oauth(name)?;
     eprintln!(
-        "nmail: {} held an earlier sign-in for {name:?} with no account in the config; \
+        "neomail: {} held an earlier sign-in for {name:?} with no account in the config; \
          revoked and deleted it",
         keyring.name()
     );
     Ok(())
 }
 
-/// `nmail account login NAME`: signs in again and replaces the refresh token.
+/// `neomail account login NAME`: signs in again and replaces the refresh token.
 pub fn login(account: &Account, no_browser: bool, out: &mut impl Write) -> Result<()> {
     let settings = oauth_settings(account, "set-password")?;
     let keyring = Keyring::open_for_oauth()?;
@@ -211,7 +211,7 @@ pub fn login(account: &Account, no_browser: bool, out: &mut impl Write) -> Resul
     Ok(())
 }
 
-/// `nmail account logout NAME`: revokes the refresh token (a failure is only a warning) and
+/// `neomail account logout NAME`: revokes the refresh token (a failure is only a warning) and
 /// deletes the keyring entry.
 pub fn logout(account: &Account, out: &mut impl Write) -> Result<()> {
     let settings = oauth_settings(account, "delete-password")?;
@@ -233,12 +233,12 @@ pub fn logout(account: &Account, out: &mut impl Write) -> Result<()> {
             keyring.delete_oauth(&account.name)?;
             if e.is::<keyring::Malformed>() {
                 eprintln!(
-                    "nmail: warning: the keyring entry for {:?} was malformed; deleted it \
+                    "neomail: warning: the keyring entry for {:?} was malformed; deleted it \
                      without revoking",
                     account.name
                 );
             } else {
-                eprintln!("nmail: warning: {e:#}; deleted it without revoking");
+                eprintln!("neomail: warning: {e:#}; deleted it without revoking");
             }
             writeln!(
                 out,
@@ -256,7 +256,7 @@ pub fn logout(account: &Account, out: &mut impl Write) -> Result<()> {
         match result {
             Ok(()) => revoked = true,
             Err(e) => eprintln!(
-                "nmail: warning: {} did not revoke the sign-in ({e:#}); deleting it here anyway",
+                "neomail: warning: {} did not revoke the sign-in ({e:#}); deleting it here anyway",
                 settings.provider.name
             ),
         }
@@ -281,7 +281,7 @@ fn oauth_settings<'a>(account: &'a Account, password_command: &str) -> Result<&'
     match &account.login {
         Login::OAuth(settings) => Ok(settings),
         Login::Password(_) => bail!(
-            "account {:?} logs in with a password, not OAuth; use `nmail account {password_command} {}`",
+            "account {:?} logs in with a password, not OAuth; use `neomail account {password_command} {}`",
             account.name,
             account.name
         ),
@@ -316,7 +316,7 @@ fn sign_in(
             if no_browser {
                 // Printing the URL is all.
             } else if let Err(e) = browser::open(url) {
-                eprintln!("nmail: cannot open a browser ({e:#}); open the URL yourself");
+                eprintln!("neomail: cannot open a browser ({e:#}); open the URL yourself");
             }
             eprintln!(
                 "Waiting up to {} minutes for the sign-in...",

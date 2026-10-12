@@ -10,7 +10,7 @@ client (slice 3).
 
 | Crate | What it holds | Why it is a crate |
 | ----- | ------------- | ----------------- |
-| `crates/nmail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, output, wiring. | The composition root. Nothing depends on it. |
+| `crates/neomail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, output, wiring. | The composition root. Nothing depends on it. |
 | `crates/nm-core` | Domain types, the `MailSource` trait, the SQLite cache, the sync engine, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
 | `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap). | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; Graph and the Gmail API become sibling crates. |
 
@@ -34,20 +34,20 @@ a scripted IMAP server over an in-memory pipe and checks the commands on the wir
 source is also checked live against Proton Bridge.
 
 **The password** comes from one of two sources, fixed per account when the config is parsed
-(`PasswordSource` in `nmail/src/config.rs`): the account's `password_command`, run with `sh -c`,
+(`PasswordSource` in `neomail/src/config.rs`): the account's `password_command`, run with `sh -c`,
 or, without one, the OS keyring entry with service `neomail` and the account name as the user.
 An account with a command never opens the keyring. `secret::account_password`
-(`nmail/src/secret.rs`) resolves it into a `Password` whose `Debug` is redacted; it is passed to
-`ImapSource::connect` and dropped after login. `nmail account set-password` and
+(`neomail/src/secret.rs`) resolves it into a `Password` whose `Debug` is redacted; it is passed to
+`ImapSource::connect` and dropped after login. `neomail account set-password` and
 `delete-password` write and remove the keyring entry; the new password is prompted for without
 echo (rpassword) or read as one line of standard input.
 
-`Keyring` (`nmail/src/keyring.rs`) holds the platform's store, chosen when it is opened: the
+`Keyring` (`neomail/src/keyring.rs`) holds the platform's store, chosen when it is opened: the
 Secret Service over the D-Bus session bus on Linux, through zbus (pure Rust, so the static musl
 build needs no libdbus), and the login keychain on macOS. Both come from keyring-core's store
 crates; the tests give `Keyring` keyring-core's in-memory mock store instead, so no test writes to
 a real keyring, and the CLI tests point D-Bus at a socket that does not exist. zbus runs its
-blocking calls on a tokio runtime of its own, which panics inside another runtime, so `nmail
+blocking calls on a tokio runtime of its own, which panics inside another runtime, so `neomail
 sync` reads each account's password before it enters `block_on`. When the keyring cannot be
 reached the error says so and suggests `password_command`, adding a WSL note when
 `WSL_DISTRO_NAME` is set or `/proc/sys/fs/binfmt_misc/WSLInterop` exists.
@@ -56,14 +56,14 @@ Neither source is a trait: `PasswordSource` is a closed enum matched in one func
 keyring-core's `CredentialStore` already is the seam between platforms and the mock.
 
 **The login method** is fixed per account when the config is parsed (`Login` in
-`nmail/src/config.rs`): a password from a `PasswordSource`, or OAuth with a provider and the
+`neomail/src/config.rs`): a password from a `PasswordSource`, or OAuth with a provider and the
 user's client ID (`oauth = { provider = "google", client_id = "…" }`; both at once is an error).
 `nm_imap::Login` carries the credential into `ImapSource::connect`: `LOGIN` with a password, or
 `AUTHENTICATE XOAUTH2` with an access token. A failed XOAUTH2 login gets Gmail's base64 JSON
 challenge, which is answered with an empty response so the server ends with `NO`; the whole
 exchange has one 60-second bound. `MailSource` does not change.
 
-**OAuth** (`nmail/src/oauth/`) is the authorization code flow for installed apps with PKCE
+**OAuth** (`neomail/src/oauth/`) is the authorization code flow for installed apps with PKCE
 (S256, a verifier from the OS CSPRNG via ring) and a loopback redirect: `loopback.rs` listens on
 127.0.0.1 on a port the OS picks, answers anything but the redirect with 404, ignores a wrong
 `state`, bounds each request (16 KiB, 10 s) and the whole wait (5 minutes), and never echoes the
@@ -80,13 +80,13 @@ is a pure function, so no test launches anything.
 
 **Where OAuth secrets live:** the client secret and refresh token are one OS keyring entry, JSON,
 with the service `neomail-oauth` and the account name as the user, so it can never collide with a
-password entry (`neomail`). Access tokens are never stored: `nmail sync` reads the entry before it
+password entry (`neomail`). Access tokens are never stored: `neomail sync` reads the entry before it
 enters `block_on`, then refreshes the access token and logs in inside it. An `invalid_grant`
 says the sign-in expired or was revoked (7 days while the app is in Testing) and to run
-`nmail account login NAME`. Every type holding a token or secret (`Secret`, `OAuthEntry`, `Pkce`,
+`neomail account login NAME`. Every type holding a token or secret (`Secret`, `OAuthEntry`, `Pkce`,
 `Login`, the HTTP `Response`) has a redacted `Debug`, and errors never quote a response body.
 
-**The config writer** (`config::append_account`, used by `nmail account add`) appends one
+**The config writer** (`config::append_account`, used by `neomail account add`) appends one
 `[[accounts]]` table to the file as text, so existing text and comments stay. It refuses a taken
 name, parses the result before writing, and writes atomically (a temporary file in the same
 directory, then a rename). A new file gets mode 0600 in a directory created with mode 0700; an
@@ -98,9 +98,9 @@ config errors quote the file: a syntax error gives its message, line and column,
 offending line, which could hold a pasted secret.
 
 **The cache** (`nm-core/src/cache.rs`) is one SQLite file, `cache.sqlite3`, in the data
-directory (created with mode 0700). On Unix, `nmail` makes the file and SQLite's `-wal` and
+directory (created with mode 0700). On Unix, `neomail` makes the file and SQLite's `-wal` and
 `-shm` files mode 0600 each time it opens the cache, even in a directory that already existed
-with looser modes (`nmail/src/main.rs`, `restrict_cache_files`). Tables:
+with looser modes (`neomail/src/main.rs`, `restrict_cache_files`). Tables:
 
 - `mailbox (account, name, uid_validity, highest_uid)`: the sync state;
 - `message (mailbox_id, uid, flags, received, date, from_*, subject, raw)`: the message source
@@ -109,7 +109,7 @@ with looser modes (`nmail/src/main.rs`, `restrict_cache_files`). Tables:
 `PRAGMA user_version` holds the schema version. A new cache gets its schema and version in one
 `BEGIN IMMEDIATE` transaction that reads the version again, so two first syncs at once or a
 crash cannot leave half a schema. A newer version than the binary knows is refused rather than
-guessed at. `nmail list` and `show` read only the cache and work offline.
+guessed at. `neomail list` and `show` read only the cache and work offline.
 
 **TLS** (`nm-imap/src/tls.rs`): rustls with the *ring* provider. Without a pin the certificate
 is checked by `rustls-platform-verifier` (the system trust store). With `cert_sha256` the server
@@ -167,7 +167,7 @@ characters and bidirectional overrides in mail are neutralised before they reach
 `.github/workflows/ci.yml` runs `cargo fmt --check`, clippy with `-D warnings` and the tests on
 Linux and macOS for every pull request and push to `main`, and `cargo check` on Rust 1.88, the
 `rust-version` in `Cargo.toml`. Every pull request and push to `main` then builds and packages
-`nmail` for x86_64 Linux (musl, statically linked, so it does not depend on the system's glibc)
+`neomail` for x86_64 Linux (musl, statically linked, so it does not depend on the system's glibc)
 and Apple-silicon macOS, so a dependency that breaks the musl build fails before it merges.
 Linux comes first ([DEC-2026-10-12-linux-first](decisions.md#dec-2026-10-12-linux-first)): the
 macOS check and build may fail without failing the run, and the macOS build is published even
@@ -188,6 +188,21 @@ old asset before it uploads the new one. The very first publish creates the rele
 uploads, then publishes it, which creates the tag; a cancelled first publish leaves a draft
 without a tag, which the next run uploads to and publishes. Only the publishing job
 can write to the repository, and a newer push cancels an older run.
+
+The assets are `neomail-<target>.tar.gz`, each holding `neomail-<target>/neomail` next to the
+README and licences, and `SHA256SUMS` (`sha256sum` format, one line per tarball), which
+publishing writes into `dist/` so it is uploaded with the tarballs and kept by the loop that
+drops assets the build did not produce
+([DEC-2026-10-12-install-channels](decisions.md#dec-2026-10-12-install-channels)).
+`install.sh`, at the repository root, picks the target from `uname` (x86_64 Linux and WSL take
+the musl build; Apple silicon, or Rosetta on it, the macOS one), downloads the tarball and
+`SHA256SUMS` from edge, verifies the checksum, and installs `neomail` atomically into
+`~/.local/bin` or the directory the user chose; it refuses to replace a binary there that is not
+neomail. All its code sits in `main`, called on the last line, so a truncated download runs
+nothing. `NEOMAIL_INSTALL_BASE_URL` points it at a mirror or a local server for tests. CI runs
+shellcheck on it for every pull request and push, and after each publish runs it against the new
+edge in Ubuntu, Alpine, Fedora and Arch containers, plus a check that half the script installs
+nothing. mise reads the same release through its GitHub backend.
 
 ## What comes next
 

@@ -1,4 +1,4 @@
-//! `nmail`: the neomail command line: a read-only INBOX (sync, list, show), passwords in the OS
+//! `neomail`: the neomail command line: a read-only INBOX (sync, list, show), passwords in the OS
 //! keyring, and Gmail through the user's own OAuth client.
 
 mod account;
@@ -29,12 +29,12 @@ const CACHE_FILE: &str = "cache.sqlite3";
 
 #[derive(Parser)]
 #[command(
-    name = "nmail",
+    name = "neomail",
     version,
     about = "neomail: a terminal email client (read-only INBOX for now)"
 )]
 struct Cli {
-    /// Config file [env: NMAIL_CONFIG] [default: $XDG_CONFIG_HOME/neomail/config.toml]
+    /// Config file [env: NEOMAIL_CONFIG] [default: $XDG_CONFIG_HOME/neomail/config.toml]
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -64,7 +64,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show one cached message by the id from `nmail list`
+    /// Show one cached message by the id from `neomail list`
     Show {
         id: i64,
         /// Print JSON (see docs/json.md)
@@ -141,7 +141,7 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("nmail: {e:#}");
+            eprintln!("neomail: {e:#}");
             ExitCode::from(EXIT_FAILURE)
         }
     }
@@ -200,7 +200,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     }
                     Err(e) => {
                         out.flush()?;
-                        eprintln!("nmail: {}: {e:#}", account.name);
+                        eprintln!("neomail: {}: {e:#}", account.name);
                         failed = true;
                     }
                 }
@@ -223,14 +223,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     }
                     cache.list(account.as_deref(), limit.get())?
                 }
-                None if account.is_some() => bail!("nothing is cached yet; run `nmail sync` first"),
+                None if account.is_some() => {
+                    bail!("nothing is cached yet; run `neomail sync` first")
+                }
                 None => Vec::new(),
             };
             if json {
                 let items: Vec<_> = entries.iter().map(output::ListItem::from).collect();
                 output::write_json(&mut out, &items)?;
             } else if entries.is_empty() {
-                eprintln!("nmail: no cached messages; run `nmail sync` first");
+                eprintln!("neomail: no cached messages; run `neomail sync` first");
             } else {
                 output::write_list(&mut out, &entries)?;
             }
@@ -296,10 +298,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Show { id, json, raw } => {
             let cache =
-                open_cache(false)?.context("nothing is cached yet; run `nmail sync` first")?;
+                open_cache(false)?.context("nothing is cached yet; run `neomail sync` first")?;
             let stored = cache
                 .get(MessageId::new(id))?
-                .with_context(|| format!("no cached message with id {id}; see `nmail list`"))?;
+                .with_context(|| format!("no cached message with id {id}; see `neomail list`"))?;
             if raw {
                 out.write_all(&stored.raw)?;
             } else {
@@ -392,7 +394,7 @@ fn check_cached_account(cache: &Cache, name: &str) -> Result<()> {
 fn refuse_oauth(account: &Account, instead: &str) -> Result<()> {
     if let Login::OAuth(settings) = &account.login {
         bail!(
-            "account {:?} signs in with {} (OAuth) and has no password; use `nmail account {instead} {}`",
+            "account {:?} signs in with {} (OAuth) and has no password; use `neomail account {instead} {}`",
             account.name,
             settings.provider.name,
             account.name

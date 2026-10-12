@@ -44,7 +44,7 @@ pub enum CacheError {
     #[error("cache database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error(
-        "the cache uses schema version {found}, newer than this nmail ({SCHEMA_VERSION}); upgrade nmail or remove the cache"
+        "the cache uses schema version {found}, newer than this neomail ({SCHEMA_VERSION}); upgrade neomail or remove the cache"
     )]
     TooNew { found: i64 },
     #[error("the cache holds an invalid value: {0}")]
@@ -62,7 +62,7 @@ pub struct MailboxRecord {
     pub highest_uid: Option<Uid>,
 }
 
-/// One row of `nmail list`.
+/// One row of `neomail list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListEntry {
     pub id: MessageId,
@@ -74,7 +74,7 @@ pub struct ListEntry {
     pub flags: Flags,
 }
 
-/// A cached message with its source, for `nmail show`.
+/// A cached message with its source, for `neomail show`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMessage {
     pub id: MessageId,

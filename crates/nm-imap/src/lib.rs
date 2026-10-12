@@ -376,7 +376,7 @@ fn flags(fetch: &Fetch) -> Flags {
     }))
 }
 
-/// Bounds one network step so a silent server cannot hang nmail.
+/// Bounds one network step so a silent server cannot hang neomail.
 async fn step<F: Future>(what: &'static str, fut: F) -> Result<F::Output, ImapError> {
     tokio::time::timeout(STEP_TIMEOUT, fut)
         .await

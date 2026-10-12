@@ -1128,6 +1128,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "neomail"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "apple-native-keyring-store",
+ "base64",
+ "chrono",
+ "clap",
+ "keyring-core",
+ "nm-core",
+ "nm-imap",
+ "ring",
+ "rpassword",
+ "rustls",
+ "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "unicode-segmentation",
+ "unicode-width",
+ "zbus-secret-service-keyring-store",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1163,34 +1191,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
-]
-
-[[package]]
-name = "nmail"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "apple-native-keyring-store",
- "base64",
- "chrono",
- "clap",
- "keyring-core",
- "nm-core",
- "nm-imap",
- "ring",
- "rpassword",
- "rustls",
- "rustls-platform-verifier",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "toml",
- "unicode-segmentation",
- "unicode-width",
- "zbus-secret-service-keyring-store",
 ]
 
 [[package]]

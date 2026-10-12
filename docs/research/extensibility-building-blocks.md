@@ -451,8 +451,8 @@ These are proposals for the synthesis, not final APIs. Conventions:
 
 ```rust
 new_key_type! { pub struct BufferId; pub struct WindowId; pub struct NsId; pub struct HookId; }
-pub struct HlId(u32);        // interned highlight group ("NmailDiagError"); theme resolves to Style
-pub struct ActionId(u32);    // index into the typed action catalogue (nmail-api)
+pub struct HlId(u32);        // interned highlight group ("NeomailDiagError"); theme resolves to Style
+pub struct ActionId(u32);    // index into the typed action catalogue (neomail-api)
 ```
 
 ### 5.1 Buffers: every view is a buffer
@@ -656,7 +656,7 @@ pub trait DecorationProvider: Send {
 - **Ephemeral providers** do the Markdown syntax highlighting of drafts (incremental, visible rows
   only), search-match highlights, quote and signature colouring, and the "selected" and "unread"
   styling of rows. Persistent marks hold diagnostics, user flags and Lua annotations.
-- **Highlights:** semantic group names (`NmailUnread`, `NmailDiagSpell`, `NmailGroupReceipts`)
+- **Highlights:** semantic group names (`NeomailUnread`, `NeomailDiagSpell`, `NeomailGroupReceipts`)
   with `link`s and `default` links (Neovim). Themes set groups. Per-window `winhl` remaps groups,
   for example to dim inactive windows. `HlId` is resolved to a `Style` once per theme change, not
   once per cell.
@@ -707,7 +707,7 @@ pub enum Hook {
     the input path.
   - `Cursor::Hold` is the place for expensive reactions such as hover-on-idle.
   - Unsubscribing is O(1) by `HookId`, and by group it is O(group size).
-- The same `MailEvent` stream is what the CLI's `nmail events --json` prints, so scripts and the
+- The same `MailEvent` stream is what the CLI's `neomail events --json` prints, so scripts and the
   TUI see one vocabulary.
 
 ### 5.6 Keymap scopes
@@ -778,7 +778,7 @@ pub struct PickItem { pub key: ItemKey, pub cols: SmallVec<[Utf32String; 4]>, pu
 - **Picker composition.** A picker is `source + format + previewer + actions + layout(style)`, all
   named registry entries. "New picker" usually means a config table (snacks), not code. The
   meta-pickers come free: pickers, actions, keymaps, providers, highlights, layouts, log.
-- `nmail pick <source> --query .. --scope .. --json` runs daemon-side sources headless through the
+- `neomail pick <source> --query .. --scope .. --json` runs daemon-side sources headless through the
   same matcher crate, so agents and the CLI query the same sources.
 
 **The other providers:**
@@ -847,15 +847,15 @@ pub trait AnimationStyle: Send {                                // the SortFx se
 - **API shape mirrors Neovim**, so the docs, users' habits and agents' prior knowledge transfer:
 
   ```lua
-  local ns  = nmail.api.create_namespace("myext.flags")
-  local buf = nmail.api.buf_create({ kind = "ext:myext.digest", modifiable = false })
-  nmail.api.buf_set_mark(buf, ns, { item = msg_key, sign = "★", hl = "NmailFlag" })
-  local win = nmail.api.open_win(buf, { relative = "cursor", anchor = "NW", style = "hover" })
-  nmail.on("Mail.Classified", { group = "myext" }, function(ev) ... end)
-  nmail.keymap.set("n", "gd", "myext.digest", { kind = "mail_list", desc = "Digest" })
-  nmail.picker.source("myext.vips", { columns = {"name","addr"}, find = function(q, push) ... end })
-  nmail.diagnostic.set(ns, buf, { { row = 3, col = 4, severity = "hint", message = "..." } })
-  nmail.ui.select = my_select   -- swap the implementation, like vim.ui.select
+  local ns  = neomail.api.create_namespace("myext.flags")
+  local buf = neomail.api.buf_create({ kind = "ext:myext.digest", modifiable = false })
+  neomail.api.buf_set_mark(buf, ns, { item = msg_key, sign = "★", hl = "NeomailFlag" })
+  local win = neomail.api.open_win(buf, { relative = "cursor", anchor = "NW", style = "hover" })
+  neomail.on("Mail.Classified", { group = "myext" }, function(ev) ... end)
+  neomail.keymap.set("n", "gd", "myext.digest", { kind = "mail_list", desc = "Digest" })
+  neomail.picker.source("myext.vips", { columns = {"name","addr"}, find = function(q, push) ... end })
+  neomail.diagnostic.set(ns, buf, { { row = 3, col = 4, severity = "hint", message = "..." } })
+  neomail.ui.select = my_select   -- swap the implementation, like vim.ui.select
   ```
 
 - **Handles** (`buf`, `win`, `ns`) are userdata wrapping generational IDs. A stale handle returns
@@ -884,7 +884,7 @@ the core" only because it has one core per editing session.
 | Store, sync, providers, jev classification, outbox | Decorations, namespaces, decoration providers |
 | `PickerSource`s over mail data: full-text search, senders (frecency), subjects, folders and labels, accounts, attachments, drafts | `PickerSource`s over UI state: draft lines, keymaps, layouts, highlights, open buffers; matcher workers for **all** pickers |
 | `CompletionSource`: addresses and contacts | `CompletionSource`: words, emoji, snippets; the completion menu and merge |
-| Event origin for `Mail.*`; `nmail events` stream | UI events (`Buf`, `Win`, `Cursor`, `Mode`); forwards to its own hooks |
+| Event origin for `Mail.*`; `neomail events` stream | UI events (`Buf`, `Win`, `Cursor`, `Mode`); forwards to its own hooks |
 | **Daemon Lua:** data hooks (on arrive, classify, send), custom actions, scheduled jobs, data sources | **TUI Lua:** keymap callbacks, decoration providers, buffer kinds, floats, `ui.select` overrides |
 | Spelling dictionaries and user word lists (persisted) | Spelling and grammar `DiagnosticSource` workers on the draft text (for example spellbook for Hunspell, harper-core for English grammar), so per-keystroke checks avoid IPC |
 
@@ -930,8 +930,8 @@ the core" only because it has one core per editing session.
 
 ## Recommendations
 
-1. **Adopt seven primitives as the frozen UI interface crate** (`nmail-ui-api` or a new
-   `nmail-ui-core`):
+1. **Adopt seven primitives as the frozen UI interface crate** (`neomail-ui-api` or a new
+   `neomail-ui-core`):
    - `Buffer` (with `Content::Text | Rows`);
    - `Window` with `Placement::Split | Float`;
    - `Layer`/`Compositor` bands;

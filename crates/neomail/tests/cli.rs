@@ -1,4 +1,4 @@
-//! `nmail list`, `show` and the offline failure paths of `sync`, against a temporary data
+//! `neomail list`, `show` and the offline failure paths of `sync`, against a temporary data
 //! directory. No network.
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
 
@@ -59,11 +59,11 @@ fn seeded() -> tempfile::TempDir {
     dir
 }
 
-fn nmail(data: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_nmail"))
+fn neomail(data: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_neomail"))
         .args(args)
-        .env("NMAIL_DATA_DIR", data)
-        .env("NMAIL_CONFIG", data.join("config.toml"))
+        .env("NEOMAIL_DATA_DIR", data)
+        .env("NEOMAIL_CONFIG", data.join("config.toml"))
         .env("HOME", data)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
@@ -87,7 +87,7 @@ fn json(o: &Output) -> Value {
 #[test]
 fn list_prints_newest_first_within_80_columns() {
     let dir = seeded();
-    let o = nmail(dir.path(), &["list"]);
+    let o = neomail(dir.path(), &["list"]);
     assert!(o.status.success(), "{}", stderr(&o));
     let out = stdout(&o);
     let lines: Vec<&str> = out.lines().collect();
@@ -112,14 +112,17 @@ fn list_prints_newest_first_within_80_columns() {
     assert_eq!(lines[0].split_whitespace().nth(1), Some("*"));
     assert_ne!(lines[2].split_whitespace().nth(1), Some("*"));
 
-    let o = nmail(dir.path(), &["list", "--account", "work", "--limit", "2"]);
+    let o = neomail(dir.path(), &["list", "--account", "work", "--limit", "2"]);
     assert_eq!(stdout(&o).lines().count(), 2);
 }
 
 #[test]
 fn list_json_shape() {
     let dir = seeded();
-    let v = json(&nmail(dir.path(), &["list", "--json", "--account", "work"]));
+    let v = json(&neomail(
+        dir.path(),
+        &["list", "--json", "--account", "work"],
+    ));
     let items = v.as_array().unwrap();
     assert_eq!(items.len(), 3);
     let first = &items[0];
@@ -137,12 +140,12 @@ fn list_json_shape() {
 #[test]
 fn show_human_json_and_raw() {
     let dir = seeded();
-    let id = json(&nmail(dir.path(), &["list", "--json"]))[2]["id"]
+    let id = json(&neomail(dir.path(), &["list", "--json"]))[2]["id"]
         .as_i64()
         .unwrap()
         .to_string();
 
-    let o = nmail(dir.path(), &["show", &id]);
+    let o = neomail(dir.path(), &["show", &id]);
     assert!(o.status.success(), "{}", stderr(&o));
     let out = stdout(&o);
     assert!(
@@ -153,13 +156,13 @@ fn show_human_json_and_raw() {
     assert!(out.contains("Subject: Oldest"), "{out}");
     assert!(out.contains("Hello from 1."), "{out}");
 
-    let v = json(&nmail(dir.path(), &["show", &id, "--json"]));
+    let v = json(&neomail(dir.path(), &["show", &id, "--json"]));
     assert_eq!(v["body_type"], "text/plain");
     assert_eq!(v["from"][0]["name"], "Ada Lovelace");
     assert_eq!(v["attachments"], serde_json::json!([]));
     assert_eq!(v["unread"], false);
 
-    let o = nmail(dir.path(), &["show", &id, "--raw"]);
+    let o = neomail(dir.path(), &["show", &id, "--raw"]);
     assert!(o.stdout.starts_with(b"From: Ada Lovelace"));
 }
 
@@ -184,7 +187,7 @@ fn list_counts_emoji_sequences_as_two_columns() {
             )],
         )
         .unwrap();
-    let o = nmail(dir.path(), &["list"]);
+    let o = neomail(dir.path(), &["list"]);
     assert!(o.status.success(), "{}", stderr(&o));
     let out = stdout(&o);
     let line = out.lines().next().unwrap();
@@ -202,7 +205,7 @@ fn cache_files_are_made_private() {
     let cache = dir.path().join("cache.sqlite3");
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o644)).unwrap();
     // An open connection keeps the -wal and -shm files, which SQLite creates with the cache
-    // file's mode, from being removed when nmail exits.
+    // file's mode, from being removed when neomail exits.
     let _open = Cache::open(&cache).unwrap();
     let mode = |file: &str| {
         let meta = std::fs::metadata(dir.path().join(file)).unwrap();
@@ -211,7 +214,7 @@ fn cache_files_are_made_private() {
     assert_eq!(mode("cache.sqlite3-wal"), 0o644);
     assert_eq!(mode("cache.sqlite3-shm"), 0o644);
 
-    assert!(nmail(dir.path(), &["list"]).status.success());
+    assert!(neomail(dir.path(), &["list"]).status.success());
     for file in ["cache.sqlite3", "cache.sqlite3-wal", "cache.sqlite3-shm"] {
         assert_eq!(mode(file), 0o600, "{file}");
     }
@@ -226,7 +229,7 @@ fn config_errors_give_the_place_but_not_the_text() {
         "[[accounts]]\nname = \"work\"\npassword = s3cret-fake-value\n",
     )
     .unwrap();
-    let o = nmail(dir.path(), &["sync"]);
+    let o = neomail(dir.path(), &["sync"]);
     assert_eq!(o.status.code(), Some(1));
     let all = format!("{}{}", stdout(&o), stderr(&o));
     assert!(all.contains("line 3, column"), "{all}");
@@ -235,12 +238,12 @@ fn config_errors_give_the_place_but_not_the_text() {
 }
 
 #[test]
-fn empty_nmail_config_counts_as_unset() {
+fn empty_neomail_config_counts_as_unset() {
     let dir = tempfile::tempdir().unwrap();
-    let o = Command::new(env!("CARGO_BIN_EXE_nmail"))
+    let o = Command::new(env!("CARGO_BIN_EXE_neomail"))
         .arg("sync")
-        .env("NMAIL_DATA_DIR", dir.path())
-        .env("NMAIL_CONFIG", "")
+        .env("NEOMAIL_DATA_DIR", dir.path())
+        .env("NEOMAIL_CONFIG", "")
         .env("HOME", dir.path())
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
@@ -253,10 +256,22 @@ fn empty_nmail_config_counts_as_unset() {
     assert!(err.contains(".config/neomail/config.toml"), "{err}");
 }
 
+/// install.sh tells our binary from d99kris/nmail and others by this prefix.
+#[test]
+fn version_names_the_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = neomail(dir.path(), &["--version"]);
+    assert!(o.status.success());
+    assert_eq!(
+        stdout(&o),
+        format!("neomail {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
 #[test]
 fn failures_are_clear_and_non_zero() {
     let dir = seeded();
-    let o = nmail(dir.path(), &["show", "999"]);
+    let o = neomail(dir.path(), &["show", "999"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(
         stderr(&o).contains("no cached message with id 999"),
@@ -264,17 +279,17 @@ fn failures_are_clear_and_non_zero() {
         stderr(&o)
     );
 
-    assert_eq!(nmail(dir.path(), &["show", "abc"]).status.code(), Some(2));
+    assert_eq!(neomail(dir.path(), &["show", "abc"]).status.code(), Some(2));
     assert_eq!(
-        nmail(dir.path(), &["list", "--limit", "0"]).status.code(),
+        neomail(dir.path(), &["list", "--limit", "0"]).status.code(),
         Some(2)
     );
 
-    let o = nmail(dir.path(), &["list", "--account", "nope"]);
+    let o = neomail(dir.path(), &["list", "--account", "nope"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("home, work"), "{}", stderr(&o));
 
-    let o = nmail(dir.path(), &["sync"]);
+    let o = neomail(dir.path(), &["sync"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("no config file"), "{}", stderr(&o));
 }
@@ -282,15 +297,15 @@ fn failures_are_clear_and_non_zero() {
 #[test]
 fn empty_data_dir_lists_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let o = nmail(dir.path(), &["list"]);
+    let o = neomail(dir.path(), &["list"]);
     assert!(o.status.success());
     assert!(stdout(&o).is_empty());
-    assert!(stderr(&o).contains("nmail sync"));
+    assert!(stderr(&o).contains("neomail sync"));
     assert_eq!(
-        json(&nmail(dir.path(), &["list", "--json"])),
+        json(&neomail(dir.path(), &["list", "--json"])),
         serde_json::json!([])
     );
-    assert_eq!(nmail(dir.path(), &["show", "1"]).status.code(), Some(1));
+    assert_eq!(neomail(dir.path(), &["show", "1"]).status.code(), Some(1));
     assert!(
         !dir.path().join("cache.sqlite3").exists(),
         "list must not create the cache"
@@ -306,7 +321,7 @@ fn password_command_output_never_appears_in_errors() {
          password_command = \"echo hunter2; exit 1\"\nimap = { host = \"imap.mail.example\" }\n",
     )
     .unwrap();
-    let o = nmail(dir.path(), &["sync"]);
+    let o = neomail(dir.path(), &["sync"]);
     assert_eq!(o.status.code(), Some(1));
     let all = format!("{}{}", stdout(&o), stderr(&o));
     assert!(all.contains("password_command failed"), "{all}");
@@ -317,13 +332,13 @@ const KEYRING_CONFIG: &str = "[[accounts]]\nname = \"work\"\nusername = \"user@m
                               imap = { host = \"imap.mail.example\" }\n";
 const FAKE_PASSWORD: &str = "s3cret-fake-password";
 
-/// Runs `nmail` with `input` on standard input and a D-Bus session bus that does not exist, so
+/// Runs `neomail` with `input` on standard input and a D-Bus session bus that does not exist, so
 /// nothing reaches a real keyring.
-fn nmail_stdin(data: &Path, args: &[&str], input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nmail"))
+fn neomail_stdin(data: &Path, args: &[&str], input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_neomail"))
         .args(args)
-        .env("NMAIL_DATA_DIR", data)
-        .env("NMAIL_CONFIG", data.join("config.toml"))
+        .env("NEOMAIL_DATA_DIR", data)
+        .env("NEOMAIL_CONFIG", data.join("config.toml"))
         .env("HOME", data)
         .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
         .env_remove("XDG_CONFIG_HOME")
@@ -333,7 +348,7 @@ fn nmail_stdin(data: &Path, args: &[&str], input: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // nmail may exit before it reads, closing the pipe.
+    // neomail may exit before it reads, closing the pipe.
     let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
     child.wait_with_output().unwrap()
 }
@@ -344,7 +359,7 @@ fn set_password_and_delete_password_check_the_account() {
     std::fs::write(dir.path().join("config.toml"), KEYRING_CONFIG).unwrap();
 
     let input = format!("{FAKE_PASSWORD}\n");
-    let o = nmail_stdin(dir.path(), &["account", "set-password", "nope"], &input);
+    let o = neomail_stdin(dir.path(), &["account", "set-password", "nope"], &input);
     assert_eq!(o.status.code(), Some(1));
     let all = format!("{}{}", stdout(&o), stderr(&o));
     assert!(
@@ -353,7 +368,7 @@ fn set_password_and_delete_password_check_the_account() {
     );
     assert!(!all.contains(FAKE_PASSWORD), "{all}");
 
-    let o = nmail_stdin(dir.path(), &["account", "delete-password", "nope"], "");
+    let o = neomail_stdin(dir.path(), &["account", "delete-password", "nope"], "");
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("configured: work"), "{}", stderr(&o));
 }
@@ -371,7 +386,7 @@ fn keyring_unavailable_is_one_line_with_a_hint() {
         &["account", "delete-password", "work"],
         &["sync"],
     ] {
-        let o = nmail_stdin(dir.path(), args, &input);
+        let o = neomail_stdin(dir.path(), args, &input);
         assert_eq!(o.status.code(), Some(1), "{args:?}");
         let (out, err) = (stdout(&o), stderr(&o));
         assert!(out.is_empty(), "{args:?}: {out}");
@@ -385,7 +400,7 @@ fn keyring_unavailable_is_one_line_with_a_hint() {
     }
     // The keyring is checked before the password is read: with nothing on standard input, the
     // error is the keyring, not the empty password.
-    let o = nmail_stdin(dir.path(), &["account", "set-password", "work"], "");
+    let o = neomail_stdin(dir.path(), &["account", "set-password", "work"], "");
     let err = stderr(&o);
     assert!(err.contains("the OS keyring is unavailable ("), "{err}");
     assert!(!err.contains("the password is empty"), "{err}");
@@ -397,12 +412,12 @@ const GMAIL_CONFIG: &str = "[[accounts]]\nname = \"gmail\"\nusername = \"you@exa
 #[test]
 fn add_off_a_terminal_names_the_missing_flags() {
     let dir = tempfile::tempdir().unwrap();
-    let o = nmail_stdin(dir.path(), &["account", "add", "gmail", "--no-browser"], "");
+    let o = neomail_stdin(dir.path(), &["account", "add", "gmail", "--no-browser"], "");
     assert_eq!(o.status.code(), Some(1));
     let err = stderr(&o);
     assert!(err.contains("not a terminal"), "{err}");
     assert!(err.contains("pass --email and --client-id"), "{err}");
-    let o = nmail_stdin(
+    let o = neomail_stdin(
         dir.path(),
         &[
             "account",
@@ -428,22 +443,22 @@ fn password_and_oauth_commands_refuse_the_other_kind_of_account() {
     for (args, hint) in [
         (
             &["account", "set-password", "gmail"][..],
-            "use `nmail account login gmail`",
+            "use `neomail account login gmail`",
         ),
         (
             &["account", "delete-password", "gmail"],
-            "use `nmail account logout gmail`",
+            "use `neomail account logout gmail`",
         ),
         (
             &["account", "login", "work", "--no-browser"],
-            "use `nmail account set-password work`",
+            "use `neomail account set-password work`",
         ),
         (
             &["account", "logout", "work"],
-            "use `nmail account delete-password work`",
+            "use `neomail account delete-password work`",
         ),
     ] {
-        let o = nmail_stdin(dir.path(), args, &input);
+        let o = neomail_stdin(dir.path(), args, &input);
         assert_eq!(o.status.code(), Some(1), "{args:?}");
         let err = stderr(&o);
         assert!(err.contains(hint), "{args:?}: {err}");
@@ -476,7 +491,7 @@ fn oauth_commands_without_a_keyring_fail_before_signing_in() {
             "--no-browser",
         ],
     ] {
-        let o = nmail_stdin(dir.path(), args, &input);
+        let o = neomail_stdin(dir.path(), args, &input);
         assert_eq!(o.status.code(), Some(1), "{args:?}");
         let (out, err) = (stdout(&o), stderr(&o));
         assert!(out.is_empty(), "{args:?}: {out}");

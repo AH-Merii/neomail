@@ -36,7 +36,7 @@ impl fmt::Debug for Password {
 /// The password of the account named `account`, from its command or the keyring. `keyring` is
 /// opened on first use and kept for the next account; an account with a command never opens it.
 /// Blocking: call it outside the async runtime (see `Keyring::open`). Errors leave out the
-/// account name, which `nmail sync` puts in front.
+/// account name, which `neomail sync` puts in front.
 pub fn account_password(
     account: &str,
     source: &PasswordSource,
@@ -63,7 +63,7 @@ pub fn oauth_secrets(account: &str, keyring: &mut Option<Keyring>) -> Result<(Se
     };
     let not_signed_in = || {
         anyhow::anyhow!(
-            "not signed in (no entry in {}); run `nmail account login {account}`",
+            "not signed in (no entry in {}); run `neomail account login {account}`",
             keyring.name()
         )
     };
@@ -73,7 +73,7 @@ pub fn oauth_secrets(account: &str, keyring: &mut Option<Keyring>) -> Result<(Se
 }
 
 /// A new password for `account`: prompted for without echo on a terminal, otherwise one line of
-/// standard input, so `pass show mail/work | nmail account set-password work` works.
+/// standard input, so `pass show mail/work | neomail account set-password work` works.
 pub fn read_new_password(account: &str) -> Result<Password> {
     let password = read_secret(&format!("Password for {account}: "), "password")?;
     Ok(Password(password))

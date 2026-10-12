@@ -349,7 +349,7 @@ async fn refresh_gets_an_access_token_and_explains_invalid_grant_and_invalid_cli
     assert!(message.contains("expired or was revoked"), "{message}");
     assert!(message.contains("7 days"), "{message}");
     assert!(
-        message.ends_with("run `nmail account login gmail`"),
+        message.ends_with("run `neomail account login gmail`"),
         "{message}"
     );
     let e = refresh(&http, &GOOGLE, &client(), &refresh_token, "gmail")
@@ -361,7 +361,7 @@ async fn refresh_gets_an_access_token_and_explains_invalid_grant_and_invalid_cli
         "{message}"
     );
     assert!(
-        message.ends_with("run `nmail account logout gmail`, then `nmail account login gmail`"),
+        message.ends_with("run `neomail account logout gmail`, then `neomail account login gmail`"),
         "{message}"
     );
 }

@@ -51,7 +51,7 @@ impl fmt::Display for UidValidity {
     }
 }
 
-/// The cache's own id for a message: what `nmail list` prints and `nmail show` takes.
+/// The cache's own id for a message: what `neomail list` prints and `neomail show` takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct MessageId(i64);
