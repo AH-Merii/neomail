@@ -99,6 +99,36 @@ impl MailSource for FakeSource {
     }
 }
 
+/// [`FakeSource`] whose connection drops after `fetches_left` fetch requests.
+struct DropsAfter {
+    inner: FakeSource,
+    fetches_left: usize,
+}
+
+impl MailSource for DropsAfter {
+    type Error = std::io::Error;
+
+    async fn examine_inbox(&mut self) -> std::io::Result<MailboxStatus> {
+        self.inner.examine_inbox().await.map_err(|e| match e {})
+    }
+
+    async fn list_all(&mut self) -> std::io::Result<Vec<ListedMessage>> {
+        self.inner.list_all().await.map_err(|e| match e {})
+    }
+
+    async fn flags_from(&mut self, from: Uid) -> std::io::Result<Vec<UidFlags>> {
+        self.inner.flags_from(from).await.map_err(|e| match e {})
+    }
+
+    async fn fetch(&mut self, uids: &[Uid]) -> std::io::Result<Vec<FetchedMessage>> {
+        self.fetches_left = self
+            .fetches_left
+            .checked_sub(1)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::ConnectionReset))?;
+        self.inner.fetch(uids).await.map_err(|e| match e {})
+    }
+}
+
 const LIMIT: NonZeroU32 = NonZeroU32::new(3).unwrap();
 
 async fn sync(source: &mut FakeSource, cache: &mut Cache) -> SyncReport {
@@ -125,13 +155,33 @@ fn highest_uid(cache: &Cache) -> Option<Uid> {
     }
 }
 
-fn report(new: usize, updated: usize, removed: usize, reset: bool) -> SyncReport {
-    SyncReport {
+fn report(new: usize, updated: usize, removed: usize, reset: bool) -> Counts {
+    Counts(SyncReport {
         new,
         updated,
         removed,
         missing: 0,
         reset,
+        ..SyncReport::default()
+    })
+}
+
+/// The counts of a report, compared without its new ids and initial flag (tested on their own),
+/// except that every message counted as new must have its id.
+#[derive(Debug)]
+struct Counts(SyncReport);
+
+impl PartialEq<Counts> for SyncReport {
+    fn eq(&self, other: &Counts) -> bool {
+        let o = &other.0;
+        self.new_ids.len() == self.new
+            && (
+                self.new,
+                self.updated,
+                self.removed,
+                self.missing,
+                self.reset,
+            ) == (o.new, o.updated, o.removed, o.missing, o.reset)
     }
 }
 
@@ -346,8 +396,10 @@ async fn a_first_sync_missing_a_body_sets_no_watermark() {
         .await
         .unwrap();
     assert_eq!((r.new, r.missing), (1, 0));
+    assert!(r.initial, "UID 2 is old mail, not new");
     assert_eq!(source.fetched, vec![2]);
     assert_eq!(highest_uid(&cache), Uid::new(3));
+    assert!(!sync(&mut source, &mut cache).await.initial);
 }
 
 #[tokio::test]
@@ -381,17 +433,23 @@ async fn progress_counts_up_per_batch_and_stays_quiet_with_nothing_new() {
     let mut cache = Cache::open_in_memory().unwrap();
     let mut seen = Vec::new();
     let limit = NonZeroU32::new(500).unwrap();
-    let r = sync_inbox_with_progress(&mut source, &mut cache, "work", limit, |p| seen.push(p))
-        .await
-        .unwrap();
+    let mut r = SyncReport::default();
+    sync_inbox_with_progress(&mut source, &mut cache, "work", limit, &mut r, |p| {
+        seen.push(p);
+    })
+    .await
+    .unwrap();
     assert_eq!(r.new, 120);
     let done: Vec<(usize, usize)> = seen.iter().map(|p| (p.done, p.total)).collect();
     assert_eq!(done, [(0, 120), (50, 120), (100, 120), (120, 120)]);
 
     let mut again: Vec<Progress> = Vec::new();
-    sync_inbox_with_progress(&mut source, &mut cache, "work", limit, |p| again.push(p))
-        .await
-        .unwrap();
+    let mut r = SyncReport::default();
+    sync_inbox_with_progress(&mut source, &mut cache, "work", limit, &mut r, |p| {
+        again.push(p);
+    })
+    .await
+    .unwrap();
     assert!(again.is_empty(), "{again:?}");
 }
 
@@ -412,4 +470,114 @@ async fn a_by_id_mailbox_is_reset_to_imap() {
     assert_eq!(sync(&mut source, &mut cache).await, report(3, 0, 1, true));
     assert_eq!(cached_uids(&cache), vec![3, 4, 5]);
     assert_eq!(highest_uid(&cache), Uid::new(5));
+}
+
+#[tokio::test]
+async fn a_sync_reports_the_ids_it_added_and_whether_it_started_from_nothing() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let mut source = FakeSource::new(7, 1..=5);
+    let first = sync(&mut source, &mut cache).await;
+    assert!(first.initial, "nothing was cached");
+    assert_eq!(first.new_ids.len(), 3);
+
+    source.messages.insert(8, Flags::default());
+    source.messages.insert(9, Flags::default());
+    let later = sync(&mut source, &mut cache).await;
+    assert!(!later.initial);
+    let ids_of = |uids: &[u32]| -> Vec<nm_core::MessageId> {
+        let mut ids: Vec<_> = cache
+            .list(Some("work"), 100)
+            .unwrap()
+            .into_iter()
+            .filter(|e| uids.contains(&e.uid.unwrap().get()))
+            .map(|e| e.id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    let mut new_ids = later.new_ids.clone();
+    new_ids.sort();
+    assert_eq!(new_ids, ids_of(&[8, 9]));
+
+    let quiet = sync(&mut source, &mut cache).await;
+    assert!(!quiet.initial && quiet.new_ids.is_empty());
+
+    // A rebuilt cache starts from nothing again: its messages were cached before.
+    let mut renumbered = FakeSource::new(8, 101..=104);
+    let rebuilt = sync(&mut renumbered, &mut cache).await;
+    assert!(rebuilt.reset && rebuilt.initial);
+}
+
+#[tokio::test]
+async fn a_sync_that_fails_keeps_the_ids_of_the_batches_it_stored() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let mut source = FakeSource::new(7, 1..=3);
+    sync(&mut source, &mut cache).await;
+    source
+        .messages
+        .extend((4..=103).map(|u| (u, Flags::default())));
+    // Batch 1 (UIDs 4 to 53) is stored; batch 2's fetch fails.
+    let mut dropping = DropsAfter {
+        inner: source,
+        fetches_left: 1,
+    };
+    let mut r = SyncReport::default();
+    let result =
+        sync_inbox_with_progress(&mut dropping, &mut cache, "work", LIMIT, &mut r, |_| {}).await;
+    assert!(result.is_err());
+    let mut stored: Vec<nm_core::MessageId> = cache
+        .list(Some("work"), 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| (4..=53).contains(&e.uid.unwrap().get()))
+        .map(|e| e.id)
+        .collect();
+    stored.sort();
+    assert_eq!(stored.len(), 50);
+    assert_eq!(cached_uids(&cache).len(), 53, "batch 2 was not stored");
+    let mut reported = r.new_ids.clone();
+    reported.sort();
+    assert_eq!(reported, stored, "batch 1's ids are reported");
+    assert!(!r.initial && r.new == 50);
+}
+
+#[tokio::test]
+async fn the_rest_of_an_interrupted_first_sync_is_not_new_mail() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let limit = NonZeroU32::new(200).unwrap();
+    // Batch 1 (UIDs 1 to 50) is stored; batch 2's fetch fails.
+    let mut dropping = DropsAfter {
+        inner: FakeSource::new(7, 1..=103),
+        fetches_left: 1,
+    };
+    let mut first = SyncReport::default();
+    let result =
+        sync_inbox_with_progress(&mut dropping, &mut cache, "work", limit, &mut first, |_| {})
+            .await;
+    assert!(result.is_err());
+    assert!(first.initial && first.new == 50);
+
+    let mut source = dropping.inner;
+    let second = sync_inbox(&mut source, &mut cache, "work", limit)
+        .await
+        .unwrap();
+    assert_eq!(second.new, 53);
+    assert!(second.initial, "the first sync's old mail is not new mail");
+
+    source.messages.insert(104, Flags::default());
+    let third = sync_inbox(&mut source, &mut cache, "work", limit)
+        .await
+        .unwrap();
+    assert!(!third.initial && third.new == 1);
+}
+
+#[tokio::test]
+async fn mail_after_a_first_sync_of_an_empty_inbox_is_new_mail() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let mut source = FakeSource::new(7, []);
+    assert!(sync(&mut source, &mut cache).await.initial);
+
+    source.messages.insert(1, Flags::default());
+    let later = sync(&mut source, &mut cache).await;
+    assert!(!later.initial && later.new == 1);
 }

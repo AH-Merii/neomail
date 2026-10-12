@@ -11,6 +11,8 @@ mod graph;
 mod http;
 mod keyring;
 mod lock;
+#[cfg(unix)]
+mod notify;
 mod oauth;
 mod output;
 mod pager;
@@ -194,6 +196,9 @@ enum Command {
         /// Time between the starts of two rounds: digits followed by s, m or h, from 30s to 24h
         #[arg(long, value_name = "DURATION", default_value = daemon::DEFAULT_INTERVAL, value_parser = daemon::parse_interval)]
         interval: daemon::Interval,
+        /// Do not show desktop notifications of new mail
+        #[arg(long)]
+        no_notify: bool,
     },
     /// List cached messages, newest first ('*' marks unread)
     List {
@@ -562,7 +567,10 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
             }
         }
         #[cfg(unix)]
-        Command::Daemon { interval } => daemon::run(config::config_path(cli.config)?, interval)?,
+        Command::Daemon {
+            interval,
+            no_notify,
+        } => daemon::run(config::config_path(cli.config)?, interval, no_notify)?,
         Command::List {
             account,
             limit,

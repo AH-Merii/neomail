@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 
 use crate::cache::{Cache, CacheError, MailboxKind, MailboxRecord};
 use crate::source::MailSource;
-use crate::types::{Flags, ListedMessage, Uid, UidFlags};
+use crate::types::{Flags, ListedMessage, MessageId, Uid, UidFlags};
 
 /// The only mailbox slice 1 syncs.
 pub const INBOX: &str = "INBOX";
@@ -17,7 +17,7 @@ pub const DEFAULT_LIMIT: NonZeroU32 = NonZeroU32::MIN.saturating_add(499);
 pub(crate) const FETCH_BATCH: usize = 50;
 
 /// What one sync changed in the cache.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncReport {
     /// Messages fetched and added.
     pub new: usize,
@@ -30,6 +30,15 @@ pub struct SyncReport {
     pub missing: usize,
     /// The server's UIDVALIDITY changed, so the cache was rebuilt.
     pub reset: bool,
+    /// The sync is, or finishes, one that started from an empty mailbox it created: the account's
+    /// first sync, or a rebuild after [`reset`](Self::reset). It stays set for every sync of that
+    /// mailbox until one completes, so the rest of an interrupted first sync is not new mail
+    /// either ([`MailboxRecord::synced`](crate::cache::MailboxRecord::synced)). Its new messages
+    /// are not new mail.
+    pub initial: bool,
+    /// The cache ids of the messages this sync added, in the order they were stored. Ids are never
+    /// reused, so a message that was already cached is never among them.
+    pub new_ids: Vec<MessageId>,
 }
 
 /// How far a sync has got with fetching new messages, for a progress display: `done` of `total`
@@ -67,20 +76,27 @@ pub async fn sync_inbox<S: MailSource>(
     account: &str,
     limit: NonZeroU32,
 ) -> Result<SyncReport, SyncError<S::Error>> {
-    sync_inbox_with_progress(source, cache, account, limit, |_| {}).await
+    let mut report = SyncReport::default();
+    sync_inbox_with_progress(source, cache, account, limit, &mut report, |_| {}).await?;
+    Ok(report)
 }
 
-/// [`sync_inbox`], calling `progress` once the new messages are known (`done` 0) and after each
-/// batch is stored. It is not called when there is nothing new to fetch.
+/// [`sync_inbox`], filling `report` as it goes and calling `progress` once the new messages are
+/// known (`done` 0) and after each batch is stored. `progress` is not called when there is nothing
+/// new to fetch.
+///
+/// Each batch is stored as it comes, so when the sync fails, `report` still holds what it changed
+/// before the failure: [`SyncReport::new_ids`] has the messages already stored, which the next
+/// sync finds cached and does not report again.
 pub async fn sync_inbox_with_progress<S: MailSource>(
     source: &mut S,
     cache: &mut Cache,
     account: &str,
     limit: NonZeroU32,
+    report: &mut SyncReport,
     mut progress: impl FnMut(Progress),
-) -> Result<SyncReport, SyncError<S::Error>> {
+) -> Result<(), SyncError<S::Error>> {
     let status = source.examine_inbox().await.map_err(SyncError::Source)?;
-    let mut report = SyncReport::default();
 
     // A by-id mailbox is reset too: its messages have no UIDs.
     let (mailbox_id, highest_uid) = match cache.mailbox(account, INBOX)? {
@@ -91,12 +107,17 @@ pub async fn sync_inbox_with_progress<S: MailSource>(
                     uid_validity,
                     highest_uid,
                 },
-        }) if uid_validity == status.uid_validity => (id, highest_uid),
+            synced,
+        }) if uid_validity == status.uid_validity => {
+            report.initial = !synced;
+            (id, highest_uid)
+        }
         previous => {
             if let Some(old) = previous {
                 report.reset = true;
                 report.removed = cache.message_count(old.id)?;
             }
+            report.initial = true;
             let reset = cache.reset_mailbox(account, INBOX, status.uid_validity)?;
             (reset.id, None)
         }
@@ -128,7 +149,7 @@ pub async fn sync_inbox_with_progress<S: MailSource>(
                 Some(first) => first.uid,
                 None => match highest.get().checked_add(1).and_then(Uid::new) {
                     Some(next) => next,
-                    None => return Ok(report), // UID space exhausted: nothing can be new.
+                    None => return Ok(()), // UID space exhausted: nothing can be new.
                 },
             };
             let listing = if status.exists == 0 {
@@ -200,15 +221,21 @@ pub async fn sync_inbox_with_progress<S: MailSource>(
                 .filter(|uid| lowest_missing.is_none_or(|lowest| *uid < lowest))
                 .max()
         };
-        cache.store_messages(mailbox_id, &fetched, raise_to)?;
+        let stored = cache.store_messages(mailbox_id, &fetched, raise_to)?;
         report.new += fetched.len();
+        report.new_ids.extend(stored);
         done.done += batch.len();
         progress(done);
     }
     if let Some(watermark) = watermark.filter(|_| lowest_missing.is_none()) {
         cache.raise_highest_uid(mailbox_id, watermark)?;
     }
-    Ok(report)
+    // A first sync still owed a body is not done: the next sync stays initial, so the old mail it
+    // fetches is not announced as new.
+    if !first_sync || lowest_missing.is_none() {
+        cache.mark_synced(mailbox_id)?;
+    }
+    Ok(())
 }
 
 /// Picks the UIDs of the `limit` messages that arrived last (ties and unknown dates by UID,

@@ -13,7 +13,7 @@ neomail daemon --interval 1m    # digits followed by s, m or h, from 30s to 24h
 It prints one line when it starts, then stays in the foreground:
 
 ```text
-neomail daemon: syncing 2 accounts every 5 minutes; Ctrl-C stops
+neomail daemon: syncing 2 accounts every 5 minutes, notifications on; Ctrl-C stops
 ```
 
 Ctrl-C (SIGINT) or SIGTERM lets the account being synced finish, then exits 0. A second Ctrl-C
@@ -28,6 +28,52 @@ interval.
 The config is read again before each round, so an account you add or remove takes effect at the
 next round. If the config becomes invalid, the daemon says so once and keeps the last good one.
 Without a config file or accounts it prints the start lines and exits 2.
+
+## Notifications
+
+On Linux, after each round, every account that got new mail in it shows one desktop
+notification:
+
+```text
+work: 5 new messages
+Ada Lovelace: Notes on the engine
+Charles Babbage: Re: Difference engine
+bob@example.com: (no subject)
+and 2 more
+```
+
+It names up to three of the new messages, newest first, by sender (the display name, else the
+address) and subject (cut at 80 characters). An account's first sync, or a rebuild of its cache,
+never notifies: that mail is not new. Neither do the syncs that finish a first sync which was
+interrupted or left a message without its body; mail that arrives before such a sync finishes
+is not announced. The sender and subject can show on a lock screen or on a screen you share;
+`neomail daemon --no-notify` turns notifications off. There is no config key for it yet.
+
+Notifications need a desktop notification service (the one in GNOME or KDE Plasma, or mako,
+dunst, swaync and the like) on your session's D-Bus. The daemon looks for one when it starts, and
+its start line says which applies:
+
+- `notifications on`;
+- `notifications off (no notification service)`: none was running or could be started, or the
+  session bus could not be reached. The daemon looks again before each round's notifications, so
+  a service your desktop starts after the daemon is found then, and the daemon prints
+  `notifications on`;
+- `notifications off (--no-notify)`;
+- `notifications off (not supported here yet)`: on macOS and other systems than Linux.
+
+The session bus, for notifications and the keyring alike, is found through
+`DBUS_SESSION_BUS_ADDRESS`, else `$XDG_RUNTIME_DIR/bus`, else `/run/user/UID/bus` (zbus's
+`Address::session`, [source][zbus-session]). A service started without your session's variables
+still reaches a bus at that path, while your session runs one there; a bus at any other address
+needs `DBUS_SESSION_BUS_ADDRESS`.
+
+[zbus-session]: https://docs.rs/crate/zbus/5.19.0/source/src/address/mod.rs
+
+A notification that fails is reported once, like a repeated sync error, and never stops a sync.
+Each call gives up after 5 seconds, and the first that fails ends that round's notifications, so a
+service that does not answer holds a round up once, not once per account. The round in which the
+daemon finds a service is the exception: looking for it and the first notification each have their
+own 5 seconds, so a service that hangs can hold that round up twice.
 
 ## As a systemd user service
 
@@ -56,15 +102,128 @@ systemctl --user enable --now neomail.service
 journalctl --user -u neomail.service -f
 ```
 
+`default.target` starts the daemon at login, which can be before your desktop starts its
+notification service; the daemon finds the service before the first notification after that
+(see [Notifications](#notifications)). An `After=graphical-session.target` line would not wait
+for it: `After=` only orders units that are started together ([systemd.unit(5)][unit-before]),
+and `PartOf=graphical-session.target` would stop syncing when the desktop session ends.
+
+[unit-before]: https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#Before=
+
 `RestartPreventExitStatus=2` keeps systemd from restarting it while the config has no accounts or
 is invalid; fix the config, then `systemctl --user restart neomail.service`. Passwords and sign-ins
 come from the same place as for `neomail sync`: a `password_command`, or the OS keyring, which a
-user service reaches through the session's D-Bus. The daemon runs a `password_command` with
-standard input closed and stops it after 60 seconds, so a command that would prompt (gpg asking
-for a passphrase) fails that account instead of stalling the others; keep its agent's cache warm,
-or use the keyring. A locked keyring is different: reading it shows the keyring's unlock prompt,
-and the round waits until that prompt is answered or cancelled, so keep the keyring unlocked while
-the daemon runs.
+user service reaches through the session's D-Bus, as it reaches the notification service. The
+daemon runs a `password_command` with standard input closed and stops it after 60 seconds, so a
+command that would prompt (gpg asking for a passphrase) fails that account instead of stalling the
+others; keep its agent's cache warm, or use the keyring. A locked keyring is different: reading it
+shows the keyring's unlock prompt, and the round waits until that prompt is answered or cancelled,
+so keep the keyring unlocked while the daemon runs.
+
+## Without systemd
+
+These examples follow each init system's own documentation; they were checked against the
+documentation only, not run under OpenRC or runit.
+
+### OpenRC (Alpine, Gentoo)
+
+OpenRC 0.60 and later run services per user (`openrc --user`, out of experimental in 0.62:
+[NEWS](https://github.com/OpenRC/openrc/blob/master/NEWS.md)). Their scripts live in
+`~/.config/rc/init.d`, every `rc-*` tool takes `--user`, and `XDG_RUNTIME_DIR` must be set; add
+`pam_openrc.so` to your login's PAM configuration to start them with your session
+([user guide](https://github.com/OpenRC/openrc/blob/master/user-guide.md), "User services"). Save
+this as `~/.config/rc/init.d/neomail`:
+
+```sh
+#!/sbin/openrc-run
+description="neomail background sync"
+supervisor=supervise-daemon
+command="${HOME}/.local/bin/neomail"
+command_args="daemon"
+output_log="${HOME}/.local/state/neomail-daemon.log"
+error_log="${HOME}/.local/state/neomail-daemon.log"
+# Exit 2 (no accounts, invalid config) would come back at once: give up after three tries.
+respawn_delay=5
+respawn_max=3
+respawn_period=60
+```
+
+Then make it executable, add it to your default runlevel and start it:
+
+```sh
+mkdir -p ~/.local/state
+chmod +x ~/.config/rc/init.d/neomail
+rc-update --user add neomail default
+rc-service --user neomail start
+```
+
+`supervisor`, `output_log`, `error_log` and the `respawn_*` settings are openrc-run's
+([openrc-run(8)](https://github.com/OpenRC/openrc/blob/master/man/openrc-run.8),
+[supervise-daemon(8)](https://github.com/OpenRC/openrc/blob/master/man/supervise-daemon.8)).
+OpenRC filters the environment of the services it starts. A user service keeps a fixed list
+(`LANG`, `LC_*`, `TERM` and OpenRC's own, plus `USER`, `LOGNAME`, `HOME`, `SHELL`, `XDG_*`,
+`EDITOR`, `VISUAL`, `PAGER`, `LESS` and `DIFFTOOL`) and the names in `rc_env_allow`
+([env_filter][openrc-env]). `DBUS_SESSION_BUS_ADDRESS` is not on the list, so by default the
+daemon finds the session bus only at `$XDG_RUNTIME_DIR/bus` (see [Notifications](#notifications)).
+To pass it through, add it to `rc_env_allow` in `~/.config/rc/rc.conf`, which overrides
+`/etc/rc.conf` for user services ([rc.conf][openrc-conf]; user guide, "User services"):
+
+```sh
+rc_env_allow="DBUS_SESSION_BUS_ADDRESS"
+```
+
+An OpenRC older than 0.60 has no user services: start `neomail daemon` from your session there.
+
+[openrc-env]: https://github.com/OpenRC/openrc/blob/14e11b7f5b09072aa1433e790bbf832800858fec/src/shared/misc.c#L60-L105
+[openrc-conf]: https://github.com/OpenRC/openrc/blob/14e11b7f5b09072aa1433e790bbf832800858fec/etc/rc.conf#L66-L68
+
+### runit (Void)
+
+Void's handbook describes two ways to run services as your user
+([Per-User Services](https://docs.voidlinux.org/config/services/user-services.html)):
+
+- **turnstile**, which starts them with your session from `~/.config/service/`, and passes your
+  session's variables through `chpst -e "$TURNSTILE_ENV_DIR"`. `DBUS_SESSION_BUS_ADDRESS` is
+  among them only if turnstile runs D-Bus as one of your services too. Otherwise (with
+  `dbus-run-session`, say) the service reaches a session bus only at the path zbus falls back
+  to (see [Notifications](#notifications)); with none there, notifications are off and the
+  keyring cannot be reached. The handbook's steps for that service:
+
+  ```sh
+  mkdir -p ~/.config/service/dbus
+  ln -s /usr/share/examples/turnstile/dbus.run ~/.config/service/dbus/run
+  ln -s /usr/share/examples/turnstile/dbus.check ~/.config/service/dbus/check
+  ```
+
+  and `core_services="dbus"` in `~/.config/service/turnstile-ready/conf`, so it starts before
+  your other services.
+- **runsvdir** as your user, a system service started at boot that watches `~/service/`. Its
+  services do not get your session's variables, so they reach a session bus only at the path
+  zbus falls back to, and only while your session runs one there (see
+  [Notifications](#notifications)). Without one, notifications are off and the keyring cannot be
+  reached: use a `password_command`.
+
+With turnstile, save this as `~/.config/service/neomail/run` and make it executable:
+
+```sh
+#!/bin/sh
+exec chpst -e "$TURNSTILE_ENV_DIR" "$HOME/.local/bin/neomail" daemon 2>&1
+```
+
+For runsvdir, put it in `~/service/neomail/run` without `chpst -e "$TURNSTILE_ENV_DIR"`. runsv
+restarts a service whose `run` exits, a second later; to keep it down on exit 2 (no accounts,
+invalid config) until you fix the config, add an executable `finish` beside `run`, which runsv
+starts with `run`'s exit code
+([runsv(8)](https://man.voidlinux.org/runsv.8), [sv(8)](https://man.voidlinux.org/sv.8)):
+
+```sh
+#!/bin/sh
+[ "$1" = 2 ] && exec sv down .
+exit 0
+```
+
+Then `SVDIR=~/.config/service sv up neomail` (or `SVDIR=~/service`) starts it again, and
+`sv status` shows it.
 
 ## What the output means
 

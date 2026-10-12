@@ -227,8 +227,9 @@ neomail completions fish > ~/.config/fish/completions/neomail.fish
 
 `neomail daemon` syncs every account now and then every 5 minutes (`--interval 1m`, from 30s to
 24h) until Ctrl-C, printing a line only when an account changed or failed. `neomail sync` still
-works alongside it. To run it as a systemd user service, and for what its output means, see
-[docs/daemon.md](docs/daemon.md).
+works alongside it. On Linux it shows a desktop notification when new mail arrives, naming the
+sender and subject (`--no-notify` turns them off). To run it as a systemd, OpenRC or runit user
+service, and for what its output means, see [docs/daemon.md](docs/daemon.md).
 
 How it fits together: [docs/architecture.md](docs/architecture.md).
 

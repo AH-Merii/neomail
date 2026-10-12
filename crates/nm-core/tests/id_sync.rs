@@ -178,13 +178,33 @@ async fn sync(source: &mut RefSource, cache: &mut Cache) -> SyncReport {
         .unwrap()
 }
 
-fn report(new: usize, updated: usize, removed: usize, reset: bool) -> SyncReport {
-    SyncReport {
+fn report(new: usize, updated: usize, removed: usize, reset: bool) -> Counts {
+    Counts(SyncReport {
         new,
         updated,
         removed,
         missing: 0,
         reset,
+        ..SyncReport::default()
+    })
+}
+
+/// The counts of a report, compared without its new ids and initial flag (tested on their own),
+/// except that every message counted as new must have its id.
+#[derive(Debug)]
+struct Counts(SyncReport);
+
+impl PartialEq<Counts> for SyncReport {
+    fn eq(&self, other: &Counts) -> bool {
+        let o = &other.0;
+        self.new_ids.len() == self.new
+            && (
+                self.new,
+                self.updated,
+                self.removed,
+                self.missing,
+                self.reset,
+            ) == (o.new, o.updated, o.removed, o.missing, o.reset)
     }
 }
 
@@ -242,19 +262,23 @@ async fn progress_counts_up_per_batch_and_stays_quiet_with_nothing_new() {
     let mut source = RefSource::new(1..=120);
     let limit = NonZeroU32::new(100).unwrap();
     let mut seen = Vec::new();
-    let r =
-        sync_inbox_by_id_with_progress(&mut source, &mut cache, "work", limit, |p| seen.push(p))
-            .await
-            .unwrap();
+    let mut r = SyncReport::default();
+    sync_inbox_by_id_with_progress(&mut source, &mut cache, "work", limit, &mut r, |p| {
+        seen.push(p);
+    })
+    .await
+    .unwrap();
     assert_eq!(r.new, 100);
     let done: Vec<(usize, usize)> = seen.iter().map(|p| (p.done, p.total)).collect();
     assert_eq!(done, [(0, 100), (50, 100), (100, 100)]);
 
     let mut again: Vec<Progress> = Vec::new();
-    let r =
-        sync_inbox_by_id_with_progress(&mut source, &mut cache, "work", limit, |p| again.push(p))
-            .await
-            .unwrap();
+    let mut r = SyncReport::default();
+    sync_inbox_by_id_with_progress(&mut source, &mut cache, "work", limit, &mut r, |p| {
+        again.push(p);
+    })
+    .await
+    .unwrap();
     assert_eq!(r, report(0, 0, 0, false));
     assert!(again.is_empty(), "{again:?}");
 }
@@ -326,9 +350,11 @@ async fn a_message_without_a_body_is_asked_for_again() {
     source.bodiless.clear();
     let r = sync(&mut source, &mut cache).await;
     assert_eq!((r.new, r.missing), (1, 0));
+    assert!(r.initial, "message 4 is old mail, not new");
     assert_eq!(source.fetched, [4]);
     assert_eq!(cached(&cache), [3, 4, 5]);
     assert_eq!(mailbox(&cache).1, Some(at(5)));
+    assert!(!sync(&mut source, &mut cache).await.initial);
 
     // The oldest of the chosen comes back without a body: the window still reaches it.
     let mut cache = Cache::open_in_memory().unwrap();
@@ -367,6 +393,45 @@ async fn a_missing_body_survives_a_later_failed_batch() {
     assert_eq!(source.fetched[0], 21);
     assert_eq!(cached(&cache), (21..=120).collect::<Vec<_>>());
     assert_eq!(mailbox(&cache).1, Some(at(120)));
+}
+
+/// The cache ids of `account`'s messages, sorted.
+fn cache_ids(cache: &Cache) -> Vec<MessageId> {
+    let mut ids: Vec<MessageId> = cache
+        .list(Some("work"), 1000)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn a_sync_that_fails_keeps_the_ids_of_the_batches_it_stored() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let mut source = RefSource::new(1..=3);
+    sync(&mut source, &mut cache).await;
+    let before = cache_ids(&cache);
+    source
+        .messages
+        .extend((4..=103).map(|n| (n, Flags::default())));
+    // Batch 1 (50 messages) is stored; batch 2's fetch fails.
+    source.fetches_left = Some(1);
+    let mut r = SyncReport::default();
+    let result =
+        sync_inbox_by_id_with_progress(&mut source, &mut cache, "work", LIMIT, &mut r, |_| {})
+            .await;
+    assert!(result.is_err());
+    let stored: Vec<MessageId> = cache_ids(&cache)
+        .into_iter()
+        .filter(|id| !before.contains(id))
+        .collect();
+    assert_eq!(stored.len(), 50);
+    let mut reported = r.new_ids.clone();
+    reported.sort();
+    assert_eq!(reported, stored, "batch 1's ids are reported");
+    assert!(!r.initial && r.new == 50);
 }
 
 #[tokio::test]
@@ -543,4 +608,59 @@ async fn a_source_that_lists_nothing_fails_conformance() {
         matches!(err, nm_core::conformance::ConformanceError::Precondition(_)),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn a_by_id_sync_reports_the_ids_it_added_and_whether_it_started_from_nothing() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let mut source = RefSource::new(1..=5);
+    let first = sync(&mut source, &mut cache).await;
+    assert!(first.initial, "nothing was cached");
+    assert_eq!(first.new_ids.len(), 3);
+
+    source.messages.insert(6, Flags::default());
+    let later = sync(&mut source, &mut cache).await;
+    assert!(!later.initial);
+    assert_eq!(later.new_ids, [cache.list(Some("work"), 1).unwrap()[0].id]);
+
+    let quiet = sync(&mut source, &mut cache).await;
+    assert!(!quiet.initial && quiet.new_ids.is_empty());
+}
+
+#[tokio::test]
+async fn the_rest_of_an_interrupted_first_by_id_sync_is_not_new_mail() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let limit = NonZeroU32::new(200).unwrap();
+    let mut source = RefSource::new(1..=103);
+    source.fetches_left = Some(1);
+    let mut first = SyncReport::default();
+    let result =
+        sync_inbox_by_id_with_progress(&mut source, &mut cache, "work", limit, &mut first, |_| {})
+            .await;
+    assert!(result.is_err());
+    assert!(first.initial && first.new == 50);
+
+    source.fetches_left = None;
+    let second = sync_inbox_by_id(&mut source, &mut cache, "work", limit)
+        .await
+        .unwrap();
+    assert_eq!(second.new, 53);
+    assert!(second.initial, "the first sync's old mail is not new mail");
+
+    source.messages.insert(104, Flags::default());
+    let third = sync_inbox_by_id(&mut source, &mut cache, "work", limit)
+        .await
+        .unwrap();
+    assert!(!third.initial && third.new == 1);
+}
+
+#[tokio::test]
+async fn mail_after_a_first_by_id_sync_of_an_empty_inbox_is_new_mail() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let mut source = RefSource::new([]);
+    assert!(sync(&mut source, &mut cache).await.initial);
+
+    source.messages.insert(1, Flags::default());
+    let later = sync(&mut source, &mut cache).await;
+    assert!(!later.initial && later.new == 1);
 }

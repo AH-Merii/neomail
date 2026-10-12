@@ -196,21 +196,24 @@ directory (created with mode 0700). On Unix, `neomail` makes the file and SQLite
 `-shm` files mode 0600 each time it opens the cache, even in a directory that already existed
 with looser modes (`neomail/src/main.rs`, `restrict_cache_files`). Tables:
 
-- `mailbox (account, name, uid_validity, highest_uid, seen_until)`: the sync state. A NULL
-  `uid_validity` marks a by-id mailbox, whose state is `seen_until` instead;
+- `mailbox (account, name, uid_validity, highest_uid, seen_until, synced)`: the sync state. A NULL
+  `uid_validity` marks a by-id mailbox, whose state is `seen_until` instead. `synced` is 0 from
+  the mailbox's creation until a sync of it completes;
 - `message (mailbox_id, uid, remote_id, flags, received, date, from_*, subject, raw)`: the
   message source plus the few fields `list` needs, so listing never parses mail. Exactly one of
   `uid` and `remote_id` is set (a `CHECK`), each unique per mailbox.
 
-Schema 2 added the by-id columns. A schema 1 cache is migrated when it is opened, following
-SQLite's procedure for other table changes: foreign keys off outside any transaction (inside one
-the pragma does nothing, and with them on, dropping the old `mailbox` would delete every message),
-then one `BEGIN IMMEDIATE` transaction that reads the version again, creates the new tables, copies
-every row with its id, drops the old tables, renames the new ones, restores the `message` id
-counter (copying would otherwise lower it to the highest id left, and a deleted newest id would be
-handed out again), recreates the index, requires an empty `PRAGMA foreign_key_check` and sets the
-version. Foreign keys go back on afterwards. Any failure rolls back to the untouched schema 1
-(`nm-core/tests/migration.rs`).
+Schema 2 added the by-id columns, and schema 3 `mailbox.synced`. A schema 2 cache gets the column in
+one `BEGIN IMMEDIATE` transaction that reads the version again, with every existing mailbox counted
+as synced (a build without the column synced it). A schema 1 cache is migrated when it is opened,
+following SQLite's procedure for other table changes: foreign keys off outside any transaction
+(inside one the pragma does nothing, and with them on, dropping the old `mailbox` would delete every
+message), then one `BEGIN IMMEDIATE` transaction that reads the version again, creates the new
+tables, copies every row with its id, drops the old tables, renames the new ones, restores the
+`message` id counter (copying would otherwise lower it to the highest id left, and a deleted newest
+id would be handed out again), recreates the index, requires an empty `PRAGMA foreign_key_check` and
+sets the version, straight to schema 3 with every mailbox synced. Foreign keys go back on
+afterwards. Any failure rolls back to the untouched schema 1 (`nm-core/tests/migration.rs`).
 
 `PRAGMA user_version` holds the schema version. A new cache gets its schema and version in one
 `BEGIN IMMEDIATE` transaction that reads the version again, so two first syncs at once or a
@@ -266,6 +269,34 @@ far. IMAP IDLE, Graph's delta query and Gmail's history will add a wake that nam
 synced by the same `Syncer` under the same account lock. No trait is needed for this part: the
 sources, the cache and the OAuth data are unchanged, and the scheduler, the reports and the locks
 have one implementation each, tested through plain values and in-memory writers.
+
+**Notifications** (`neomail/src/notify.rs`) come after a round, never inside a sync. Which mail is
+new comes from the sync: `SyncReport::new_ids` holds the cache ids of the rows it added (the cache's
+stores return them, telling an added row from an updated one by `AUTOINCREMENT`'s counter, since ids
+are never reused; each store reads the counter inside a `BEGIN IMMEDIATE` transaction, so another
+connection cannot commit between the read and the first write), and `SyncReport::initial` marks a
+sync of a mailbox it created (the first sync, or a rebuild) until one completes, whose mail is not
+new: `mailbox.synced` is set only at the end of a sync that succeeds, so the syncs that finish an
+interrupted first sync are initial too. A first sync in which a message came back without a body is
+not complete either: it leaves `mailbox.synced` unset, so the sync that later fetches that old
+message is initial. The cost: while such a body stays missing, mail that arrives meanwhile is
+fetched by an initial sync and never announced. That is the lesser error, since the rule is never to
+announce old mail. The engines fill a `&mut SyncReport` batch by batch, so a sync that fails still
+hands back the ids it stored (`Synced::partial`): the next round finds them cached and would never
+announce them. `daemon::round` returns each account's `NewMail`; `daemon::notify_round` reads the
+newest three of them (`Cache::newest_of`), formats one `Notification` per account and hands it to a
+closure, as `round` hands accounts to `sync`. The daemon's closure is `Notifier::send`: on Linux the
+freedesktop `Notify` call over the session bus with zbus (on tokio, as the keyring store already
+uses it), each call inside its own `block_on` with a 5-second timeout, so it fits between the syncs
+as they do. `Notifier::start` decides whether notifications are on (`--no-notify`, a service that
+owns `org.freedesktop.Notifications` or is activatable, the platform). If no service was found,
+`Notifier::ready` looks again before each round's notifications, since a desktop can start its
+service after the daemon, and the daemon prints `notifications on` when it finds one. A failure, a
+cache read included, goes through `Reports` under the repeated-error rule and ends the round's
+notifications, so a service that does not answer costs one timeout per round, not one per account
+(two in the round where `ready` finds it: the lookup and the first `Notify` each have their own); a
+stop request ends them too. No trait: there is one notifier per platform, the tests pass a closure,
+and the D-Bus call is tested against a zbus server on a socket pair.
 
 `sync_inbox` (`nm-core/src/sync.rs`) runs once per account:
 

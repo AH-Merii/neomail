@@ -42,6 +42,7 @@ rustix.workspace = true
 signal-hook.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
 zbus-secret-service-keyring-store.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -51,6 +52,10 @@ apple-native-keyring-store.workspace = true
 tempfile.workspace = true
 # Paused time for the device code polling tests.
 tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The notification test serves the D-Bus call on a socket pair, without a bus.
+zbus = { workspace = true, features = ["p2p"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # The daemon tests hold an account lock as the daemon would.

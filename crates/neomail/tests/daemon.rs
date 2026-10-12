@@ -90,9 +90,17 @@ fn a_failing_daemon_reports_once_keeps_running_refuses_a_second_and_stops_on_sig
     let data = dir.path();
     closed_port_config(data);
     let (mut daemon, lines) = spawn(command(data, &["daemon", "--interval", "30s"]));
+    // The session bus is a path that does not exist.
+    let notifications = if cfg!(target_os = "linux") {
+        "notifications off (no notification service)"
+    } else {
+        "notifications off (not supported here yet)"
+    };
     assert_eq!(
         next_line(&mut daemon, &lines),
-        "neomail daemon: syncing 1 account every 30 seconds; Ctrl-C stops"
+        format!(
+            "neomail daemon: syncing 1 account every 30 seconds, {notifications}; Ctrl-C stops"
+        )
     );
     let failure = next_line(&mut daemon, &lines);
     // HH:MM:SS, then the line `neomail sync` prints for the account.
@@ -125,6 +133,23 @@ fn a_failing_daemon_reports_once_keeps_running_refuses_a_second_and_stops_on_sig
     assert!(
         data.join("daemon.lock").exists(),
         "a lock file is never deleted"
+    );
+}
+
+#[test]
+fn no_notify_says_so_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    closed_port_config(data);
+    let args = ["daemon", "--interval", "30s", "--no-notify"];
+    let (mut daemon, lines) = spawn(command(data, &args));
+    let start = next_line(&mut daemon, &lines);
+    terminate(&daemon);
+    daemon.wait().unwrap();
+    assert_eq!(
+        start,
+        "neomail daemon: syncing 1 account every 30 seconds, notifications off (--no-notify); \
+         Ctrl-C stops"
     );
 }
 

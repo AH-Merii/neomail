@@ -5,6 +5,9 @@
 //! [`Syncer`] as `neomail sync`. What starts a round is a [`Wake`]: the timer for now. Push (IMAP
 //! IDLE, Graph delta, Gmail history) will be another kind of wake that names one account and
 //! feeds the same `Syncer` under the same account lock.
+//!
+//! After a round, each account that got new mail in it gets one desktop notification
+//! ([`notify_round`], through [`crate::notify`]).
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -15,11 +18,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use nm_core::SyncReport;
+use nm_core::cache::ListEntry;
+use nm_core::{MessageId, SyncReport};
 use tokio::runtime::Runtime;
 use tokio::time::Instant;
 
 use crate::config::{self, Account, Config};
+use crate::notify::{self, NewMail, Notification, Notifier};
 use crate::sync::{PASSWORD_COMMAND_TIMEOUT, Synced, Syncer, report_line};
 use crate::{lock, output};
 
@@ -274,6 +279,8 @@ pub struct Reports {
     last_warning: HashMap<String, String>,
     /// The last success's messages without a body; no entry before the first success.
     last_missing: HashMap<String, usize>,
+    /// The last failed notification's error, until one succeeds.
+    last_notify_error: Option<String>,
 }
 
 /// One line to print, without the time.
@@ -320,6 +327,21 @@ impl Reports {
         Some(Line::Error(format!("neomail: {account}: {warning}")))
     }
 
+    /// A notification that failed, unless it failed as the last one did. One that succeeds
+    /// ([`notified`](Self::notified)) lets the next failure be reported again.
+    pub fn notify_failed(&mut self, account: &str, e: &anyhow::Error) -> Option<Line> {
+        let message = format!("{e:#}");
+        if self.last_notify_error.as_ref() == Some(&message) {
+            return None;
+        }
+        self.last_notify_error = Some(message.clone());
+        Some(Line::Error(format!("neomail: {account}: {message}")))
+    }
+
+    pub fn notified(&mut self) {
+        self.last_notify_error = None;
+    }
+
     /// Forgets the accounts that are no longer configured.
     pub fn retain(&mut self, accounts: &[Account]) {
         let configured = |name: &String| accounts.iter().any(|a| &a.name == name);
@@ -360,7 +382,8 @@ impl<O: Write, E: Write> Printer<O, E> {
 }
 
 /// One round: each account in turn, skipping one whose lock another sync holds, stopping early
-/// once a stop is requested. One account's failure never stops the others.
+/// once a stop is requested. One account's failure never stops the others. Returns the accounts
+/// that got new mail, for [`notify_round`], including what a failed sync stored before it failed.
 pub fn round<O: Write, E: Write>(
     accounts: &[Account],
     data_dir: &Path,
@@ -368,8 +391,9 @@ pub fn round<O: Write, E: Write>(
     reports: &mut Reports,
     printer: &mut Printer<O, E>,
     mut sync: impl FnMut(&Account) -> Synced,
-) -> io::Result<()> {
+) -> io::Result<Vec<NewMail>> {
     reports.retain(accounts);
+    let mut new_mail = Vec::new();
     for account in accounts {
         if stop.requested() {
             break;
@@ -380,6 +404,7 @@ pub fn round<O: Write, E: Write>(
             Ok(Some(_held)) => sync(account),
             Err(e) => Synced {
                 report: Err(e),
+                partial: SyncReport::default(),
                 warnings: Vec::new(),
             },
         };
@@ -390,6 +415,48 @@ pub fn round<O: Write, E: Write>(
         }
         if let Some(line) = reports.line(&account.name, &synced.report) {
             printer.print(&line)?;
+        }
+        // A sync that failed after storing some batches still announces them: the next round
+        // finds them cached and never reports them again.
+        let stored = synced.report.as_ref().unwrap_or(&synced.partial);
+        if let Some(new) = NewMail::from_report(&account.name, stored) {
+            new_mail.push(new);
+        }
+    }
+    Ok(new_mail)
+}
+
+/// One notification per account in `new_mail`: `newest` reads the newest of its new messages
+/// from the cache, `notify` shows it. A failure is reported under the repeated-error rule and
+/// never stops the daemon.
+///
+/// The first notification that fails ends the round's notifications: a service that does not
+/// answer would otherwise hold up the round by [`notify::TIMEOUT`] once per account. A stop
+/// request ends them too.
+pub fn notify_round<O: Write, E: Write>(
+    new_mail: &[NewMail],
+    stop: &Stop,
+    mut newest: impl FnMut(&[MessageId]) -> Result<Vec<ListEntry>>,
+    mut notify: impl FnMut(&Notification) -> Result<()>,
+    reports: &mut Reports,
+    printer: &mut Printer<O, E>,
+) -> io::Result<()> {
+    for new in new_mail {
+        if stop.requested() {
+            break;
+        }
+        let shown = newest(&new.ids)
+            .context("could not show a desktop notification")
+            .map(|entries| Notification::new_mail(&new.account, new.ids.len(), &entries))
+            .and_then(|n| notify(&n));
+        match shown {
+            Ok(()) => reports.notified(),
+            Err(e) => {
+                if let Some(line) = reports.notify_failed(&new.account, &e) {
+                    printer.print(&line)?;
+                }
+                break;
+            }
         }
     }
     Ok(())
@@ -422,7 +489,7 @@ fn local_time() -> String {
 }
 
 /// `neomail daemon`.
-pub fn run(config_path: PathBuf, interval: Interval) -> Result<ExitCode> {
+pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<ExitCode> {
     let config = match Config::load(&config_path) {
         Ok(config) if !config.accounts.is_empty() => config,
         // No file or no accounts: the start lines, like bare `neomail`.
@@ -436,10 +503,12 @@ pub fn run(config_path: PathBuf, interval: Interval) -> Result<ExitCode> {
     let mut cache = crate::open_cache(true)?.context("the cache could not be created")?;
     let stop = Stop::on_signals()?;
     let runtime = crate::account::runtime()?;
+    let mut notifier = Notifier::start(&runtime, no_notify);
     let count = config.accounts.len();
     eprintln!(
-        "neomail daemon: syncing {count} account{} every {interval}; Ctrl-C stops",
-        if count == 1 { "" } else { "s" }
+        "neomail daemon: syncing {count} account{} every {interval}, {}; Ctrl-C stops",
+        if count == 1 { "" } else { "s" },
+        notifier.status()
     );
     let mut syncer = Syncer::new(
         &runtime,
@@ -469,13 +538,34 @@ pub fn run(config_path: PathBuf, interval: Interval) -> Result<ExitCode> {
             // Next to the reports' retain in `round`: a removed account's tokens go too.
             syncer.retain(&config.accounts);
             let printed = printed.and_then(|()| {
-                round(
+                let new_mail = round(
                     &config.accounts,
                     &data_dir,
                     &stop,
                     &mut reports,
                     &mut printer,
                     |account| syncer.sync(account, &mut cache),
+                )?;
+                if new_mail.is_empty() {
+                    return Ok(());
+                }
+                // Outside `block_on`, like the syncs: `ready` and `send` run the runtime
+                // themselves.
+                match notifier.ready(&runtime) {
+                    notify::Ready::Off => return Ok(()),
+                    notify::Ready::Found => printer.print(&Line::Error(format!(
+                        "neomail daemon: {}",
+                        notify::Status::On
+                    )))?,
+                    notify::Ready::On => {}
+                }
+                notify_round(
+                    &new_mail,
+                    &stop,
+                    |ids| Ok(cache.newest_of(ids, notify::SHOWN)?),
+                    |n| notifier.send(&runtime, n),
+                    &mut reports,
+                    &mut printer,
                 )
             });
             if let Err(e) = printed {
@@ -700,6 +790,7 @@ mod tests {
     ) -> impl FnMut(&Account) -> Synced {
         move |a| Synced {
             report: sync(a),
+            partial: SyncReport::default(),
             warnings: Vec::new(),
         }
     }
@@ -738,7 +829,7 @@ mod tests {
                 quiet(|a| {
                     synced.push(a.name.clone());
                     match a.name.as_str() {
-                        "work" => work.map_err(|e| anyhow::anyhow!(e)),
+                        "work" => work.clone().map_err(|e| anyhow::anyhow!(e)),
                         "home" => bail!("password command failed"),
                         _ => Ok(report(usize::from(n == 0) * 2)),
                     }
@@ -798,7 +889,15 @@ mod tests {
         let mut p = printer();
         let all = accounts(&["work"]);
         let mut rounds = |r: SyncReport, p: &mut Printer<Vec<u8>, Vec<u8>>| {
-            round(&all, dir.path(), &stop, &mut reports, p, quiet(|_| Ok(r))).unwrap();
+            round(
+                &all,
+                dir.path(),
+                &stop,
+                &mut reports,
+                p,
+                quiet(|_| Ok(r.clone())),
+            )
+            .unwrap();
             String::from_utf8(std::mem::take(&mut p.out)).unwrap()
         };
         let line =
@@ -826,6 +925,7 @@ mod tests {
         for warning in ["warning: not saved", "warning: not saved", "warning: other"] {
             round(&all, dir.path(), &stop, &mut reports, &mut p, |_| Synced {
                 report: Ok(report(0)),
+                partial: SyncReport::default(),
                 warnings: vec![warning.to_owned()],
             })
             .unwrap();
@@ -908,6 +1008,204 @@ mod tests {
         assert_eq!(
             String::from_utf8(p.out).unwrap(),
             "12:00:00 work: 1 new, 0 updated, 0 removed\n"
+        );
+    }
+
+    /// A sync that added `ids`, after the account's first sync unless `initial`.
+    fn added(initial: bool, ids: &[i64]) -> SyncReport {
+        SyncReport {
+            new: ids.len(),
+            initial,
+            new_ids: ids.iter().copied().map(MessageId::new).collect(),
+            ..SyncReport::default()
+        }
+    }
+
+    /// The cache's newest-first entries for `ids`, as message N from "Sender N".
+    fn entries(ids: &[MessageId]) -> Result<Vec<ListEntry>> {
+        let mut ids = ids.to_vec();
+        ids.sort_by(|a, b| b.cmp(a));
+        Ok(ids
+            .into_iter()
+            .take(notify::SHOWN)
+            .map(|id| ListEntry {
+                id,
+                account: String::new(),
+                uid: None,
+                date: None,
+                from: Some(nm_core::parse::EmailAddress {
+                    name: Some(format!("Sender {id}")),
+                    address: None,
+                }),
+                subject: Some(format!("Message {id}")),
+                flags: nm_core::Flags::default(),
+            })
+            .collect())
+    }
+
+    #[test]
+    fn each_account_with_new_mail_gets_one_notification_per_round_and_a_first_sync_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = Stop::new().unwrap();
+        let mut reports = Reports::default();
+        let mut p = printer();
+        let all = accounts(&["work", "home", "club", "new"]);
+        let mut shown = Vec::new();
+        for n in 0..2 {
+            let new_mail = round(&all, dir.path(), &stop, &mut reports, &mut p, |a| Synced {
+                report: Ok(match (a.name.as_str(), n) {
+                    ("work", 0) => added(false, &[1, 2, 3, 4, 5]),
+                    ("work", _) => added(false, &[9]),
+                    ("home", 0) => added(false, &[6]),
+                    // Its first sync: the cache held nothing for it.
+                    ("new", 0) => added(true, &[7, 8]),
+                    ("new", _) => added(false, &[10, 11]),
+                    _ => added(false, &[]),
+                }),
+                partial: SyncReport::default(),
+                warnings: Vec::new(),
+            })
+            .unwrap();
+            let notify = |n: &Notification| {
+                shown.push(n.clone());
+                Ok(())
+            };
+            notify_round(&new_mail, &stop, entries, notify, &mut reports, &mut p).unwrap();
+        }
+        let summaries: Vec<&str> = shown.iter().map(|n| n.summary.as_str()).collect();
+        assert_eq!(
+            summaries,
+            [
+                "work: 5 new messages",
+                "home: 1 new message",
+                "work: 1 new message",
+                "new: 2 new messages",
+            ]
+        );
+        assert_eq!(
+            shown[0].body,
+            "Sender 5: Message 5
+Sender 4: Message 4
+Sender 3: Message 3
+and 2 more"
+        );
+        assert!(p.err.is_empty());
+    }
+
+    #[test]
+    fn a_failing_notification_is_reported_once_and_syncing_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = Stop::new().unwrap();
+        let mut reports = Reports::default();
+        let mut p = printer();
+        let all = accounts(&["work", "home"]);
+        let mut synced = 0;
+        // Per round: whether the notification service answers.
+        for works in [false, false, false, true, false] {
+            let new_mail = round(&all, dir.path(), &stop, &mut reports, &mut p, |_| {
+                synced += 1;
+                Synced {
+                    report: Ok(added(false, &[synced])),
+                    partial: SyncReport::default(),
+                    warnings: Vec::new(),
+                }
+            })
+            .unwrap();
+            let notify = |_: &Notification| {
+                if works {
+                    Ok(())
+                } else {
+                    bail!("could not show a desktop notification: no reply")
+                }
+            };
+            notify_round(&new_mail, &stop, entries, notify, &mut reports, &mut p).unwrap();
+        }
+        assert_eq!(synced, 10, "every account, every round");
+        assert_eq!(
+            String::from_utf8(p.err).unwrap(),
+            "12:00:00 neomail: work: could not show a desktop notification: no reply\n\
+             12:00:00 neomail: work: could not show a desktop notification: no reply\n",
+            "once, then again only after one worked"
+        );
+        // A cache that cannot be read fails the notification the same way, and says so.
+        let mut p = printer();
+        let new_mail = [NewMail {
+            account: "work".to_owned(),
+            ids: vec![MessageId::new(1)],
+        }];
+        let unreadable = |_: &[MessageId]| -> Result<Vec<ListEntry>> { bail!("disk I/O error") };
+        let never = |_: &Notification| -> Result<()> { panic!("nothing to show") };
+        notify_round(&new_mail, &stop, unreadable, never, &mut reports, &mut p).unwrap();
+        assert_eq!(
+            String::from_utf8(p.err).unwrap(),
+            "12:00:00 neomail: work: could not show a desktop notification: disk I/O error\n"
+        );
+    }
+
+    #[test]
+    fn a_hung_notification_service_is_waited_for_once_per_round_and_a_stop_ends_the_round() {
+        let stop = Stop::new().unwrap();
+        let mut reports = Reports::default();
+        let mut p = printer();
+        let new_mail = [
+            NewMail {
+                account: "work".to_owned(),
+                ids: vec![MessageId::new(1)],
+            },
+            NewMail {
+                account: "home".to_owned(),
+                ids: vec![MessageId::new(2)],
+            },
+        ];
+        let mut tried = Vec::new();
+        for _ in 0..2 {
+            let hung = |n: &Notification| -> Result<()> {
+                tried.push(n.summary.clone());
+                bail!("could not show a desktop notification: the service did not answer")
+            };
+            notify_round(&new_mail, &stop, entries, hung, &mut reports, &mut p).unwrap();
+        }
+        assert_eq!(
+            tried,
+            ["work: 1 new message", "work: 1 new message"],
+            "one try per round, not one per account"
+        );
+        assert_eq!(
+            String::from_utf8(std::mem::take(&mut p.err)).unwrap(),
+            "12:00:00 neomail: work: could not show a desktop notification: the service did not \
+             answer\n",
+            "reported once"
+        );
+
+        stop.request();
+        let never = |_: &Notification| -> Result<()> { panic!("a stop was requested") };
+        notify_round(&new_mail, &stop, entries, never, &mut reports, &mut p).unwrap();
+    }
+
+    #[test]
+    fn a_sync_that_fails_after_storing_some_mail_still_announces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = Stop::new().unwrap();
+        let mut reports = Reports::default();
+        let mut p = printer();
+        let all = accounts(&["work"]);
+        let new_mail = round(&all, dir.path(), &stop, &mut reports, &mut p, |_| Synced {
+            report: Err(anyhow::anyhow!("the mail server request failed")),
+            partial: added(false, &[1, 2]),
+            warnings: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            new_mail,
+            [NewMail {
+                account: "work".to_owned(),
+                ids: vec![MessageId::new(1), MessageId::new(2)],
+            }]
+        );
+        assert_eq!(
+            String::from_utf8(p.err).unwrap(),
+            "12:00:00 neomail: work: the mail server request failed\n",
+            "the failure is still reported"
         );
     }
 
