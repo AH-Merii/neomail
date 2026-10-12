@@ -6,6 +6,7 @@ use std::convert::Infallible;
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
+use nm_core::cache::MailboxKind;
 use nm_core::{
     Cache, FetchedMessage, Flags, ListedMessage, MailSource, MailboxStatus, Progress, SyncReport,
     Uid, UidFlags, UidValidity, sync_inbox, sync_inbox_with_progress,
@@ -111,10 +112,17 @@ fn cached_uids(cache: &Cache) -> Vec<u32> {
         .list(Some("work"), 100)
         .unwrap()
         .iter()
-        .map(|e| e.uid.get())
+        .map(|e| e.uid.unwrap().get())
         .collect();
     uids.sort_unstable();
     uids
+}
+
+fn highest_uid(cache: &Cache) -> Option<Uid> {
+    match cache.mailbox("work", "INBOX").unwrap().unwrap().kind {
+        MailboxKind::Imap { highest_uid, .. } => highest_uid,
+        MailboxKind::ById { .. } => panic!("the IMAP mailbox became a by-id one"),
+    }
 }
 
 fn report(new: usize, updated: usize, removed: usize, reset: bool) -> SyncReport {
@@ -311,8 +319,7 @@ async fn a_message_without_a_body_is_asked_for_again() {
     let r = sync(&mut source, &mut cache).await;
     assert_eq!((r.new, r.missing), (2, 1));
     assert_eq!(cached_uids(&cache), vec![1, 2, 3, 5]);
-    let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
-    assert_eq!(mailbox.highest_uid, Uid::new(3));
+    assert_eq!(highest_uid(&cache), Uid::new(3));
 
     // Once the server sends it, the next sync fetches 4 alone.
     source.bodiless.clear();
@@ -322,8 +329,7 @@ async fn a_message_without_a_body_is_asked_for_again() {
     assert_eq!((r.new, r.missing), (1, 0));
     assert_eq!(source.fetched, vec![4]);
     assert_eq!(cached_uids(&cache), vec![1, 2, 3, 4, 5]);
-    let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
-    assert_eq!(mailbox.highest_uid, Uid::new(4));
+    assert_eq!(highest_uid(&cache), Uid::new(4));
 }
 
 #[tokio::test]
@@ -333,8 +339,7 @@ async fn a_first_sync_missing_a_body_sets_no_watermark() {
     source.bodiless.push(2);
     let r = sync(&mut source, &mut cache).await;
     assert_eq!((r.new, r.missing), (2, 1));
-    let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
-    assert_eq!(mailbox.highest_uid, None);
+    assert_eq!(highest_uid(&cache), None);
 
     source.bodiless.clear();
     let r = sync_inbox(&mut source, &mut cache, "work", LIMIT)
@@ -342,8 +347,7 @@ async fn a_first_sync_missing_a_body_sets_no_watermark() {
         .unwrap();
     assert_eq!((r.new, r.missing), (1, 0));
     assert_eq!(source.fetched, vec![2]);
-    let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
-    assert_eq!(mailbox.highest_uid, Uid::new(3));
+    assert_eq!(highest_uid(&cache), Uid::new(3));
 }
 
 #[tokio::test]
@@ -363,14 +367,12 @@ async fn a_first_sync_run_again_keeps_what_it_cached() {
     assert_eq!((r.new, r.removed, r.missing), (1, 0, 1));
     assert_eq!(source.fetched, vec![4]);
     assert_eq!(cached_uids(&cache), vec![1, 2, 4]);
-    let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
-    assert_eq!(mailbox.highest_uid, None);
+    assert_eq!(highest_uid(&cache), None);
 
     // Once 3 is expunged, the first sync completes and sets the watermark.
     source.messages.remove(&3);
     assert_eq!(sync(&mut source, &mut cache).await, report(0, 0, 0, false));
-    let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
-    assert_eq!(mailbox.highest_uid, Uid::new(4));
+    assert_eq!(highest_uid(&cache), Uid::new(4));
 }
 
 #[tokio::test]
@@ -391,4 +393,23 @@ async fn progress_counts_up_per_batch_and_stays_quiet_with_nothing_new() {
         .await
         .unwrap();
     assert!(again.is_empty(), "{again:?}");
+}
+
+#[tokio::test]
+async fn a_by_id_mailbox_is_reset_to_imap() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let by_id = cache.reset_id_mailbox("work", "INBOX").unwrap();
+    let listed = nm_core::IdListed {
+        id: nm_core::RemoteId::new("AAMkAGI2").unwrap(),
+        flags: Flags::default(),
+        received: DateTime::from_timestamp(1_000_000, 0).unwrap(),
+    };
+    cache
+        .store_id_messages(by_id.id, &[(&listed, raw(1).as_slice())], None)
+        .unwrap();
+
+    let mut source = FakeSource::new(7, 1..=5);
+    assert_eq!(sync(&mut source, &mut cache).await, report(3, 0, 1, true));
+    assert_eq!(cached_uids(&cache), vec![3, 4, 5]);
+    assert_eq!(highest_uid(&cache), Uid::new(5));
 }
