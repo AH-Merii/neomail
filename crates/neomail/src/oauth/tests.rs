@@ -457,6 +457,7 @@ async fn refresh_gets_an_access_token_and_explains_invalid_grant_and_invalid_cli
         .await
         .unwrap();
     assert_eq!(refreshed.access_token.expose(), ACCESS);
+    assert_eq!(refreshed.expires_in, Some(Duration::from_secs(3599)));
     assert!(refreshed.refresh_token.is_none(), "Google does not rotate");
     let form = http.forms.borrow()[0].1.clone();
     assert_eq!(form["grant_type"], "refresh_token");
@@ -816,12 +817,37 @@ async fn microsoft_refresh_asks_for_the_refresh_scope_and_returns_the_rotated_to
     );
 }
 
+#[tokio::test]
+async fn expires_in_is_read_as_a_number_or_a_string_and_may_be_missing() {
+    let http = FakeHttp::new(&[
+        (
+            200,
+            &format!(r#"{{"access_token":"{ACCESS}","expires_in":"3600"}}"#),
+        ),
+        (200, &format!(r#"{{"access_token":"{ACCESS}"}}"#)),
+        (
+            200,
+            &format!(r#"{{"access_token":"{ACCESS}","expires_in":"soon"}}"#),
+        ),
+    ]);
+    let refresh_token = Secret::new(REFRESH.into());
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let r = refresh(&http, &GOOGLE, &client(), &refresh_token, "gmail")
+            .await
+            .unwrap();
+        got.push(r.expires_in);
+    }
+    assert_eq!(got, [Some(Duration::from_secs(3600)), None, None]);
+}
+
 #[test]
 fn a_refresh_token_is_written_back_only_when_it_changed() {
     let saved = Secret::new(REFRESH.into());
     let with = |token: Option<&str>| Refreshed {
         access_token: Secret::new(ACCESS.into()),
         refresh_token: token.map(|t| Secret::new(t.into())),
+        expires_in: None,
     };
     assert!(with(None).rotated(&saved).is_none());
     assert!(with(Some(REFRESH)).rotated(&saved).is_none());

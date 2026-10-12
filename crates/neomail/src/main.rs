@@ -5,15 +5,19 @@
 mod account;
 mod browser;
 mod config;
+#[cfg(unix)]
+mod daemon;
 mod graph;
 mod http;
 mod keyring;
+mod lock;
 mod oauth;
 mod output;
 mod pager;
 mod secret;
 mod setup;
 mod style;
+mod sync;
 
 use std::ffi::OsString;
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
@@ -23,10 +27,10 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use nm_core::{Cache, MessageId, sync_inbox_with_progress};
-use nm_imap::{CertPin, ImapConfig, ImapSource, Security};
+use nm_core::{Cache, MessageId};
+use nm_imap::{CertPin, Security};
 
-use crate::config::{Account, Config, Login, PasswordSource, Server};
+use crate::config::{Account, Config, Login, PasswordSource};
 use crate::keyring::Keyring;
 use crate::output::Mode;
 use crate::secret::{Input, Password};
@@ -182,6 +186,14 @@ enum Command {
         /// How many of the newest messages the first sync takes per account, or all (later syncs fetch all new mail)
         #[arg(long, value_name = "N|all", value_parser = parse_limit, default_value_t = Limit::Count(nm_core::sync::DEFAULT_LIMIT))]
         limit: Limit,
+    },
+    /// Keep every account's cache current: sync them all now and then every interval, until Ctrl-C or SIGTERM
+    #[cfg(unix)]
+    #[command(after_help = "Guide: https://github.com/AH-Merii/neomail/blob/main/docs/daemon.md")]
+    Daemon {
+        /// Time between the starts of two rounds: digits followed by s, m or h, from 30s to 24h
+        #[arg(long, value_name = "DURATION", default_value = daemon::DEFAULT_INTERVAL, value_parser = daemon::parse_interval)]
+        interval: daemon::Interval,
     },
     /// List cached messages, newest first ('*' marks unread)
     List {
@@ -504,89 +516,33 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
     let mut out = BufWriter::new(stdout.lock());
     let code = match command {
         Command::Sync { account, limit } => {
-            let limit = limit.get();
             let config = Config::load(&config::config_path(cli.config)?)?;
             let accounts = config.select(account.as_deref())?;
+            let data_dir = config::data_dir()?;
             let mut cache = open_cache(true)?.context("the cache could not be created")?;
             let runtime = account::runtime()?;
             let stderr = io::stderr();
-            let mut progress = output::ProgressLine::new(stderr.is_terminal());
+            let progress = output::ProgressLine::new(stderr.is_terminal());
+            let mut syncer = sync::Syncer::new(&runtime, limit.get(), progress);
             let mut failed = false;
-            let mut keyring = None;
             for account in accounts {
-                let progress = &mut progress;
-                // Keyring reads stay outside block_on: their blocking calls start a runtime of
-                // their own.
-                let result = match &account.login {
-                    Login::Password(source) => {
-                        secret::account_password(&account.name, source, &mut keyring).and_then(
-                            |password| {
-                                let Server::Imap(imap) = &account.server else {
-                                    bail!("a password account reads mail over IMAP");
-                                };
-                                let login = nm_imap::Login::Password(password.expose());
-                                runtime.block_on(sync_imap(
-                                    imap,
-                                    &account.name,
-                                    login,
-                                    &mut cache,
-                                    limit,
-                                    progress,
-                                ))
-                            },
-                        )
+                // One sync per account: the daemon may be syncing this one.
+                let result = lock::wait_for_account(&data_dir, &account.name, || {
+                    eprintln!(
+                        "neomail: waiting for neomail daemon to finish syncing {}",
+                        account.name
+                    );
+                })
+                .and_then(|_held| {
+                    let synced = syncer.sync(account, &mut cache);
+                    syncer.progress.clear(&mut io::stderr());
+                    for warning in synced.warnings {
+                        eprintln!("neomail: {}: {warning}", account.name);
                     }
-                    Login::OAuth(settings) => secret::oauth_secrets(&account.name, &mut keyring)
-                        .and_then(|(client_secret, refresh_token)| {
-                            let refreshed = runtime.block_on(account::refresh(
-                                account,
-                                settings,
-                                client_secret.clone(),
-                                &refresh_token,
-                            ))?;
-                            // A rotated refresh token is written back outside block_on, like
-                            // every keyring call. The old one is not revoked, so a failed write
-                            // is only a warning.
-                            if let Some(rotated) = refreshed.rotated(&refresh_token)
-                                && let Err(e) = secret::save_refresh_token(
-                                    &account.name,
-                                    &mut keyring,
-                                    client_secret.as_ref(),
-                                    rotated,
-                                )
-                            {
-                                eprintln!(
-                                    "neomail: {}: warning: {} sent a new refresh token, but \
-                                         it could not be saved ({e:#}); the saved one is used \
-                                         until it stops working",
-                                    account.name, settings.provider.name
-                                );
-                            }
-                            // The same token reaches IMAP (XOAUTH2) or Microsoft Graph.
-                            let token = &refreshed.access_token;
-                            match &account.server {
-                                Server::Imap(imap) => runtime.block_on(sync_imap(
-                                    imap,
-                                    &account.name,
-                                    nm_imap::Login::XOAuth2 {
-                                        access_token: token.expose(),
-                                    },
-                                    &mut cache,
-                                    limit,
-                                    progress,
-                                )),
-                                Server::Graph { .. } => runtime.block_on(graph::sync(
-                                    &account.name,
-                                    token,
-                                    &mut cache,
-                                    limit,
-                                    progress,
-                                )),
-                            }
-                        }),
-                }
-                .map(|report| report_line(&account.name, &report));
-                progress.clear(&mut io::stderr());
+                    synced.report
+                })
+                .map(|report| sync::report_line(&account.name, &report));
+                syncer.progress.clear(&mut io::stderr());
                 match result {
                     Ok(line) => {
                         writeln!(out, "{line}")?;
@@ -605,6 +561,8 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
                 ExitCode::SUCCESS
             }
         }
+        #[cfg(unix)]
+        Command::Daemon { interval } => daemon::run(config::config_path(cli.config)?, interval)?,
         Command::List {
             account,
             limit,
@@ -1134,42 +1092,6 @@ fn set_password(keyring: &Keyring, account: &Account, password: &Password) -> Re
         line.push_str(" The account's password_command takes precedence while it is set.");
     }
     Ok(line)
-}
-
-/// Syncs an IMAP account's INBOX.
-async fn sync_imap(
-    imap: &ImapConfig,
-    account: &str,
-    login: nm_imap::Login<'_>,
-    cache: &mut Cache,
-    limit: NonZeroU32,
-    progress: &mut output::ProgressLine,
-) -> Result<nm_core::SyncReport> {
-    let mut source = ImapSource::connect(imap, login).await?;
-    let result = sync_inbox_with_progress(&mut source, cache, account, limit, |p| {
-        progress.update(&mut io::stderr(), account, p);
-    })
-    .await;
-    source.logout().await;
-    Ok(result?)
-}
-
-/// `sync`'s line for one account, the same for IMAP and Graph.
-fn report_line(account: &str, r: &nm_core::SyncReport) -> String {
-    let reset = if r.reset {
-        " (the server's mailbox is not the cached one; cache rebuilt)"
-    } else {
-        ""
-    };
-    let missing = if r.missing > 0 {
-        format!(", {} without a body (retried next sync)", r.missing)
-    } else {
-        String::new()
-    };
-    format!(
-        "{account}: {} new, {} updated, {} removed{missing}{reset}",
-        r.new, r.updated, r.removed
-    )
 }
 
 #[cfg(test)]

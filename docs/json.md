@@ -131,8 +131,9 @@ naming its line number, and nothing is shown. `--raw` takes exactly one id.
 | ---- | ------- |
 | 0 | Success. `list` with nothing cached also succeeds, printing `[]` with `--json`. |
 | 0 | Also when the reader of standard output goes away early (`neomail list \| head -1`, quitting the pager): neomail stops quietly. |
-| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others. |
-| 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s input without an id; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help. |
+| 0 | `daemon` stopped by SIGINT or SIGTERM. A failing account does not stop it. |
+| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others. A second `daemon` for the same data directory exits 1. |
+| 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s input without an id; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help; `daemon` without a config file or accounts (the start lines) or with an invalid config. |
 
 Errors go to standard error, in these forms:
 

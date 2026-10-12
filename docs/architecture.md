@@ -5,13 +5,14 @@ in [decisions.md](decisions.md). The slices so far follow
 [DEC-2026-10-11-build-first](decisions.md#dec-2026-10-11-build-first): a read-only INBOX in the
 CLI (slice 1), IMAP passwords in the OS keyring (slice 2), Gmail through the user's own OAuth
 client (slice 3), getting started and setup (slice 4), output for people and pipes (slice 5) and
-Outlook through Microsoft Graph with the user's own Entra app (slice 6).
+Outlook through Microsoft Graph with the user's own Entra app (slice 6), and the first part of
+background sync (slice 7): `neomail daemon`, which polls.
 
 ## Crates
 
 | Crate | What it holds | Why it is a crate |
 | ----- | ------------- | ----------------- |
-| `crates/neomail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, output, wiring. | The composition root. Nothing depends on it. |
+| `crates/neomail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, the daemon and its locks, output, wiring. | The composition root. Nothing depends on it. |
 | `crates/nm-core` | Domain types, the `MailSource` and `IdSource` traits, the SQLite cache, the sync engines, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
 | `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap). | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; the Gmail API becomes a sibling crate. |
 | `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
@@ -135,7 +136,7 @@ is a pure function, so no test launches anything.
 **Where OAuth secrets live:** the client secret (omitted for a public client) and refresh token
 are one OS keyring entry, JSON, with the service `neomail-oauth` and the account name as its
 `username` attribute, so it can never collide with a password entry (`neomail`). Access tokens are
-never stored: `neomail sync` reads the entry before it enters `block_on`, refreshes the access
+never stored on disk: the sync reads the entry before it enters `block_on`, refreshes the access
 token inside it, and leaves it again to write back a **rotated refresh token** (Microsoft sends a
 new one with each refresh; a failed write is a warning, since the old token is not revoked), then
 syncs. An `invalid_grant` gives the provider's reason (7 days while a Google app is in Testing; 90
@@ -226,11 +227,45 @@ off.
 
 ## How sync works
 
-`neomail sync` picks the engine from the account's server (`config::Server`, fixed at parse: a
+`neomail sync` and `neomail daemon` sync an account through one function,
+`sync::Syncer::sync` (`neomail/src/sync.rs`), which picks the engine from the account's server (`config::Server`, fixed at parse: a
 password account is always IMAP, an OAuth account's provider decides): `Imap` runs `sync_inbox`
 over `ImapSource`, `Graph` runs `sync_inbox_by_id` over `GraphSource`. An OAuth account's access
 token comes from the same refresh and rotated-token write-back either way, and both print the same
-line and progress.
+line and progress. `Syncer` keeps each access token in memory (`sync::Tokens`) until 5 minutes
+before the `expires_in` of the token answer (RFC 6749, section 5.1), for the account settings it
+was issued under; a token without a lifetime is used once, and any failure drops the account's
+token. The times are wall-clock (`SystemTime`): Linux's `Instant` is `CLOCK_MONOTONIC`, which stops
+during suspend, so a token would outlive its expiry across a laptop's sleep; a clock set back
+before the token's issue drops it. `neomail sync` starts with none, so it refreshes every run, as before.
+
+## The daemon
+
+`neomail daemon` (`neomail/src/daemon.rs`) runs rounds: `run_rounds` starts one at once, then
+each `interval` after the previous one started, or at once when a round ran longer, without making
+up missed ones (`next_round`). A round reads the config again (an invalid one is reported once and
+the last good one kept), then syncs each account in turn through the same `Syncer`, keeping the
+keyring and the tokens between rounds. `Reports` decides what is printed: a change, a failure that
+differs from the account's last one, and the success after a failure, each after the local time.
+
+The rounds run outside the runtime and wait inside it (`Stop::wait_until`), so keyring calls stay
+outside `block_on`. SIGINT and SIGTERM (signal-hook) set a flag that the round checks between
+accounts, and write a byte to a socket pair that ends the wait at once; a second signal takes the
+default action, as in the pager. A signal ignored at start stays ignored. The tests drive
+`run_rounds` on tokio's paused clock and a round's output through in-memory writers.
+
+**Locks** (`neomail/src/lock.rs`) are `flock(2)` through rustix (std's `File::lock` needs Rust
+1.89): the daemon holds `DATA_DIR/daemon.lock` for its whole life, so a second daemon exits 1;
+`neomail sync` and the daemon hold `DATA_DIR/locks/ACCOUNT.lock` while they sync that account
+(the name with bytes other than letters, digits, `_`, `-` and a non-leading `.` as `%XX`). `sync`
+waits for it and says so once; the daemon skips the account for that round. A lock dies with its
+process, so a crash leaves nothing to clean up, and lock files are never deleted.
+
+**Where push plugs in:** what starts a round is a `daemon::Wake`, only the timer or a stop so
+far. IMAP IDLE, Graph's delta query and Gmail's history will add a wake that names one account,
+synced by the same `Syncer` under the same account lock. No trait is needed for this part: the
+sources, the cache and the OAuth data are unchanged, and the scheduler, the reports and the locks
+have one implementation each, tested through plain values and in-memory writers.
 
 `sync_inbox` (`nm-core/src/sync.rs`) runs once per account:
 
@@ -354,7 +389,8 @@ The order of the slices is in [roadmap.md](roadmap.md). What they change in the 
 
 - **More providers:** Graph's delta query may add a sync token to `IdSource`; the Gmail API
   becomes another source crate.
-- **More mail:** folders beyond INBOX, CONDSTORE/QRESYNC to refresh flags cheaply, and IDLE.
+- **More mail:** folders beyond INBOX, and CONDSTORE/QRESYNC to refresh flags cheaply.
+- **Push:** IMAP IDLE, Graph's delta query and the Gmail API with history, as wakes of the daemon.
 - **Actions:** flags, moves and deletes need a write side on the source and a way to record
   pending changes in the cache.
 - **The TUI** builds on the same cache and actions as the CLI.

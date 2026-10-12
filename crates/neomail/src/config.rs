@@ -124,7 +124,7 @@ fn xdg_dir(var: &str, fallback: &str) -> Result<PathBuf> {
 }
 
 /// One account, validated.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub name: String,
     pub server: Server,
@@ -152,7 +152,7 @@ impl Account {
 
 /// Where the account's mail is read. A password account is always IMAP; an OAuth account's
 /// provider decides ([`oauth::MailApi`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Server {
     Imap(ImapConfig),
     /// Microsoft Graph, for the signed-in user's own mailbox.

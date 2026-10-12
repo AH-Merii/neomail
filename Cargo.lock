@@ -1153,6 +1153,7 @@ dependencies = [
  "nm-imap",
  "ring",
  "rpassword",
+ "rustix",
  "rustls",
  "rustls-platform-verifier",
  "serde",
