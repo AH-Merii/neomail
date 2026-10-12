@@ -1,6 +1,6 @@
-//! install.sh's checks that need no download: the base URL rule, the tools it needs and
-//! `--uninstall`. Nothing here reaches the network: curl and wget are stand-ins that only record
-//! that they ran.
+//! install.sh's checks that need no download: the base URL rule, the tools it needs, the build it
+//! picks for a machine and `--uninstall`. Nothing here reaches the network: curl and wget are
+//! stand-ins that only record the arguments they ran with.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
 
@@ -25,8 +25,8 @@ fn which(tool: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{tool} is not on PATH"))
 }
 
-/// A bin directory whose curl and wget only touch `ran` in `dir`, so a test can tell whether
-/// a download was tried, plus links to `tools`.
+/// A bin directory whose curl and wget only append their arguments to `ran` in `dir`, so a test
+/// can tell whether a download was tried and of what, plus links to `tools`.
 fn bin(dir: &Path, tools: &[&str]) -> PathBuf {
     let bin = dir.join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -34,7 +34,7 @@ fn bin(dir: &Path, tools: &[&str]) -> PathBuf {
     for fake in ["curl", "wget"] {
         write_exe(
             &bin.join(fake),
-            &format!("touch '{}'; exit 1", ran.display()),
+            &format!("printf '%s\\n' \"$*\" >> '{}'; exit 1", ran.display()),
         );
     }
     for tool in tools {
@@ -150,5 +150,67 @@ fn uninstall_gives_the_keyring_step_first_and_names_only_existing_directories() 
             let named = err.contains(&format!("\"{}\"", path.join("neomail").display()));
             assert_eq!(named, existing.contains(&d), "{d}:\n{err}");
         }
+    }
+}
+
+/// The tarball install.sh asks for on a machine whose `uname -s` and `uname -m` print `os` and
+/// `machine`, or None if it downloaded nothing. The downloads fail, so it exits with an error.
+fn asset_for(os: &str, machine: &str) -> (Option<String>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = bin(dir.path(), &[]);
+    write_exe(
+        &bin.join("uname"),
+        &format!("case \"$1\" in -s) echo {os} ;; -m) echo {machine} ;; *) exit 1 ;; esac"),
+    );
+    // The retry after a failed download waits 10 seconds.
+    write_exe(&bin.join("sleep"), "exit 0");
+    let mut path = vec![bin];
+    path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let path = std::env::join_paths(path).unwrap();
+    let base = "https://mirror.example/edge";
+    let o = install(
+        dir.path(),
+        Path::new(&path),
+        &[("NEOMAIL_INSTALL_BASE_URL", base)],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(1), "{os}/{machine}: {}", stderr(&o));
+    let ran = std::fs::read_to_string(dir.path().join("ran")).ok();
+    let asset = ran.map(|ran| {
+        let first = ran.lines().next().unwrap();
+        let url = first.split(' ').next_back().unwrap();
+        url.strip_prefix(&format!("{base}/")).unwrap().to_owned()
+    });
+    (asset, stderr(&o))
+}
+
+#[test]
+fn each_linux_machine_with_a_build_gets_its_own_tarball() {
+    for (machine, want) in [
+        ("x86_64", "neomail-x86_64-unknown-linux-musl.tar.gz"),
+        ("amd64", "neomail-x86_64-unknown-linux-musl.tar.gz"),
+        ("aarch64", "neomail-aarch64-unknown-linux-musl.tar.gz"),
+        ("arm64", "neomail-aarch64-unknown-linux-musl.tar.gz"),
+    ] {
+        let (asset, err) = asset_for("Linux", machine);
+        assert_eq!(asset.as_deref(), Some(want), "{machine}: {err}");
+    }
+}
+
+#[test]
+fn a_linux_machine_without_a_build_is_told_to_build_from_source() {
+    for machine in ["armv7l", "armv6l", "i686"] {
+        let (asset, err) = asset_for("Linux", machine);
+        assert_eq!(asset, None, "{machine}: a download ran");
+        assert!(
+            err.contains(&format!(
+                "There is no prebuilt neomail for Linux {machine} yet"
+            )),
+            "{machine}: {err}"
+        );
+        assert!(
+            err.contains("cargo install --locked --git"),
+            "{machine}: {err}"
+        );
     }
 }

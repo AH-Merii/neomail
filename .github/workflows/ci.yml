@@ -74,6 +74,12 @@ jobs:
           # musl: a static binary that runs on any x86_64 Linux, whatever its glibc.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+          # The same static build for 64-bit ARM Linux (Raspberry Pi OS 64-bit, ARM laptops and
+          # servers), built natively on GitHub's arm64 runner, which is free for public
+          # repositories (https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
+          # so the build needs no cross toolchain.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
@@ -89,7 +95,11 @@ jobs:
       - name: Install the musl C toolchain (ring and the bundled SQLite are C)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # The cc crate looks for aarch64-linux-musl-gcc for this target (it only tries musl-gcc for
+      # x86_64), and Ubuntu's musl-tools ships musl-gcc alone; CC_<target> overrides the choice.
       - run: cargo build --release --locked --target ${{ matrix.target }} -p neomail
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about
@@ -147,11 +157,13 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      # download-artifact succeeds with whatever exists, so check that the Linux build is there.
+      # download-artifact succeeds with whatever exists, so check that the Linux builds are there.
       # The macOS one may be missing after an allowed failure; the loop below then drops its old
       # asset rather than leave it frozen at an older commit.
-      - name: Require the Linux build
-        run: test -s dist/neomail-x86_64-unknown-linux-musl.tar.gz
+      - name: Require the Linux builds
+        run: |
+          test -s dist/neomail-x86_64-unknown-linux-musl.tar.gz
+          test -s dist/neomail-aarch64-unknown-linux-musl.tar.gz
       # install.sh and mise check the tarballs against this file. It is written into dist/ so the
       # loop below, which drops assets that are not in dist/, keeps it.
       - name: Write SHA256SUMS
@@ -200,11 +212,13 @@ jobs:
 
   # install.sh against the edge that publish-edge just uploaded, on a fresh container of each
   # distribution: a full install, then half of the script piped into sh, which must install
-  # nothing (all of its code runs from main on the last line).
+  # nothing (all of its code runs from main on the last line). The entries with a runner run on
+  # GitHub's arm64 runner, so docker pulls the arm64 image and install.sh picks the aarch64 build;
+  # the container checks `uname -m` against arch to be sure.
   install-edge:
-    name: Install edge (${{ matrix.image }})
+    name: Install edge (${{ matrix.image }}${{ matrix.arch && format(', {0}', matrix.arch) || '' }})
     needs: publish-edge
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -218,14 +232,26 @@ jobs:
             setup: dnf install -y tar gzip
           - image: archlinux:latest
             setup: "true"
+          - image: ubuntu:latest
+            setup: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+          - image: alpine:latest
+            setup: "true"
+            runner: ubuntu-24.04-arm
+            arch: aarch64
     steps:
       - uses: actions/checkout@v7
       - name: Install and run neomail
         env:
           IMAGE: ${{ matrix.image }}
           SETUP: ${{ matrix.setup }}
+          ARCH: ${{ matrix.arch || 'x86_64' }}
         run: |
-          docker run --rm -e SETUP -v "$PWD:/src:ro" -w /src "$IMAGE" sh -euc '
+          docker run --rm -e SETUP -e ARCH -v "$PWD:/src:ro" -w /src "$IMAGE" sh -euc '
+            if [ "$(uname -m)" != "$ARCH" ]; then
+              echo "the container is $(uname -m), not $ARCH"; exit 1
+            fi
             sh -c "$SETUP"
             half=$(( $(wc -c < install.sh) / 2 ))
             head -c "$half" install.sh | NEOMAIL_INSTALL_DIR=/opt/truncated sh || true
