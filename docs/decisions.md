@@ -240,6 +240,9 @@ the new entry.
   read-only inbox in the CLI: `nmail` syncs one account's inbox, lists its messages and shows one.
   Design docs stay short and follow the code. A review runs at most two rounds, and what is left
   becomes an issue. The agent kit and the docs lint wait until the app needs them.
+- **CLI first** ([DEC-2026-10-11-cli-first](#dec-2026-10-11-cli-first)): every CLI feature is
+  built before the TUI starts. A feature with both a command and a screen ships its command first;
+  the TUI then puts keys and screens on actions the CLI already has.
 - **Live tests** ([DEC-2026-10-11-test-accounts](#dec-2026-10-11-test-accounts)): the three
   dedicated test accounts may send and receive freely. The owner's personal accounts are never used.
 - **Architecture rules** ([DEC-2026-10-11-architecture-retro](#dec-2026-10-11-architecture-retro)),
@@ -522,3 +525,14 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Refines:** [DEC-2026-10-11-architecture-retro](#dec-2026-10-11-architecture-retro). Its rules
   apply to code as it lands: seams are listed per slice, reviews stop after two rounds, and the
   manifest and docs lint wait until there is code to check. These details are Claude's.
+
+### <a id="dec-2026-10-11-cli-first"></a>DEC-2026-10-11-cli-first: finish the CLI before the TUI
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-11 (ef6ee949:3427).
+- **Context:** the roadmap had the read-only TUI as slice 6, after sign-in and background sync but
+  before triage, redaction, jev and sending in the CLI.
+- **Owner's words:** "I had a look at the roadmap and I would like to propose that we finish all
+  the cli features before begining with the tui"
+- **Ruling:** the "CLI first" bullet under [Project and delivery](#project-and-delivery).
+  [roadmap.md](roadmap.md) splits each feature that has both a command and a screen into a CLI
+  slice and a TUI slice. That split is Claude's.
