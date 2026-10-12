@@ -3,8 +3,8 @@
 This page follows the code: it describes what exists, not what is planned. Product decisions live
 in [decisions.md](decisions.md). The slices so far follow
 [DEC-2026-10-11-build-first](decisions.md#dec-2026-10-11-build-first): a read-only INBOX in the
-CLI (slice 1), IMAP passwords in the OS keyring (slice 2) and Gmail through the user's own OAuth
-client (slice 3).
+CLI (slice 1), IMAP passwords in the OS keyring (slice 2), Gmail through the user's own OAuth
+client (slice 3) and getting started and setup (slice 4).
 
 ## Crates
 
@@ -91,6 +91,33 @@ says the sign-in expired or was revoked (7 days while the app is in Testing) and
 name, parses the result before writing, and writes atomically (a temporary file in the same
 directory, then a rename). A new file gets mode 0600 in a directory created with mode 0700; an
 existing one keeps its mode.
+
+**Setup** (`neomail/src/setup.rs`, DEC-2026-10-12-cli-ux): a password **provider is data**, a
+`Preset` (`IMAP`, `PROTON`, `GMAIL_APP_PASSWORD`: fixed host, port and security, prompts, an
+intro, and whether to pin the certificate), and one flow serves them all. `gather` takes the flags
+and asks for the rest only when `Input::can_prompt` (standard input is a terminal and neither
+`--no-input` nor `NEOMAIL_NO_INPUT` is set); otherwise a missing value is a `UsageError` (exit 2)
+naming the flags. `execute` then runs, in order: `check_append`, before any network or keyring
+step; for Proton, `nm_imap::server_certificate` reads Bridge's certificate over a connection that
+accepts any certificate and sends nothing, shows its SHA-256 and pins it only when it equals
+`--cert-sha256` or the user confirms; the secret (the keyring is opened before it is asked for,
+or the `--password-command` is run); `nm_imap::check_login`, a read-only login that opens INBOX
+with `EXAMINE` and logs out; and only then the keyring write and `append_account`. A failed step
+writes nothing and stores nothing. The steps that leave the process are fields of `Deps`, plain
+function values, so the tests give a mock keyring and fake certificate and login steps; the
+login check itself is tested on the wire against the scripted server (`nm-imap/src/wire_tests.rs`).
+Gmail with OAuth keeps its own flow (`account.rs`); `main.rs` picks the provider, from a numbered
+menu on a terminal. No new trait: the presets are values, `Deps` has one real and one fake set,
+and the seams below it (`CredentialStore`, `Transport`, the config writer) already exist.
+
+**Getting started** (`main.rs`): bare `neomail` without a config file prints the start lines and
+the README's "Try it" URL on standard error and exits 2, never prompting; with a config it prints
+help. `list` and `show` check only whether the config file exists (`config::exists`) to tell "no
+accounts yet; add one with `neomail account add`" from "run `neomail sync`". `account list` and
+`config check` read only the config; `config check` prints a syntax error as `PATH:LINE:COL:
+message` from `config::SyntaxError`, never quoting the file. `sync` shows a per-account counter
+(`output::ProgressLine`, fed by `nm_core::sync_inbox_with_progress` after each batch) on standard
+error only when standard error is a terminal.
 
 Errors never quote a password, a token, the command's output or the command, and keyring errors are
 rewritten so the stored bytes keyring-core carries in some of them are never printed. Nor do

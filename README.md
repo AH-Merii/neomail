@@ -48,10 +48,48 @@ cargo install --locked --git https://github.com/AH-Merii/neomail neomail
 
 Each tarball carries the licences of the crates built into it in `THIRD-PARTY-LICENSES`.
 
-### Configure
+### Add an account
 
-Create `~/.config/neomail/config.toml` (or `$XDG_CONFIG_HOME/neomail/config.toml`; `--config PATH`
-or `NEOMAIL_CONFIG` point elsewhere, and an empty `NEOMAIL_CONFIG` counts as unset):
+```sh
+neomail account add                # a menu: gmail, gmail-app-password, proton, imap
+neomail sync && neomail list
+```
+
+`neomail account add` asks for what it needs, logs in read-only (it opens INBOX with `EXAMINE`)
+and only then writes the account to the config file. Every question has a flag, so scripts can
+run it with `--no-input` (or `NEOMAIL_NO_INPUT=1`), which turns any missing value into a usage
+error. Secrets are never flags: they are prompted for without echo, read as one line of standard
+input, or come from `--password-command`. `--no-check` skips the login. `neomail account add
+--help` lists the flags with examples.
+
+- **Proton Mail**, through Proton Mail Bridge (paid Proton plans), on
+  127.0.0.1 port 1143 with STARTTLS:
+
+  ```sh
+  neomail account add proton
+  ```
+
+  It asks for the username and the password Bridge shows, never your Proton password. It reads
+  Bridge's self-signed certificate, shows its SHA-256 and asks before pinning it. Off a terminal,
+  pass the SHA-256 you expect with `--cert-sha256`; a different certificate is refused.
+- **Gmail with an app password:** `neomail account add gmail-app-password`. Google: "To create an
+  app password, you need 2-Step Verification on your Google Account"
+  ([Google's help](https://support.google.com/accounts/answer/185833)).
+- **Gmail with your own OAuth app:** `neomail account add gmail`, below.
+- **Any IMAP server:** `neomail account add imap --name work --username you@example.com --host
+  imap.example.com` (`--port`, `--security tls|starttls`, `--cert-sha256`).
+
+```sh
+neomail account list               # name, login, username, server, security, pinned
+neomail config path                # where the config file is
+neomail config check               # parse it offline: PATH:LINE:COL: message, or "ok: N accounts"
+```
+
+### Edit the config by hand
+
+The config is `~/.config/neomail/config.toml` (or `$XDG_CONFIG_HOME/neomail/config.toml`;
+`--config PATH` or `NEOMAIL_CONFIG` point elsewhere, and an empty `NEOMAIL_CONFIG` counts as
+unset). `account add` appends to it and keeps your text and comments:
 
 ```toml
 [[accounts]]
@@ -75,8 +113,7 @@ cert_sha256 = "AB:CD:…"   # 64 hex digits
 - `security` is `"tls"` (default, port 993) or `"starttls"` (port 143). There is no plaintext
   option and no way to skip certificate checks.
 - Without `cert_sha256` the certificate is verified against the system's trust store. With it,
-  only that exact certificate is accepted. Get it with
-  `openssl s_client -connect 127.0.0.1:1143 -starttls imap </dev/null | openssl x509 -noout -fingerprint -sha256`.
+  only that exact certificate is accepted.
 
 ### Passwords
 

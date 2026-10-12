@@ -75,18 +75,36 @@ pub fn client_config(pin: Option<CertPin>) -> Result<Arc<ClientConfig>, rustls::
     Ok(Arc::new(config))
 }
 
+/// A config that accepts any certificate, only so that its SHA-256 can be read and shown to the
+/// user (`server_certificate`). Nothing is ever sent over such a connection.
+pub(crate) fn capture_config() -> Result<Arc<ClientConfig>, rustls::Error> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = PinVerifier {
+        pin: None,
+        algorithms: provider.signature_verification_algorithms,
+    };
+    Ok(Arc::new(
+        ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth(),
+    ))
+}
+
 /// Accepts exactly one certificate, by its SHA-256, and still checks the handshake signatures
-/// against that certificate's key, so the peer must hold its private key.
+/// against that certificate's key, so the peer must hold its private key. With no pin it accepts
+/// any certificate: only [`capture_config`] builds one so, to read the certificate.
 #[derive(Debug)]
 struct PinVerifier {
-    pin: CertPin,
+    pin: Option<CertPin>,
     algorithms: WebPkiSupportedAlgorithms,
 }
 
 impl PinVerifier {
     fn new(pin: CertPin, provider: &CryptoProvider) -> Self {
         Self {
-            pin,
+            pin: Some(pin),
             algorithms: provider.signature_verification_algorithms,
         }
     }
@@ -102,13 +120,12 @@ impl ServerCertVerifier for PinVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         let actual = CertPin::of(end_entity.as_ref());
-        if actual == self.pin {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::General(format!(
-                "the server certificate's SHA-256 is {actual}, which does not match cert_sha256 {}",
-                self.pin
-            )))
+        match self.pin {
+            None => Ok(ServerCertVerified::assertion()),
+            Some(pin) if pin == actual => Ok(ServerCertVerified::assertion()),
+            Some(pin) => Err(rustls::Error::General(format!(
+                "the server certificate's SHA-256 is {actual}, which does not match cert_sha256 {pin}"
+            ))),
         }
     }
 
@@ -193,5 +210,6 @@ mod tests {
     fn both_configs_build() {
         assert!(client_config(Some(CertPin::of(b"x"))).is_ok());
         assert!(client_config(None).is_ok());
+        assert!(capture_config().is_ok());
     }
 }

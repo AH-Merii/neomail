@@ -6,6 +6,7 @@ mod wire_tests;
 
 use std::future::Future;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_imap::types::{Fetch, Flag};
@@ -14,6 +15,7 @@ use futures_util::TryStreamExt;
 use nm_core::{
     FetchedMessage, Flags, ListedMessage, MailSource, MailboxStatus, Uid, UidFlags, UidValidity,
 };
+use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -138,6 +140,8 @@ pub enum ImapError {
         #[source]
         source: async_imap::error::Error,
     },
+    #[error("the server presented no certificate")]
+    NoCertificate,
     #[error("the server did not report a valid UIDVALIDITY for INBOX")]
     NoUidValidity,
     #[error("timed out during {0}")]
@@ -168,44 +172,87 @@ impl ImapSource {
     /// Connects, secures the connection, and logs in with `login`.
     pub async fn connect(config: &ImapConfig, login: Login<'_>) -> Result<Self, ImapError> {
         let tls = tls::client_config(config.cert_pin).map_err(ImapError::TlsConfig)?;
-        let connector = TlsConnector::from(tls);
-        let server_name = ServerName::try_from(config.host.clone())
-            .map_err(|_| ImapError::ServerName(config.host.clone()))?;
-        let addr = format!("{}:{}", config.host, config.port);
-        let tcp = step("connect", TcpStream::connect(&addr))
-            .await?
-            .map_err(|source| ImapError::Connect { addr, source })?;
-
-        let handshake = |tcp| async {
-            step(
-                "the TLS handshake",
-                connector.connect(server_name.clone(), tcp),
-            )
-            .await?
-            .map_err(|source| ImapError::Handshake {
-                host: config.host.clone(),
-                source,
-            })
-        };
-        let client = match config.security {
-            Security::Tls => {
-                let mut client = Client::new(handshake(tcp).await?);
-                greeting(&mut client).await?;
-                client
-            }
-            Security::StartTls => {
-                let mut plain = Client::new(tcp);
-                greeting(&mut plain).await?;
-                step("STARTTLS", plain.run_command_and_check_ok("STARTTLS", None))
-                    .await?
-                    .map_err(ImapError::StartTls)?;
-                Client::new(handshake(plain.into_inner()).await?)
-            }
-        };
-
+        let client = open(config, tls).await?;
         let session = log_in(client, &config.username, login).await?;
         Ok(Self { session, exists: 0 })
     }
+}
+
+/// Logs in, opens INBOX read-only with `EXAMINE` and logs out: the check `neomail account add`
+/// runs before it writes the config. Returns the number of messages in INBOX.
+pub async fn check_login(config: &ImapConfig, login: Login<'_>) -> Result<u32, ImapError> {
+    let tls = tls::client_config(config.cert_pin).map_err(ImapError::TlsConfig)?;
+    let client = open(config, tls).await?;
+    check_on(client, &config.username, login).await
+}
+
+/// [`check_login`] on a greeted connection. Shared with the wire tests.
+async fn check_on<T: Transport>(
+    client: Client<T>,
+    user: &str,
+    login: Login<'_>,
+) -> Result<u32, ImapError> {
+    let session = log_in(client, user, login).await?;
+    let mut source = ImapSource { session, exists: 0 };
+    let status = source.examine_inbox().await;
+    source.logout().await;
+    Ok(status?.exists)
+}
+
+/// The SHA-256 of the certificate the server at `config` presents, for the user to compare and
+/// pin (Proton Mail Bridge uses a self-signed one). The certificate is not trusted for anything:
+/// the connection is closed after the handshake (and the greeting), without logging in.
+/// `config.cert_pin` is ignored.
+pub async fn server_certificate(config: &ImapConfig) -> Result<CertPin, ImapError> {
+    let tls = tls::capture_config().map_err(ImapError::TlsConfig)?;
+    let client = open(config, tls).await?;
+    let stream = client.into_inner();
+    stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|cert| CertPin::of(cert.as_ref()))
+        .ok_or(ImapError::NoCertificate)
+}
+
+/// Connects to `config`'s server, secures the connection with `tls` (TLS from the first byte or
+/// STARTTLS) and reads the greeting.
+async fn open(config: &ImapConfig, tls: Arc<ClientConfig>) -> Result<Client<Stream>, ImapError> {
+    let connector = TlsConnector::from(tls);
+    let server_name = ServerName::try_from(config.host.clone())
+        .map_err(|_| ImapError::ServerName(config.host.clone()))?;
+    let addr = format!("{}:{}", config.host, config.port);
+    let tcp = step("connect", TcpStream::connect(&addr))
+        .await?
+        .map_err(|source| ImapError::Connect { addr, source })?;
+
+    let handshake = |tcp| async {
+        step(
+            "the TLS handshake",
+            connector.connect(server_name.clone(), tcp),
+        )
+        .await?
+        .map_err(|source| ImapError::Handshake {
+            host: config.host.clone(),
+            source,
+        })
+    };
+    Ok(match config.security {
+        Security::Tls => {
+            let mut client = Client::new(handshake(tcp).await?);
+            greeting(&mut client).await?;
+            client
+        }
+        Security::StartTls => {
+            let mut plain = Client::new(tcp);
+            greeting(&mut plain).await?;
+            step("STARTTLS", plain.run_command_and_check_ok("STARTTLS", None))
+                .await?
+                .map_err(ImapError::StartTls)?;
+            Client::new(handshake(plain.into_inner()).await?)
+        }
+    })
 }
 
 impl<T: Transport> ImapSource<T> {

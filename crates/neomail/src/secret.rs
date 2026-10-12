@@ -72,19 +72,64 @@ pub fn oauth_secrets(account: &str, keyring: &mut Option<Keyring>) -> Result<(Se
     Ok((entry.client_secret(), refresh_token))
 }
 
+/// Whether neomail may ask for something: standard input is a terminal, and neither
+/// `--no-input` nor `NEOMAIL_NO_INPUT` forbids prompts.
+#[derive(Debug, Clone, Copy)]
+pub struct Input {
+    pub terminal: bool,
+    pub no_input: bool,
+}
+
+impl Input {
+    pub fn detect(no_input: bool) -> Self {
+        Self {
+            terminal: io::stdin().is_terminal(),
+            no_input,
+        }
+    }
+
+    pub fn can_prompt(self) -> bool {
+        self.terminal && !self.no_input
+    }
+
+    /// Why nothing can be asked, for the usage error that names the missing flags.
+    pub fn why_not(self) -> &'static str {
+        if self.no_input {
+            "--no-input (or NEOMAIL_NO_INPUT) forbids prompts"
+        } else {
+            "standard input is not a terminal, so nothing can be asked"
+        }
+    }
+}
+
+/// A usage error for values that are missing and cannot be asked for: `flags` lists what to pass.
+pub fn cannot_ask(input: Input, flags: &str) -> anyhow::Error {
+    anyhow::Error::new(crate::UsageError(format!(
+        "{}: pass {flags}",
+        input.why_not()
+    )))
+}
+
 /// A new password for `account`: prompted for without echo on a terminal, otherwise one line of
 /// standard input, so `pass show mail/work | neomail account set-password work` works.
-pub fn read_new_password(account: &str) -> Result<Password> {
-    let password = read_secret(&format!("Password for {account}: "), "password")?;
+pub fn read_new_password(account: &str, input: Input) -> Result<Password> {
+    let password = read_secret(&format!("Password for {account}: "), "password", input)?;
     Ok(Password(password))
 }
 
 /// A secret, prompted for with `prompt` and without echo on a terminal, otherwise one line of
-/// standard input. `what` names it in errors ("password", "client secret").
-pub fn read_secret(prompt: &str, what: &str) -> Result<String> {
+/// standard input. `what` names it in errors ("password", "client secret"). With `--no-input`
+/// on a terminal it is a usage error: pipe the secret instead.
+pub fn read_secret(prompt: &str, what: &str, input: Input) -> Result<String> {
     let stdin = io::stdin();
-    if !stdin.is_terminal() {
+    if !input.terminal {
         return read_secret_line(stdin.lock(), what);
+    }
+    if input.no_input {
+        return Err(anyhow::Error::new(crate::UsageError(format!(
+            "{}: pipe the {what} on standard input instead",
+            input.why_not()
+        ))));
     }
     let secret =
         rpassword::prompt_password(prompt).with_context(|| format!("cannot read the {what}"))?;
@@ -132,7 +177,7 @@ fn trim_newline(mut s: String) -> String {
 
 /// Runs `command` through `sh -c` and returns its standard output with one trailing newline
 /// removed. Standard input and standard error stay attached, so a command can prompt (gpg, pass).
-fn run_password_command(command: &str) -> Result<Password> {
+pub fn run_password_command(command: &str) -> Result<Password> {
     let output = match Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -192,5 +237,21 @@ mod tests {
         }
         let secret = read_secret_line("hunter2 \r\nnext\n".as_bytes(), "password").unwrap();
         assert_eq!(secret, "hunter2 ");
+    }
+
+    #[test]
+    fn no_input_on_a_terminal_refuses_the_prompt_as_a_usage_error() {
+        let input = Input {
+            terminal: true,
+            no_input: true,
+        };
+        assert!(!input.can_prompt());
+        let e = read_secret("Password: ", "password", input).unwrap_err();
+        assert!(e.is::<crate::UsageError>(), "{e:#}");
+        assert_eq!(
+            format!("{e:#}"),
+            "--no-input (or NEOMAIL_NO_INPUT) forbids prompts: pipe the password on standard \
+             input instead"
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! What `list` and `show` print, for people and for scripts. The JSON shapes are documented in
+//! What `list`, `show` and `account list` print, for people and for scripts. The JSON shapes are documented in
 //! docs/json.md; change them only by adding fields.
 
 use std::io::{self, Write};
@@ -7,9 +7,12 @@ use chrono::{DateTime, Local, Utc};
 use nm_core::cache::{ListEntry, StoredMessage};
 use nm_core::parse::{Attachment, BodyKind, EmailAddress, ParsedMessage};
 use nm_core::{Flags, MessageId, Uid};
+use nm_imap::Security;
 use serde::Serialize;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+use crate::config::{Account, Login, PasswordSource};
 
 /// The human list fits this many columns.
 pub const WIDTH: usize = 80;
@@ -112,6 +115,94 @@ pub fn write_list(out: &mut impl Write, entries: &[ListEntry]) -> io::Result<()>
         writeln!(out, "{}", line.trim_end())?;
     }
     Ok(())
+}
+
+/// One line per configured account: name, login kind, username, host, port, security and
+/// whether the certificate is pinned, in aligned columns. Reads nothing but the config.
+pub fn write_accounts(out: &mut impl Write, accounts: &[Account]) -> io::Result<()> {
+    let rows: Vec<[String; 7]> = accounts
+        .iter()
+        .map(|a| {
+            let login = match &a.login {
+                Login::Password(PasswordSource::Keyring) => "password",
+                Login::Password(PasswordSource::Command(_)) => "password_command",
+                Login::OAuth(_) => "oauth",
+            };
+            let security = match a.imap.security {
+                Security::Tls => "tls",
+                Security::StartTls => "starttls",
+            };
+            let pinned = if a.imap.cert_pin.is_some() {
+                "pinned"
+            } else {
+                "-"
+            };
+            [
+                one_line(&a.name),
+                login.to_owned(),
+                one_line(&a.imap.username),
+                one_line(&a.imap.host),
+                a.imap.port.to_string(),
+                security.to_owned(),
+                pinned.to_owned(),
+            ]
+        })
+        .collect();
+    let mut widths = [0; 7];
+    for row in &rows {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.width());
+        }
+    }
+    for row in &rows {
+        let line: Vec<String> = row
+            .iter()
+            .zip(widths)
+            .map(|(cell, w)| fit(cell, w, true))
+            .collect();
+        writeln!(out, "{}", line.join("  ").trim_end())?;
+    }
+    Ok(())
+}
+
+/// The per-account counter `neomail sync` shows on standard error ("work: fetching 50/120"),
+/// updated in place and cleared at the end. Disabled (off a terminal) it writes nothing.
+pub struct ProgressLine {
+    enabled: bool,
+    shown: bool,
+}
+
+impl ProgressLine {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            shown: false,
+        }
+    }
+
+    /// Best effort: a failed write to standard error does not stop the sync.
+    pub fn update(&mut self, out: &mut impl Write, account: &str, p: nm_core::Progress) {
+        if !self.enabled {
+            return;
+        }
+        let _ = write!(
+            out,
+            "\r\x1b[2K{}: fetching {}/{}",
+            one_line(account),
+            p.done,
+            p.total
+        );
+        let _ = out.flush();
+        self.shown = true;
+    }
+
+    pub fn clear(&mut self, out: &mut impl Write) {
+        if self.shown {
+            let _ = write!(out, "\r\x1b[2K");
+            let _ = out.flush();
+            self.shown = false;
+        }
+    }
 }
 
 pub fn write_show(out: &mut impl Write, item: &ShowItem<'_>) -> io::Result<()> {
@@ -240,5 +331,27 @@ mod tests {
     fn escapes_are_neutralised() {
         assert_eq!(one_line("a\x1b[31mb\nc\u{202E}d"), "a [31mb c d");
         assert_eq!(text("a\r\n\x1b]0;x\x07b\tc"), "a\n\u{FFFD}]0;x\u{FFFD}b\tc");
+    }
+
+    #[test]
+    fn progress_off_a_terminal_writes_nothing_and_on_one_clears_itself() {
+        let p = nm_core::Progress {
+            done: 50,
+            total: 120,
+        };
+        let mut off = ProgressLine::new(false);
+        let mut out = Vec::new();
+        off.update(&mut out, "work", p);
+        off.clear(&mut out);
+        assert!(out.is_empty());
+
+        let mut on = ProgressLine::new(true);
+        on.update(&mut out, "pro\x1b[31mton", p);
+        on.clear(&mut out);
+        on.clear(&mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\r\x1b[2Kpro [31mton: fetching 50/120\r\x1b[2K"
+        );
     }
 }

@@ -9,7 +9,7 @@ pub mod types;
 
 pub use cache::{Cache, CacheError};
 pub use source::MailSource;
-pub use sync::{SyncError, SyncReport, sync_inbox};
+pub use sync::{Progress, SyncError, SyncReport, sync_inbox, sync_inbox_with_progress};
 pub use types::{
     FetchedMessage, Flags, ListedMessage, MailboxStatus, MessageId, Uid, UidFlags, UidValidity,
 };

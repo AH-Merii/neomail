@@ -3,7 +3,7 @@
 //! Keyring calls stay outside the async runtime (zbus starts one of its own); only the sign-in,
 //! the token refresh and the revocation run inside it.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -12,6 +12,7 @@ use crate::config::{self, Account, Login, OAuthSettings};
 use crate::keyring::{self, Keyring, OAuthEntry};
 use crate::oauth::http::Https;
 use crate::oauth::{self, Provider, Secret, SignedIn};
+use crate::secret::Input;
 use crate::{browser, secret};
 
 const GUIDE: &str = "https://github.com/AH-Merii/neomail/blob/main/docs/gmail.md";
@@ -57,9 +58,10 @@ pub fn add(
     provider: &'static Provider,
     config_path: &Path,
     args: AddArgs,
+    input: Input,
     out: &mut impl Write,
 ) -> Result<()> {
-    let interactive = io::stdin().is_terminal();
+    let interactive = input.can_prompt();
     if !interactive {
         let missing: Vec<&str> = [
             ("--email", args.email.is_none()),
@@ -69,11 +71,13 @@ pub fn add(
         .filter_map(|(flag, missing)| missing.then_some(flag))
         .collect();
         if !missing.is_empty() {
-            bail!(
-                "standard input is not a terminal, so nothing can be asked: pass {} (the client \
-                 secret is then read as one line of standard input)",
-                missing.join(" and ")
-            );
+            return Err(secret::cannot_ask(
+                input,
+                &format!(
+                    "{} (the client secret is then read as one line of standard input)",
+                    missing.join(" and ")
+                ),
+            ));
         }
     } else {
         eprintln!("{}", GMAIL_STEPS.replace("GUIDE", GUIDE));
@@ -109,8 +113,11 @@ pub fn add(
     if client_id.is_empty() {
         bail!("the client ID is empty");
     }
-    let client_secret =
-        secret::read_secret("Client secret (from step 5, not shown): ", "client secret")?;
+    let client_secret = secret::read_secret(
+        "Client secret (from step 5, not shown): ",
+        "client secret",
+        input,
+    )?;
     // Before the browser: no point signing in when the sign-in cannot be kept. Opening the
     // store does not reach it yet; reading an entry does. The append is tried with the address
     // given, which the sign-in must match.
@@ -180,7 +187,12 @@ fn revoke_leftover(
 }
 
 /// `neomail account login NAME`: signs in again and replaces the refresh token.
-pub fn login(account: &Account, no_browser: bool, out: &mut impl Write) -> Result<()> {
+pub fn login(
+    account: &Account,
+    no_browser: bool,
+    input: Input,
+    out: &mut impl Write,
+) -> Result<()> {
     let settings = oauth_settings(account, "set-password")?;
     let keyring = Keyring::open_for_oauth()?;
     let client_secret = match keyring.get_oauth(&account.name)? {
@@ -188,6 +200,7 @@ pub fn login(account: &Account, no_browser: bool, out: &mut impl Write) -> Resul
         None => Secret::new(secret::read_secret(
             &format!("Client secret for {}: ", settings.client_id),
             "client secret",
+            input,
         )?),
     };
     let client = oauth::Client {
