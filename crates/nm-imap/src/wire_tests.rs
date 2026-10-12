@@ -9,7 +9,10 @@ use async_imap::Client;
 use nm_core::{Cache, sync_inbox};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
-use super::{ImapError, ImapSource, Login, greeting, log_in, xoauth2_response};
+use super::{
+    ImapConfig, ImapError, ImapSource, Login, Security, check_on, greeting, log_in,
+    server_certificate, xoauth2_response,
+};
 
 /// The FETCH response for one whole, unread message.
 fn message(uid: u32) -> String {
@@ -22,6 +25,11 @@ fn message(uid: u32) -> String {
 
 /// Answers each command like a small server would, and returns every command line it got.
 async fn scripted_server(stream: DuplexStream) -> Vec<String> {
+    scripted_server_refusing(stream, false).await
+}
+
+/// [`scripted_server`], answering LOGIN with `NO` when `refuse_login` is set.
+async fn scripted_server_refusing(stream: DuplexStream, refuse_login: bool) -> Vec<String> {
     let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
     let mut seen = Vec::new();
@@ -51,6 +59,11 @@ async fn scripted_server(stream: DuplexStream) -> Vec<String> {
             None
         };
         seen.push(command.to_owned());
+        if refuse_login && upper.starts_with("LOGIN") {
+            let reply = format!("{tag} NO [AUTHENTICATIONFAILED] Invalid credentials\r\n");
+            write.write_all(reply.as_bytes()).await.unwrap();
+            continue;
+        }
         let done = upper.starts_with("LOGOUT");
         let reply = match reply {
             Some(untagged) => format!("{untagged}{tag} OK done\r\n"),
@@ -189,4 +202,60 @@ async fn xoauth2_failure_answers_the_json_challenge_with_an_empty_line() {
     assert_eq!(responses[1], "", "the empty SASL response");
     let message = format!("{e} {e:?}");
     assert!(!message.contains("ya29.expired"), "{message}");
+}
+
+async fn login_check(refuse: bool) -> (Result<u32, ImapError>, Vec<String>) {
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(scripted_server_refusing(server_end, refuse));
+    let mut client = Client::new(client_end);
+    greeting(&mut client).await.unwrap();
+    let result = check_on(client, "user", Login::Password("password")).await;
+    (result, server.await.unwrap())
+}
+
+#[tokio::test]
+async fn login_check_examines_inbox_and_logs_out() {
+    let (result, commands) = login_check(false).await;
+    assert_eq!(result.unwrap(), 2);
+    let verbs: Vec<String> = commands
+        .iter()
+        .map(|c| {
+            c.split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase()
+        })
+        .collect();
+    assert_eq!(verbs, ["LOGIN", "EXAMINE", "LOGOUT"], "{commands:?}");
+    assert!(commands[1].contains("INBOX"), "{commands:?}");
+}
+
+#[tokio::test]
+async fn login_check_reports_a_refused_login_without_the_password() {
+    let (result, commands) = login_check(true).await;
+    let e = result.unwrap_err();
+    assert!(matches!(e, ImapError::Login { .. }), "{e:?}");
+    assert_eq!(e.to_string(), "login as user failed");
+    assert!(!format!("{e:?}").contains("\"password\""), "{e:?}");
+    assert_eq!(
+        commands.len(),
+        1,
+        "nothing after the refused login: {commands:?}"
+    );
+}
+
+#[tokio::test]
+async fn reading_the_certificate_of_a_closed_port_fails_to_connect() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let config = ImapConfig {
+        host: "127.0.0.1".to_owned(),
+        port,
+        security: Security::StartTls,
+        username: "user".to_owned(),
+        cert_pin: None,
+    };
+    let e = server_certificate(&config).await.unwrap_err();
+    assert!(matches!(e, ImapError::Connect { .. }), "{e:?}");
 }

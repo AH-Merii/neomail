@@ -75,8 +75,8 @@ One object.
 | Code | Meaning |
 | ---- | ------- |
 | 0 | Success. `list` with nothing cached also succeeds, printing `[]` with `--json`. |
-| 1 | Failure: no config, a bad config, an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. |
-| 2 | Bad usage: an unknown option or an invalid value. |
+| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. |
+| 2 | Bad usage: an unknown option or an invalid value; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help. |
 
 Errors go to standard error. A failure (exit 1) prints one line starting with `neomail:`. A usage
 error (exit 2) comes from the argument parser: it starts with `error:` and may be followed by a

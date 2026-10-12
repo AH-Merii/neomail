@@ -67,6 +67,7 @@ fn neomail(data: &Path, args: &[&str]) -> Output {
         .env("HOME", data)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("NEOMAIL_NO_INPUT")
         .output()
         .unwrap()
 }
@@ -294,22 +295,66 @@ fn failures_are_clear_and_non_zero() {
     assert!(stderr(&o).contains("no config file"), "{}", stderr(&o));
 }
 
+const ADD_HINT: &str = "no accounts yet; add one with `neomail account add`";
+
 #[test]
-fn empty_data_dir_lists_nothing() {
+fn without_a_config_list_show_and_sync_name_the_next_command() {
     let dir = tempfile::tempdir().unwrap();
     let o = neomail(dir.path(), &["list"]);
     assert!(o.status.success());
     assert!(stdout(&o).is_empty());
-    assert!(stderr(&o).contains("neomail sync"));
+    assert_eq!(stderr(&o), format!("neomail: {ADD_HINT}\n"));
     assert_eq!(
         json(&neomail(dir.path(), &["list", "--json"])),
         serde_json::json!([])
     );
-    assert_eq!(neomail(dir.path(), &["show", "1"]).status.code(), Some(1));
+    for args in [&["show", "1"][..], &["list", "--account", "work"]] {
+        let o = neomail(dir.path(), args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}");
+        assert_eq!(stderr(&o), format!("neomail: {ADD_HINT}\n"), "{args:?}");
+    }
+    let o = neomail(dir.path(), &["sync"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = stderr(&o);
+    assert!(err.contains("no config file at "), "{err}");
+    assert!(err.contains(ADD_HINT), "{err}");
+    assert!(
+        err.contains("https://github.com/AH-Merii/neomail#try-it"),
+        "{err}"
+    );
     assert!(
         !dir.path().join("cache.sqlite3").exists(),
         "list must not create the cache"
     );
+
+    // With a config but nothing cached, the next command is sync.
+    std::fs::write(dir.path().join("config.toml"), KEYRING_CONFIG).unwrap();
+    let o = neomail(dir.path(), &["list"]);
+    assert!(o.status.success());
+    assert!(stderr(&o).contains("run `neomail sync`"), "{}", stderr(&o));
+    let o = neomail(dir.path(), &["show", "1"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("run `neomail sync`"), "{}", stderr(&o));
+}
+
+#[test]
+fn bare_neomail_prints_the_start_without_a_config_and_help_with_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = neomail_stdin(dir.path(), &[], "");
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(
+        stderr(&o),
+        "neomail: no accounts yet. Start with:\n  neomail account add\n  \
+         neomail sync && neomail list\nGuide: https://github.com/AH-Merii/neomail#try-it\n"
+    );
+    std::fs::write(dir.path().join("config.toml"), KEYRING_CONFIG).unwrap();
+    let o = neomail_stdin(dir.path(), &[], "");
+    assert_eq!(o.status.code(), Some(2));
+    let err = stderr(&o);
+    assert!(err.contains("Usage: neomail"), "{err}");
+    assert!(err.contains("Examples:"), "{err}");
+    assert!(!err.contains("docs/"), "help links are absolute: {err}");
 }
 
 #[test]
@@ -326,6 +371,9 @@ fn password_command_output_never_appears_in_errors() {
     let all = format!("{}{}", stdout(&o), stderr(&o));
     assert!(all.contains("password_command failed"), "{all}");
     assert!(!all.contains("hunter2"), "{all}");
+    // Off a terminal, sync shows no progress line: stderr holds only the error.
+    assert_eq!(stderr(&o).lines().count(), 1, "{all}");
+    assert!(!all.contains('\r') && !all.contains("fetching"), "{all:?}");
 }
 
 const KEYRING_CONFIG: &str = "[[accounts]]\nname = \"work\"\nusername = \"user@mail.example\"\n\
@@ -343,6 +391,7 @@ fn neomail_stdin(data: &Path, args: &[&str], input: &str) -> Output {
         .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("NEOMAIL_NO_INPUT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -413,7 +462,7 @@ const GMAIL_CONFIG: &str = "[[accounts]]\nname = \"gmail\"\nusername = \"you@exa
 fn add_off_a_terminal_names_the_missing_flags() {
     let dir = tempfile::tempdir().unwrap();
     let o = neomail_stdin(dir.path(), &["account", "add", "gmail", "--no-browser"], "");
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     let err = stderr(&o);
     assert!(err.contains("not a terminal"), "{err}");
     assert!(err.contains("pass --email and --client-id"), "{err}");
@@ -429,7 +478,7 @@ fn add_off_a_terminal_names_the_missing_flags() {
         ],
         "",
     );
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     assert!(stderr(&o).contains("pass --client-id ("), "{}", stderr(&o));
     assert!(!dir.path().join("config.toml").exists());
 }
@@ -505,4 +554,200 @@ fn oauth_commands_without_a_keyring_fail_before_signing_in() {
         std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
         GMAIL_CONFIG
     );
+}
+
+#[test]
+fn add_without_a_provider_off_a_terminal_lists_the_providers() {
+    let dir = tempfile::tempdir().unwrap();
+    for (args, why) in [
+        (&["account", "add"][..], "standard input is not a terminal"),
+        (&["account", "add", "--no-input"], "--no-input"),
+    ] {
+        let o = neomail_stdin(dir.path(), args, "");
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        let err = stderr(&o);
+        assert!(err.starts_with(&format!("neomail: {why}")), "{err}");
+        assert!(
+            err.contains("one of gmail, gmail-app-password, proton, imap"),
+            "{err}"
+        );
+        assert!(!err.contains("Which kind of account?"), "no menu: {err}");
+    }
+    assert!(!dir.path().join("config.toml").exists());
+}
+
+const PIN: &str = "AB:CD:AB:CD:AB:CD:AB:CD:AB:CD:AB:CD:AB:CD:AB:CD:\
+                   AB:CD:AB:CD:AB:CD:AB:CD:AB:CD:AB:CD:AB:CD:AB:CD";
+
+#[test]
+fn no_input_and_missing_values_are_usage_errors_that_write_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let proton = ["account", "add", "proton", "--username", "you@example.com"];
+    let o = neomail_stdin(dir.path(), &proton, &format!("{FAKE_PASSWORD}\n"));
+    assert_eq!(o.status.code(), Some(2));
+    let err = stderr(&o);
+    assert!(err.contains("pass --cert-sha256"), "{err}");
+    assert!(!err.contains(FAKE_PASSWORD), "{err}");
+
+    let imap = ["account", "add", "imap", "--no-input", "--name", "work"];
+    let o = neomail_stdin(dir.path(), &imap, "");
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(
+        stderr(&o),
+        "neomail: --no-input (or NEOMAIL_NO_INPUT) forbids prompts: pass --username and --host\n"
+    );
+    // NEOMAIL_NO_INPUT=1 is the same as --no-input.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_neomail"))
+        .args(["account", "add", "imap", "--name", "work"])
+        .env("NEOMAIL_NO_INPUT", "1")
+        .env("NEOMAIL_CONFIG", dir.path().join("config.toml"))
+        .env("HOME", dir.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdin.take());
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stderr(&o).contains("forbids prompts"), "{}", stderr(&o));
+
+    let o = neomail_stdin(dir.path(), &["account", "add", "proton", "--host", "h"], "");
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        stderr(&o).contains("--host does not apply to `neomail account add proton`"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!dir.path().join("config.toml").exists());
+}
+
+#[test]
+fn add_proton_without_a_check_then_list_and_check_the_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = neomail_stdin(
+        dir.path(),
+        &[
+            "account",
+            "add",
+            "proton",
+            "--username",
+            "you@example.com",
+            "--cert-sha256",
+            PIN,
+            "--password-command",
+            "pass show bridge",
+            "--no-check",
+        ],
+        "",
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("Next: neomail sync --account proton"),
+        "{}",
+        stdout(&o)
+    );
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "{}\n{KEYRING_CONFIG}\n{GMAIL_CONFIG}",
+            std::fs::read_to_string(dir.path().join("config.toml")).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let o = neomail_stdin(dir.path(), &["account", "list"], "");
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = stdout(&o);
+    let rows: Vec<Vec<&str>> = out
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            vec![
+                "proton",
+                "password_command",
+                "you@example.com",
+                "127.0.0.1",
+                "1143",
+                "starttls",
+                "pinned"
+            ],
+            vec![
+                "work",
+                "password",
+                "user@mail.example",
+                "imap.mail.example",
+                "993",
+                "tls",
+                "-"
+            ],
+            vec![
+                "gmail",
+                "oauth",
+                "you@example.com",
+                "imap.gmail.com",
+                "993",
+                "tls",
+                "-"
+            ],
+        ]
+    );
+    // Aligned: every column starts at the same place on each line.
+    let starts = |line: &str| line.find("you@").or_else(|| line.find("user@"));
+    let first = starts(out.lines().next().unwrap());
+    assert!(out.lines().all(|l| starts(l) == first), "{out}");
+
+    let o = neomail_stdin(dir.path(), &["config", "check"], "");
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "ok: 3 accounts\n");
+}
+
+#[test]
+fn config_path_and_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let o = neomail(dir.path(), &["config", "path"]);
+    assert!(o.status.success());
+    assert_eq!(stdout(&o), format!("{}\n", path.display()));
+    let other = dir.path().join("other.toml");
+    let o = neomail(
+        dir.path(),
+        &["config", "path", "--config", other.to_str().unwrap()],
+    );
+    assert_eq!(stdout(&o), format!("{}\n", other.display()));
+
+    let o = neomail(dir.path(), &["config", "check"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("no config file at"), "{}", stderr(&o));
+    let o = neomail(dir.path(), &["account", "list"]);
+    assert!(o.status.success());
+    assert!(stdout(&o).is_empty());
+    assert_eq!(
+        stderr(&o),
+        "neomail: no accounts yet; add one with `neomail account add`\n"
+    );
+
+    // A secret pasted without quotes on line 3.
+    std::fs::write(
+        &path,
+        "[[accounts]]\nname = \"work\"\npassword = s3cret-fake-value\n",
+    )
+    .unwrap();
+    let o = neomail(dir.path(), &["config", "check"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    let err = stderr(&o);
+    assert!(
+        err.starts_with(&format!("{}:3:12: ", path.display())),
+        "{err}"
+    );
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(!err.contains("s3cret"), "{err}");
+
+    std::fs::write(&path, KEYRING_CONFIG).unwrap();
+    let o = neomail(dir.path(), &["config", "check"]);
+    assert_eq!(stdout(&o), "ok: 1 account\n");
 }

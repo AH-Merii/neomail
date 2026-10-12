@@ -32,6 +32,14 @@ pub struct SyncReport {
     pub reset: bool,
 }
 
+/// How far a sync has got with fetching new messages, for a progress display: `done` of `total`
+/// messages asked for so far.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub done: usize,
+    pub total: usize,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError<E: std::error::Error + 'static> {
     #[error("the mail server request failed")]
@@ -58,6 +66,18 @@ pub async fn sync_inbox<S: MailSource>(
     cache: &mut Cache,
     account: &str,
     limit: NonZeroU32,
+) -> Result<SyncReport, SyncError<S::Error>> {
+    sync_inbox_with_progress(source, cache, account, limit, |_| {}).await
+}
+
+/// [`sync_inbox`], calling `progress` once the new messages are known (`done` 0) and after each
+/// batch is stored. It is not called when there is nothing new to fetch.
+pub async fn sync_inbox_with_progress<S: MailSource>(
+    source: &mut S,
+    cache: &mut Cache,
+    account: &str,
+    limit: NonZeroU32,
+    mut progress: impl FnMut(Progress),
 ) -> Result<SyncReport, SyncError<S::Error>> {
     let status = source.examine_inbox().await.map_err(SyncError::Source)?;
     let mut report = SyncReport::default();
@@ -143,6 +163,13 @@ pub async fn sync_inbox<S: MailSource>(
     // The lowest UID that was asked for but came back without a body. The watermark never passes
     // it, so the next sync asks for it again.
     let mut lowest_missing: Option<Uid> = None;
+    let mut done = Progress {
+        done: 0,
+        total: new.len(),
+    };
+    if !new.is_empty() {
+        progress(done);
+    }
     for batch in new.chunks(FETCH_BATCH) {
         let mut fetched = source.fetch(batch).await.map_err(SyncError::Source)?;
         fetched.retain(|m| batch.binary_search(&m.uid).is_ok());
@@ -166,6 +193,8 @@ pub async fn sync_inbox<S: MailSource>(
         };
         cache.store_messages(mailbox.id, &fetched, raise_to)?;
         report.new += fetched.len();
+        done.done += batch.len();
+        progress(done);
     }
     if let Some(watermark) = watermark.filter(|_| lowest_missing.is_none()) {
         cache.raise_highest_uid(mailbox.id, watermark)?;

@@ -33,6 +33,37 @@ pub fn data_dir() -> Result<PathBuf> {
     }
 }
 
+/// The README's "Try it", for messages: the release tarball ships no docs/.
+pub const GUIDE_URL: &str = "https://github.com/AH-Merii/neomail#try-it";
+
+/// What every "no config yet" message says next.
+pub const ADD_HINT: &str = "add one with `neomail account add`";
+
+/// Whether the config file exists, without reading or parsing it.
+pub fn exists(path: &Path) -> bool {
+    path.exists()
+}
+
+/// A TOML error with its place, never quoting the file.
+#[derive(Debug)]
+pub struct SyntaxError {
+    pub line: usize,
+    pub column: usize,
+    pub message: String,
+}
+
+impl std::fmt::Display for SyntaxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "line {}, column {}: {}",
+            self.line, self.column, self.message
+        )
+    }
+}
+
+impl std::error::Error for SyntaxError {}
+
 /// A TOML error as its message and position only. toml's own `Display` quotes the offending
 /// line, and serde's type, value and variant errors quote the value; either could echo a
 /// secret pasted into the config.
@@ -43,7 +74,11 @@ fn syntax_error(text: &str, e: &toml::de::Error) -> anyhow::Error {
             let before = text.get(..span.start).unwrap_or(text);
             let line = before.matches('\n').count() + 1;
             let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
-            anyhow::anyhow!("line {line}, column {column}: {message}")
+            anyhow::Error::new(SyntaxError {
+                line,
+                column,
+                message,
+            })
         }
         None => anyhow::anyhow!("{message}"),
     }
@@ -172,7 +207,8 @@ impl Config {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
-                "no config file at {}; create one (see \"Try it\" in the README) or pass --config",
+                "no config file at {}: no accounts yet; {ADD_HINT} (guide: {GUIDE_URL}), or pass \
+                 --config",
                 path.display()
             ),
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
@@ -324,6 +360,38 @@ pub fn oauth_account_toml(
         quote(provider.id),
         quote(client_id)
     )
+}
+
+/// The TOML for a new password account, ready to append to the config file. Without
+/// `password_command` the password is in the OS keyring.
+pub fn password_account_toml(
+    name: &str,
+    imap: &ImapConfig,
+    password_command: Option<&str>,
+) -> String {
+    let quote = |s: &str| toml::Value::String(s.to_owned()).to_string();
+    let mut block = format!(
+        "[[accounts]]\nname = {}\nusername = {}\n",
+        quote(name),
+        quote(&imap.username)
+    );
+    if let Some(command) = password_command {
+        block.push_str(&format!("password_command = {}\n", quote(command)));
+    }
+    let security = match imap.security {
+        Security::Tls => "tls",
+        Security::StartTls => "starttls",
+    };
+    block.push_str(&format!(
+        "[accounts.imap]\nhost = {}\nport = {}\nsecurity = {}\n",
+        quote(&imap.host),
+        imap.port,
+        quote(security)
+    ));
+    if let Some(pin) = imap.cert_pin {
+        block.push_str(&format!("cert_sha256 = {}\n", quote(&pin.to_string())));
+    }
+    block
 }
 
 /// The config file's text, or `None` when there is no file yet.
@@ -731,5 +799,54 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
         assert!(check_append(&path, "gmail", &block).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), inline);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn password_account_toml_round_trips_through_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let pin: CertPin = "ab".repeat(32).parse().unwrap();
+        let imap = ImapConfig {
+            host: "127.0.0.1".into(),
+            port: 1143,
+            security: Security::StartTls,
+            username: "you@example.com".into(),
+            cert_pin: Some(pin),
+        };
+        let block = password_account_toml("proton", &imap, Some("pass show \"bridge\""));
+        assert_eq!(
+            block,
+            format!(
+                "[[accounts]]\nname = \"proton\"\nusername = \"you@example.com\"\n\
+                 password_command = 'pass show \"bridge\"'\n[accounts.imap]\nhost = \"127.0.0.1\"\n\
+                 port = 1143\nsecurity = \"starttls\"\ncert_sha256 = \"{}\"\n",
+                "ab".repeat(32)
+            )
+        );
+        append_account(&path, "proton", &block).unwrap();
+        let plain = ImapConfig {
+            host: "imap.mail.example".into(),
+            port: 993,
+            security: Security::Tls,
+            username: "user@mail.example".into(),
+            cert_pin: None,
+        };
+        append_account(&path, "work", &password_account_toml("work", &plain, None)).unwrap();
+        let c = Config::load(&path).unwrap();
+        let proton = c.find("proton").unwrap();
+        assert_eq!(
+            (proton.imap.port, proton.imap.security, proton.imap.cert_pin),
+            (1143, Security::StartTls, Some(pin))
+        );
+        assert_eq!(
+            proton.login,
+            Login::Password(PasswordSource::Command("pass show \"bridge\"".into()))
+        );
+        let work = c.find("work").unwrap();
+        assert_eq!(
+            (work.imap.host.as_str(), work.imap.port, work.imap.cert_pin),
+            ("imap.mail.example", 993, None)
+        );
+        assert_eq!(work.login, Login::Password(PasswordSource::Keyring));
     }
 }

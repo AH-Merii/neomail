@@ -7,8 +7,8 @@ use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
 use nm_core::{
-    Cache, FetchedMessage, Flags, ListedMessage, MailSource, MailboxStatus, SyncReport, Uid,
-    UidFlags, UidValidity, sync_inbox,
+    Cache, FetchedMessage, Flags, ListedMessage, MailSource, MailboxStatus, Progress, SyncReport,
+    Uid, UidFlags, UidValidity, sync_inbox, sync_inbox_with_progress,
 };
 
 /// An in-memory INBOX that records which UIDs were fetched.
@@ -371,4 +371,24 @@ async fn a_first_sync_run_again_keeps_what_it_cached() {
     assert_eq!(sync(&mut source, &mut cache).await, report(0, 0, 0, false));
     let mailbox = cache.mailbox("work", "INBOX").unwrap().unwrap();
     assert_eq!(mailbox.highest_uid, Uid::new(4));
+}
+
+#[tokio::test]
+async fn progress_counts_up_per_batch_and_stays_quiet_with_nothing_new() {
+    let mut source = FakeSource::new(1, 1..=120);
+    let mut cache = Cache::open_in_memory().unwrap();
+    let mut seen = Vec::new();
+    let limit = NonZeroU32::new(500).unwrap();
+    let r = sync_inbox_with_progress(&mut source, &mut cache, "work", limit, |p| seen.push(p))
+        .await
+        .unwrap();
+    assert_eq!(r.new, 120);
+    let done: Vec<(usize, usize)> = seen.iter().map(|p| (p.done, p.total)).collect();
+    assert_eq!(done, [(0, 120), (50, 120), (100, 120), (120, 120)]);
+
+    let mut again: Vec<Progress> = Vec::new();
+    sync_inbox_with_progress(&mut source, &mut cache, "work", limit, |p| again.push(p))
+        .await
+        .unwrap();
+    assert!(again.is_empty(), "{again:?}");
 }
