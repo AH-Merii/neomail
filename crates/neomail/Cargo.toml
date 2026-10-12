@@ -47,6 +47,8 @@ apple-native-keyring-store.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Paused time for the device code polling tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

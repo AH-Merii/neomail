@@ -1,12 +1,22 @@
 //! OAuth 2.0 sign-in for an installed app (RFC 8252): the authorization code flow with PKCE
-//! (RFC 7636) and a loopback redirect, against the user's own client registration. A provider is
-//! data ([`Provider`]): its endpoints, scopes and IMAP server.
+//! (RFC 7636) and a loopback redirect, or the device code flow (RFC 8628, [`device`]), against the
+//! user's own client registration. A provider is data ([`Provider`]): its endpoints, client kind,
+//! scopes and mail API.
 //!
 //! Tokens and the client secret are [`Secret`]s, whose `Debug` is redacted; errors never quote
 //! them, nor a token endpoint's response body.
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "part 3 of slice 6 wires it into `account add outlook`"
+    )
+)]
+pub mod device;
 pub mod http;
 pub mod loopback;
+mod provider;
 #[cfg(test)]
 mod tests;
 
@@ -21,52 +31,12 @@ use sha2::{Digest, Sha256};
 
 use self::http::Http;
 use self::loopback::Listener;
+#[cfg(test)]
+pub use self::provider::MICROSOFT;
+pub use self::provider::{ClientKind, GOOGLE, MailApi, PROVIDERS, Provider, provider};
 
 /// How long the browser has to come back to the loopback listener.
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-
-/// An OAuth provider, as data: slice 6 adds Microsoft as another value, not another type.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Provider {
-    /// The `provider` value in the config.
-    pub id: &'static str,
-    /// For messages: "Google".
-    pub name: &'static str,
-    pub auth_url: &'static str,
-    pub token_url: &'static str,
-    pub revoke_url: &'static str,
-    /// Every scope asked for, space-separated.
-    pub scope: &'static str,
-    /// The scope mail access needs. A user can untick it on Google's granular consent screen,
-    /// so the granted scopes are checked for it.
-    pub mail_scope: &'static str,
-    pub imap_host: &'static str,
-    pub imap_port: u16,
-    /// Extra query parameters for the authorization URL.
-    pub auth_params: &'static [(&'static str, &'static str)],
-}
-
-/// Google, per <https://developers.google.com/identity/protocols/oauth2/native-app>.
-/// `access_type=offline` asks for a refresh token; `prompt=consent` makes Google return one on
-/// every sign-in, not only the first.
-pub const GOOGLE: Provider = Provider {
-    id: "google",
-    name: "Google",
-    auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
-    token_url: "https://oauth2.googleapis.com/token",
-    revoke_url: "https://oauth2.googleapis.com/revoke",
-    scope: "https://mail.google.com/ openid email",
-    mail_scope: "https://mail.google.com/",
-    imap_host: "imap.gmail.com",
-    imap_port: 993,
-    auth_params: &[("access_type", "offline"), ("prompt", "consent")],
-};
-
-pub const PROVIDERS: &[&Provider] = &[&GOOGLE];
-
-pub fn provider(id: &str) -> Option<&'static Provider> {
-    PROVIDERS.iter().copied().find(|p| p.id == id)
-}
 
 /// A token or client secret. `Debug` is redacted so it cannot leak through `{:?}`.
 #[derive(Clone, PartialEq, Eq)]
@@ -88,11 +58,28 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// The user's own client registration.
+/// The user's own client registration. A public client has no secret.
 #[derive(Debug, Clone)]
 pub struct Client {
     pub id: String,
-    pub secret: Secret,
+    pub secret: Option<Secret>,
+}
+
+impl Client {
+    /// `client_id`, and `client_secret` for a confidential provider only: a public client that
+    /// sends one is refused (AADSTS700025,
+    /// <https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes>).
+    fn credentials(&self, provider: &Provider) -> Result<Vec<(&'static str, &str)>> {
+        let mut pairs = vec![("client_id", self.id.as_str())];
+        if provider.client == ClientKind::Confidential {
+            let secret = self
+                .secret
+                .as_ref()
+                .with_context(|| format!("the {} client secret is missing", provider.name))?;
+            pairs.push(("client_secret", secret.expose()));
+        }
+        Ok(pairs)
+    }
 }
 
 /// PKCE's verifier and its S256 challenge (RFC 7636 section 4).
@@ -201,7 +188,7 @@ pub async fn sign_in<H: Http>(
     let listener = Listener::bind().await?;
     let pkce = Pkce::new()?;
     let state = random_url_safe(24)?;
-    let redirect_uri = listener.redirect_uri();
+    let redirect_uri = listener.redirect_uri(provider.redirect_host);
     show(&auth_url(
         provider,
         &client.id,
@@ -233,10 +220,12 @@ impl fmt::Debug for TokenResponse {
 struct ErrorResponse {
     error: String,
     error_description: Option<String>,
+    /// Microsoft's numeric codes (the AADSTS number).
+    #[serde(default)]
+    error_codes: Vec<u64>,
 }
 
-/// Exchanges the authorization code for tokens and checks what came back: the mail scope, a
-/// refresh token, and the address in the ID token.
+/// Exchanges the authorization code for tokens and checks what came back.
 pub async fn exchange_code<H: Http>(
     http: &H,
     provider: &Provider,
@@ -245,24 +234,33 @@ pub async fn exchange_code<H: Http>(
     pkce: &Pkce,
     redirect_uri: &str,
 ) -> Result<SignedIn> {
-    let form = [
+    let mut form = vec![
         ("grant_type", "authorization_code"),
         ("code", code.expose()),
-        ("client_id", client.id.as_str()),
-        ("client_secret", client.secret.expose()),
         ("code_verifier", pkce.verifier.expose()),
         ("redirect_uri", redirect_uri),
     ];
+    form.extend(client.credentials(provider)?);
     let tokens = token_request(http, provider, &form)
         .await
         .map_err(|e| e.context(format!("{} refused the sign-in", provider.name)))?;
-    let granted = tokens.scope.as_deref().unwrap_or("");
-    if !granted.split(' ').any(|s| s == provider.mail_scope) {
+    check_sign_in(provider, tokens)
+}
+
+/// The checks every sign-in's tokens pass, whichever flow got them: a mail grant, a refresh
+/// token, and an address in the ID token.
+fn check_sign_in(provider: &Provider, tokens: TokenResponse) -> Result<SignedIn> {
+    if !grants_mail(provider, tokens.scope.as_deref()) {
         bail!(
             "{} did not grant mail access ({}); sign in again and, if the consent screen shows \
              a checkbox for mail access, tick it",
             provider.name,
-            provider.mail_scope
+            provider
+                .mail_scopes
+                .iter()
+                .map(|s| format!("{}{s}", provider.scope_prefix))
+                .collect::<Vec<_>>()
+                .join(" or ")
         );
     }
     let refresh_token = tokens
@@ -278,6 +276,44 @@ pub async fn exchange_code<H: Http>(
     })
 }
 
+/// Whether the granted scopes include one of the provider's mail grants. A missing `scope`
+/// means the scopes requested ("if omitted, the token is for the scopes requested on the initial
+/// leg", <https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow>).
+/// Microsoft returns full URLs in any case, so the prefix is stripped and case is ignored.
+pub fn grants_mail(provider: &Provider, granted: Option<&str>) -> bool {
+    let prefix = provider.scope_prefix;
+    granted
+        .unwrap_or(provider.scope)
+        .split_ascii_whitespace()
+        .any(|scope| {
+            let bare = match scope.get(..prefix.len()) {
+                Some(head) if head.eq_ignore_ascii_case(prefix) => &scope[prefix.len()..],
+                _ => scope,
+            };
+            provider
+                .mail_scopes
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(bare))
+        })
+}
+
+/// What a refresh brings: an access token and, when the provider rotates it, a new refresh
+/// token.
+#[derive(Debug)]
+pub struct Refreshed {
+    pub access_token: Secret,
+    pub refresh_token: Option<Secret>,
+}
+
+impl Refreshed {
+    /// The new refresh token to write back, when the provider sent one that differs from
+    /// `saved`. The old one is not revoked
+    /// (<https://learn.microsoft.com/en-us/entra/identity-platform/refresh-tokens>).
+    pub fn rotated(&self, saved: &Secret) -> Option<&Secret> {
+        self.refresh_token.as_ref().filter(|new| *new != saved)
+    }
+}
+
 /// A fresh access token from the refresh token. `account` names the account in the hint for an
 /// expired or revoked sign-in.
 pub async fn refresh<H: Http>(
@@ -286,67 +322,86 @@ pub async fn refresh<H: Http>(
     client: &Client,
     refresh_token: &Secret,
     account: &str,
-) -> Result<Secret> {
-    let form = [
+) -> Result<Refreshed> {
+    let mut form = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token.expose()),
-        ("client_id", client.id.as_str()),
-        ("client_secret", client.secret.expose()),
     ];
-    match token_request(http, provider, &form).await {
-        Ok(tokens) => tokens
-            .access_token
-            .filter(|t| !t.is_empty())
-            .map(Secret)
-            .with_context(|| format!("{} returned no access token", provider.name)),
-        Err(e) if e.downcast_ref::<InvalidGrant>().is_some() => bail!(
-            "the saved {} sign-in expired or was revoked (an app in Testing mode gets sign-ins \
-             that last 7 days; see docs/gmail.md); run `neomail account login {account}`",
-            provider.name
-        ),
-        Err(e) if e.is::<BadClient>() => bail!(
-            "cannot refresh the {} sign-in: {e:#}; run `neomail account logout {account}`, then \
-             `neomail account login {account}`",
-            provider.name
-        ),
-        Err(e) => Err(e.context(format!("cannot refresh the {} sign-in", provider.name))),
+    form.extend(client.credentials(provider)?);
+    if let Some(scope) = provider.refresh_scope {
+        form.push(("scope", scope));
     }
+    let tokens = match token_request(http, provider, &form).await {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            return Err(match e.downcast_ref::<EndpointError>() {
+                Some(err) if err.code == "invalid_grant" => anyhow!(
+                    "the saved {} sign-in expired or was revoked ({}); run `neomail account \
+                     login {account}`",
+                    provider.name,
+                    provider.setup.expired_hint
+                ),
+                Some(err) if err.is_bad_client() => anyhow!(
+                    "cannot refresh the {} sign-in: {e:#}; run `neomail account logout {account}`, \
+                     then `neomail account login {account}`",
+                    provider.name
+                ),
+                _ => e.context(format!("cannot refresh the {} sign-in", provider.name)),
+            });
+        }
+    };
+    let access_token = tokens
+        .access_token
+        .filter(|t| !t.is_empty())
+        .map(Secret)
+        .with_context(|| format!("{} returned no access token", provider.name))?;
+    Ok(Refreshed {
+        access_token,
+        refresh_token: tokens.refresh_token.filter(|t| !t.is_empty()).map(Secret),
+    })
 }
 
-/// Revokes a token, so it stops working even where a copy survived.
+/// Revokes a token, so it stops working even where a copy survived. Fails for a provider with no
+/// revocation endpoint; callers check [`Provider::revoke_url`] first.
 pub async fn revoke<H: Http>(http: &H, provider: &Provider, token: &Secret) -> Result<()> {
-    let response = http
-        .post_form(provider.revoke_url, &[("token", token.expose())])
-        .await?;
+    let url = provider
+        .revoke_url
+        .with_context(|| format!("{} has no token revocation endpoint", provider.name))?;
+    let response = http.post_form(url, &[("token", token.expose())]).await?;
     if response.status == 200 {
         return Ok(());
     }
-    Err(endpoint_error(&response.body, response.status))
+    Err(endpoint_error(provider, &response.body, response.status))
 }
 
-/// `invalid_grant` from the token endpoint: the code or refresh token is no longer valid.
+/// An OAuth error response (RFC 6749 section 5.2): the code, the line to show and a hint. The
+/// code and description are defined by the server and hold no secret, but are cleaned of control
+/// characters.
 #[derive(Debug)]
-struct InvalidGrant;
+pub struct EndpointError {
+    pub code: String,
+    message: String,
+    hint: Option<&'static str>,
+}
 
-impl fmt::Display for InvalidGrant {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("invalid_grant")
+impl EndpointError {
+    /// `invalid_client` or `unauthorized_client`: the client ID or secret is wrong.
+    fn is_bad_client(&self) -> bool {
+        matches!(self.code.as_str(), "invalid_client" | "unauthorized_client")
     }
 }
 
-impl std::error::Error for InvalidGrant {}
-
-/// `invalid_client` or `unauthorized_client`: the client ID or secret is wrong.
-#[derive(Debug)]
-struct BadClient(String);
-
-impl fmt::Display for BadClient {
+impl fmt::Display for EndpointError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}; check the client ID and secret", self.0)
+        f.write_str(&self.message)?;
+        match self.hint {
+            Some(hint) => write!(f, "; {hint}"),
+            None => Ok(()),
+        }
     }
 }
 
-impl std::error::Error for BadClient {}
+impl std::error::Error for EndpointError {}
 
 async fn token_request<H: Http>(
     http: &H,
@@ -355,46 +410,61 @@ async fn token_request<H: Http>(
 ) -> Result<TokenResponse> {
     let response = http.post_form(provider.token_url, form).await?;
     if response.status != 200 {
-        return Err(endpoint_error(&response.body, response.status));
+        return Err(endpoint_error(provider, &response.body, response.status));
     }
     // serde_json's errors can quote the input, which holds tokens: never pass them on.
     serde_json::from_slice(&response.body)
         .map_err(|_| anyhow!("the token endpoint's answer is not the expected JSON"))
 }
 
-/// The OAuth error code and description from an error response (RFC 6749 section 5.2); both are
-/// defined by the server and hold no secret, but are cleaned of control characters.
-fn endpoint_error(body: &[u8], status: u16) -> anyhow::Error {
+/// Text from the server, fit for the terminal: control characters (escape sequences included)
+/// dropped, and at most `max` characters.
+fn printable(s: &str, max: usize) -> String {
+    s.chars().filter(|c| !c.is_control()).take(max).collect()
+}
+
+/// The error from a response that is not 200: an [`EndpointError`] when it is OAuth's JSON.
+fn endpoint_error(provider: &Provider, body: &[u8], status: u16) -> anyhow::Error {
     let Ok(e) = serde_json::from_slice::<ErrorResponse>(body) else {
         return anyhow!("HTTP status {status}");
     };
-    if e.error == "invalid_grant" {
-        return anyhow::Error::new(InvalidGrant);
-    }
-    let clean = |s: &str| -> String {
-        s.chars()
-            .filter(|c| !c.is_control())
-            .take(200)
-            .collect::<String>()
-    };
+    let clean = |s: &str| printable(s, 200);
     let message = match e.error_description.as_deref().map(clean) {
         Some(d) if !d.is_empty() => format!("{}: {d}", clean(&e.error)),
         _ => clean(&e.error),
     };
-    match e.error.as_str() {
-        "invalid_client" | "unauthorized_client" => anyhow::Error::new(BadClient(message)),
-        _ => anyhow!("{message}"),
+    let coded = e.error_codes.iter().find_map(|code| {
+        provider
+            .error_code_hints
+            .iter()
+            .find(|(c, _)| c == code)
+            .map(|(_, hint)| *hint)
+    });
+    let mut error = EndpointError {
+        code: e.error,
+        message,
+        hint: coded,
+    };
+    if error.hint.is_none() && error.is_bad_client() {
+        error.hint = Some(match provider.client {
+            ClientKind::Confidential => "check the client ID and secret",
+            ClientKind::Public => "check the client ID",
+        });
     }
+    anyhow::Error::new(error)
 }
 
-/// The `email` claim of an ID token. The signature is not checked: the token came straight from
-/// the token endpoint over TLS, and OpenID Connect Core 1.0 section 3.1.3.7, step 6, allows TLS
-/// server validation in place of the signature then.
+/// The account's address from an ID token: its `email` claim, else `preferred_username`, since
+/// Microsoft's `email` "isn't always" there
+/// (<https://learn.microsoft.com/en-us/entra/identity-platform/scopes-oidc>). The signature is
+/// not checked: the token came straight from the token endpoint over TLS, and OpenID Connect
+/// Core 1.0 section 3.1.3.7, step 6, allows TLS server validation in place of the signature then.
 pub fn id_token_email(id_token: &str) -> Result<String> {
     #[derive(Deserialize)]
     struct Claims {
         email: Option<String>,
         email_verified: Option<bool>,
+        preferred_username: Option<String>,
     }
     let malformed = || anyhow!("the ID token is malformed");
     let payload = id_token.split('.').nth(1).ok_or_else(malformed)?;
@@ -408,5 +478,6 @@ pub fn id_token_email(id_token: &str) -> Result<String> {
     claims
         .email
         .filter(|e| !e.is_empty())
+        .or(claims.preferred_username.filter(|u| u.contains('@')))
         .context("the ID token holds no address; the \"email\" scope is missing")
 }

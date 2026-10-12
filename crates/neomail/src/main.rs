@@ -514,19 +514,35 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
                     }),
                     Login::OAuth(settings) => secret::oauth_secrets(&account.name, &mut keyring)
                         .and_then(|(client_secret, refresh_token)| {
-                            runtime.block_on(async {
-                                let token = account::access_token(
-                                    account,
-                                    settings,
-                                    client_secret,
-                                    &refresh_token,
+                            let refreshed = runtime.block_on(account::refresh(
+                                account,
+                                settings,
+                                client_secret.clone(),
+                                &refresh_token,
+                            ))?;
+                            // A rotated refresh token is written back outside block_on, like
+                            // every keyring call. The old one is not revoked, so a failed write
+                            // is only a warning.
+                            if let Some(rotated) = refreshed.rotated(&refresh_token)
+                                && let Err(e) = secret::save_refresh_token(
+                                    &account.name,
+                                    &mut keyring,
+                                    client_secret.as_ref(),
+                                    rotated,
                                 )
-                                .await?;
-                                let login = nm_imap::Login::XOAuth2 {
-                                    access_token: token.expose(),
-                                };
-                                sync_account(account, login, &mut cache, limit, progress).await
-                            })
+                            {
+                                eprintln!(
+                                    "neomail: {}: warning: {} sent a new refresh token, but \
+                                         it could not be saved ({e:#}); the saved one is used \
+                                         until it stops working",
+                                    account.name, settings.provider.name
+                                );
+                            }
+                            let login = nm_imap::Login::XOAuth2 {
+                                access_token: refreshed.access_token.expose(),
+                            };
+                            runtime
+                                .block_on(sync_account(account, login, &mut cache, limit, progress))
                         }),
                 };
                 progress.clear(&mut io::stderr());

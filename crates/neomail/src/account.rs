@@ -11,40 +11,9 @@ use anyhow::{Context, Result, bail};
 use crate::config::{self, Account, Login, OAuthSettings};
 use crate::keyring::{self, Keyring, OAuthEntry};
 use crate::oauth::http::Https;
-use crate::oauth::{self, Provider, Secret, SignedIn};
+use crate::oauth::{self, ClientKind, Provider, Refreshed, Secret, SignedIn};
 use crate::secret::Input;
 use crate::{browser, secret};
-
-const GUIDE: &str = "https://github.com/AH-Merii/neomail/blob/main/docs/gmail.md";
-
-/// The one-time setup, shown before the wizard asks for anything. The why of each step is in
-/// the guide.
-const GMAIL_STEPS: &str = "\
-Gmail signs in through your own Google OAuth client: neomail ships none, so no one else's app
-is ever granted access to your mail. Set one up once (about 5 minutes; why each step exists:
-GUIDE):
-
- 1. Create a Google Cloud project: https://console.cloud.google.com/projectcreate
-    Why: a client belongs to a project; its own keeps it apart from anything else. No billing.
- 2. Enable the Gmail API: https://console.cloud.google.com/apis/library/gmail.googleapis.com
-    Why: so the Gmail scope is offered in step 4 (a later neomail also uses the API).
- 3. Google Auth Platform > Branding > Get started: an app name, your address, Audience
-    External, then Create. Then Audience > Test users: add your Gmail address.
-    Why: External lets a personal Gmail account sign in; in Testing only test users can.
- 4. Data Access > Add or remove scopes: add https://mail.google.com/ and save.
-    Why: it is the scope Gmail's IMAP requires.
- 5. Clients > Create client > Application type: Desktop app. Copy its client ID and its
-    client secret now: Google shows the secret only once. Lost it? Open the client and click
-    Add secret.
-    Why: a Desktop app client may send the sign-in back to http://127.0.0.1 on any port,
-    which is where neomail waits for it.
-
-At sign-in Google may warn that it hasn't verified the app: it is yours, so go on (Continue
-while the app is in Testing; once published, Advanced, then Go to the app's name).
-While the app's publishing status is Testing, Google ends the sign-in after 7 days and you
-run `neomail account login NAME` again. To avoid that, publish it (Audience > Publish app): an
-app for your own use (under 100 users) needs no verification.
-";
 
 pub struct AddArgs {
     pub name: Option<String>,
@@ -53,8 +22,8 @@ pub struct AddArgs {
     pub no_browser: bool,
 }
 
-/// `neomail account add gmail`: asks for what is missing, signs in, stores the sign-in in the
-/// keyring, then appends the account to the config file.
+/// `neomail account add gmail`: shows the provider's setup steps, asks for what is missing,
+/// signs in, stores the sign-in in the keyring, then appends the account to the config file.
 pub fn add(
     provider: &'static Provider,
     config_path: &Path,
@@ -63,6 +32,8 @@ pub fn add(
     out: &mut impl Write,
 ) -> Result<()> {
     let interactive = input.can_prompt();
+    let setup = &provider.setup;
+    let confidential = provider.client == ClientKind::Confidential;
     if !interactive {
         let missing: Vec<&str> = [
             ("--email", args.email.is_none()),
@@ -72,29 +43,34 @@ pub fn add(
         .filter_map(|(flag, missing)| missing.then_some(flag))
         .collect();
         if !missing.is_empty() {
+            let secret_note = if confidential {
+                " (the client secret is then read as one line of standard input)"
+            } else {
+                ""
+            };
             return Err(secret::cannot_ask(
                 input,
-                &format!(
-                    "{} (the client secret is then read as one line of standard input)",
-                    missing.join(" and ")
-                ),
+                &format!("{}{secret_note}", missing.join(" and ")),
             ));
         }
     } else {
-        eprintln!("{}", GMAIL_STEPS.replace("GUIDE", GUIDE));
+        eprintln!("{}", setup.steps.replace("GUIDE", setup.guide));
     }
 
     let name = match args.name {
         Some(name) => name.trim().to_owned(),
         None if interactive => {
-            let typed = secret::prompt_line("Account name in neomail [gmail]: ")?;
+            let typed = secret::prompt_line(&format!(
+                "Account name in neomail [{}]: ",
+                setup.default_name
+            ))?;
             if typed.is_empty() {
-                "gmail".to_owned()
+                setup.default_name.to_owned()
             } else {
                 typed
             }
         }
-        None => "gmail".to_owned(),
+        None => setup.default_name.to_owned(),
     };
     if name.is_empty() {
         bail!("the account name is empty");
@@ -102,23 +78,27 @@ pub fn add(
     config::check_can_add(config_path, &name)?;
     let email = match args.email {
         Some(email) => email.trim().to_owned(),
-        None => secret::prompt_line("Gmail address: ")?,
+        None => secret::prompt_line(setup.address_prompt)?,
     };
     if !email.contains('@') {
         bail!("{email:?} is not an email address");
     }
     let client_id = match args.client_id {
         Some(id) => id.trim().to_owned(),
-        None => secret::prompt_line("Client ID (from step 5): ")?,
+        None => secret::prompt_line(setup.client_id_prompt)?,
     };
     if client_id.is_empty() {
         bail!("the client ID is empty");
     }
-    let client_secret = secret::read_secret(
-        "Client secret (from step 5, not shown): ",
-        "client secret",
-        input,
-    )?;
+    let client_secret = if confidential {
+        Some(Secret::new(secret::read_secret(
+            setup.client_secret_prompt,
+            "client secret",
+            input,
+        )?))
+    } else {
+        None
+    };
     // Before the browser: no point signing in when the sign-in cannot be kept. On Linux,
     // opening the store connects to the Secret Service; reading the entry checks it answers.
     // The append is tried with the address given, which the sign-in must match.
@@ -137,7 +117,7 @@ pub fn add(
     }
     let client = oauth::Client {
         id: client_id,
-        secret: Secret::new(client_secret),
+        secret: client_secret,
     };
 
     let signed_in = sign_in(provider, &client, &email, args.no_browser)?;
@@ -168,23 +148,29 @@ fn revoke_leftover(
     name: &str,
     leftover: &OAuthEntry,
 ) -> Result<()> {
-    let line = clear_leftover(keyring, name, leftover, provider.name, |token| {
-        Https::new().and_then(|http| runtime()?.block_on(oauth::revoke(&http, provider, token)))
-    })?;
+    let revoke = provider.revoke_url.map(|_| {
+        |token: &Secret| {
+            Https::new().and_then(|http| runtime()?.block_on(oauth::revoke(&http, provider, token)))
+        }
+    });
+    let line = clear_leftover(keyring, name, leftover, provider.name, revoke)?;
     eprintln!("{line}");
     Ok(())
 }
 
-/// Revokes the leftover's refresh token with `revoke` (a failure is only a warning), deletes the
-/// entry, and returns the line that says which of those happened.
+/// Revokes the leftover's refresh token with `revoke` (a failure is only a warning; `None` when
+/// the provider has no revocation endpoint), deletes the entry, and returns the line that says
+/// which of those happened.
 fn clear_leftover(
     keyring: &Keyring,
     name: &str,
     leftover: &OAuthEntry,
     provider: &str,
-    revoke: impl FnOnce(&Secret) -> Result<()>,
+    revoke: Option<impl FnOnce(&Secret) -> Result<()>>,
 ) -> Result<String> {
-    let revoked = leftover.refresh_token().map(|token| revoke(&token));
+    let token = leftover.refresh_token();
+    let can_revoke = revoke.is_some();
+    let revoked = token.zip(revoke).map(|(token, revoke)| revoke(&token));
     keyring.delete_oauth(name)?;
     let held = format!(
         "{} held an earlier sign-in for {name:?} with no account in the config",
@@ -195,6 +181,9 @@ fn clear_leftover(
         Some(Err(e)) => format!(
             "neomail: warning: {held}; deleted it, but {provider} did not revoke it ({e:#})"
         ),
+        None if !can_revoke => {
+            format!("neomail: {held}; deleted it ({provider} has no token revocation endpoint)")
+        }
         None => format!("neomail: {held}; deleted it (it had no refresh token to revoke)"),
     })
 }
@@ -208,13 +197,17 @@ pub fn login(
 ) -> Result<()> {
     let settings = oauth_settings(account, "set-password")?;
     let keyring = Keyring::open_for_oauth()?;
-    let client_secret = match keyring.get_oauth(&account.name)? {
-        Some(entry) => entry.client_secret(),
-        None => Secret::new(secret::read_secret(
+    let saved = keyring
+        .get_oauth(&account.name)?
+        .and_then(|entry| entry.client_secret());
+    let client_secret = match (settings.provider.client, saved) {
+        (ClientKind::Public, _) => None,
+        (ClientKind::Confidential, Some(saved)) => Some(saved),
+        (ClientKind::Confidential, None) => Some(Secret::new(secret::read_secret(
             &format!("Client secret for {}: ", settings.client_id),
             "client secret",
             input,
-        )?),
+        )?)),
     };
     let client = oauth::Client {
         id: settings.client_id.clone(),
@@ -275,6 +268,19 @@ pub fn logout(account: &Account, out: &mut impl Write) -> Result<()> {
             return Ok(());
         }
     };
+    let provider = settings.provider;
+    if provider.revoke_url.is_none() {
+        keyring.delete_oauth(&account.name)?;
+        writeln!(
+            out,
+            "Signed out {:?}: {} has no token revocation endpoint, so the sign-in was deleted \
+             from {} only.",
+            account.name,
+            provider.name,
+            keyring.name()
+        )?;
+        return Ok(());
+    }
     let mut revoked = false;
     if let Some(token) = entry.refresh_token() {
         let result = Https::new()
@@ -316,7 +322,7 @@ fn oauth_settings<'a>(account: &'a Account, password_command: &str) -> Result<&'
 
 fn entry(client: &oauth::Client, signed_in: &SignedIn) -> OAuthEntry {
     OAuthEntry {
-        client_secret: client.secret.expose().to_owned(),
+        client_secret: client.secret.as_ref().map(|s| s.expose().to_owned()),
         refresh_token: Some(signed_in.refresh_token.expose().to_owned()),
     }
 }
@@ -361,13 +367,23 @@ fn sign_in(
     Ok(signed_in)
 }
 
-/// A fresh access token for an OAuth account, inside the caller's runtime.
-pub async fn access_token(
+/// A fresh access token for an OAuth account, and the refresh token if the provider rotated it,
+/// inside the caller's runtime. A confidential provider's entry without a client secret cannot
+/// refresh: the error says to log in again, which asks for it.
+pub async fn refresh(
     account: &Account,
     settings: &OAuthSettings,
-    client_secret: Secret,
+    client_secret: Option<Secret>,
     refresh_token: &Secret,
-) -> Result<Secret> {
+) -> Result<Refreshed> {
+    if settings.provider.client == ClientKind::Confidential && client_secret.is_none() {
+        bail!(
+            "the keyring entry holds no client secret, which {} needs; run `neomail account \
+             login {}`",
+            settings.provider.name,
+            account.name
+        );
+    }
     let http = Https::new()?;
     let client = oauth::Client {
         id: settings.client_id.clone(),
@@ -418,17 +434,18 @@ mod tests {
         for (refresh_token, result, end) in cases {
             let keyring = Keyring::with_store(mock::Store::new().unwrap(), "the mock", false);
             let leftover = OAuthEntry {
-                client_secret: "cs".into(),
+                client_secret: Some("cs".into()),
                 refresh_token: refresh_token.map(str::to_owned),
             };
             keyring.set_oauth("gmail", &leftover).unwrap();
             let called = Cell::new(false);
-            let line = clear_leftover(&keyring, "gmail", &leftover, "Google", |token| {
+            let revoke = |token: &Secret| {
                 called.set(true);
                 assert_eq!(token.expose(), "rt");
                 result.map_err(|e| anyhow!(e))
-            })
-            .unwrap();
+            };
+            let line =
+                clear_leftover(&keyring, "gmail", &leftover, "Google", Some(revoke)).unwrap();
             assert!(
                 line.ends_with(end) && line.contains("the mock held an earlier sign-in"),
                 "{line}"
@@ -437,5 +454,46 @@ mod tests {
             assert_eq!(called.get(), refresh_token.is_some());
             assert!(keyring.get_oauth("gmail").unwrap().is_none(), "deleted");
         }
+    }
+
+    #[test]
+    fn a_google_entry_without_a_client_secret_says_to_log_in_again() {
+        let config = config::Config::parse(
+            "[[accounts]]\nname = \"gmail\"\nusername = \"you@example.com\"\n\
+             oauth = { provider = \"google\", client_id = \"1234-abc.apps.googleusercontent.com\" }\n",
+        )
+        .unwrap();
+        let account = &config.accounts[0];
+        let Login::OAuth(settings) = &account.login else {
+            panic!("{:?}", account.login)
+        };
+        let refresh_token = Secret::new("rt".into());
+        // The check comes before any request, so this never reaches the network.
+        let e = runtime()
+            .unwrap()
+            .block_on(refresh(account, settings, None, &refresh_token))
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .ends_with("needs; run `neomail account login gmail`"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_leftover_without_a_revocation_endpoint_is_only_deleted() {
+        let keyring = Keyring::with_store(mock::Store::new().unwrap(), "the mock", false);
+        let leftover = OAuthEntry {
+            client_secret: None,
+            refresh_token: Some("rt".into()),
+        };
+        keyring.set_oauth("outlook", &leftover).unwrap();
+        let no_revoke: Option<fn(&Secret) -> Result<()>> = None;
+        let line = clear_leftover(&keyring, "outlook", &leftover, "Microsoft", no_revoke).unwrap();
+        assert!(
+            line.ends_with("; deleted it (Microsoft has no token revocation endpoint)"),
+            "{line}"
+        );
+        assert!(keyring.get_oauth("outlook").unwrap().is_none(), "deleted");
     }
 }
