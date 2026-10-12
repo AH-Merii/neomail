@@ -153,6 +153,10 @@ fn is_one_program(command: &str) -> bool {
 #[cfg(unix)]
 use interrupts::HeldInterrupts;
 
+/// Whether a signal was ignored, for the daemon's handlers too.
+#[cfg(unix)]
+pub use interrupts::ignored_now;
+
 #[cfg(unix)]
 mod interrupts {
     use std::os::unix::process::ExitStatusExt;
@@ -206,7 +210,7 @@ mod interrupts {
     /// Whether `signal` is ignored now, from the SigIgn mask in /proc/self/status (std and
     /// signal-hook have no safe way to ask, and this crate has no `unsafe`).
     #[cfg(target_os = "linux")]
-    fn ignored_now(signal: i32) -> bool {
+    pub fn ignored_now(signal: i32) -> bool {
         let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
             return false;
         };
@@ -219,7 +223,7 @@ mod interrupts {
 
     /// Elsewhere there is no safe way to ask: assume the default, as before this check.
     #[cfg(not(target_os = "linux"))]
-    fn ignored_now(_signal: i32) -> bool {
+    pub fn ignored_now(_signal: i32) -> bool {
         false
     }
 

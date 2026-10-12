@@ -5,8 +5,10 @@
 //! quote the command either, in case someone inlined a secret in it.
 
 use std::fmt;
-use std::io::{self, BufRead, IsTerminal};
-use std::process::{Command, Stdio};
+use std::io::{self, BufRead, IsTerminal, Read};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -33,17 +35,31 @@ impl fmt::Debug for Password {
     }
 }
 
-/// The password of the account named `account`, from its command or the keyring. `keyring` is
-/// opened on first use and kept for the next account; an account with a command never opens it.
-/// Blocking: call it outside the async runtime (see `Keyring::open`). Errors leave out the
-/// account name, which `neomail sync` puts in front.
+/// How a `password_command` runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandMode {
+    /// Attached to the terminal, so it can prompt (gpg, pass), with no time limit: `neomail sync`.
+    Interactive,
+    /// Standard input closed, and stopped after this long: `neomail daemon`, where nobody answers
+    /// a prompt and one stuck command must not stall every other account.
+    Unattended(Duration),
+}
+
+/// The password of the account named `account`, from its command (run as `mode` says) or the
+/// keyring. `keyring` is opened on first use and kept for the next account; an account with a
+/// command never opens it. Blocking: call it outside the async runtime (see `Keyring::open`).
+/// Errors leave out the account name, which `neomail sync` puts in front.
 pub fn account_password(
     account: &str,
     source: &PasswordSource,
     keyring: &mut Option<Keyring>,
+    mode: CommandMode,
 ) -> Result<Password> {
     match source {
-        PasswordSource::Command(command) => run_password_command(command),
+        PasswordSource::Command(command) => match mode {
+            CommandMode::Interactive => run_password_command(command),
+            CommandMode::Unattended(limit) => run_password_command_within(command, limit),
+        },
         PasswordSource::Keyring => {
             let keyring = match keyring {
                 Some(k) => k,
@@ -211,10 +227,78 @@ pub fn run_password_command(command: &str) -> Result<Password> {
         Ok(output) => output,
         Err(e) => bail!("could not run password_command with sh: {e}"),
     };
-    if !output.status.success() {
-        bail!("password_command failed ({})", output.status);
+    password_from(output.status, output.stdout)
+}
+
+/// [`run_password_command`] for nobody at the terminal: standard input is closed, so a command
+/// that would prompt fails instead, and a command still running after `limit` is killed (the
+/// `sh` neomail started, nothing else) and reported as an error.
+///
+/// A process the command started in the background that keeps standard output open is left
+/// running; so is the thread reading that output, until it closes.
+pub fn run_password_command_within(command: &str, limit: Duration) -> Result<Password> {
+    let deadline = Instant::now() + limit;
+    let mut child = match Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => bail!("could not run password_command with sh: {e}"),
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("could not read password_command's output");
+    };
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = stdout.read_to_end(&mut bytes).map(|_| bytes);
+        // The receiver is gone once the command timed out; nobody needs the output then.
+        let _ = sender.send(read);
+    });
+    let timed_out = |mut child: std::process::Child| {
+        // Kills only the child spawned above, never a pid; `wait` reaps it.
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::anyhow!(
+            "password_command did not finish within {} s",
+            limit.as_secs_f64()
+        )
+    };
+    let stdout = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("could not read password_command's output: {e}");
+        }
+        Err(_) => return Err(timed_out(child)),
+    };
+    // Standard output is closed; the command has almost always exited by now.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => return Err(timed_out(child)),
+            Err(e) => bail!("could not wait for password_command: {e}"),
+        }
+    };
+    password_from(status, stdout)
+}
+
+/// The password a finished `password_command` printed.
+fn password_from(status: ExitStatus, stdout: Vec<u8>) -> Result<Password> {
+    if !status.success() {
+        bail!("password_command failed ({status})");
     }
-    let Ok(password) = String::from_utf8(output.stdout) else {
+    let Ok(password) = String::from_utf8(stdout) else {
         bail!("password_command printed something that is not UTF-8");
     };
     let password = trim_newline(password);
@@ -246,6 +330,48 @@ mod tests {
         assert_eq!(trim_newline("a\n\n".into()), "a\n");
         assert_eq!(trim_newline("a\r".into()), "a\r");
         assert!(run_password_command("printf '\\377'").is_err());
+    }
+
+    #[test]
+    fn an_unattended_command_gets_the_same_password() {
+        let p =
+            run_password_command_within("printf 'hunter2\\n'", Duration::from_secs(60)).unwrap();
+        assert_eq!(p.expose(), "hunter2");
+        let e = run_password_command_within("echo hunter2; exit 3", Duration::from_secs(60))
+            .unwrap_err();
+        assert_eq!(format!("{e:#}"), "password_command failed (exit status: 3)");
+    }
+
+    #[test]
+    fn an_unattended_command_cannot_wait_for_input() {
+        // Standard input is closed, so a prompt reads end of file instead of waiting.
+        let e = run_password_command_within(
+            "read -r line; printf %s \"$line\"",
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert_eq!(format!("{e:#}"), "password_command printed nothing");
+    }
+
+    #[test]
+    fn an_unattended_command_that_never_finishes_is_stopped() {
+        let limit = Duration::from_millis(50);
+        let started = Instant::now();
+        // Still printing: standard output stays open.
+        let e = run_password_command_within("exec sleep 3600", limit).unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "password_command did not finish within 0.05 s"
+        );
+        // Done printing, but never exits.
+        let e = run_password_command_within("printf hunter2; exec >&-; exec sleep 3600", limit)
+            .unwrap_err();
+        assert!(!format!("{e:#}").contains("hunter2"), "{e:#}");
+        assert_eq!(
+            format!("{e:#}"),
+            "password_command did not finish within 0.05 s"
+        );
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     #[test]

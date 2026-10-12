@@ -39,7 +39,7 @@ pub enum Security {
 
 /// Where and how to connect. The credential is passed separately as a [`Login`] and never stored
 /// here.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImapConfig {
     pub host: String,
     pub port: u16,

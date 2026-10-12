@@ -37,6 +37,9 @@ rustls-platform-verifier = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# flock(2) for the daemon and account locks (crates/neomail/src/lock.rs): std's File::lock needs
+# Rust 1.89. Already in the tree through terminal_size.
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 # Holds Ctrl-C off while the pager runs (crates/neomail/src/pager.rs); its safe API avoids `unsafe`.
 signal-hook = { version = "0.4", default-features = false }
 tempfile = "3"

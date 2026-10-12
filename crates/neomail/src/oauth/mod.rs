@@ -201,6 +201,9 @@ struct TokenResponse {
     refresh_token: Option<String>,
     scope: Option<String>,
     id_token: Option<String>,
+    /// Seconds the access token lives (RFC 6749, section 5.1). Some endpoints send it as a
+    /// string, so it is read leniently rather than failing the whole answer.
+    expires_in: Option<serde_json::Value>,
 }
 
 impl fmt::Debug for TokenResponse {
@@ -297,6 +300,9 @@ pub fn grants_mail(provider: &Provider, granted: Option<&str>) -> bool {
 pub struct Refreshed {
     pub access_token: Secret,
     pub refresh_token: Option<Secret>,
+    /// How long the access token lives from when the answer arrived, when the provider said
+    /// (`expires_in`, RFC 6749 section 5.1, RECOMMENDED rather than required).
+    pub expires_in: Option<std::time::Duration>,
 }
 
 impl Refreshed {
@@ -352,7 +358,18 @@ pub async fn refresh<H: Http>(
     Ok(Refreshed {
         access_token,
         refresh_token: tokens.refresh_token.filter(|t| !t.is_empty()).map(Secret),
+        expires_in: tokens.expires_in.as_ref().and_then(seconds),
     })
+}
+
+/// `expires_in` as a number of seconds, or a string of digits.
+fn seconds(value: &serde_json::Value) -> Option<std::time::Duration> {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+    .map(std::time::Duration::from_secs)
 }
 
 /// Revokes a token, so it stops working even where a copy survived. Fails for a provider with no
