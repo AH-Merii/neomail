@@ -395,3 +395,104 @@ fn keyring_unavailable_is_one_line_with_a_hint() {
         assert!(!err.contains(FAKE_PASSWORD), "{err}");
     }
 }
+
+const GMAIL_CONFIG: &str = "[[accounts]]\nname = \"gmail\"\nusername = \"you@example.com\"\n\
+                            oauth = { provider = \"google\", client_id = \"1234-abc.apps.googleusercontent.com\" }\n";
+
+#[test]
+fn add_off_a_terminal_names_the_missing_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = nmail_stdin(dir.path(), &["account", "add", "gmail", "--no-browser"], "");
+    assert_eq!(o.status.code(), Some(1));
+    let err = stderr(&o);
+    assert!(err.contains("not a terminal"), "{err}");
+    assert!(err.contains("pass --email and --client-id"), "{err}");
+    let o = nmail_stdin(
+        dir.path(),
+        &[
+            "account",
+            "add",
+            "gmail",
+            "--email",
+            "you@example.com",
+            "--no-browser",
+        ],
+        "",
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("pass --client-id ("), "{}", stderr(&o));
+    assert!(!dir.path().join("config.toml").exists());
+}
+
+#[test]
+fn password_and_oauth_commands_refuse_the_other_kind_of_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = format!("{GMAIL_CONFIG}{KEYRING_CONFIG}");
+    std::fs::write(dir.path().join("config.toml"), config).unwrap();
+    let input = format!("{FAKE_PASSWORD}\n");
+    for (args, hint) in [
+        (
+            &["account", "set-password", "gmail"][..],
+            "use `nmail account login gmail`",
+        ),
+        (
+            &["account", "delete-password", "gmail"],
+            "use `nmail account logout gmail`",
+        ),
+        (
+            &["account", "login", "work", "--no-browser"],
+            "use `nmail account set-password work`",
+        ),
+        (
+            &["account", "logout", "work"],
+            "use `nmail account delete-password work`",
+        ),
+    ] {
+        let o = nmail_stdin(dir.path(), args, &input);
+        assert_eq!(o.status.code(), Some(1), "{args:?}");
+        let err = stderr(&o);
+        assert!(err.contains(hint), "{args:?}: {err}");
+        assert!(!err.contains(FAKE_PASSWORD), "{err}");
+    }
+}
+
+/// No Secret Service on the bus: every OAuth command fails in one line before any sign-in
+/// starts (no URL is printed, so no browser could open). Linux only, like the test above.
+#[cfg(target_os = "linux")]
+#[test]
+fn oauth_commands_without_a_keyring_fail_before_signing_in() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), GMAIL_CONFIG).unwrap();
+    let input = format!("{FAKE_PASSWORD}\n");
+    for args in [
+        &["account", "logout", "gmail"][..],
+        &["account", "login", "gmail", "--no-browser"],
+        &["sync"],
+        &[
+            "account",
+            "add",
+            "gmail",
+            "--name",
+            "other",
+            "--email",
+            "you@example.com",
+            "--client-id",
+            "1234-abc.apps.googleusercontent.com",
+            "--no-browser",
+        ],
+    ] {
+        let o = nmail_stdin(dir.path(), args, &input);
+        assert_eq!(o.status.code(), Some(1), "{args:?}");
+        let (out, err) = (stdout(&o), stderr(&o));
+        assert!(out.is_empty(), "{args:?}: {out}");
+        assert!(err.contains("the OS keyring is unavailable ("), "{err}");
+        assert!(err.contains("OAuth sign-ins are kept only there"), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(!err.contains(FAKE_PASSWORD), "{err}");
+        assert!(!err.contains("accounts.google.com"), "{err}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        GMAIL_CONFIG
+    );
+}

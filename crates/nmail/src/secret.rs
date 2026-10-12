@@ -1,4 +1,5 @@
-//! Getting an account's password: from its `password_command`, or from the OS keyring.
+//! Getting an account's password (from its `password_command` or the OS keyring) or OAuth
+//! sign-in (from the OS keyring), and reading secrets from the terminal or standard input.
 //!
 //! The password is never logged, echoed, stored or put in an error message. Error messages do not
 //! quote the command either, in case someone inlined a secret in it.
@@ -9,8 +10,9 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{Account, PasswordSource};
+use crate::config::PasswordSource;
 use crate::keyring::Keyring;
+use crate::oauth::Secret;
 
 /// A password. `Debug` is redacted so it cannot leak through `{:?}`.
 pub struct Password(String);
@@ -31,42 +33,82 @@ impl fmt::Debug for Password {
     }
 }
 
-/// The account's password, from its command or the keyring. `keyring` is opened on first use
-/// and kept for the next account; an account with a command never opens it. Blocking: call it
-/// outside the async runtime (see `Keyring::open`). Errors leave out the account name, which
-/// `nmail sync` puts in front.
-pub fn account_password(account: &Account, keyring: &mut Option<Keyring>) -> Result<Password> {
-    match &account.password {
+/// The password of the account named `account`, from its command or the keyring. `keyring` is
+/// opened on first use and kept for the next account; an account with a command never opens it.
+/// Blocking: call it outside the async runtime (see `Keyring::open`). Errors leave out the
+/// account name, which `nmail sync` puts in front.
+pub fn account_password(
+    account: &str,
+    source: &PasswordSource,
+    keyring: &mut Option<Keyring>,
+) -> Result<Password> {
+    match source {
         PasswordSource::Command(command) => run_password_command(command),
         PasswordSource::Keyring => {
             let keyring = match keyring {
                 Some(k) => k,
                 None => keyring.insert(Keyring::open()?),
             };
-            keyring.get(&account.name)
+            keyring.get(account)
         }
     }
+}
+
+/// An OAuth account's client secret and refresh token from the keyring, opened on first use
+/// like [`account_password`]. Blocking, like it.
+pub fn oauth_secrets(account: &str, keyring: &mut Option<Keyring>) -> Result<(Secret, Secret)> {
+    let keyring = match keyring {
+        Some(k) => k,
+        None => keyring.insert(Keyring::open_for_oauth()?),
+    };
+    let not_signed_in = || {
+        anyhow::anyhow!(
+            "not signed in (no entry in {}); run `nmail account login {account}`",
+            keyring.name()
+        )
+    };
+    let entry = keyring.get_oauth(account)?.ok_or_else(not_signed_in)?;
+    let refresh_token = entry.refresh_token().ok_or_else(not_signed_in)?;
+    Ok((entry.client_secret(), refresh_token))
 }
 
 /// A new password for `account`: prompted for without echo on a terminal, otherwise one line of
 /// standard input, so `pass show mail/work | nmail account set-password work` works.
 pub fn read_new_password(account: &str) -> Result<Password> {
+    let password = read_secret(&format!("Password for {account}: "), "password")?;
+    Ok(Password(password))
+}
+
+/// A secret, prompted for with `prompt` and without echo on a terminal, otherwise one line of
+/// standard input. `what` names it in errors ("password", "client secret").
+pub fn read_secret(prompt: &str, what: &str) -> Result<String> {
     let stdin = io::stdin();
-    let password = if stdin.is_terminal() {
-        rpassword::prompt_password(format!("Password for {account}: "))
-            .context("cannot read the password")?
+    let secret = if stdin.is_terminal() {
+        rpassword::prompt_password(prompt).with_context(|| format!("cannot read the {what}"))?
     } else {
         let mut line = String::new();
         stdin
             .lock()
             .read_line(&mut line)
-            .context("cannot read the password from standard input")?;
+            .with_context(|| format!("cannot read the {what} from standard input"))?;
         trim_newline(line)
     };
-    if password.is_empty() {
-        bail!("the password is empty; nothing was stored");
+    if secret.is_empty() {
+        bail!("the {what} is empty; nothing was stored");
     }
-    Ok(Password(password))
+    Ok(secret)
+}
+
+/// One line typed on the terminal (echoed), after `prompt` on standard error, trimmed.
+pub fn prompt_line(prompt: &str) -> Result<String> {
+    use std::io::Write;
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    if io::stdin().lock().read_line(&mut line)? == 0 {
+        bail!("standard input closed");
+    }
+    Ok(line.trim().to_owned())
 }
 
 /// Removes one trailing `\n` or `\r\n`.

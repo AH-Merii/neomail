@@ -9,7 +9,7 @@ use async_imap::Client;
 use nm_core::{Cache, sync_inbox};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
-use super::{ImapSource, greeting};
+use super::{ImapError, ImapSource, Login, greeting, log_in, xoauth2_response};
 
 /// The FETCH response for one whole, unread message.
 fn message(uid: u32) -> String {
@@ -71,10 +71,8 @@ async fn sync_sends_only_read_only_commands() {
 
     let mut client = Client::new(client_end);
     greeting(&mut client).await.unwrap();
-    let session = client
-        .login("user", "password")
+    let session = log_in(client, "user", Login::Password("password"))
         .await
-        .map_err(|(e, _)| e)
         .unwrap();
     let mut source = ImapSource { session, exists: 0 };
 
@@ -113,4 +111,82 @@ async fn sync_sends_only_read_only_commands() {
         assert!(!c.contains("BODY[]"), "a fetch without PEEK: {c}");
         assert!(!c.contains("+FLAGS") && !c.contains("-FLAGS"), "{c}");
     }
+}
+
+const TOKEN: &str = "ya29.not-a-real-token";
+
+/// Gmail's side of `AUTHENTICATE XOAUTH2`: an empty challenge, then `OK` for the right token or,
+/// for any other, the base64 JSON error challenge, an empty client response, and `NO`. Returns
+/// the decoded client responses.
+async fn xoauth2_server(stream: DuplexStream) -> Vec<String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let (read, mut write) = tokio::io::split(stream);
+    let mut lines = BufReader::new(read).lines();
+    write.write_all(b"* OK Gimap ready\r\n").await.unwrap();
+    let line = lines.next_line().await.unwrap().unwrap();
+    let (tag, command) = line.split_once(' ').unwrap();
+    assert_eq!(command, "AUTHENTICATE XOAUTH2");
+    write.write_all(b"+ \r\n").await.unwrap();
+    let first = lines.next_line().await.unwrap().unwrap();
+    let decoded = String::from_utf8(b64.decode(&first).unwrap()).unwrap();
+    let mut responses = vec![decoded.clone()];
+    if decoded == xoauth2_response("user@gmail.example", TOKEN) {
+        let reply = format!("* CAPABILITY IMAP4rev1\r\n{tag} OK user authenticated\r\n");
+        write.write_all(reply.as_bytes()).await.unwrap();
+    } else {
+        let json = r#"{"status":"400","schemes":"Bearer","scope":"https://mail.google.com/"}"#;
+        let challenge = format!("+ {}\r\n", b64.encode(json));
+        write.write_all(challenge.as_bytes()).await.unwrap();
+        responses.push(lines.next_line().await.unwrap().unwrap());
+        let reply = format!("{tag} NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)\r\n");
+        write.write_all(reply.as_bytes()).await.unwrap();
+    }
+    responses
+}
+
+async fn xoauth2_login(token: &str) -> (Result<(), ImapError>, Vec<String>) {
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(xoauth2_server(server_end));
+    let mut client = Client::new(client_end);
+    greeting(&mut client).await.unwrap();
+    let login = Login::XOAuth2 {
+        access_token: token,
+    };
+    let result = log_in(client, "user@gmail.example", login).await.map(drop);
+    (result, server.await.unwrap())
+}
+
+#[test]
+fn xoauth2_response_is_googles_format() {
+    assert_eq!(
+        xoauth2_response(
+            "someuser@example.com",
+            "ya29.vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg"
+        ),
+        "user=someuser@example.com\x01auth=Bearer ya29.vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg\x01\x01"
+    );
+    let login = Login::XOAuth2 {
+        access_token: TOKEN,
+    };
+    assert!(!format!("{login:?}").contains(TOKEN));
+    assert!(!format!("{:?}", Login::Password(TOKEN)).contains(TOKEN));
+}
+
+#[tokio::test]
+async fn xoauth2_success() {
+    let (result, responses) = xoauth2_login(TOKEN).await;
+    result.unwrap();
+    assert_eq!(responses, [xoauth2_response("user@gmail.example", TOKEN)]);
+}
+
+#[tokio::test]
+async fn xoauth2_failure_answers_the_json_challenge_with_an_empty_line() {
+    let (result, responses) = xoauth2_login("ya29.expired").await;
+    let e = result.unwrap_err();
+    assert!(matches!(e, ImapError::Login { .. }), "{e:?}");
+    assert_eq!(responses.len(), 2, "{responses:?}");
+    assert_eq!(responses[1], "", "the empty SASL response");
+    let message = format!("{e} {e:?}");
+    assert!(!message.contains("ya29.expired"), "{message}");
 }
