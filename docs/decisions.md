@@ -625,3 +625,24 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   provider menu, flags and `--no-input`, `account list` and `config path|check`, the stdout and
   stderr split, `--color` and CLICOLOR, every "no config" message naming the next command, and
   colour never carrying meaning alone.
+
+### <a id="dec-2026-10-12-outlook-defaults"></a>DEC-2026-10-12-outlook-defaults: Outlook's open questions
+
+- **Status:** proposed by Claude on 2026-10-12. The owner was shown these questions with defaults
+  before slice 6 was built and has not answered yet; slice 6 follows the defaults.
+- **Proposal:**
+  - `--json` and `--jsonl` give `uid: null` for a message read through Microsoft Graph, which has
+    no UIDs ([json.md](json.md)). `account list` keeps its field types: a Graph account shows
+    Graph's host, port 443 and `tls`, and `server` says `"graph"`.
+  - Device code sign-in is chosen on its own over SSH without a display: `SSH_CONNECTION` or
+    `SSH_TTY` set and not empty, and `DISPLAY` and `WAYLAND_DISPLAY` unset or empty. neomail says
+    so, and `--device-code` asks for it anywhere.
+  - Outlook asks for `Mail.Read` only, until triage (roadmap slice 8) needs to write.
+  - The setup docs say an app registration needs a directory, and only what Microsoft documents
+    about getting one; they make no claim about what happens when an Azure subscription ends.
+  - Logout deletes the sign-in from the keyring and says Microsoft has no revocation endpoint; it
+    prints no link to the consent page.
+  - A tenant override, for an app registered in one organisation only, is a follow-up
+    ([#32](https://github.com/AH-Merii/neomail/issues/32)), not part of slice 6.
+- **Builds on:** "Outlook" in [Accounts and providers](#accounts-and-providers) and
+  [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).
