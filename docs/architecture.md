@@ -168,8 +168,12 @@ characters and bidirectional overrides in mail are neutralised before they reach
 Linux and macOS for every pull request and push to `main`, and `cargo check` on Rust 1.88, the
 `rust-version` in `Cargo.toml`. Every pull request and push to `main` then builds and packages
 `nmail` for x86_64 Linux (musl, statically linked, so it does not depend on the system's glibc)
-and Apple-silicon macOS, so a dependency that breaks either release build fails before it
-merges. Only a push to `main` publishes them as the rolling `edge` pre-release
+and Apple-silicon macOS, so a dependency that breaks the musl build fails before it merges.
+Linux comes first ([DEC-2026-10-12-linux-first](decisions.md#dec-2026-10-12-linux-first)): the
+macOS check and build may fail without failing the run, and the macOS build is published even
+when the macOS check failed. A failed macOS build leaves edge without a macOS tarball until the
+next one succeeds; the release notes say so. Only a push to `main` publishes the tarballs, as
+the rolling `edge` pre-release
 ([DEC-2026-10-11-main-usable](decisions.md#dec-2026-10-11-main-usable)). Each tarball holds a
 `THIRD-PARTY-LICENSES` file that cargo-about generates from the dependency tree (`about.toml`
 lists the accepted licences; a crate under any other fails the build). Once the release exists,

@@ -202,6 +202,9 @@ the new entry.
 
 - **First release: Linux, macOS, and WSL (WSL2)** — CI, prebuilt binaries, OS keyring on Linux and
   macOS. Native Windows later.
+- **Linux first** ([DEC-2026-10-12-linux-first](#dec-2026-10-12-linux-first)): for now all work
+  targets Linux; the first goal is neomail working there. macOS stays in the first release, but no
+  slice waits on it and a macOS-only CI failure doesn't block a merge.
 - **WSL specifics are first-class:** detect WSL (`WSL_DISTRO_NAME` / WSLInterop) and handle it —
   secrets fall back when no Secret Service is available (password command such as `pass`, Windows
   Credential Manager via interop, or an encrypted file store), OAuth opens the Windows browser
@@ -226,7 +229,8 @@ the new entry.
   the gains ([DEC-2026-10-11-agent-kit-skill](#dec-2026-10-11-agent-kit-skill)).
 - **Autonomy:** agents work on GitButler branches; Claude creates, updates and merges PRs without
   asking ([DEC-2026-10-11-pr-autonomy](#dec-2026-10-11-pr-autonomy)); changes are merged to `main`
-  once CI passes and a review agent has passed them
+  once the CI run passes (a macOS-only failure leaves it green:
+  [DEC-2026-10-12-linux-first](#dec-2026-10-12-linux-first)) and a review agent has passed them
   ([DEC-2026-10-11-merge-gate](#dec-2026-10-11-merge-gate), proposed); the docs site is published to GitHub Pages; pre-release builds may be cut without
   asking.
 - Commits in this repository are unsigned (local `commit.gpgsign=false`) while agents work
@@ -536,3 +540,18 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Ruling:** the "CLI first" bullet under [Project and delivery](#project-and-delivery).
   [roadmap.md](roadmap.md) splits each feature that has both a command and a screen into a CLI
   slice and a TUI slice. That split is Claude's.
+
+### <a id="dec-2026-10-12-linux-first"></a>DEC-2026-10-12-linux-first: Linux before macOS
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-12 (f679d889:502).
+- **Context:** every slice so far was built and checked for Linux and macOS (a macOS CI job, a
+  keychain store and an Apple-silicon edge build), while the owner and all live checks are on Linux.
+- **Owner's words:** "for now let us prioritize all work for linux and not macos, the intial goal
+  is to get this wroking on linux"
+- **Ruling:** the "Linux first" bullet under [Platforms](#platforms). It changes the order, not the
+  scope: the "First release" bullet still lists macOS. WSL runs Linux, so it stays in. Keeping
+  macOS CI jobs as non-blocking, rather than removing them, is Claude's call.
+- **Refines:** the merge condition in [DEC-2026-10-11-pr-autonomy](#dec-2026-10-11-pr-autonomy)
+  ("once CI passes") and [DEC-2026-10-11-merge-gate](#dec-2026-10-11-merge-gate) ("once CI is
+  green"): both mean the CI workflow run concludes `success`. A failed macOS job still shows as a
+  failed check, but it leaves the run green, so it no longer holds back a merge.
