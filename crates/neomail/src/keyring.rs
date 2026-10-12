@@ -54,8 +54,8 @@ impl std::fmt::Display for Malformed {
         let account = &self.0;
         write!(
             f,
-            "the keyring entry for {account:?} is malformed; run `nmail account logout \
-             {account}`, then `nmail account login {account}`"
+            "the keyring entry for {account:?} is malformed; run `neomail account logout \
+             {account}`, then `neomail account login {account}`"
         )
     }
 }
@@ -110,7 +110,7 @@ impl Keyring {
             Ok(password) => Ok(Password::new(password)),
             Err(Error::NoEntry) => Err(anyhow!(
                 "no password in {} (service {SERVICE:?}, user {account:?}); run \
-                 `nmail account set-password {account}` or set password_command",
+                 `neomail account set-password {account}` or set password_command",
                 self.name
             )),
             Err(e) => Err(error(&e, SERVICE, account, self.wsl)),
@@ -282,7 +282,7 @@ mod tests {
         let message = format!("{:#}", k.get("work").unwrap_err());
         assert!(message.contains("no password in the mock"), "{message}");
         assert!(
-            message.contains("run `nmail account set-password work` or set password_command"),
+            message.contains("run `neomail account set-password work` or set password_command"),
             "{message}"
         );
     }
@@ -346,7 +346,7 @@ mod tests {
         let message = format!("{:#}", k.get_oauth("bad").unwrap_err());
         assert!(!message.contains(SECRET), "{message}");
         assert!(
-            message.ends_with("run `nmail account logout bad`, then `nmail account login bad`"),
+            message.ends_with("run `neomail account logout bad`, then `neomail account login bad`"),
             "{message}"
         );
         fail_next_in(

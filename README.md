@@ -8,7 +8,7 @@
 A fast, modal terminal email client for Outlook, Gmail and Proton Mail.
 
 > **Status:** early development. What works today: a read-only INBOX over IMAP in the command
-> line (`nmail sync`, `nmail list`, `nmail show`), with passwords (an app password, Proton Mail
+> line (`neomail sync`, `neomail list`, `neomail show`), with passwords (an app password, Proton Mail
 > Bridge) or, for Gmail, OAuth sign-in through your own Google client. Nothing changes on the
 > server. There is no TUI yet, and no Outlook sign-in.
 
@@ -16,23 +16,42 @@ A fast, modal terminal email client for Outlook, Gmail and Proton Mail.
 
 ### Install
 
-From source, with Rust 1.88 or newer:
+Everything is pre-alpha. The builds come from the
+[edge pre-release](https://github.com/AH-Merii/neomail/releases/tag/edge), which is rebuilt from
+`main` on every merge, so expect breaking changes. They cover Linux x86_64 (WSL included; a
+static musl binary that needs no particular glibc) and, when its build passed, macOS on Apple
+silicon.
+
+The installer downloads the edge build for your platform, checks it against the release's
+`SHA256SUMS` and puts `neomail` in `~/.local/bin` (or `$XDG_BIN_HOME`, `$NEOMAIL_INSTALL_DIR`,
+`--to DIR`). It edits no shell startup file: it prints the `PATH` line to add if one is needed.
 
 ```sh
-cargo install --locked --git https://github.com/AH-Merii/neomail nmail
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/AH-Merii/neomail/main/install.sh | sh
 ```
 
-Or download a build of the latest `main` from the
-[edge pre-release](https://github.com/AH-Merii/neomail/releases/tag/edge) (Linux x86_64, a
-static binary that needs no particular glibc, and, when its build passed, macOS on Apple
-silicon), unpack it, and put
-`nmail` on your `PATH`. Edge is rebuilt on every merge, so expect changes. Each tarball carries
-the licences of the crates built into it in `THIRD-PARTY-LICENSES`.
+Run it again to update, or pass `--uninstall` to remove the binary
+(`curl ... | sh -s -- --uninstall`); `sh install.sh --help` lists the options.
+
+With [mise](https://mise.jdx.dev/dev-tools/backends/github.html):
+
+```sh
+mise use -g github:AH-Merii/neomail@edge
+mise install --force github:AH-Merii/neomail@edge   # fetch a newer edge; the tag name never changes
+```
+
+Or from source, with Rust 1.88 or newer:
+
+```sh
+cargo install --locked --git https://github.com/AH-Merii/neomail neomail
+```
+
+Each tarball carries the licences of the crates built into it in `THIRD-PARTY-LICENSES`.
 
 ### Configure
 
 Create `~/.config/neomail/config.toml` (or `$XDG_CONFIG_HOME/neomail/config.toml`; `--config PATH`
-or `NMAIL_CONFIG` point elsewhere, and an empty `NMAIL_CONFIG` counts as unset):
+or `NEOMAIL_CONFIG` point elsewhere, and an empty `NEOMAIL_CONFIG` counts as unset):
 
 ```toml
 [[accounts]]
@@ -65,9 +84,9 @@ An account without `password_command` reads its password from the OS keyring: th
 on Linux (GNOME Keyring, KeePassXC and others), the login keychain on macOS. Store it once:
 
 ```sh
-nmail account set-password work      # prompts without echo
-pass show mail/work | nmail account set-password work   # or one line on stdin
-nmail account delete-password work
+neomail account set-password work      # prompts without echo
+pass show mail/work | neomail account set-password work   # or one line on stdin
+neomail account delete-password work
 ```
 
 The entry has the service `neomail` and the account name as the user. An account with
@@ -86,32 +105,32 @@ Gmail signs in with OAuth through a Google OAuth client you create yourself; neo
 wizard prints them too:
 
 ```sh
-nmail account add gmail          # asks for the address, client ID and secret, then opens the browser
-nmail sync --account gmail
-nmail account login gmail        # sign in again (needed every 7 days while the app is in Testing)
-nmail account logout gmail       # revoke the sign-in and delete it from the keyring
+neomail account add gmail          # asks for the address, client ID and secret, then opens the browser
+neomail sync --account gmail
+neomail account login gmail        # sign in again (needed every 7 days while the app is in Testing)
+neomail account logout gmail       # revoke the sign-in and delete it from the keyring
 ```
 
 The account is added to the config file without secrets; the client secret and refresh token stay
 in the OS keyring (service `neomail-oauth`). `--no-browser` only prints the sign-in URL. On WSL the
 Windows browser opens (`wslview` or `explorer.exe`), or the one in `$BROWSER`.
 
-The cache lives in `~/.local/share/neomail/` (`$XDG_DATA_HOME/neomail/`, or `NMAIL_DATA_DIR`).
+The cache lives in `~/.local/share/neomail/` (`$XDG_DATA_HOME/neomail/`, or `NEOMAIL_DATA_DIR`).
 
 ### Use
 
 ```sh
-nmail sync                 # fetch new mail for every account: "work: 12 new, 1 updated, 0 removed"
-nmail list                 # newest first; * marks unread
-nmail show 42              # headers, body, attachments
+neomail sync                 # fetch new mail for every account: "work: 12 new, 1 updated, 0 removed"
+neomail list                 # newest first; * marks unread
+neomail show 42              # headers, body, attachments
 ```
 
-- `nmail sync --account work --limit 100`: the first sync takes the 500 messages that arrived
+- `neomail sync --account work --limit 100`: the first sync takes the 500 messages that arrived
   last unless `--limit` says otherwise. Later syncs fetch all mail that is new since, however
   much, refresh flags and drop deleted mail. Messages are fetched without marking them read.
-- `nmail list --account work --limit 20 --json` and `nmail show 42 --json` print JSON for
+- `neomail list --account work --limit 20 --json` and `neomail show 42 --json` print JSON for
   scripts; see [docs/json.md](docs/json.md) for the shapes and exit codes.
-- `nmail show 42 --raw` prints the message source.
+- `neomail show 42 --raw` prints the message source.
 
 How it fits together: [docs/architecture.md](docs/architecture.md).
 

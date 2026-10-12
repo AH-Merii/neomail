@@ -1,5 +1,5 @@
 [package]
-name = "nmail"
+name = "neomail"
 description = "neomail, a terminal email client"
 version.workspace = true
 edition.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 publish = false
 
 [[bin]]
-name = "nmail"
+name = "neomail"
 path = "src/main.rs"
 
 [dependencies]

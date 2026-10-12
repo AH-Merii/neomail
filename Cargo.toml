@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/nmail", "crates/nm-core", "crates/nm-imap"]
+members = ["crates/neomail", "crates/nm-core", "crates/nm-imap"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,11 +20,11 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 html2text = "0.17"
 # Must match the html5ever that html2text uses: its RcDom is the parse target.
 html5ever = "0.40"
-# The OS keyring: keyring-core's API, plus one store per platform (crates/nmail/src/keyring.rs).
+# The OS keyring: keyring-core's API, plus one store per platform (crates/neomail/src/keyring.rs).
 keyring-core = { version = "1", default-features = false }
 apple-native-keyring-store = { version = "1.0.2", default-features = false, features = ["keychain"] }
 # Pure-Rust D-Bus (zbus) rather than libdbus, so the static musl build keeps linking. Its blocking
-# calls run on a tokio runtime of its own; nmail reads passwords before entering its own runtime.
+# calls run on a tokio runtime of its own; neomail reads passwords before entering its own runtime.
 zbus-secret-service-keyring-store = { version = "1.0.1", default-features = false, features = ["rt-tokio-crypto-rust"] }
 mail-parser = "0.11"
 rpassword = "7.5"

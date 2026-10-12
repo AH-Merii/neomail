@@ -8,13 +8,13 @@ use serde::Serialize;
 const HTML_WRAP: usize = 80;
 
 /// Above this size or nesting depth, HTML is not laid out (html2text's work grows faster than
-/// linearly with nesting, so hostile mail could stall `nmail show`); its tags are stripped instead.
+/// linearly with nesting, so hostile mail could stall `neomail show`); its tags are stripped instead.
 const HTML_MAX_BYTES: usize = 1 << 20;
 const HTML_MAX_DEPTH: usize = 100;
 
 /// The first line of a body whose HTML was only stripped of tags.
 pub const HTML_STRIPPED_NOTE: &str =
-    "[nmail: this HTML is too large or too deeply nested to lay out; showing its text only]";
+    "[neomail: this HTML is too large or too deeply nested to lay out; showing its text only]";
 
 /// A sender or recipient.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -73,7 +73,7 @@ pub struct Attachment {
     pub size: usize,
 }
 
-/// A message as `nmail show` presents it.
+/// A message as `neomail show` presents it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMessage {
     pub date: Option<DateTime<Utc>>,

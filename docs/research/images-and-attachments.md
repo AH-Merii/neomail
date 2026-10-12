@@ -171,7 +171,7 @@ touched.
   wrap the decode in `catch_unwind`.
 - **Out of process?** Not for v1. The chosen decoders are memory-safe Rust, the limits are strict,
   and a subprocess adds about 5–20 ms of spawn time per image. Keep a seam (`ImageDecoder` trait)
-  so a later "paranoid" mode can run `nmail __decode` under `setrlimit(RLIMIT_AS, RLIMIT_CPU)` plus
+  so a later "paranoid" mode can run `neomail __decode` under `setrlimit(RLIMIT_AS, RLIMIT_CPU)` plus
   seccomp/landlock, returning RGBA over a pipe. That is the only way to truly kill a runaway
   decode.
 - **SVG is not rendered.**
@@ -370,9 +370,9 @@ touched.
   private-mode config), never 0o755. Clear the executable bits even if the umask allows them.
 - **macOS quarantine.**
   - A CLI binary has no `Info.plist`, so `LSFileQuarantineEnabled` does not apply. Files that
-    `nmail` writes are **not** quarantined automatically; curl and wget behave the same, and
+    `neomail` writes are **not** quarantined automatically; curl and wget behave the same, and
     malware abuses this.
-  - neomail must set `com.apple.quarantine = "0081;<hex unix time>;nmail;<UUID>"` itself (the
+  - neomail must set `com.apple.quarantine = "0081;<hex unix time>;neomail;<UUID>"` itself (the
     `xattr` 1.6.1 crate) on every saved attachment. Then Gatekeeper checks it on first open.
   - "Kept" (decisions) therefore means: never remove it, and copy it when re-saving.
 - **Downloads directory.**
@@ -556,11 +556,11 @@ touched.
   `Image{src, alt, w, h}` annotation per `<img>`. A `DecorationProvider` in namespace `image` then
   turns each annotation into either:
   - a **block mark** when the image is allowed, decodable and images are on; or
-  - a **one-line virt_text placeholder** otherwise, styled with highlight groups `NmailImageBlocked`
-    and `NmailImageTracker`, for example
+  - a **one-line virt_text placeholder** otherwise, styled with highlight groups `NeomailImageBlocked`
+    and `NeomailImageTracker`, for example
     `▣ logo.png 240×80 · remote blocked · gi load · gI always for acme.com`.
 
-  Tracking pixels collapse to a single sign-column marker (`NmailTracker`) with a hover that
+  Tracking pixels collapse to a single sign-column marker (`NeomailTracker`) with a hover that
   explains it.
 - **Text-only fallback.** When `images = off`, on half-blocks with `images.halfblocks = false`, on
   a slow or SSH link, or under `MotionPref::Reduced`-style budgets, only placeholders are shown.
@@ -593,15 +593,15 @@ touched.
 
 | Action | CLI | Notes |
 |---|---|---|
-| `attachment.list` | `nmail attachment list <msg\|query> --json` | Metadata only, including `sniffed_type`, `declared_type`, `mismatch`, `dangerous`, `inline` |
-| `attachment.fetch` | `nmail attachment fetch <id…> [--progress ndjson]` | Downloads into the cache; returns the cache path |
-| `attachment.save` | `nmail attachment save <id…\|--all> [--dir D] [--overwrite=never]` | Sanitised names, `O_EXCL`, quarantine xattr; prints final paths |
-| `attachment.open` | `nmail attachment open <id> [--yes]` | Saves first, then opens. Dangerous kinds need `--yes` or an interactive confirm. |
-| `attachment.text` | `nmail attachment cat <id> --text` | Extracted text wrapped as data: `{"provenance":"attachment","untrusted":true,"text":…}` |
-| `image.load_remote` | `nmail image allow --message M \| --sender S \| --domain D` | Persists the permission; never overrides the tracker list |
+| `attachment.list` | `neomail attachment list <msg\|query> --json` | Metadata only, including `sniffed_type`, `declared_type`, `mismatch`, `dangerous`, `inline` |
+| `attachment.fetch` | `neomail attachment fetch <id…> [--progress ndjson]` | Downloads into the cache; returns the cache path |
+| `attachment.save` | `neomail attachment save <id…\|--all> [--dir D] [--overwrite=never]` | Sanitised names, `O_EXCL`, quarantine xattr; prints final paths |
+| `attachment.open` | `neomail attachment open <id> [--yes]` | Saves first, then opens. Dangerous kinds need `--yes` or an interactive confirm. |
+| `attachment.text` | `neomail attachment cat <id> --text` | Extracted text wrapped as data: `{"provenance":"attachment","untrusted":true,"text":…}` |
+| `image.load_remote` | `neomail image allow --message M \| --sender S \| --domain D` | Persists the permission; never overrides the tracker list |
 | `image.toggle` | n/a (TUI) | Per buffer; `gi`/`gI` default keys |
-| `draft.attach` | `nmail draft attach <draft> <path…\|--clipboard> [--inline]` | Same validation as the composer |
-| `draft.detach` / `draft.inline` | `nmail draft detach …` | n/a |
+| `draft.attach` | `neomail draft attach <draft> <path…\|--clipboard> [--inline]` | Same validation as the composer |
+| `draft.detach` / `draft.inline` | `neomail draft detach …` | n/a |
 
 - **MCP.**
   - Expose `attachment_list`, `attachment_text` and `attachment_save` (restricted to the
@@ -749,8 +749,8 @@ touched.
      placeholders when off or blocked.
    - Attachments, files and images are `PickerSource`s. Image, text, PDF, archive and dangerous
      views are `Previewer`s.
-   - All operations are registry actions shared by keys, CLI (`nmail attachment …`, `nmail image
-     allow …`, `nmail draft attach …`) and MCP. Agents get list, text and save, but not open or
+   - All operations are registry actions shared by keys, CLI (`neomail attachment …`, `neomail image
+     allow …`, `neomail draft attach …`) and MCP. Agents get list, text and save, but not open or
      remote-load, by default.
 
 ## Open questions

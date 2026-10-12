@@ -25,7 +25,7 @@ use self::loopback::Listener;
 /// How long the browser has to come back to the loopback listener.
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// An OAuth provider, as data: slice 4 adds Microsoft as another value, not another type.
+/// An OAuth provider, as data: slice 6 adds Microsoft as another value, not another type.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Provider {
     /// The `provider` value in the config.
@@ -301,12 +301,12 @@ pub async fn refresh<H: Http>(
             .with_context(|| format!("{} returned no access token", provider.name)),
         Err(e) if e.downcast_ref::<InvalidGrant>().is_some() => bail!(
             "the saved {} sign-in expired or was revoked (an app in Testing mode gets sign-ins \
-             that last 7 days; see docs/gmail.md); run `nmail account login {account}`",
+             that last 7 days; see docs/gmail.md); run `neomail account login {account}`",
             provider.name
         ),
         Err(e) if e.is::<BadClient>() => bail!(
-            "cannot refresh the {} sign-in: {e:#}; run `nmail account logout {account}`, then \
-             `nmail account login {account}`",
+            "cannot refresh the {} sign-in: {e:#}; run `neomail account logout {account}`, then \
+             `neomail account login {account}`",
             provider.name
         ),
         Err(e) => Err(e.context(format!("cannot refresh the {} sign-in", provider.name))),

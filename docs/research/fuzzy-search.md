@@ -446,7 +446,7 @@ phrase  := '"' … '"'
 - **Column targeting** like Helix's `%column text` falls out of the same parser: `subject:` and
   `from:` are columns.
 - `OR` and parentheses can come later. Gmail supports them, but most users never type them.
-- **The same parser serves the CLI** (`nmail search 'from:jeff is:unread budget' --json`) and
+- **The same parser serves the CLI** (`neomail search 'from:jeff is:unread budget' --json`) and
   agents, so pickers, CLI and MCP share one query language. That satisfies "agents and the CLI
   can query the same sources".
 - **Prior art:** Gmail operators (`from: to: cc: subject: after: before: older_than:
@@ -539,7 +539,7 @@ pub trait ItemSink { fn push(&mut self, item: PickerItem) -> Result<(), Cancelle
   layout is a float, and it fires events (`PickerOpen`, `PickerSelect`, `PickerClose`).
   Selections feed frecency through the action registry.
 - **CLI and agents:**
-  `nmail pick <source> --query '…' --scope account:work --limit 50 --json` calls `produce`, runs
+  `neomail pick <source> --query '…' --scope account:work --limit 50 --json` calls `produce`, runs
   a one-shot `Pattern::match_list` and prints JSON. The ranking is the same as the TUI's.
 
 ## Key facts

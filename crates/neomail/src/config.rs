@@ -10,12 +10,12 @@ use serde::Deserialize;
 
 use crate::oauth::{self, Provider};
 
-/// Where the config file is: `--config`, then `NMAIL_CONFIG`, then
+/// Where the config file is: `--config`, then `NEOMAIL_CONFIG`, then
 /// `$XDG_CONFIG_HOME/neomail/config.toml`, then `~/.config/neomail/config.toml`. An empty
-/// `NMAIL_CONFIG` counts as unset, like an empty `NMAIL_DATA_DIR`.
+/// `NEOMAIL_CONFIG` counts as unset, like an empty `NEOMAIL_DATA_DIR`.
 pub fn config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     match explicit.or_else(|| {
-        env::var_os("NMAIL_CONFIG")
+        env::var_os("NEOMAIL_CONFIG")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
     }) {
@@ -24,10 +24,10 @@ pub fn config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-/// Where the cache lives: `NMAIL_DATA_DIR`, then `$XDG_DATA_HOME/neomail`, then
+/// Where the cache lives: `NEOMAIL_DATA_DIR`, then `$XDG_DATA_HOME/neomail`, then
 /// `~/.local/share/neomail`.
 pub fn data_dir() -> Result<PathBuf> {
-    match env::var_os("NMAIL_DATA_DIR").filter(|v| !v.is_empty()) {
+    match env::var_os("NEOMAIL_DATA_DIR").filter(|v| !v.is_empty()) {
         Some(dir) => Ok(PathBuf::from(dir)),
         None => Ok(xdg_dir("XDG_DATA_HOME", ".local/share")?.join("neomail")),
     }
