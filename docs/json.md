@@ -69,7 +69,9 @@ Listings print tab-separated values when standard output is not a terminal, or w
 one record per line, fields separated by one tab, no header, no padding, nothing cut off. Every
 control character in a field (tab, CR, LF, ESC and the rest of C0 and C1) and every bidi control
 becomes one space, so each record has the same number of fields. With `--color always` the fields
-carry colour codes (for `fzf --ansi`); otherwise they never do.
+carry colour codes (for `fzf --ansi`). So they do with `CLICOLOR_FORCE` set (to anything but
+empty or `0`) when `NO_COLOR` is not set and `--color` is not given or `auto`. `--color never`
+makes sure they carry none.
 
 | Command | Fields |
 | ------- | ------ |
@@ -126,6 +128,24 @@ naming its line number, and nothing is shown. `--raw` takes exactly one id.
 | 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others. |
 | 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s input without an id; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help. |
 
-Errors go to standard error. A failure (exit 1) prints one line starting with `neomail:`. A usage
-error (exit 2) comes from the argument parser: it starts with `error:` and may be followed by a
-usage hint on further lines.
+Errors go to standard error, in these forms:
+
+- An error from the argument parser (exit 2: an unknown option, an invalid value, conflicting
+  output flags) starts with `error:` and may be followed by a usage hint on further lines.
+- neomail's own usage errors (exit 2) are one line starting with `neomail:`: a value that cannot
+  be asked for (standard input is not a terminal, or `--no-input`), a line of `show -`'s input
+  without an id, `--raw` with several ids, `-` mixed with ids, an option that does not apply to
+  the provider. They look like failures; only the exit code tells them apart.
+- Bare `neomail` (exit 2) prints the start lines (`neomail: no accounts yet. Start with:` and the
+  commands) without a config, or the help with one.
+- A failure (exit 1) prints a line starting with `neomail:`; `sync` prints one per failed account.
+  A failed `config check` prints `PATH:LINE:COL: message` for a syntax error or `PATH: message`
+  for an invalid value, without the `neomail:` prefix; a missing config file is an ordinary
+  `neomail:` failure.
+
+`jq -r` decodes the strings in JSON, so it prints any control character in them raw, ESC and bidi
+controls included: a subject can then move the cursor or reorder the text on a terminal. `jq -c`
+is not enough either: it escapes only the C0 controls, and prints bidi controls and C1 controls
+(such as U+009B, a one-byte CSI) as raw UTF-8. Print untrusted fields with `jq -ac`, which escapes
+every character outside ASCII as `\uXXXX`; or use the plain listings, which turn those characters
+into spaces (see Plain output); or keep the output off the terminal.

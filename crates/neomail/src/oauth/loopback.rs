@@ -3,8 +3,8 @@
 //!
 //! It answers anything that is not the redirect (a favicon, a stray tab) with 404 and keeps
 //! waiting, ignores a redirect with the wrong `state` (another page cannot end the sign-in),
-//! handles connections concurrently, bounds each request's size and time, gives up after the
-//! overall timeout, and never puts the code in a page, a message or an error.
+//! handles up to [`MAX_CONNECTIONS`] connections concurrently, bounds each request's size and
+//! time, gives up after the overall timeout, and never puts the code in a page, a message or an error.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +20,9 @@ use super::Secret;
 const MAX_REQUEST: usize = 16 * 1024;
 /// How long one connection may take to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many connections are handled at once. More wait in the kernel's queue until one ends, so
+/// a local process opening many cannot make the listener hold an unbounded number.
+pub const MAX_CONNECTIONS: usize = 16;
 
 pub struct Listener {
     listener: TcpListener,
@@ -70,13 +73,15 @@ impl Listener {
     }
 
     /// Accepts connections and handles each on its own task, so an idle one (a browser's
-    /// speculative preconnect) cannot hold up the redirect. Dropping the set aborts the rest.
+    /// speculative preconnect) cannot hold up the redirect. At most [`MAX_CONNECTIONS`] are
+    /// handled at once: at the cap it stops accepting until one ends. Dropping the set aborts the
+    /// rest.
     async fn accept_until_done(&self, state: &str) -> Result<Secret> {
         let state: Arc<str> = state.into();
         let mut handlers = JoinSet::new();
         loop {
             let request = tokio::select! {
-                accepted = self.listener.accept() => {
+                accepted = self.listener.accept(), if handlers.len() < MAX_CONNECTIONS => {
                     let (stream, _) = accepted.context("the sign-in listener failed")?;
                     handlers.spawn(handle(stream, state.clone()));
                     continue;

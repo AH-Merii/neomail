@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::http::Response;
-use super::loopback::{Listener, Request, parse_request};
+use super::loopback::{Listener, MAX_CONNECTIONS, Request, parse_request};
 use super::*;
 
 const SECRET: &str = "GOCSPX-not-a-real-secret";
@@ -198,6 +198,44 @@ async fn an_idle_connection_does_not_hold_up_the_redirect() {
         .await
         .unwrap();
     assert_eq!(code.expose(), CODE);
+    drop(idle);
+}
+
+#[tokio::test]
+async fn the_listener_handles_at_most_max_connections_at_once() {
+    let listener = Listener::bind().await.unwrap();
+    let port: u16 = listener
+        .redirect_uri()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // A full set of idle connections, then the redirect. Connections are accepted in order.
+    let mut idle = Vec::new();
+    for _ in 0..MAX_CONNECTIONS {
+        idle.push(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap(),
+        );
+    }
+    let redirect = format!("GET /?state=st4te&code={CODE} HTTP/1.1\r\n\r\n");
+    let browser = tokio::spawn(async move { send(port, redirect.as_bytes()).await });
+    // At the cap the redirect is not accepted, so this wait ends without a code. Without the
+    // cap the redirect would be answered at once, as in the idle-connection test above.
+    let e = listener
+        .wait("st4te", Duration::from_millis(500))
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("no sign-in came back"), "{e:#}");
+    // The redirect waited in the queue, not lost: once the slots are free it is handled.
+    let code = listener
+        .wait("st4te", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(code.expose(), CODE);
+    assert!(browser.await.unwrap().starts_with("HTTP/1.1 200 "));
     drop(idle);
 }
 

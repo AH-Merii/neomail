@@ -87,7 +87,7 @@ struct Cli {
 #[derive(clap::Args)]
 #[group(multiple = false)]
 struct ListingFormat {
-    /// Print TSV: one record per line, id first, no header (the default when stdout is not a terminal)
+    /// Print TSV: one record per line, key field first (id or name), no header (the default when stdout is not a terminal)
     #[arg(long)]
     plain: bool,
     /// Print a JSON array (https://github.com/AH-Merii/neomail/blob/main/docs/json.md)
@@ -1053,7 +1053,7 @@ fn refuse_oauth(account: &Account, instead: &str) -> Result<()> {
 fn set_password(keyring: &Keyring, account: &Account, password: &Password) -> Result<String> {
     keyring.set(&account.name, password)?;
     let mut line = format!(
-        "Stored the password for {:?} in {} (service {:?}, user {:?}).",
+        "Stored the password for {:?} in {} (service {:?}, username {:?}).",
         account.name,
         keyring.name(),
         keyring::SERVICE,

@@ -109,7 +109,7 @@ impl Keyring {
         match self.entry(SERVICE, account)?.get_password() {
             Ok(password) => Ok(Password::new(password)),
             Err(Error::NoEntry) => Err(anyhow!(
-                "no password in {} (service {SERVICE:?}, user {account:?}); run \
+                "no password in {} (service {SERVICE:?}, username {account:?}); run \
                  `neomail account set-password {account}` or set password_command",
                 self.name
             )),
@@ -208,7 +208,7 @@ fn error(e: &Error, service: &str, account: &str, wsl: bool) -> anyhow::Error {
         }
         Error::Ambiguous(items) => {
             return anyhow!(
-                "{} keyring items match service {service:?} and user {account:?}; delete all but one",
+                "{} keyring items match service {service:?} and username {account:?}; delete all but one",
                 items.len()
             );
         }

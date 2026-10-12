@@ -301,6 +301,21 @@ fn empty_neomail_config_counts_as_unset() {
     assert!(err.contains(".config/neomail/config.toml"), "{err}");
 }
 
+#[test]
+fn plain_help_fits_list_and_account_list() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [&["list", "--help"][..], &["account", "list", "--help"]] {
+        let o = neomail(dir.path(), args);
+        assert!(o.status.success(), "{args:?}: {}", stderr(&o));
+        let help = stdout(&o);
+        assert!(
+            help.contains("key field first (id or name)"),
+            "{args:?}: {help}"
+        );
+        assert!(!help.contains("id first"), "{args:?}: {help}");
+    }
+}
+
 /// install.sh tells our binary from d99kris/nmail and others by this prefix.
 #[test]
 fn version_names_the_binary() {
@@ -1005,14 +1020,14 @@ fn show_never_pages_off_a_terminal() {
     assert!(!marker.exists(), "the pager ran off a terminal");
 }
 
-/// A pager that catches Ctrl-C as less does, then reports whether neomail, its parent, was still
-/// alive half a second after the Ctrl-C.
+/// A pager that catches Ctrl-C as less does (and Ctrl-\, which less ignores), then reports
+/// whether neomail, its parent, was still alive half a second after the key.
 #[cfg(target_os = "linux")]
-const PAGER_CATCHING_CTRL_C: &str = r#"trap 'touch "DIR/got-int"' INT
+const PAGER_CATCHING_CTRL_C: &str = r#"trap 'touch "DIR/got-signal"' INT QUIT
 cat >/dev/null
 touch "DIR/ready"
 i=0
-while [ ! -e "DIR/got-int" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
+while [ ! -e "DIR/got-signal" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
 sleep 0.5
 read -r _ _ _ ppid _ < /proc/$$/stat
 if [ "$ppid" = "$PPID" ]; then echo alive; else echo orphaned; fi > "DIR/result"
@@ -1025,18 +1040,40 @@ touch "DIR/ready"
 exec sleep 20
 "#;
 
+/// A pager that waits until the test has pressed its key, then half a second more, and exits 0
+/// after writing DIR/result. A signal that is not ignored kills it before that.
+#[cfg(target_os = "linux")]
+const PAGER_WAITING_OUT_THE_KEY: &str = r#"cat >/dev/null
+touch "DIR/ready"
+i=0
+while [ ! -e "DIR/pressed" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
+sleep 0.5
+echo done > "DIR/result"
+"#;
+
 /// Runs `show` on a terminal (`script` gives it one) with `pager`, an sh script in which DIR is
 /// the data directory, presses Ctrl-C once the pager has written DIR/ready, and returns how
 /// neomail exited, with the data directory.
 #[cfg(target_os = "linux")]
 fn ctrl_c_while_paging(pager: &str) -> (std::process::ExitStatus, tempfile::TempDir) {
+    key_while_paging(pager, b"\x03", "")
+}
+
+/// [`ctrl_c_while_paging`] with any `key`, and `before`, sh commands run before neomail
+/// replaces the shell (such as `trap '' INT`). DIR/pressed is written once the key is sent.
+#[cfg(target_os = "linux")]
+fn key_while_paging(
+    pager: &str,
+    key: &[u8],
+    before: &str,
+) -> (std::process::ExitStatus, tempfile::TempDir) {
     let dir = seeded();
     let data = dir.path();
     let id = &ids(data)[2];
     let script = data.join("pager.sh");
     std::fs::write(&script, pager.replace("DIR", data.to_str().unwrap())).unwrap();
     // `exec` keeps neomail the terminal's foreground process group, with the pager in it.
-    let run = format!("exec '{}' show {id}", env!("CARGO_BIN_EXE_neomail"));
+    let run = format!("{before}exec '{}' show {id}", env!("CARGO_BIN_EXE_neomail"));
     let mut c = Command::new("script");
     c.args(["-qec", &run, "/dev/null"]);
     isolate(&mut c, data);
@@ -1057,10 +1094,12 @@ fn ctrl_c_while_paging(pager: &str) -> (std::process::ExitStatus, tempfile::Temp
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    // ^C on the terminal: SIGINT to the foreground process group, neomail and the pager.
+    // ^C on the terminal: SIGINT to the foreground process group, neomail and the pager (^\:
+    // SIGQUIT).
     let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(b"\x03").unwrap();
+    stdin.write_all(key).unwrap();
     stdin.flush().unwrap();
+    std::fs::write(data.join("pressed"), "").unwrap();
     let status = child.wait().unwrap();
     drop(stdin);
     (status, dir)
@@ -1075,14 +1114,47 @@ fn ctrl_c_in_the_pager_waits_for_the_pager() {
     assert!(result.is_ok(), "neomail exited before its pager");
     assert_eq!(result.unwrap(), "alive\n", "neomail died before its pager");
     assert!(
-        dir.path().join("got-int").exists(),
+        dir.path().join("got-signal").exists(),
         "the pager never saw the Ctrl-C"
     );
-    // How neomail exits after waiting depends on the system's sh, which runs the pager. bash
-    // execs the pager, so neomail sees the pager's own exit and exits 0. Ubuntu's dash keeps a
-    // shell between them that dies of the Ctrl-C once the pager has exited (CI run 38274337495),
-    // and neomail follows it with 130. Either way it waited.
-    assert!(status.success() || status.code() == Some(130), "{status:?}");
+    // The pager caught the Ctrl-C and exited 0, and neomail follows it. That needs the pager to
+    // be neomail's own child: Ubuntu's dash, unlike bash, keeps a shell between them unless told
+    // to `exec`, and that shell died of the Ctrl-C once the pager had exited (CI run 38274337495).
+    assert!(status.success(), "{status:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ctrl_backslash_in_the_pager_waits_for_the_pager() {
+    let (status, dir) = key_while_paging(PAGER_CATCHING_CTRL_C, b"\x1c", "");
+    let result = std::fs::read_to_string(dir.path().join("result"));
+    assert!(result.is_ok(), "neomail exited before its pager");
+    assert_eq!(result.unwrap(), "alive\n", "neomail died before its pager");
+    assert!(
+        dir.path().join("got-signal").exists(),
+        "the pager never saw the Ctrl-\\"
+    );
+    // A dash left between neomail and the pager would die of the SIGQUIT at once, and neomail
+    // would exit before the pager; the pager command is execed so that none is left.
+    assert!(status.success(), "{status:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn keys_ignored_when_neomail_starts_stay_ignored_while_paging() {
+    // An asynchronous job without job control starts with SIGINT and SIGQUIT ignored. The
+    // pager inherits that, so it outlives the key, and neomail exits with it.
+    for (key, trap) in [(&b"\x03"[..], "INT"), (b"\x1c", "QUIT")] {
+        let (status, dir) =
+            key_while_paging(PAGER_WAITING_OUT_THE_KEY, key, &format!("trap '' {trap}; "));
+        let result = std::fs::read_to_string(dir.path().join("result"));
+        assert_eq!(
+            result.ok().as_deref(),
+            Some("done\n"),
+            "{trap}: the pager died"
+        );
+        assert!(status.success(), "{trap}: {status:?}");
+    }
 }
 
 #[cfg(target_os = "linux")]

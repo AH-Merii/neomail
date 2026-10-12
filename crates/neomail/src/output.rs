@@ -463,9 +463,14 @@ fn size(bytes: usize) -> String {
 }
 
 /// Whether a character could change what the terminal shows: control characters (escape
-/// sequences) and bidirectional overrides.
+/// sequences) and every bidi control: the marks ALM, LRM and RLM, the embeddings and overrides,
+/// and the isolates.
 fn unsafe_char(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
 }
 
 /// A header value made safe for one line.
@@ -579,7 +584,7 @@ mod tests {
             entry(
                 1,
                 Some(("Ada\tL\x1b[31m", "ada@mail.example")),
-                "a\tb\r\nc\u{85}d\u{202E}e",
+                "a\tb\r\nc\u{85}d\u{202E}e\u{061C}f\u{200E}g\u{200F}h\u{2066}i",
                 false,
             ),
             entry(2, Some(("", "bob@mail.example")), &long, true),
@@ -594,7 +599,7 @@ mod tests {
         }
         assert_eq!(
             lines[0],
-            "1\t*\t2026-10-10T09:30:00Z\two rk\tAda L [31m <ada@mail.example>\ta b  c d e"
+            "1\t*\t2026-10-10T09:30:00Z\two rk\tAda L [31m <ada@mail.example>\ta b  c d e f g h i"
         );
         assert_eq!(lines[1].split('\t').nth(5), Some(long.as_str()));
         assert_eq!(lines[1].split('\t').nth(4), Some("bob@mail.example"));

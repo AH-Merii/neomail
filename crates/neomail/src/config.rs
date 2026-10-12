@@ -151,7 +151,8 @@ pub struct OAuthSettings {
 pub enum PasswordSource {
     /// Run through `sh -c`; its output is the password. The command is not secret, its output is.
     Command(String),
-    /// The OS keyring entry with service `neomail` and the account name as the user.
+    /// The OS keyring entry with service `neomail` and the account name as its `username`
+    /// attribute.
     Keyring,
 }
 
