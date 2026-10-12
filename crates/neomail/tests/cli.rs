@@ -1007,6 +1007,7 @@ fn show_never_pages_off_a_terminal() {
 
 /// A pager that catches Ctrl-C as less does, then reports whether neomail, its parent, was still
 /// alive half a second after the Ctrl-C.
+#[cfg(target_os = "linux")]
 const PAGER_CATCHING_CTRL_C: &str = r#"trap 'touch "DIR/got-int"' INT
 cat >/dev/null
 touch "DIR/ready"
@@ -1018,6 +1019,7 @@ if [ "$ppid" = "$PPID" ]; then echo alive; else echo orphaned; fi > "DIR/result"
 "#;
 
 /// A pager that dies of Ctrl-C.
+#[cfg(target_os = "linux")]
 const PAGER_DYING_OF_CTRL_C: &str = r#"cat >/dev/null
 touch "DIR/ready"
 exec sleep 20
@@ -1076,7 +1078,11 @@ fn ctrl_c_in_the_pager_waits_for_the_pager() {
         dir.path().join("got-int").exists(),
         "the pager never saw the Ctrl-C"
     );
-    assert!(status.success(), "{status:?}");
+    // How neomail exits after waiting depends on the system's sh, which runs the pager. bash
+    // execs the pager, so neomail sees the pager's own exit and exits 0. Ubuntu's dash keeps a
+    // shell between them that dies of the Ctrl-C once the pager has exited (CI run 38274337495),
+    // and neomail follows it with 130. Either way it waited.
+    assert!(status.success() || status.code() == Some(130), "{status:?}");
 }
 
 #[cfg(target_os = "linux")]
