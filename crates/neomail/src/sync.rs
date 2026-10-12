@@ -59,14 +59,26 @@ impl<'a> Syncer<'a> {
     /// blocking calls start a runtime of their own, which panics inside another.
     pub fn sync(&mut self, account: &Account, cache: &mut Cache) -> Synced {
         let mut warnings = Vec::new();
-        let report = self.sync_inner(account, cache, &mut warnings);
-        if report.is_err() {
-            // The token may be what failed (revoked, or refused by the server): ask for a new one
-            // next time. A keyring that failed is opened again, in case its service restarted.
-            self.tokens.forget(&account.name);
-            self.keyring = None;
+        let mut stored = SyncReport::default();
+        match self.sync_inner(account, cache, &mut stored, &mut warnings) {
+            Ok(()) => Synced {
+                report: Ok(stored),
+                partial: SyncReport::default(),
+                warnings,
+            },
+            Err(e) => {
+                // The token may be what failed (revoked, or refused by the server): ask for a new
+                // one next time. A keyring that failed is opened again, in case its service
+                // restarted.
+                self.tokens.forget(&account.name);
+                self.keyring = None;
+                Synced {
+                    report: Err(e),
+                    partial: stored,
+                    warnings,
+                }
+            }
         }
-        Synced { report, warnings }
     }
 
     /// Drops what is kept for accounts no longer in `accounts`.
@@ -78,8 +90,9 @@ impl<'a> Syncer<'a> {
         &mut self,
         account: &Account,
         cache: &mut Cache,
+        report: &mut SyncReport,
         warnings: &mut Vec<String>,
-    ) -> Result<SyncReport> {
+    ) -> Result<()> {
         let runtime = self.runtime;
         let limit = self.limit;
         let progress = &mut self.progress;
@@ -101,6 +114,7 @@ impl<'a> Syncer<'a> {
                     login,
                     cache,
                     limit,
+                    report,
                     progress,
                 ))
             }
@@ -119,11 +133,17 @@ impl<'a> Syncer<'a> {
                         },
                         cache,
                         limit,
+                        report,
                         progress,
                     )),
-                    Server::Graph { .. } => {
-                        runtime.block_on(graph::sync(&account.name, token, cache, limit, progress))
-                    }
+                    Server::Graph { .. } => runtime.block_on(graph::sync(
+                        &account.name,
+                        token,
+                        cache,
+                        limit,
+                        report,
+                        progress,
+                    )),
                 }
             }
         }
@@ -135,6 +155,9 @@ impl<'a> Syncer<'a> {
 /// daemon with the time and only when one differs from the account's last.
 pub struct Synced {
     pub report: Result<SyncReport>,
+    /// When the sync failed, what it changed before the failure: the batches it already stored,
+    /// with their [`SyncReport::new_ids`]. Empty when it succeeded; `report` has it all then.
+    pub partial: SyncReport,
     pub warnings: Vec<String>,
 }
 
@@ -244,10 +267,11 @@ async fn sync_imap(
     login: nm_imap::Login<'_>,
     cache: &mut Cache,
     limit: NonZeroU32,
+    report: &mut SyncReport,
     progress: &mut output::ProgressLine,
-) -> Result<SyncReport> {
+) -> Result<()> {
     let mut source = ImapSource::connect(imap, login).await?;
-    let result = sync_inbox_with_progress(&mut source, cache, account, limit, |p| {
+    let result = sync_inbox_with_progress(&mut source, cache, account, limit, report, |p| {
         progress.update(&mut io::stderr(), account, p);
     })
     .await;

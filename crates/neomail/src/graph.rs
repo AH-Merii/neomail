@@ -54,16 +54,17 @@ fn check_failed(e: GraphError) -> anyhow::Error {
     }
 }
 
-/// Syncs a Graph account's INBOX with `access_token`.
+/// Syncs a Graph account's INBOX with `access_token`, filling `report` as it goes.
 pub async fn sync(
     account: &str,
     access_token: &Secret,
     cache: &mut Cache,
     limit: NonZeroU32,
+    report: &mut SyncReport,
     progress: &mut output::ProgressLine,
-) -> Result<SyncReport> {
+) -> Result<()> {
     let mut source = GraphSource::new(Https::new()?, access_token.expose());
-    sync_inbox_by_id_with_progress(&mut source, cache, account, limit, |p| {
+    sync_inbox_by_id_with_progress(&mut source, cache, account, limit, report, |p| {
         progress.update(&mut io::stderr(), account, p);
     })
     .await

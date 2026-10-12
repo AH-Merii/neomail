@@ -485,30 +485,41 @@ fn size(bytes: usize) -> String {
     }
 }
 
-/// Whether a character could change what the terminal shows: control characters (escape
-/// sequences) and every bidi control: the marks ALM, LRM and RLM, the embeddings and overrides,
-/// and the isolates.
+/// Whether a character could change what the terminal or a notification shows: control
+/// characters (escape sequences; NEL, U+0085, is one), the line and paragraph separators U+2028
+/// and U+2029 (a line break where Unicode line breaking applies, as in a desktop notification),
+/// and every bidi control: the marks ALM, LRM and RLM, the embeddings and overrides, and the
+/// isolates.
 fn unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            '\u{0085}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
         )
 }
 
 /// A header value made safe for one line.
-fn one_line(s: &str) -> String {
+pub(crate) fn one_line(s: &str) -> String {
     s.chars()
         .map(|c| if unsafe_char(c) { ' ' } else { c })
         .collect()
 }
 
-/// A body made safe for the terminal, keeping newlines and tabs.
+/// A body made safe for the terminal, keeping newlines and tabs; the line and paragraph
+/// separators U+2028 and U+2029 become newlines, so a body keeps its line breaks.
 fn text(s: &str) -> String {
     s.chars()
         .filter(|c| *c != '\r')
         .map(|c| match c {
             '\n' | '\t' => c,
+            '\u{2028}' | '\u{2029}' => '\n',
             c if unsafe_char(c) => '\u{FFFD}',
             c => c,
         })
@@ -672,7 +683,9 @@ mod tests {
     #[test]
     fn escapes_are_neutralised() {
         assert_eq!(one_line("a\x1b[31mb\nc\u{202E}d"), "a [31mb c d");
+        assert_eq!(one_line("a\u{2028}b\u{2029}c\u{85}d"), "a b c d");
         assert_eq!(text("a\r\n\x1b]0;x\x07b\tc"), "a\n\u{FFFD}]0;x\u{FFFD}b\tc");
+        assert_eq!(text("a\u{2028}b\u{2029}c\u{85}d"), "a\nb\nc\u{FFFD}d");
     }
 
     #[test]

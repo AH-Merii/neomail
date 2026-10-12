@@ -29,6 +29,9 @@ apple-native-keyring-store = { version = "1.0.2", default-features = false, feat
 # Pure-Rust D-Bus (zbus) rather than libdbus, so the static musl build keeps linking. Its blocking
 # calls run on a tokio runtime of its own; neomail reads passwords before entering its own runtime.
 zbus-secret-service-keyring-store = { version = "1.0.1", default-features = false, features = ["rt-tokio-crypto-rust"] }
+# Desktop notifications from `neomail daemon` (Linux). The version the keyring store already brings
+# in, on tokio as there, so no crate or feature enters the tree.
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 mail-parser = "0.11"
 rpassword = "7.5"
 rusqlite = { version = "0.40", features = ["bundled"] }

@@ -71,32 +71,45 @@ pub async fn sync_inbox_by_id<S: IdSource>(
     account: &str,
     limit: NonZeroU32,
 ) -> Result<SyncReport, SyncError<S::Error>> {
-    sync_inbox_by_id_with_progress(source, cache, account, limit, |_| {}).await
+    let mut report = SyncReport::default();
+    sync_inbox_by_id_with_progress(source, cache, account, limit, &mut report, |_| {}).await?;
+    Ok(report)
 }
 
-/// [`sync_inbox_by_id`], calling `progress` once the new messages are known (`done` 0) and after
-/// each batch is stored. It is not called when there is nothing new to fetch.
+/// [`sync_inbox_by_id`], filling `report` as it goes and calling `progress` once the new messages
+/// are known (`done` 0) and after each batch is stored. `progress` is not called when there is
+/// nothing new to fetch.
+///
+/// Each batch is stored as it comes, so when the sync fails, `report` still holds what it changed
+/// before the failure: [`SyncReport::new_ids`] has the messages already stored, which the next
+/// sync finds cached and does not report again.
 pub async fn sync_inbox_by_id_with_progress<S: IdSource>(
     source: &mut S,
     cache: &mut Cache,
     account: &str,
     limit: NonZeroU32,
+    report: &mut SyncReport,
     mut progress: impl FnMut(Progress),
-) -> Result<SyncReport, SyncError<S::Error>> {
-    let mut report = SyncReport::default();
+) -> Result<(), SyncError<S::Error>> {
     let (mailbox_id, seen_until) = match cache.mailbox(account, INBOX)? {
         Some(MailboxRecord {
             id,
             kind: MailboxKind::ById { seen_until },
-        }) => (id, seen_until),
+            synced,
+        }) => {
+            report.initial = !synced;
+            (id, seen_until)
+        }
         previous => {
             if let Some(old) = previous {
                 report.reset = true;
                 report.removed = cache.message_count(old.id)?;
             }
+            report.initial = true;
             (cache.reset_id_mailbox(account, INBOX)?.id, None)
         }
     };
+    let was_synced = !report.initial;
 
     let cached = cache.cached_ids(mailbox_id)?;
     let oldest_cached = cached.iter().map(|c| c.received).min();
@@ -168,8 +181,9 @@ pub async fn sync_inbox_by_id_with_progress<S: IdSource>(
             }
         }
         // Saved with the batch: a later batch that fails must not lose the hole.
-        cache.store_id_messages(mailbox_id, &store, oldest_missing)?;
+        let stored = cache.store_id_messages(mailbox_id, &store, oldest_missing)?;
         report.new += store.len();
+        report.new_ids.extend(stored);
         done.done += batch.len();
         progress(done);
     }
@@ -178,7 +192,12 @@ pub async fn sync_inbox_by_id_with_progress<S: IdSource>(
     if let Some(next) = next {
         cache.set_seen_until(mailbox_id, next)?;
     }
-    Ok(report)
+    // A first sync still owed a body is not done: the next sync stays initial, so the old mail it
+    // fetches is not announced as new.
+    if was_synced || oldest_missing.is_none() {
+        cache.mark_synced(mailbox_id)?;
+    }
+    Ok(())
 }
 
 /// The `limit` messages of `listing` that arrived last, once each: a source may return more.

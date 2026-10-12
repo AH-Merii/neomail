@@ -1,9 +1,9 @@
-//! Schema 1 to 2: a cache written by the v1 schema, pinned here as it shipped, is migrated.
+//! Caches written by the v1 and v2 schemas, pinned here as they shipped, are migrated.
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
 
 use std::path::Path;
 
-use nm_core::cache::MailboxKind;
+use nm_core::cache::{MailboxKind, SCHEMA_VERSION};
 use nm_core::{Cache, FetchedMessage, Flags, Uid, UidValidity};
 use rusqlite::Connection;
 
@@ -108,6 +108,10 @@ fn rows_and_ids_are_kept_and_the_next_id_is_fresh() {
             highest_uid: Uid::new(3)
         }
     );
+    assert!(
+        work.synced,
+        "a mailbox from before `synced` counts as synced"
+    );
 
     // Id 5 was deleted before the migration; it is not handed out again.
     cache.insert_messages(work.id, &[msg(4)]).unwrap();
@@ -129,7 +133,7 @@ fn rows_and_ids_are_kept_and_the_next_id_is_fresh() {
     drop(cache);
 
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(user_version(&conn), 2);
+    assert_eq!(user_version(&conn), SCHEMA_VERSION);
     let index: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'message_order'",
@@ -208,4 +212,80 @@ fn a_failed_migration_leaves_a_working_v1_cache() {
         [],
     )
     .unwrap();
+}
+
+/// The schema 2 tables, exactly as nm-core wrote them. Never edit: they stand for caches on disk.
+const V2_SCHEMA: &str = "
+CREATE TABLE mailbox (
+    id           INTEGER PRIMARY KEY,
+    account      TEXT    NOT NULL,
+    name         TEXT    NOT NULL,
+    -- NULL for a by-id mailbox, whose messages are keyed by remote_id instead of uid.
+    uid_validity INTEGER,
+    highest_uid  INTEGER NOT NULL DEFAULT 0,
+    -- By-id mailboxes only: the arrival time the next sync's window must reach back to.
+    seen_until   INTEGER,
+    UNIQUE (account, name),
+    CHECK (uid_validity IS NULL OR seen_until IS NULL)
+);
+CREATE TABLE message (
+    -- AUTOINCREMENT: a message id is never reused, even after the newest row is deleted, so an
+    -- id a script saved can never point at a different message (docs/json.md).
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    mailbox_id   INTEGER NOT NULL REFERENCES mailbox (id) ON DELETE CASCADE,
+    -- Exactly one of uid (IMAP) and remote_id (by-id sources such as Microsoft Graph).
+    uid          INTEGER,
+    remote_id    TEXT CHECK (remote_id <> ''),
+    flags        TEXT    NOT NULL,
+    -- Required for by-id rows: their engine windows on the arrival time.
+    received     INTEGER CHECK (remote_id IS NULL OR received IS NOT NULL),
+    date         INTEGER,
+    from_name    TEXT,
+    from_address TEXT,
+    subject      TEXT,
+    raw          BLOB    NOT NULL,
+    UNIQUE (mailbox_id, uid),
+    UNIQUE (mailbox_id, remote_id),
+    CHECK ((uid IS NULL) <> (remote_id IS NULL))
+);
+CREATE INDEX message_order ON message (COALESCE(received, date, 0) DESC, id DESC);
+";
+
+#[test]
+fn a_v2_cache_is_migrated_with_its_mailboxes_synced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.sqlite3");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(V2_SCHEMA).unwrap();
+    conn.pragma_update(None, "user_version", 2).unwrap();
+    conn.execute_batch(
+        "INSERT INTO mailbox (id, account, name, uid_validity, highest_uid, seen_until)
+             VALUES (1, 'work', 'INBOX', 7, 3, NULL), (2, 'home', 'INBOX', NULL, 0, 1000);
+         INSERT INTO message (mailbox_id, uid, flags, received, subject, raw)
+             VALUES (1, 1, '', 100, 'one', x'00');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut cache = Cache::open(&path).unwrap();
+    let work = cache.mailbox("work", "INBOX").unwrap().unwrap();
+    let home = cache.mailbox("home", "INBOX").unwrap().unwrap();
+    assert!(work.synced && home.synced);
+    assert_eq!(cache.list(Some("work"), 10).unwrap().len(), 1);
+    // A mailbox created after the migration is not synced until a sync completes.
+    let reset = cache
+        .reset_mailbox("work", "INBOX", UidValidity::new(8).unwrap())
+        .unwrap();
+    assert!(!reset.synced);
+    assert!(!cache.mailbox("work", "INBOX").unwrap().unwrap().synced);
+    cache.mark_synced(reset.id).unwrap();
+    assert!(cache.mailbox("work", "INBOX").unwrap().unwrap().synced);
+    drop(cache);
+
+    assert_eq!(
+        user_version(&Connection::open(&path).unwrap()),
+        SCHEMA_VERSION
+    );
+    // Reopening a migrated cache changes nothing.
+    assert!(Cache::open(&path).is_ok());
 }

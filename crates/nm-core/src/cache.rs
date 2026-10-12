@@ -13,9 +13,9 @@ use crate::types::{
 
 /// The schema this build writes. A cache with a newer version is refused, not guessed at; an
 /// older one is migrated by [`Cache::open`].
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
-/// The tables of schema 2, named `mailbox{suffix}` and `message{suffix}`: the migration from 1
+/// The tables of schema 3, named `mailbox{suffix}` and `message{suffix}`: the migration from 1
 /// creates them under temporary names first. `message` refers to `mailbox` by its final name.
 fn tables(suffix: &str) -> String {
     format!(
@@ -29,6 +29,9 @@ CREATE TABLE mailbox{suffix} (
     highest_uid  INTEGER NOT NULL DEFAULT 0,
     -- By-id mailboxes only: the arrival time the next sync's window must reach back to.
     seen_until   INTEGER,
+    -- 1 once a sync of this mailbox has completed. Until then its new messages are old mail of a
+    -- first sync (or a rebuild) that has not finished, not new mail.
+    synced       INTEGER NOT NULL DEFAULT 0,
     UNIQUE (account, name),
     CHECK (uid_validity IS NULL OR seen_until IS NULL)
 );
@@ -59,12 +62,13 @@ CREATE TABLE message{suffix} (
 const INDEX: &str =
     "CREATE INDEX message_order ON message (COALESCE(received, date, 0) DESC, id DESC);";
 
-/// Schema 1 to 2, after the tables of 2 exist as `mailbox_v2` and `message_v2`: copy every row
-/// with its id, drop the old tables, rename the new ones and recreate the index (which went with
-/// the old `message`). <https://www.sqlite.org/lang_altertable.html#otheralter>
+/// Schema 1 to 3, after the tables of 3 exist as `mailbox_v2` and `message_v2`: copy every row
+/// with its id (a mailbox as synced, as [`MIGRATE_V2`] does), drop the old tables, rename the new
+/// ones and recreate the index (which went with the old `message`).
+/// <https://www.sqlite.org/lang_altertable.html#otheralter>
 const MIGRATE_V1_ROWS: &str = "
-INSERT INTO mailbox_v2 (id, account, name, uid_validity, highest_uid)
-    SELECT id, account, name, uid_validity, highest_uid FROM mailbox;
+INSERT INTO mailbox_v2 (id, account, name, uid_validity, highest_uid, synced)
+    SELECT id, account, name, uid_validity, highest_uid, 1 FROM mailbox;
 INSERT INTO message_v2
     (id, mailbox_id, uid, flags, received, date, from_name, from_address, subject, raw)
     SELECT id, mailbox_id, uid, flags, received, date, from_name, from_address, subject, raw
@@ -73,6 +77,14 @@ DROP TABLE message;
 DROP TABLE mailbox;
 ALTER TABLE mailbox_v2 RENAME TO mailbox;
 ALTER TABLE message_v2 RENAME TO message;
+";
+
+/// Schema 2 to 3: `mailbox.synced`. A mailbox that already exists was synced by a build without
+/// it and counts as synced; at worst, one whose first sync was interrupted before the upgrade has
+/// the rest of that sync reported as new mail once.
+const MIGRATE_V2: &str = "
+ALTER TABLE mailbox ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
+UPDATE mailbox SET synced = 1;
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +106,10 @@ pub type Result<T, E = CacheError> = std::result::Result<T, E>;
 pub struct MailboxRecord {
     pub id: i64,
     pub kind: MailboxKind,
+    /// A sync of this mailbox has completed ([`Cache::mark_synced`]). `false` from
+    /// [`Cache::reset_mailbox`] or [`Cache::reset_id_mailbox`] until then, so a first sync that
+    /// is interrupted and finished by later syncs is a first sync throughout.
+    pub synced: bool,
 }
 
 /// How a mailbox's messages are keyed, with the sync state that goes with it.
@@ -170,6 +186,9 @@ impl Cache {
         if schema_version(&conn)? == 1 {
             migrate_v1(&mut conn)?;
         }
+        if schema_version(&conn)? == 2 {
+            migrate_v2(&mut conn)?;
+        }
         conn.pragma_update(None, "foreign_keys", true)?;
         match schema_version(&conn)? {
             SCHEMA_VERSION => Ok(Self { conn }),
@@ -182,7 +201,7 @@ impl Cache {
         let row = self
             .conn
             .query_row(
-                "SELECT id, uid_validity, highest_uid, seen_until FROM mailbox
+                "SELECT id, uid_validity, highest_uid, seen_until, synced FROM mailbox
                  WHERE account = ?1 AND name = ?2",
                 params![account, name],
                 |r| {
@@ -191,11 +210,12 @@ impl Cache {
                         r.get::<_, Option<i64>>(1)?,
                         r.get::<_, i64>(2)?,
                         r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, bool>(4)?,
                     ))
                 },
             )
             .optional()?;
-        row.map(|(id, validity, highest, seen_until)| {
+        row.map(|(id, validity, highest, seen_until, synced)| {
             let kind = match validity {
                 Some(validity) => MailboxKind::Imap {
                     uid_validity: u32::try_from(validity)
@@ -208,7 +228,7 @@ impl Cache {
                     seen_until: seen_until.map(time_from_db).transpose()?,
                 },
             };
-            Ok(MailboxRecord { id, kind })
+            Ok(MailboxRecord { id, kind, synced })
         })
         .transpose()
     }
@@ -247,6 +267,7 @@ impl Cache {
                 uid_validity,
                 highest_uid: None,
             },
+            synced: false,
         })
     }
 
@@ -295,7 +316,7 @@ impl Cache {
     /// Stores fetched messages and raises the mailbox's highest UID to theirs, in one transaction.
     pub fn insert_messages(&mut self, mailbox_id: i64, messages: &[FetchedMessage]) -> Result<()> {
         let highest = messages.iter().map(|m| m.uid).max();
-        self.store_messages(mailbox_id, messages, highest)
+        self.store_messages(mailbox_id, messages, highest).map(drop)
     }
 
     /// Raises the mailbox's highest UID to `uid` (never lowers it): UIDs up to it are not new.
@@ -310,13 +331,23 @@ impl Cache {
     /// Stores fetched messages and, when `raise_to` is given, raises the mailbox's highest UID to
     /// it (never lowers it), in one transaction. A first sync passes `None`, because the messages
     /// it picks need not be the highest UIDs on the server.
+    ///
+    /// Returns the ids of the rows it added; a message that was already cached keeps its id and
+    /// is not among them.
     pub fn store_messages(
         &mut self,
         mailbox_id: i64,
         messages: &[FetchedMessage],
         raise_to: Option<Uid>,
-    ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+    ) -> Result<Vec<MessageId>> {
+        // Immediate: the read of the last issued id comes before the first write, and a deferred
+        // transaction whose read went stale (another connection committed in between) fails its
+        // first write at once with "database is locked", without waiting the busy timeout.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let issued = last_issued_id(&tx)?;
+        let mut added = Vec::new();
         {
             let mut insert = tx.prepare(
                 // An upsert, not INSERT OR REPLACE: REPLACE deletes the row and inserts a new
@@ -327,23 +358,30 @@ impl Cache {
                  ON CONFLICT (mailbox_id, uid) DO UPDATE SET
                      flags = excluded.flags, received = excluded.received, date = excluded.date,
                      from_name = excluded.from_name, from_address = excluded.from_address,
-                     subject = excluded.subject, raw = excluded.raw",
+                     subject = excluded.subject, raw = excluded.raw
+                 RETURNING id",
             )?;
             for m in messages {
                 let s = parse::summarize(&m.raw);
                 let (from_name, from_address) =
                     s.from.map(|a| (a.name, a.address)).unwrap_or_default();
-                insert.execute(params![
-                    mailbox_id,
-                    m.uid.get(),
-                    m.flags.to_storage(),
-                    m.received.map(|d| d.timestamp()),
-                    s.date.map(|d| d.timestamp()),
-                    from_name,
-                    from_address,
-                    s.subject,
-                    m.raw,
-                ])?;
+                let id: i64 = insert.query_row(
+                    params![
+                        mailbox_id,
+                        m.uid.get(),
+                        m.flags.to_storage(),
+                        m.received.map(|d| d.timestamp()),
+                        s.date.map(|d| d.timestamp()),
+                        from_name,
+                        from_address,
+                        s.subject,
+                        m.raw,
+                    ],
+                    |r| r.get(0),
+                )?;
+                if id > issued {
+                    added.push(MessageId::new(id));
+                }
             }
             if let Some(max) = raise_to {
                 tx.execute(
@@ -353,7 +391,7 @@ impl Cache {
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(added)
     }
 
     /// Empties the mailbox (creating it if needed) as a by-id mailbox with no `seen_until`.
@@ -372,6 +410,7 @@ impl Cache {
         Ok(MailboxRecord {
             id,
             kind: MailboxKind::ById { seen_until: None },
+            synced: false,
         })
     }
 
@@ -431,13 +470,22 @@ impl Cache {
     /// `missing_since`, the oldest arrival that came back without a body, lowers `seen_until` to
     /// it in the same transaction (never raises it), so a sync that fails after this batch still
     /// starts its next window at that message.
+    ///
+    /// Returns the ids of the rows it added, as [`store_messages`](Self::store_messages) does.
     pub fn store_id_messages(
         &mut self,
         mailbox_id: i64,
         messages: &[(&IdListed, &[u8])],
         missing_since: Option<DateTime<Utc>>,
-    ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+    ) -> Result<Vec<MessageId>> {
+        // Immediate: the read of the last issued id comes before the first write, and a deferred
+        // transaction whose read went stale (another connection committed in between) fails its
+        // first write at once with "database is locked", without waiting the busy timeout.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let issued = last_issued_id(&tx)?;
+        let mut added = Vec::new();
         if let Some(missing) = missing_since {
             tx.execute(
                 "UPDATE mailbox SET seen_until = MIN(COALESCE(seen_until, ?2), ?2)
@@ -454,26 +502,40 @@ impl Cache {
                  ON CONFLICT (mailbox_id, remote_id) DO UPDATE SET
                      flags = excluded.flags, received = excluded.received, date = excluded.date,
                      from_name = excluded.from_name, from_address = excluded.from_address,
-                     subject = excluded.subject, raw = excluded.raw",
+                     subject = excluded.subject, raw = excluded.raw
+                 RETURNING id",
             )?;
             for (listed, raw) in messages {
                 let s = parse::summarize(raw);
                 let (from_name, from_address) =
                     s.from.map(|a| (a.name, a.address)).unwrap_or_default();
-                insert.execute(params![
-                    mailbox_id,
-                    listed.id.as_str(),
-                    listed.flags.to_storage(),
-                    listed.received.timestamp(),
-                    s.date.map(|d| d.timestamp()),
-                    from_name,
-                    from_address,
-                    s.subject,
-                    raw,
-                ])?;
+                let id: i64 = insert.query_row(
+                    params![
+                        mailbox_id,
+                        listed.id.as_str(),
+                        listed.flags.to_storage(),
+                        listed.received.timestamp(),
+                        s.date.map(|d| d.timestamp()),
+                        from_name,
+                        from_address,
+                        s.subject,
+                        raw,
+                    ],
+                    |r| r.get(0),
+                )?;
+                if id > issued {
+                    added.push(MessageId::new(id));
+                }
             }
         }
         tx.commit()?;
+        Ok(added)
+    }
+
+    /// Records that a sync of the mailbox has completed: [`MailboxRecord::synced`].
+    pub fn mark_synced(&mut self, mailbox_id: i64) -> Result<()> {
+        self.conn
+            .execute("UPDATE mailbox SET synced = 1 WHERE id = ?1", [mailbox_id])?;
         Ok(())
     }
 
@@ -509,20 +571,49 @@ impl Cache {
                 r.get::<_, String>(7)?,
             ))
         })?;
-        rows.map(|row| {
-            let (id, account, uid, date, name, address, subject, flags) = row?;
-            Ok(ListEntry {
-                id: MessageId::new(id),
-                account,
-                uid: uid.map(uid_from_db).transpose()?,
-                date: date.and_then(|t| DateTime::from_timestamp(t, 0)),
-                from: (name.is_some() || address.is_some())
-                    .then_some(EmailAddress { name, address }),
-                subject,
-                flags: Flags::from_storage(&flags),
-            })
-        })
-        .collect()
+        rows.map(|row| list_entry(row?)).collect()
+    }
+
+    /// The `limit` newest of the messages `ids`, newest first as [`list`](Self::list) orders
+    /// them. Ids that are not cached are left out.
+    pub fn newest_of(&self, ids: &[MessageId], limit: usize) -> Result<Vec<ListEntry>> {
+        // Well below SQLite's limit on parameters (32766 since 3.32).
+        const CHUNK: usize = 500;
+        let mut found: Vec<(i64, ListRow)> = Vec::new();
+        for chunk in ids.chunks(CHUNK) {
+            let marks = vec!["?"; chunk.len()].join(", ");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT m.id, b.account, m.uid, COALESCE(m.date, m.received), m.from_name,
+                        m.from_address, m.subject, m.flags, COALESCE(m.received, m.date, 0)
+                 FROM message m JOIN mailbox b ON b.id = m.mailbox_id
+                 WHERE m.id IN ({marks})"
+            ))?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(chunk.iter().map(|id| id.get())),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(8)?,
+                        (
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                        ),
+                    ))
+                },
+            )?;
+            for row in rows {
+                found.push(row?);
+            }
+        }
+        // ORDER BY COALESCE(received, date, 0) DESC, id DESC, as `list`.
+        found.sort_by(|(a, ra), (b, rb)| (b, rb.0).cmp(&(a, ra.0)));
+        found.truncate(limit);
+        found.into_iter().map(|(_, row)| list_entry(row)).collect()
     }
 
     /// The accounts that have a cached mailbox, sorted.
@@ -571,7 +662,7 @@ fn schema_version(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
 }
 
-/// Schema 1 to 2, in one `BEGIN IMMEDIATE` transaction: any failure rolls back and leaves
+/// Schema 1 to 3, in one `BEGIN IMMEDIATE` transaction: any failure rolls back and leaves
 /// schema 1 as it was.
 fn migrate_v1(conn: &mut Connection) -> Result<()> {
     // Outside the transaction, where it takes effect
@@ -618,6 +709,57 @@ fn migrate_v1(conn: &mut Connection) -> Result<()> {
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
+}
+
+/// Schema 2 to 3, in one `BEGIN IMMEDIATE` transaction that reads the version again: any failure
+/// leaves schema 2 as it was.
+fn migrate_v2(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if schema_version(&tx)? != 2 {
+        return Ok(());
+    }
+    tx.execute_batch(MIGRATE_V2)?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// A row of `list`: id, account, uid, date, from name, from address, subject, flags.
+type ListRow = (
+    i64,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn list_entry(row: ListRow) -> Result<ListEntry> {
+    let (id, account, uid, date, name, address, subject, flags) = row;
+    Ok(ListEntry {
+        id: MessageId::new(id),
+        account,
+        uid: uid.map(uid_from_db).transpose()?,
+        date: date.and_then(|t| DateTime::from_timestamp(t, 0)),
+        from: (name.is_some() || address.is_some()).then_some(EmailAddress { name, address }),
+        subject,
+        flags: Flags::from_storage(&flags),
+    })
+}
+
+/// The highest message id handed out so far (AUTOINCREMENT's counter), so a store can tell the
+/// rows it adds (above it) from the ones it updates. No counter yet means none was handed out.
+fn last_issued_id(conn: &Connection) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'message'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
 }
 
 fn time_from_db(seconds: i64) -> Result<DateTime<Utc>> {
@@ -725,6 +867,46 @@ mod tests {
     }
 
     #[test]
+    fn newest_of_picks_the_newest_of_the_given_ids_in_list_order() {
+        let mut cache = Cache::open_in_memory().unwrap();
+        let mb = cache
+            .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
+            .unwrap();
+        let added = cache
+            .store_messages(
+                mb.id,
+                &[
+                    msg(1, 100, "a"),
+                    msg(2, 400, "b"),
+                    msg(3, 300, "c"),
+                    msg(4, 200, "d"),
+                ],
+                None,
+            )
+            .unwrap();
+        assert_eq!(added.len(), 4);
+        let subjects = |ids: &[MessageId], limit| -> Vec<String> {
+            cache
+                .newest_of(ids, limit)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.subject.unwrap())
+                .collect()
+        };
+        assert_eq!(subjects(&added, 3), ["b", "c", "d"]);
+        // Only the ids asked for; one that is not cached is left out.
+        let gone = MessageId::new(999);
+        assert_eq!(subjects(&[added[0], added[3], gone], 3), ["d", "a"]);
+        assert!(subjects(&[], 3).is_empty());
+        let entry = &cache.newest_of(&added[1..2], 1).unwrap()[0];
+        assert_eq!(
+            entry,
+            &cache.list(None, 1).unwrap()[0],
+            "the same entry as list"
+        );
+    }
+
+    #[test]
     fn ids_are_stable_and_never_reused() {
         let mut cache = Cache::open_in_memory().unwrap();
         let mb = cache
@@ -743,11 +925,15 @@ mod tests {
         };
         let before = ids(&cache);
 
-        // Storing a cached message again keeps its id.
-        cache
-            .store_messages(mb.id, &[msg(11, 2, "b2")], None)
+        // Storing a cached message again keeps its id, and is not reported as added.
+        let added = cache
+            .store_messages(mb.id, &[msg(11, 2, "b2"), msg(14, 5, "e")], None)
             .unwrap();
-        assert_eq!(ids(&cache), before);
+        assert_eq!(ids(&cache)[1..], before[..]);
+        assert_eq!(added, [ids(&cache)[0].1], "only the new row");
+        cache
+            .apply_changes(mb.id, &[], &[Uid::new(14).unwrap()])
+            .unwrap();
 
         // Expunge the newest-inserted row, then add new mail: the new id is a fresh one.
         cache
