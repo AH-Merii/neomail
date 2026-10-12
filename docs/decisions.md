@@ -207,6 +207,8 @@ the new entry.
     colours plain output, for `fzf --ansi`; nothing ever colours `--json`, `--jsonl` or `--raw`.
     NO_COLOR removes all styling, bold and underline included: stricter than no-color.org, which
     covers colour only, so one rule holds. Colour never carries meaning alone.
+- **Marking read and unread** is `neomail mark read|unread`: online only, with the output rules
+  above ([DEC-2026-10-13-mark](#dec-2026-10-13-mark), proposed).
 - **Easy to extend** with new functionality and UI later.
 - **Agentically customizable, like Pi** (Mario Zechner's agent harness): agents can extend and
   customize neomail themselves (extensions, docs written for agents, hot reload).
@@ -721,3 +723,30 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   labels alone do not call for the API.
 - **Supersedes:** the "Gmail API, with IMAP as a fallback" part of the "Gmail sign-in modes"
   bullet under [Accounts and providers](#accounts-and-providers).
+
+### <a id="dec-2026-10-13-mark"></a>DEC-2026-10-13-mark: marking mail read or unread from the CLI
+
+- **Status:** proposed by Claude on 2026-10-13, while the owner was away ("no more questions for
+  now", f679d889:6909). Part 1 of roadmap slice 8 follows it.
+- **Proposal:**
+  - The command is `neomail mark read|unread ID...`. The ids are the cache's, as `neomail list`
+    prints them, and `-` reads them from standard input, as for `neomail show`.
+  - It is online only: it writes to the server, then updates the cache with what the server
+    reported, and nothing is queued.
+  - It takes the account's lock, as `neomail sync` does, so a sync of the same account never runs
+    in between.
+  - Over IMAP it sets or clears `\Seen` with `UID STORE` in INBOX, and refuses when UIDVALIDITY
+    changed since the last sync. Nothing it does deletes, expunges or moves a message.
+  - Output follows [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux): one line on a terminal, the
+    marked ids in a pipe, one object per message with `--json` or `--jsonl`. It exits 0, 1 when
+    any message failed, and 2 on a usage error.
+  - The actions are a typed set, `mark-read` and `mark-unread`, applied through one function that
+    the TUI, scripts and agents will share. Archive, delete and move join it in the next part.
+  - New Outlook sign-ins ask for `Mail.Read` and `Mail.ReadWrite`. A sign-in made before keeps
+    `Mail.Read` and keeps syncing; `mark` on it asks the user to run `neomail account login NAME`
+    once.
+- **Builds on:** "The CLI can do everything the TUI can" in
+  [CLI, scripting, agents, extensibility](#cli-scripting-agents-extensibility),
+  [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux), and "Outlook asks for `Mail.Read` only, until
+  triage (roadmap slice 8) needs to write" in
+  [DEC-2026-10-12-outlook-defaults](#dec-2026-10-12-outlook-defaults).
