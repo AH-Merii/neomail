@@ -53,7 +53,7 @@ Amber was chosen because no mail client and no Neovim mark uses it, and it reads
 - Adwaita Sans (SIL OFL), instanced at `wght 600, opsz 32`, outlined by `src/text.py`, so the font is not needed at runtime.
 - Always lowercase, `neomail`, in one colour: ink on light, off-white on dark, `currentColor` in mono. Never colour part of the word or give it the accent.
 - Tracking 0, the font's own spacing.
-- `nmail` is the binary name in code and commands, never a logo.
+- `neomail` is the binary name in code and commands, never a logo.
 
 ## Geometry (64-unit grid, `MASTER` in `src/brand.py`)
 
