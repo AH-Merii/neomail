@@ -287,6 +287,7 @@ mod interrupts {
 
         /// Set in the copy of this test binary that the next test starts with the keyboard
         /// signals ignored.
+        #[cfg(target_os = "linux")]
         const IGNORED_CHILD: &str = "NEOMAIL_TEST_STARTED_WITH_KEYS_IGNORED";
 
         #[cfg(target_os = "linux")]
