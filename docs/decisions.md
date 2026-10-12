@@ -11,7 +11,8 @@ the new entry.
 
 ## Identity
 
-- **Name:** neomail (inspired by Neovim). **Binary:** `nmail`.
+- **Name:** neomail (inspired by Neovim). **Binary:** `neomail`
+  ([DEC-2026-10-12-binary-neomail](#dec-2026-10-12-binary-neomail)).
 - **What it is:** a fast, lightweight, secure terminal email client (TUI + CLI) for viewing, sorting,
   filtering, grouping, sending, archiving and deleting mail.
 - **Language:** Rust.
@@ -26,7 +27,7 @@ the new entry.
   search, choosing the sending identity, and per-account settings.
 - **No built-in OAuth client IDs (owner decision, liability).** neomail ships with *no* Google or
   Microsoft client registrations. Each user registers their own OAuth app ("bring your own client"),
-  guided by an in-app wizard (`nmail account add`) and step-by-step docs that explain *why* each
+  guided by an in-app wizard (`neomail account add`) and step-by-step docs that explain *why* each
   step exists. Never embed or borrow another application's client ID (e.g. Thunderbird's).
 - **Gmail sign-in modes:** (1) the user's own Google OAuth client (Gmail API, with IMAP as a
   fallback), (2) app password over IMAP/SMTP (requires Google 2-Step Verification).
@@ -166,7 +167,7 @@ the new entry.
   - Filenames are sanitised: no path traversal, and no control or bidirectional characters. Saved files are never executable, and macOS quarantine flags are kept.
 - **Attachments are searchable.**
   - An attachments picker searches all accounts by name, type, sender and date.
-  - The CLI and agents get the same commands (`nmail attachment list|save|open --json`). Agents read attachment text as data, never as instructions.
+  - The CLI and agents get the same commands (`neomail attachment list|save|open --json`). Agents read attachment text as data, never as instructions.
 - **Drafting with files and images:**
   - Attach with `:attach` and a fuzzy file picker, by pasting or dropping a file path, or by pasting an image from the clipboard.
   - Markdown images (`![alt](path)`) are sent as inline images. Per-identity signatures can include a logo. The composer previews images inline.
@@ -216,7 +217,9 @@ the new entry.
 - **GitHub repo** (public) managed with the **GitButler CLI (`but`)** so parallel agents don't step on
   each other's toes.
 - **CI/CD** for builds and tests.
-- **Clear, simple installation.**
+- **Clear, simple installation** ([DEC-2026-10-12-install-channels](#dec-2026-10-12-install-channels)):
+  an `install.sh` one-liner and mise from the `edge` pre-release for now; Homebrew and the AUR
+  later.
 - **A simple website with docs hosted on GitHub Pages**, including a first-time setup guide
   (why and how to register OAuth apps, Proton Bridge, app passwords, keyring).
 - **A neomail logo** ([DEC-2026-10-11-logo](#dec-2026-10-11-logo)): variation 05, "Split and
@@ -236,12 +239,12 @@ the new entry.
 - Commits in this repository are unsigned (local `commit.gpgsign=false`) while agents work
   unattended.
 - **`main` is always usable** ([DEC-2026-10-11-main-usable](#dec-2026-10-11-main-usable)): every
-  merge to `main` builds and publishes `nmail`, so whatever has landed can be tried while the rest
+  merge to `main` builds and publishes `neomail`, so whatever has landed can be tried while the rest
   is still being built. A merged CLI command works before the TUI exists, and independent features
   become usable as each one merges.
 - **Build first** ([DEC-2026-10-11-build-first](#dec-2026-10-11-build-first)): neomail grows in
   thin slices, each usable on its own and merged to `main` when it works. The first slice is a
-  read-only inbox in the CLI: `nmail` syncs one account's inbox, lists its messages and shows one.
+  read-only inbox in the CLI: `neomail` syncs one account's inbox, lists its messages and shows one.
   Design docs stay short and follow the code. A review runs at most two rounds, and what is left
   becomes an issue. The agent kit and the docs lint wait until the app needs them.
 - **CLI first** ([DEC-2026-10-11-cli-first](#dec-2026-10-11-cli-first)): every CLI feature is
@@ -555,3 +558,28 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   ("once CI passes") and [DEC-2026-10-11-merge-gate](#dec-2026-10-11-merge-gate) ("once CI is
   green"): both mean the CI workflow run concludes `success`. A failed macOS job still shows as a
   failed check, but it leaves the run green, so it no longer holds back a merge.
+
+### <a id="dec-2026-10-12-binary-neomail"></a>DEC-2026-10-12-binary-neomail: the binary is `neomail`
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-12 (f679d889:1343).
+- **Context:** `nmail` is already the binary of d99kris/nmail, an established terminal email
+  client: a Homebrew core formula and the AUR packages `nmail`, `nmail-bin` and `nmail-git`. Its
+  installer writes `~/.local/bin/nmail`, and its uninstaller removes that path. `neomail` was free
+  on Homebrew, the AUR and crates.io when checked.
+- **Owner's words:** chose "Rename to `neomail` (Recommended)" when asked what the binary should be
+  called.
+- **Ruling:** the binary, the Cargo package and the release assets are `neomail`; environment
+  variables are `NEOMAIL_*`. Supersedes the "Binary" part of the Name bullet under
+  [Identity](#identity). Log entries keep `nmail` where they quote or describe the past.
+
+### <a id="dec-2026-10-12-install-channels"></a>DEC-2026-10-12-install-channels: install.sh and mise first
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-12 (f679d889:1343).
+- **Context:** research on install.sh, mise, the AUR and Homebrew. mise's github backend installs
+  from the `edge` pre-release with no registry entry. AUR account registration is closed. A Homebrew
+  tap needs versioned releases with fixed checksums.
+- **Owner's words:** "install.sh and mise, without the rest for now." and, on the AUR, "no need for
+  aur for now"
+- **Ruling:** the "Clear, simple installation" bullet under
+  [Project and delivery](#project-and-delivery). Edge gets a `SHA256SUMS` asset, which the
+  installer checks. Homebrew and the AUR wait.
