@@ -22,8 +22,8 @@ from anything else you run. No billing account is needed.
 Open <https://console.cloud.google.com/apis/library/gmail.googleapis.com> with the project
 selected and click **Enable**.
 
-*Why:* it makes Gmail's scopes available to the project in step 4. neomail uses IMAP today and
-will use the API in a later version.
+*Why:* it makes Gmail's scopes available to the project in step 4. neomail reads your mail over
+IMAP with one of them.
 
 ## 3. Set up the Google Auth Platform: Branding and Audience
 

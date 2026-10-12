@@ -1,5 +1,5 @@
-//! The by-id sync engine with a source that tracks changes since a cursor (Graph's delta query,
-//! later Gmail's history): an in-memory INBOX with a change log. No network.
+//! The by-id sync engine with a source that tracks changes since a cursor (Graph's delta query):
+//! an in-memory INBOX with a change log. No network.
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
 
 use std::collections::BTreeMap;

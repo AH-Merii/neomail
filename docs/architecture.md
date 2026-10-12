@@ -14,7 +14,7 @@ background sync (slice 7): `neomail daemon`, which polls.
 | ----- | ------------- | ----------------- |
 | `crates/neomail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, the daemon and its locks, output, wiring. | The composition root. Nothing depends on it. |
 | `crates/nm-core` | Domain types, the `MailSource` and `IdSource` traits, the SQLite cache, the sync engines, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
-| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap). | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; the Gmail API becomes a sibling crate. |
+| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap). | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
 | `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
 
 A new crate needs a reason of the same kind: a second implementation of a seam, or a heavy
@@ -56,7 +56,7 @@ the whole round since it, or `None` when the provider refuses the cursor. A roun
 `IdChange::Present { id, flags?, received? }` and `IdChange::Removed(id)`; fields a provider leaves
 out of an update stay as cached. Both default to `Ok(None)`, so a source without change tracking
 (the reference source, the conformance fakes) is unchanged and the engine lists as before. Graph's
-delta link is the first cursor; Gmail's `historyId` fits the same shape. They are methods with
+delta link is the cursor. They are methods with
 defaults rather than a second trait, because the engine is one engine either way: a separate
 `ChangeSource` bound would need a second entry point or specialisation to pick it, and every
 source that implements it also implements `IdSource`. `Cursor`'s `Debug` is redacted, so it is
@@ -353,8 +353,7 @@ other news (`Watch`), or `Stop`. `daemon::on_wake` handles each, outside the run
   cursor seam makes one delta request when nothing changed.
 
 No trait: there is one watcher, and the tests give `Push` a closure that plays scripted events on
-tokio's paused clock, as `round` and `notify_round` take closures. Gmail's history, the next part,
-will fit as another source of the same events: a watcher or a check.
+tokio's paused clock, as `round` and `notify_round` take closures.
 
 **Notifications** (`neomail/src/notify.rs`) come after a round, never inside a sync. Which mail is
 new comes from the sync: `SyncReport::new_ids` holds the cache ids of the rows it added (the cache's
@@ -523,11 +522,12 @@ nothing. mise reads the same release through its GitHub backend.
 
 The order of the slices is in [roadmap.md](roadmap.md). What they change in the code:
 
-- **More providers:** the Gmail API becomes another source crate, with its history as the
-  cursor of `IdSource`'s change methods.
+- **More providers:** another provider's API becomes a source crate behind `IdSource`. Gmail stays
+  on IMAP; a slice that needs what IMAP can't do adds the Gmail API for that part only
+  ([DEC-2026-10-12-gmail-imap](decisions.md#dec-2026-10-12-gmail-imap)).
 - **More mail:** folders beyond INBOX, and CONDSTORE/QRESYNC to refresh flags cheaply.
-- **Push:** IMAP IDLE and the one-minute Outlook check (Graph's delta query) are wakes of the
-  daemon; the Gmail API with history comes next.
+- **Push:** IMAP IDLE, Gmail included, and the one-minute Outlook check (Graph's delta query) are
+  wakes of the daemon.
 - **Actions:** flags, moves and deletes need a write side on the source and a way to record
   pending changes in the cache.
 - **The TUI** builds on the same cache and actions as the CLI.
