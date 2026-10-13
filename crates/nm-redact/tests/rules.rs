@@ -398,7 +398,7 @@ fn a_one_time_code_after_a_keyword_is_masked() {
             "Temporary password - <code>",
         ),
         ("Password: Tr0ub4dor&3.", "Password: <code>."),
-        ("passcode is hunterxyz, ok", "passcode is <code>, ok"),
+        ("passcode is: hunterxyz, ok", "passcode is: <code>, ok"),
     ] {
         assert_eq!(plain(text), want, "{text}");
     }
@@ -421,6 +421,31 @@ fn a_one_time_code_after_a_keyword_is_masked() {
         ("password: : Xk#92!pq7", "password: : <code>"),
         ("password - - Xk#92!pq7", "password - - <code>"),
         ("password is: hunterxyz", "password is: <code>"),
+        // After "is" or "was" alone, only a token that looks like a secret: a digit, a symbol, or
+        // a capital after its first letter. Security notices say "was changed".
+        ("Your password was changed", "Your password was changed"),
+        (
+            "Your password is about to expire",
+            "Your password is about to expire",
+        ),
+        ("passcode is hunterxyz, ok", "passcode is hunterxyz, ok"),
+        // Title Case subjects: a capital first letter is no sign of a secret.
+        ("Your Password Was Changed", "Your Password Was Changed"),
+        (
+            "Your Password Is About To Expire",
+            "Your Password Is About To Expire",
+        ),
+        ("Your password was Reset", "Your password was Reset"),
+        // All capitals: a capital after the first letter is no sign of a secret either.
+        ("YOUR PASSWORD WAS CHANGED", "YOUR PASSWORD WAS CHANGED"),
+        (
+            "YOUR PASSWORD IS ABOUT TO EXPIRE",
+            "YOUR PASSWORD IS ABOUT TO EXPIRE",
+        ),
+        ("Your password is hunterXyz", "Your password is <code>"),
+        ("Your password is hunter2", "Your password is <code>"),
+        ("Your password is Xk#pq", "Your password is <code>"),
+        ("Your password was tempPass", "Your password was <code>"),
         (
             "password: passcode: Xk#92!pq7",
             "password: passcode: <code>",
@@ -538,4 +563,314 @@ fn counts_list_every_kind_and_pieces_rebuild_the_text() {
         })
         .collect();
     assert_eq!(rebuilt, r.as_str());
+}
+
+// Arabic mail (issue #60). The From name is محمد العتيبي and the To name سارة أحمد, both made up.
+
+fn arabic(text: &str) -> String {
+    with(&["محمد العتيبي", "سارة أحمد"], &[], text)
+}
+
+#[test]
+fn an_arabic_name_from_the_headers_is_masked_as_a_word() {
+    for (text, want) in [
+        (
+            "مرحبا محمد، شكرا لك يا سارة أحمد.",
+            "مرحبا <name>، شكرا لك يا <name> <name>.",
+        ),
+        // A letter or the article joined to its front.
+        ("شكرا لمحمد وسارة والعتيبي", "شكرا <name> <name> <name>"),
+        (
+            "بمحمد، للعتيبي، بالعتيبي، وأحمد",
+            "<name>، <name>، <name>، <name>",
+        ),
+        // Short vowels, a stretched letter, a hamza left off.
+        ("مُحَمَّد ومحـــمد وسَارَة واحمد", "<name> <name> <name> <name>"),
+        // "And" before another prefix, and the vocative joined to a name.
+        (
+            "تحياتي لك ولمحمد وبسارة وللعتيبي",
+            "تحياتي لك <name> <name> <name>",
+        ),
+        ("يامحمد كيفك؟ ياسارة شكراً", "<name> كيفك؟ <name> شكراً"),
+        // The accusative, written with its ending either way round.
+        ("أبلغت محمداً ثم محمدًا", "أبلغت <name> ثم <name>"),
+    ] {
+        assert_eq!(arabic(text), want, "{text}");
+    }
+    // A header written with vowels matches the body without them.
+    assert_eq!(with(&["مُحَمَّد"], &[], "مع محمد"), "مع <name>");
+}
+
+#[test]
+fn ordinary_arabic_words_that_look_like_a_name_stay() {
+    // علي (Ali) is not على ("on"), منى (Muna) not مني ("from me"), رحمة (Rahma) not رحمه.
+    let known = ["علي حسن", "منى", "رحمة"];
+    for text in [
+        "الكتاب على الطاولة",
+        "رسالة مني إليك",
+        "رحمه الله",
+        // A prefix and a name that make another word: "perhaps I", "actual", "and perhaps I".
+        "لعلي أراك غدا",
+        "هذا الخصم فعلي وليس وهميا",
+        "ولعلي أراك غدا",
+        // A name's start or end inside a longer word.
+        "عليك وعلينا",
+    ] {
+        assert_eq!(with(&known, &[], text), text, "{text}");
+    }
+    assert_eq!(with(&["ريم"], &[], "عميل كريم"), "عميل كريم");
+    assert_eq!(with(&["ريم"], &[], "كريم"), "كريم");
+    // Names that are ordinary words, against stock lines of mail: the definite form ("our valued
+    // customer", "the light", "the happy Eid"), the madda alef ("I hope", "any", "amen"), and a
+    // prefix that makes another word ("we have", "our parents", "existence").
+    for (name, text) in [
+        (
+            "كريم منصور",
+            "عميلنا الكريم، شكرا لثقتكم. نقرأ القرآن الكريم.",
+        ),
+        ("نور حسن", "النور جميل. بالنور. أحسن الحسن."),
+        ("سعيد", "العيد السعيد"),
+        ("أمل سعيد", "آمل أن تكون بخير. بالأمل نعيش."),
+        ("آية حسن", "إذا كانت لديك أية أسئلة، تواصل معنا لأية أسئلة."),
+        ("أمين علي", "اللهم آمين."),
+        (
+            "دينا خالد",
+            "لدينا عرض خاص لك. ولدينا المزيد. نشكر والدينا على كل شيء.",
+        ),
+        ("جود خالد", "في حال وجود أي استفسار، نحن هنا."),
+    ] {
+        assert_eq!(with(&[name], &[], text), text, "{name}: {text}");
+    }
+    // The madda is kept, not dropped: a header's آية still masks آية and وآية.
+    assert_eq!(with(&["آية حسن"], &[], "مع آية وآية"), "مع <name> <name>");
+}
+
+#[test]
+fn an_arabic_organisation_name_masks_none_of_its_words() {
+    // Made-up senders whose names are ordinary nouns, against lines of their own mail.
+    for (name, text) in [
+        (
+            "البنك الأهلي",
+            "تواصل مع البنك فوراً. البنك الأهلي لن يطلب منك رمز التحقق أبداً.",
+        ),
+        (
+            "شركة الاتصالات السعودية",
+            "فاتورة الاتصالات جاهزة. نخدمك في المملكة العربية السعودية.",
+        ),
+        (
+            "خدمة العملاء - متجر أكمي",
+            "فريق خدمة العملاء جاهز لخدمتك. تقييمك لخدمة التوصيل يهمنا.",
+        ),
+        ("وزارة الصحة", "نتمنى لكم الصحة والعافية."),
+        ("مصرف الراجحي", "شكرا لاختيارك الراجحي."),
+    ] {
+        assert_eq!(with(&[name], &[], text), text, "{name}: {text}");
+    }
+    // A person's name next to it on another header is still masked.
+    assert_eq!(
+        with(
+            &["البنك الأهلي", "سارة أحمد"],
+            &[],
+            "عزيزتي سارة، البنك يرحب بك"
+        ),
+        "عزيزتي <name>، البنك يرحب بك"
+    );
+}
+
+#[test]
+fn arabic_name_particles_are_not_masked_alone() {
+    let known = ["خالد بن عبد الله آل سعود", "أبو أحمد", "سيف الله"];
+    // عبد الله is one name, in the header and the body; الله alone stays.
+    assert_eq!(
+        with(
+            &known,
+            &[],
+            "من عبد الله وعبدالله، إن شاء الله، ابن خالد وأبو"
+        ),
+        "من <name> <name>، إن شاء الله، ابن <name> وأبو"
+    );
+    assert_eq!(with(&["عبدالرحمن"], &[], "عبد الرحمن"), "<name>");
+}
+
+#[test]
+fn names_in_other_scripts_without_capitals_are_masked_as_words() {
+    assert_eq!(
+        with(&["דנה כהן"], &[], "שלום דנה כהן"),
+        "שלום <name> <name>"
+    );
+    assert_eq!(with(&["प्रिया शर्मा"], &[], "नमस्ते प्रिया"), "नमस्ते <name>");
+    assert_eq!(
+        with(&["김 민수"], &[], "안녕하세요 민수 님"),
+        "안녕하세요 <name> 님"
+    );
+}
+
+#[test]
+fn a_code_or_password_after_an_arabic_keyword_is_masked() {
+    for (text, want) in [
+        ("كلمة المرور: hunterxyz", "كلمة المرور: <code>"),
+        // Arabic punctuation after the password ends it, as `,` does.
+        ("كلمة المرور: hunterxyz، شكرا", "كلمة المرور: <code>، شكرا"),
+        (
+            "كلمة المرور المؤقتة: Xk#92!pq7",
+            "كلمة المرور المؤقتة: <code>",
+        ),
+        ("كلمة السر: P@ssw0rd2026", "كلمة السر: <code>"),
+        ("الرقم السري: 0042", "الرقم السري: <code>"),
+        (
+            "كلمة المرور الخاصة بك هي: hunterxyz",
+            "كلمة المرور الخاصة بك هي: <code>",
+        ),
+        ("كلمة المرور هي Xk#92!pq7", "كلمة المرور هي <code>"),
+        ("رمز التحقق: ٤٨٢٩١٠", "رمز التحقق: <code>"),
+        (
+            "رمز التحقق الخاص بك هو 482913، لا تشاركه",
+            "رمز التحقق الخاص بك هو <code>، لا تشاركه",
+        ),
+        ("رمز التفعيل 7K3X9", "رمز التفعيل <code>"),
+        ("رمز الدخول: 4821", "رمز الدخول: <code>"),
+        (
+            "الرمز أحادي الاستخدام الخاص بك هو:\n7319",
+            "الرمز أحادي الاستخدام الخاص بك هو:\n<code>",
+        ),
+        ("رمز التحقق ٤٨٢ ٩١٧", "رمز التحقق <code>"),
+        // "Your password", "your code", and one or two words before a colon or "is".
+        ("كلمة مرورك: P@ssw0rd", "كلمة مرورك: <code>"),
+        ("كلمة سرك: hunterxyz", "كلمة سرك: <code>"),
+        ("رمزك: A7K9Q2", "رمزك: <code>"),
+        ("كلمة مرورك هي Hunter2026", "كلمة مرورك هي <code>"),
+        (
+            "كلمة مروركم المؤقتة هي Xy7kL2p",
+            "كلمة مروركم المؤقتة هي <code>",
+        ),
+        ("رقمك السري: 0042", "رقمك السري: <code>"),
+        ("كلمة مرور حسابك: hunterxyz", "كلمة مرور حسابك: <code>"),
+        (
+            "كلمة سر الواي فاي: sunshine2026",
+            "كلمة سر الواي فاي: <code>",
+        ),
+    ] {
+        assert_eq!(plain(text), want, "{text}");
+    }
+    // "is" with no other separator, and no token that looks like a secret: ordinary words stay.
+    for text in [
+        "تم تغيير كلمة المرور الخاصة بك",
+        "كلمة المرور هي مفتاح حسابك",
+        "رمز التحقق صالح لمدة 10 دقائق",
+        "أدخل رمز التحقق المرسل إليك",
+        "تم تغيير كلمة مرورك",
+        "تم تغيير كلمة مرورك بنجاح. إذا لم تكن أنت، تواصل معنا",
+        "كلمة مرورك ستنتهي قريبا - يرجى تغييرها",
+        "كلمة مرورك الجديدة هي الأقوى",
+    ] {
+        assert_eq!(plain(text), text, "{text}");
+    }
+}
+
+#[test]
+fn an_amount_in_an_arabic_currency_or_with_arabic_separators_is_masked() {
+    for amount in [
+        "١٢٠ ر.س",
+        "١٬٢٥٠٫٥٠ ر.س",
+        "\u{200f}١٬٢٥٠٫٥٠\u{a0}ر.س.\u{200f}",
+        "1,250.50 د.إ.",
+        "٥٠٠ جنيه",
+        "500 جنيه مصري",
+        "١٢٫٥٠٠ د.ك",
+        "747.5 ريال",
+        "460ريال",
+        "75 درهم",
+        "٣ دينار",
+        "100 دولار",
+        "١٠٠ دولار أمريكي",
+        "٣ دولارات",
+        "99 يورو",
+        "١٢٠ \u{fdfc}",
+        "\u{20c1} 120",
+        "12.00 SAR",
+    ] {
+        let out = plain(&format!("المبلغ: {amount} فقط"));
+        assert!(
+            out.starts_with("المبلغ: ")
+                && out.contains("<amount>")
+                && !out.contains(char::is_numeric),
+            "{amount:?} -> {out:?}"
+        );
+    }
+    // The accusative ending after 11 to 99, Arab currency codes and `SR`: masked to the end.
+    for (text, want) in [
+        ("المبلغ ٥٠ ريالاً فقط", "المبلغ <amount> فقط"),
+        ("السعر 50 ريالًا فقط", "السعر <amount> فقط"),
+        ("بقيمة ٥٠ درهماً", "بقيمة <amount>"),
+        ("بقيمة ٢٠ ديناراً", "بقيمة <amount>"),
+        ("بقيمة ٢٠٠ جنيهاً مصرياً", "بقيمة <amount> مصرياً"),
+        ("بقيمة ١٥ ليرةً", "بقيمة <amount>"),
+        ("Total: EGP 1,200", "Total: <amount>"),
+        ("Total: KWD 1,200.500", "Total: <amount>"),
+        ("Total: 45 QAR", "Total: <amount>"),
+        ("الإجمالي: SR 120.00", "الإجمالي: <amount>"),
+        ("الإجمالي: 120.00 SR", "الإجمالي: <amount>"),
+    ] {
+        assert_eq!(plain(text), want, "{text}");
+    }
+    // A word that starts like a currency is not one; a grouped number alone is kept, as `1,500` is.
+    // A score before a club whose name starts with `ريال` ("Real") is no amount.
+    for text in [
+        "لديك ١٠ رسائل",
+        "منذ ٣ ليالٍ",
+        "عدد الزوار ١٬٥٠٠",
+        "برشلونة ٢-١ ريال مدريد",
+        "فاز ريال بيتيس 3 - 1 ريال سوسيداد",
+    ] {
+        assert_eq!(plain(text), text, "{text}");
+    }
+}
+
+#[test]
+fn a_date_with_an_arabic_month_name_stays_a_date() {
+    for date in [
+        "١٦ يناير ٢٠٢٦",
+        "16 أغسطس 2026",
+        "١٦ كانون الثاني ٢٠٢٦",
+        "٣ تشرين الأول ٢٠٢٦",
+        "12 أكتوبر/تشرين الأول 2026",
+        "١٥ رمضان ١٤٤٧هـ",
+        "٢٧ رجب ١٤٤٧ هـ",
+        "١ ذو الحجة ١٤٤٧",
+        "٢٠ ذي القعدة ١٤٤٧هـ",
+        "٥ ذي الحجة ١٤٤٧ هـ",
+        "١ ربيع الثاني ١٤٤٨هـ",
+        "١٤٤٧/٠٥/١٢هـ",
+        "يوليو وأغسطس ٢٠٢٦",
+        "١٦ جانفي ٢٠٢٦",
+        "يناير ٢٠٢٦",
+        "١٦\u{200f}/١\u{200f}/٢٠٢٦",
+    ] {
+        let text = format!("الموعد {date} صباحا");
+        assert_eq!(plain(&text), text, "{date}");
+    }
+    // A word that ends in a month's name is no date: `الحساب` ("the account") ends in `اب`.
+    for (text, want) in [
+        ("رقم الحساب 2045 مغلق", "رقم الحساب <number> مغلق"),
+        ("من الكتاب ١٤٣٢", "من الكتاب <number>"),
+    ] {
+        assert_eq!(plain(text), want, "{text}");
+    }
+}
+
+#[test]
+fn a_number_with_direction_marks_between_its_groups_is_masked_whole() {
+    for mark in [
+        '\u{200e}', '\u{200f}', '\u{61c}', '\u{2066}', '\u{2069}', '\u{202b}',
+    ] {
+        let text = format!("اتصل ٠٥٠{mark}-١٢٣{mark}-٤٥٦٧{mark} الآن");
+        assert_eq!(plain(&text), format!("اتصل <phone>{mark} الآن"), "{mark:?}");
+        let text = format!("رقم الطلب 12{mark}34{mark}56");
+        assert_eq!(plain(&text), "رقم الطلب <number>", "{mark:?}");
+    }
+    // A mark between two letters still splits two words.
+    assert_eq!(
+        with(&["Ana Lopez"], &[], "Ana\u{200e}Lopez"),
+        "<name>\u{200e}<name>"
+    );
 }

@@ -9,9 +9,11 @@ use regex::Regex;
 
 use crate::{Kind, Known, Mask, Redacted};
 
-const CUR_CODE: &str =
-    "USD|EUR|GBP|CHF|JPY|CNY|INR|CAD|AUD|NZD|SEK|NOK|DKK|PLN|CZK|HUF|BRL|MXN|ZAR|SGD|HKD|AED|SAR";
-const CUR_SYM: &str = r"[$€£¥₹₩₽]|(?:US|CA|AU|NZ|HK|SG|A|C|R)\$";
+/// ISO 4217 codes, with the Arab currencies' (`EGP`, `KWD` …) and `SR`, the Latin abbreviation
+/// Saudi shops print for the riyal.
+const CUR_CODE: &str = "USD|EUR|GBP|CHF|JPY|CNY|INR|CAD|AUD|NZD|SEK|NOK|DKK|PLN|CZK|HUF|BRL|MXN|ZAR|SGD|HKD\
+     |AED|SAR|EGP|KWD|QAR|OMR|BHD|JOD|MAD|TND|DZD|IQD|LBP|SR";
+const CUR_SYM: &str = r"[$€£¥₹₩₽\u{fdfc}\u{20c1}]|(?:US|CA|AU|NZ|HK|SG|A|C|R)\$";
 // Thousands separators: comma, dot, apostrophe, no-break and narrow no-break space (not a plain
 // space, which would join neighbouring numbers).
 const NUM: &str = r"\d{1,3}(?:[,.'\u{a0}\u{202f}]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?";
@@ -22,6 +24,46 @@ const MONTH: &str = "jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|
 const CODE_WORD: &str = "code|otp|pin|passcode|password|verification|2fa";
 /// Keywords whose next token is a secret whatever it holds: a password need not hold a digit.
 const SECRET_WORD: &str = "pin|passcode|password";
+/// Currencies written in Arabic, after the number as CLDR's Arabic formats put them: the dotted
+/// symbols (`ر.س`, `د.إ`, `ج.م` …, from CLDR's `ar` currency data), the words (`ريال`, `درهم`,
+/// `دينار`, `جنيه`, `ليرة`, `دولار`, `يورو`, with their plurals and the accusative ending `اً`, `ًا`
+/// or `ً` that follows the numbers 11 to 99: `٥٠ ريالاً`) and the rial signs U+FDFC and U+20C1.
+/// Longer forms first, as the regex takes the first alternative that matches.
+const CUR_AR: &str = "(?:ر\\.\\s?[سقعي]|د\\.\\s?[إكبأمجتعل]|ج\\.\\s?[مس]|ل\\.\\s?[سل])\\.?\
+                      |(?:ريالات|ريال|دراهم|درهم|دنانير|دينار|جنيهات|جنيه|ليرات|ليرة|دولارات|دولار\
+                      |يورو)(?:ا\u{64b}?|\u{64b}ا?)?|\u{fdfc}|\u{20c1}";
+/// Month names written in Arabic, from CLDR 48: the Gregorian names of `ar`, the Levantine and
+/// Iraqi names of `ar_SY`, `ar_LB`, `ar_IQ` and `ar_JO`, the Maghreb names of `ar_DZ`, `ar_TN` and
+/// `ar_MA`, and the Hijri names of `ar`. A hamza or madda on an alef may be left off. `ذي` is the
+/// form of `ذو` after a day (`٢٠ ذي القعدة`), and `ربيع الثاني` a common name for `ربيع الآخر`.
+const MONTH_AR: &str = "يناير|فبراير|مارس|[أا]بريل|مايو|يونيو|يوليوز|يوليو|[أا]غسطس|سبتمبر\
+                        |[أا]كتوبر|نوفمبر|ديسمبر|كانون\\s+الثاني|كانون\\s+ال[أا]ول|شباط|[آا]ذار\
+                        |نيسان|[أا]يار|حزيران|تموز|[آا]ب|[أا]يلول|تشرين\\s+ال[أا]ول\
+                        |تشرين\\s+الثاني|جانفي|فيفري|[أا]فريل|ماي|جوان|جويلية|[أا]وت|غشت|شتنبر\
+                        |نونبر|دجنبر|محرم|صفر|ربيع\\s+ال[أا]ول|ربيع\\s+ال[آا]خر\
+                        |جمادى\\s+ال[أا]ولى|جمادى\\s+ال[آا]خرة|رجب|شعبان|رمضان|شوال\
+                        |ربيع\\s+الثاني|ذ[وي]\\s+القعدة|ذ[وي]\\s+الحجة";
+/// Arabic words for a one-time code: `رمز` ("code") alone, as `رمزك` or `رمزكم` ("your code"), or
+/// with the kind of code, and `كود`. Microsoft's wording puts `الخاص بك` ("your") before `هو`
+/// ("is").
+const CODE_AR: &str = "(?:ال)?رمز(?:كم|ك)?(?:\\s+(?:التحقق|التفعيل|الدخول|ال[أا]مان|المرور|[أا]حادي\\s+الاستخدام))?\
+                       |كود(?:\\s+التحقق|\\s+التفعيل)?";
+/// Arabic words for a password or PIN, with or without `ك` or `كم` ("your": `كلمة مرورك`), then
+/// words that may stand between them and the secret: "temporary", "new", "current", "your", "for
+/// one time".
+const SECRET_AR: &str = "(?:كلمة\\s+(?:ال)?(?:مرور|سر)(?:كم|ك)?|(?:ال)?رقم(?:كم|ك)?\\s+(?:ال)?سري\
+                         |(?:ال)?رمز(?:كم|ك)?\\s+(?:ال)?سري\
+                         |رمز\\s+الدخول)(?:\\s+(?:المؤقتة|المؤقت|الجديدة|الجديد|الحالية|الحالي\
+                         |الخاصة\\s+بك|الخاص\\s+بك|لمرة\\s+واحدة))*";
+/// A separator between an Arabic password keyword and the secret: a symbol, or `هو` or `هي` ("is").
+const AR_SEP: &str = r"(?:\s*(?:[:#=>–—→-]|(?:هو|هي)(?:[\s:]|$)))";
+/// The separators allowed after other words between the keyword and the secret: only a colon or
+/// "is", so "your password expires soon - renew it" is no password.
+const AR_SEP_AFTER_WORDS: &str = r"(?:\s*(?::|(?:هو|هي)(?:[\s:]|$)))";
+/// Direction marks (U+200E, U+200F, U+061C), embeddings and overrides (U+202A to U+202E) and
+/// isolates (U+2066 to U+2069): invisible, and set inside numbers and around currency symbols by
+/// CLDR's Arabic formats.
+const MARKS: &str = "\u{200e}\u{200f}\u{61c}\u{202a}-\u{202e}\u{2066}-\u{2069}";
 /// File extensions that look like a top-level domain: `report.pdf` is not a host.
 const FILE_EXT: &[&str] = &[
     "pdf", "txt", "doc", "docx", "xls", "xlsx", "csv", "png", "jpg", "jpeg", "gif", "zip", "htm",
@@ -81,16 +123,19 @@ struct Patterns {
     date_iso: Regex,
     date_numeric: Regex,
     date_month: Regex,
+    date_month_ar: Regex,
     iban: Regex,
     card: Regex,
     amount: Regex,
     code: Regex,
     secret: Regex,
+    code_ar: Regex,
+    secret_ar: Regex,
     phone_intl: Regex,
     phone_national: Regex,
     digits: Regex,
     digit: Regex,
-    other_digit: Regex,
+    to_fold: Regex,
     word: Regex,
 }
 
@@ -125,16 +170,21 @@ static P: LazyLock<Patterns> = LazyLock::new(|| {
         host_goes_on: re(r"^[\p{M}\p{Cf}]*[\p{L}\p{N}]"),
         domain: re(&format!(r"(?-u:\b){domain_host}(?-u:\b)")),
         date_iso: re(
-            r"(?-u:\b)(?:19|20)\d{2}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?",
+            r"(?-u:\b)(?:19|20|14)\d{2}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?",
         ),
         date_numeric: re(r"(?-u:\b)\d{1,2}[-/.]\d{1,2}[-/.](?:\d{4}|\d{2})(?-u:\b)"),
         date_month: re(&format!(
             r"(?i)(?-u:\b)(?:\d{{1,2}}(?:st|nd|rd|th)?\s+)?(?:{MONTH})\.?(?:\s+\d{{1,2}}(?:st|nd|rd|th)?)?,?\s+(?:19|20)\d{{2}}(?-u:\b)"
         )),
+        // The year may carry the Hijri era, joined or after a space (`١٤٤٧هـ`, `١٤٤٧ هـ`): the era is
+        // letters, which no rule masks. A slash may pair two names (`أكتوبر/تشرين الأول`).
+        date_month_ar: re(&format!(
+            r"(?:(?-u:\b)\d{{1,2}}\s+)?(?:{MONTH_AR})(?:\s*/\s*(?:{MONTH_AR}))?\s*[،,]?\s+(?:19|20|14)\d{{2}}(?-u:\b)"
+        )),
         iban: re(r"(?-u:\b)[A-Z]{2}[0-9]{2}"),
         card: re(r"(?-u:\b)\d(?:[ -]?\d){12,18}(?-u:\b)"),
         amount: re(&format!(
-            r"(?:{CUR_SYM}|(?-u:\b)(?:{CUR_CODE}))\s?(?:{NUM}){MAG}|(?-u:\b)(?:{NUM}){MAG}\s?(?:[€£$¥₹]|(?:{CUR_CODE}|{CUR_WORD})(?-u:\b))"
+            r"(?:{CUR_SYM}|(?-u:\b)(?:{CUR_CODE}))\s?(?:{NUM}){MAG}|(?-u:\b)(?:{NUM}){MAG}\s?(?:[€£$¥₹]|(?:{CUR_CODE}|{CUR_WORD})(?-u:\b)|(?:{CUR_AR}))"
         )),
         code: re(&format!(
             r"(?i)(?-u:\b)(?:{CODE_WORD})(?:\s+(?:{CODE_WORD}))*(?-u:\b)(?:\s+(?:is|was))?\s*[:#=\-]?\s*(\d{{2,4}}(?:[ .\-]\d{{2,4}}){{1,3}}|\d(?:[ .\-]\d){{3,15}}|[a-z0-9][a-z0-9\-]{{2,14}}[a-z0-9])(?-u:\b)"
@@ -144,13 +194,22 @@ static P: LazyLock<Patterns> = LazyLock::new(|| {
         secret: re(&format!(
             r"(?i)(?-u:\b)(?:{SECRET_WORD})(?-u:\b)((?:\s*(?:[:#=>–—→-]|(?-u:\b)(?:is|was)(?-u:\b)))*)\s*"
         )),
+        // Arabic keywords take no ASCII word boundary, which never holds before an Arabic letter.
+        code_ar: re(&format!(
+            r"(?:{CODE_AR})(?:\s+الخاص\s+بك)?(?:\s+(?:هو|هي))?\s*[:#=\-]?\s*(\d{{2,4}}(?:[ .\-]\d{{2,4}}){{1,3}}|\d(?:[ .\-]\d){{3,15}}|[a-zA-Z0-9][a-zA-Z0-9\-]{{2,14}}[a-zA-Z0-9])(?-u:\b)"
+        )),
+        // One or two other words may stand between the keyword and a separator after them: "the
+        // password of your account:", `كلمة سر الواي فاي:` ("the Wi-Fi password:").
+        secret_ar: re(&format!(
+            r"(?:{SECRET_AR})(?:(?:\s+[\p{{L}}\p{{M}}]+){{1,2}}({AR_SEP_AFTER_WORDS}+)|({AR_SEP}*))\s*"
+        )),
         phone_intl: re(r"(?:\+|(?-u:\b)00)\d[\d \-.()/]{5,20}\d(?-u:\b)"),
         phone_national: re(
             r"(?:\(\d{2,5}\)\s?|(?-u:\b)\d{2,5}[ .\-/])\d{2,4}(?:[ .\-/]\d{2,5}){0,3}(?-u:\b)",
         ),
         digits: re(r"\d{4,}"),
         digit: re(r"^\d$"),
-        other_digit: re(r"[\d--0-9]"),
+        to_fold: re(&format!(r"[\d--0-9]|[\u{{66b}}\u{{66c}}{MARKS}]")),
         word: re(r"[\p{L}\p{M}\p{N}]+(?:['’‘´`＇][\p{L}\p{M}\p{N}]+)*"),
     }
 });
@@ -270,19 +329,20 @@ impl Found {
     }
 }
 
-/// Masks every match in `text`. Digits from other scripts (`０９０ １２３ ４５６`) are folded to
-/// ASCII first, so every rule's digit counts, checksums and word boundaries see them as digits.
+/// Masks every match in `text`. Digits from other scripts (`٠٥٠ ١٢٣ ٤٥٦٧`, `０９０`) and Arabic
+/// number separators are folded to ASCII first, and direction marks dropped, so every rule's digit
+/// counts, checksums and word boundaries see them as digits (see [`fold_digits`]).
 pub(crate) fn redact(text: &str, known: &Known) -> Redacted {
-    let Some((folded, map)) = fold_digits(text) else {
+    let Some(fold) = fold_digits(text) else {
         return write(text, find(text, known));
     };
-    let spans = find(&folded, known)
+    let spans = find(&fold.text, known)
         .into_iter()
         .map(|s| Span {
-            start: map[s.start],
-            end: map[s.end],
+            start: fold.start(s.start),
+            end: fold.end(s.end),
             kind: s.kind,
-            host: s.host.map(|(hs, he)| (map[hs], map[he])),
+            host: s.host.map(|(hs, he)| (fold.start(hs), fold.end(he))),
         })
         .collect();
     write(text, spans)
@@ -311,28 +371,89 @@ pub(crate) fn digit(c: char) -> Option<u8> {
     u8::try_from((u32::from(c) - start) % 10).ok()
 }
 
-/// `text` with every non-ASCII decimal digit replaced by its ASCII digit, and for each byte of the
-/// result (and its end) the matching byte offset in `text`; `None` when there is nothing to fold.
-fn fold_digits(text: &str) -> Option<(String, Vec<usize>)> {
-    if !P.other_digit.is_match(text) {
+/// Whether `c` is a direction mark, embedding, override or isolate ([`MARKS`]).
+fn is_mark(c: char) -> bool {
+    matches!(c, '\u{200e}' | '\u{200f}' | '\u{61c}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// A text as the rules see it, and where each of its bytes came from.
+struct Folded {
+    text: String,
+    /// For each byte of `text`, the offset in the input of the character it came from.
+    starts: Vec<usize>,
+    /// For each byte of `text`, the offset in the input just after that character.
+    ends: Vec<usize>,
+    len: usize,
+}
+
+impl Folded {
+    fn start(&self, at: usize) -> usize {
+        self.starts.get(at).copied().unwrap_or(self.len)
+    }
+
+    fn end(&self, at: usize) -> usize {
+        at.checked_sub(1).map_or(0, |i| self.ends[i])
+    }
+}
+
+/// `text` as the rules see it: every non-ASCII decimal digit as its ASCII digit, the Arabic
+/// decimal and thousands separators (U+066B, U+066C) as `.` and `,`, and the direction marks
+/// ([`is_mark`]) dropped, so `٠٥٠‎-١٢٣‎-٤٥٦٧` is one phone number and `١٬٢٥٠٫٥٠` reads as
+/// `1,250.50`. A mark between two letters stays, so it still splits two words written against
+/// each other. `None` when there is nothing to fold.
+fn fold_digits(text: &str) -> Option<Folded> {
+    if !P.to_fold.is_match(text) {
         return None;
     }
-    let mut folded = String::with_capacity(text.len());
-    let mut map = Vec::with_capacity(text.len() + 1);
+    let mut f = Folded {
+        text: String::with_capacity(text.len()),
+        starts: Vec::with_capacity(text.len()),
+        ends: Vec::with_capacity(text.len()),
+        len: text.len(),
+    };
+    // Where the run of marks being read ends, and whether a letter follows it: read once per run,
+    // so a long run of marks costs linear time.
+    let mut run: Option<(usize, bool)> = None;
     for (i, c) in text.char_indices() {
-        match digit(c).filter(|_| !c.is_ascii()) {
-            Some(d) => {
-                folded.push(char::from(b'0' + d));
-                map.push(i);
+        let end = i + c.len_utf8();
+        let ascii = match c {
+            '\u{66b}' => Some(b'.'),
+            '\u{66c}' => Some(b','),
+            c if is_mark(c) => {
+                let before = f.text.chars().next_back().is_some_and(char::is_alphabetic);
+                let after = match run {
+                    Some((run_end, letter)) if i < run_end => letter,
+                    _ => {
+                        let rest = &text[end..];
+                        let next = rest.char_indices().find(|&(_, c)| !is_mark(c));
+                        let run_end = next.map_or(text.len(), |(j, _)| end + j);
+                        let letter = next.is_some_and(|(_, c)| c.is_alphabetic());
+                        run = Some((run_end, letter));
+                        letter
+                    }
+                };
+                if !(before && after) {
+                    continue;
+                }
+                None
+            }
+            c if !c.is_ascii() => digit(c).map(|d| b'0' + d),
+            _ => None,
+        };
+        match ascii {
+            Some(b) => {
+                f.text.push(char::from(b));
+                f.starts.push(i);
+                f.ends.push(end);
             }
             None => {
-                folded.push(c);
-                map.extend(i..i + c.len_utf8());
+                f.text.push(c);
+                f.starts.extend(i..end);
+                f.ends.extend(std::iter::repeat_n(end, c.len_utf8()));
             }
         }
     }
-    map.push(text.len());
-    Some((folded, map))
+    Some(f)
 }
 
 /// Every span to mask in `text`, merged.
@@ -348,7 +469,9 @@ fn find(text: &str, known: &Known) -> Vec<Span> {
     ibans(text, &mut f);
     cards(text, &mut f);
     for m in P.amount.find_iter(text) {
-        f.push(m.start(), m.end(), Kind::Amount);
+        if !real_club(m.as_str(), &text[m.end()..]) {
+            f.push(m.start(), m.end(), Kind::Amount);
+        }
     }
     phones(text, &mut f);
     for m in P.digits.find_iter(text) {
@@ -356,6 +479,24 @@ fn find(text: &str, known: &Known) -> Vec<Span> {
     }
     names(text, known, &mut f);
     merge(f.spans)
+}
+
+/// Spanish clubs whose name starts with `ريال` ("Real"), as sports news writes them.
+const REAL_CLUBS: [&str; 6] = [
+    "مدريد",
+    "سوسيداد",
+    "بيتيس",
+    "مايوركا",
+    "سرقسطة",
+    "بلد الوليد",
+];
+
+/// Whether an amount match ending in `ريال` is a score before a club's name: `٢-١ ريال مدريد`.
+fn real_club(amount: &str, after: &str) -> bool {
+    amount.ends_with("ريال") && {
+        let next = after.trim_start();
+        next.len() < after.len() && REAL_CLUBS.iter().any(|c| next.starts_with(c))
+    }
 }
 
 /// How each kind is spelled; [`Kind::Link`] adds its host.
@@ -682,7 +823,8 @@ fn numbers_in(s: &str) -> Vec<u32> {
 }
 
 /// Dates and date-times are kept: ISO (`2026-01-16`, with an optional time), day-month-year or
-/// month-day-year with one separator, and dates with an English month name.
+/// month-day-year with one separator, and dates with an English or Arabic month name
+/// (`16 January 2026`, `١٦ يناير ٢٠٢٦`, `١٥ رمضان ١٤٤٧هـ`).
 fn dates(text: &str, f: &mut Found) {
     let day_month = |d: u32, m: u32| (1..=31).contains(&d) && (1..=12).contains(&m);
     for m in P.date_iso.find_iter(text) {
@@ -701,6 +843,21 @@ fn dates(text: &str, f: &mut Found) {
     }
     for m in P.date_month.find_iter(text) {
         f.keep(m.start(), m.end());
+    }
+    // An Arabic month name starts a word or follows one joined letter ("and", "in", "to", "so"):
+    // `وأغسطس 2026`, but not the end of `الحساب 2045` ("the account"), which ends in `اب` (August).
+    // Short vowels and the tatweel count as letters (`char::is_alphabetic`).
+    for m in P.date_month_ar.find_iter(text) {
+        let mut before = text[..m.start()].chars().rev().skip_while(|&c| is_mark(c));
+        let starts_word = m.as_str().starts_with(|c: char| c.is_ascii_digit())
+            || match before.next() {
+                Some('و' | 'ب' | 'ل' | 'ف') => !before.next().is_some_and(char::is_alphabetic),
+                Some(c) => !c.is_alphabetic(),
+                None => true,
+            };
+        if starts_word {
+            f.keep(m.start(), m.end());
+        }
     }
 }
 
@@ -891,10 +1048,12 @@ fn cards(text: &str, f: &mut Found) {
 /// One-time codes: a 4 to 16 character token holding a digit, right after a keyword, or digit
 /// groups joined by single spaces, dots or hyphens (`482 917`, `123.456`, `4 8 2 9`) holding 4 to
 /// 16 digits. After a password, passcode or PIN keyword, a token of 4 to 64 characters, symbols
-/// and all (`Xk#92!pq7`): any token after a separator (`:`, `#`, `=`, `is`, `was`, a dash or an
-/// arrow, one or several), else only one holding a digit or a symbol, so "Reset your password
-/// here" and "Pin this message" stay. A dash joining two words (`password-protected`) is no
-/// separator. A token that is itself a keyword is never masked.
+/// and all (`Xk#92!pq7`): any token after a separator (`:`, `#`, `=`, a dash or an arrow, one or
+/// several, with or without "is" or "was"), else only one that looks like a secret: holding a
+/// digit or a symbol, or a capital letter after its first letter. So "Reset your password here",
+/// "Pin this message" and "Your password was changed" stay. A dash joining two words
+/// (`password-protected`) is no separator. A token that is itself a keyword is never masked. The
+/// Arabic keywords ([`CODE_AR`], [`SECRET_AR`], with `هو` or `هي` for "is") work the same way.
 fn codes(text: &str, f: &mut Found) {
     let ok = |g: &str| {
         let digits = g.bytes().filter(u8::is_ascii_digit).count();
@@ -905,23 +1064,34 @@ fn codes(text: &str, f: &mut Found) {
         }
     };
     let mut found = Vec::new();
-    for c in P.code.captures_iter(text) {
+    for c in P
+        .code
+        .captures_iter(text)
+        .chain(P.code_ar.captures_iter(text))
+    {
         if let Some(g) = c.get(1).filter(|g| ok(g.as_str())) {
             found.push((g.start(), g.end()));
         }
     }
-    for c in P.secret.captures_iter(text) {
+    for c in P
+        .secret
+        .captures_iter(text)
+        .chain(P.secret_ar.captures_iter(text))
+    {
         let start = c.get(0).map_or(0, |m| m.end());
-        let separated = c.get(1).is_some_and(|g| {
+        // A separator other than a word: "is", "was", هو and هي alone only say a secret may follow.
+        let separated = c.get(1).or_else(|| c.get(2)).is_some_and(|g| {
             let sep = g.as_str();
             let joins_words = matches!(sep, "-" | "–" | "—") && g.end() == start;
-            !sep.trim().is_empty() && !joins_words
+            sep.contains(|c: char| !c.is_alphabetic() && !c.is_whitespace()) && !joins_words
         });
         let rest = &text[start..];
         let token = secret_token(&rest[..rest.find(char::is_whitespace).unwrap_or(rest.len())]);
         let core = token.trim_matches(|c: char| !c.is_alphanumeric());
         let keyword = CODE_WORD.split('|').any(|k| k.eq_ignore_ascii_case(core));
-        let secretive = core.chars().any(|c| !c.is_alphabetic());
+        let secretive = core.chars().any(|c| !c.is_alphabetic())
+            || (core.chars().skip(1).any(char::is_uppercase)
+                && core.chars().any(char::is_lowercase));
         if (4..=64).contains(&token.chars().count()) && !keyword && (separated || secretive) {
             found.push((start, start + token.len()));
         }
@@ -933,9 +1103,14 @@ fn codes(text: &str, f: &mut Found) {
     }
 }
 
-/// A secret without the punctuation that ends its sentence, as [`trim_url`] trims it, except a `!`
-/// or `?`, which a password more often ends in than a sentence does after one.
+/// Arabic punctuation that ends a sentence or clause: comma, semicolon, question mark, full stop.
+const AR_PUNCT: [char; 4] = ['،', '؛', '؟', '۔'];
+
+/// A secret without the punctuation that ends its sentence, as [`trim_url`] trims it, or Arabic
+/// punctuation ([`AR_PUNCT`]), except a `!` or `?`, which a password more often ends in than a
+/// sentence does after one.
 fn secret_token(token: &str) -> &str {
+    let token = token.trim_end_matches(AR_PUNCT);
     let trimmed = trim_url(token).len();
     let back = token[trimmed..]
         .bytes()
@@ -976,13 +1151,189 @@ fn phones(text: &str, f: &mut Found) {
     }
 }
 
-/// Known names as whole words; a possessive `'s` stays outside the mask.
+/// `word` as a name in a script without capital letters is compared: Arabic short vowels and
+/// other marks (U+064B to U+065F, U+0670) and the stretching tatweel (U+0640) dropped, the alef
+/// with a hamza or wasla (`أ`, `إ`, `ٱ`) written as a bare `ا`, and the Persian keheh and yeh
+/// (`ک`, `ی`) as Arabic `ك` and `ي`. So `مُحَمَّد` and `محـمد` are `محمد`. It never joins `ي` and `ى`
+/// (`علي`, the name Ali, against `على`, "on"), `ة` and `ه` (`رحمة`, Rahma, against `رحمه`, "his
+/// mercy"), nor the madda `آ` and `ا` (`آمل`, "I hope", against `أمل`, Amal; `آمين`, "amen",
+/// against `أمين`, Amin), which search engines fold but which would make common words match names.
+pub(crate) fn fold_name(word: &str) -> String {
+    word.chars()
+        .filter(|&c| !matches!(c, '\u{64b}'..='\u{65f}' | '\u{670}' | '\u{640}'))
+        .map(|c| match c {
+            'أ' | 'إ' | 'ٱ' => 'ا',
+            'ک' => 'ك',
+            'ی' => 'ي',
+            c => c,
+        })
+        .collect()
+}
+
+/// Words of an Arabic name that are ordinary words or particles on their own: "son of", "daughter
+/// of", "father of", "mother of", "family of", "servant of", "God", "the faith". As folded by
+/// [`fold_name`]. A header's `عبد الله` is matched as one name (`عبدالله`), never as `الله`.
+pub(crate) const NAME_PARTICLES: &[&str] = &[
+    "بن",
+    "ابن",
+    "بنت",
+    "ابو",
+    "ام",
+    "آل",
+    "ال",
+    "عبد",
+    "الله",
+    "الدين",
+];
+
+/// Arabic words that make a display name an organisation's: "bank", "company", "institution",
+/// "group", "service(s)", "customers", "store", "team", "support", "ministry", "authority",
+/// "centre", "platform", "administration", "university", "hospital", "municipality", "post",
+/// "app", "portal", "office", "airlines", "aviation", "telecom", "fund", "academy", "pharmacy",
+/// "school". As folded by [`fold_name`], without the article. No given or family name is one of
+/// them, and mail from `البنك الأهلي` or `خدمة العملاء` uses these words throughout its body.
+pub(crate) const ORG_WORDS: &[&str] = &[
+    "بنك",
+    "مصرف",
+    "شركة",
+    "مؤسسة",
+    "مجموعة",
+    "خدمة",
+    "خدمات",
+    "عملاء",
+    "متجر",
+    "فريق",
+    "دعم",
+    "وزارة",
+    "هيئة",
+    "مركز",
+    "منصة",
+    "ادارة",
+    "جامعة",
+    "مستشفى",
+    "بلدية",
+    "بريد",
+    "تطبيق",
+    "بوابة",
+    "مكتب",
+    "خطوط",
+    "طيران",
+    "اتصالات",
+    "صندوق",
+    "اكاديمية",
+    "صيدلية",
+    "مدرسة",
+];
+
+/// Whether a display name's folded words name an organisation: one of them, with or without the
+/// article, is in [`ORG_WORDS`].
+pub(crate) fn is_org_name(words: &[String]) -> bool {
+    words
+        .iter()
+        .any(|w| ORG_WORDS.contains(&w.strip_prefix("ال").unwrap_or(w)))
+}
+
+/// What may be joined to the front of an Arabic name: the letters "and", "with" and "to". The
+/// article is never stripped, as no given name carries it: `الكريم` ("the valued") is not the name
+/// `كريم`. A family name keeps its article in the header (`العتيبي`), so `والعتيبي` and `بالعتيبي`
+/// match through `و` and `ب`, and `للعتيبي` through `لل`, which is `ل` before the article with its
+/// alef dropped. `ف` ("so") and `ك` ("like") are left out: they rarely come before a name, and
+/// `فعلي` ("actual") or `كريم` ("generous") would then match the names `علي` and `ريم`.
+const PREFIXES: [&str; 3] = ["و", "ب", "ل"];
+
+/// Common words that are a prefix and a name: `لعلي` ("perhaps I") is not `ل` + `علي`, `لدينا`
+/// ("we have") not `ل` + `دينا`, `وجود` ("existence") not `و` + `جود`. As folded by [`fold_name`].
+const PREFIXED_WORDS: [&str; 3] = ["لعلي", "لدينا", "وجود"];
+
+/// Whether `folded` (a folded body word) is a known name in a script without capitals, written
+/// alone, with a [`PREFIXES`] entry joined to it, `و` before one, or `يا`; `Some(true)` when it is
+/// the particle `عبد`, which is a name only with the next word (`عبد الله`).
+fn caseless_name(known: &Known, folded: &str) -> Option<bool> {
+    one_prefix(known, folded)
+        // `و` ("and") before another prefix: `ولمحمد`, `وبسارة`, `وللعتيبي`; `ولدينا` ("and we
+        // have") stays, as `لدينا` is in [`PREFIXED_WORDS`].
+        .or_else(|| {
+            folded
+                .strip_prefix('و')
+                .filter(|_| !PREFIXED_WORDS.contains(&folded))
+                .and_then(|rest| one_prefix(known, rest))
+        })
+        // The vocative `يا` joined to a name, as informal mail writes it: `يامحمد`.
+        .or_else(|| {
+            folded
+                .strip_prefix("يا")
+                .filter(|rest| known.caseless.contains(*rest))
+                .map(|_| false)
+        })
+}
+
+/// [`caseless_name`] with at most one prefix.
+fn one_prefix(known: &Known, folded: &str) -> Option<bool> {
+    let bare = std::iter::once(folded);
+    let stripped = PREFIXES
+        .iter()
+        .filter(|_| !PREFIXED_WORDS.contains(&folded))
+        .filter_map(|p| folded.strip_prefix(p))
+        .filter(|rest| rest.chars().count() >= 2);
+    // `لل` is `ل` before the article, whose alef is dropped: `للعتيبي` is `ل` + `العتيبي`.
+    let article = folded
+        .strip_prefix("لل")
+        .map(|rest| format!("ال{rest}"))
+        .filter(|_| !PREFIXED_WORDS.contains(&folded));
+    for w in bare.chain(stripped).chain(article.as_deref()) {
+        if known.caseless.contains(w) {
+            return Some(false);
+        }
+        if w == "عبد" && known.has_compounds {
+            return Some(true);
+        }
+    }
+    None
+}
+
+/// Known names as whole words; a possessive `'s` stays outside the mask. A name in a script
+/// without capitals is matched after [`fold_name`], with a joined prefix or not, and the whole word
+/// is masked (`لمحمد` becomes `<name>`).
 fn names(text: &str, known: &Known, f: &mut Found) {
-    if known.names.is_empty() {
+    if known.names.is_empty() && known.caseless.is_empty() {
         return;
     }
-    for m in P.word.find_iter(text) {
+    let mut words = P.word.find_iter(text).peekable();
+    while let Some(m) = words.next() {
         let w = m.as_str();
+        if !w.is_ascii() && !known.caseless.is_empty() {
+            let folded = fold_name(w);
+            // A name in the accusative keeps the alef of its ending once the vowels are dropped:
+            // `خالداً` and `خالدًا` are `خالدا`, so `خالد` is tried as well.
+            let accusative = (w.ends_with("\u{627}\u{64b}") || w.ends_with("\u{64b}\u{627}"))
+                .then(|| folded.strip_suffix('ا'))
+                .flatten();
+            let name = caseless_name(known, &folded)
+                .or_else(|| accusative.and_then(|a| caseless_name(known, a)));
+            match name {
+                Some(false) => {
+                    f.push(m.start(), m.end(), Kind::Name);
+                    continue;
+                }
+                // `عبد` and the next word, past spaces only, as one name.
+                Some(true) => {
+                    let next = words.peek().filter(|n| {
+                        text[m.end()..n.start()]
+                            .chars()
+                            .all(|c| c == ' ' || is_mark(c))
+                    });
+                    if let Some(n) = next {
+                        let joined = format!("{folded}{}", fold_name(n.as_str()));
+                        if caseless_name(known, &joined) == Some(false) {
+                            f.push(m.start(), n.end(), Kind::Name);
+                            words.next();
+                            continue;
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
         let stem = w
             .strip_suffix('s')
             .and_then(|r| r.strip_suffix('\'').or_else(|| r.strip_suffix(APOSTROPHES)))
