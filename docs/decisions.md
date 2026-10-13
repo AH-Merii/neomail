@@ -304,6 +304,12 @@ the new entry.
   (why and how to register OAuth apps, Proton Bridge, app passwords, keyring).
 - **A neomail logo** ([DEC-2026-10-11-logo](#dec-2026-10-11-logo)): variation 05, "Split and
   statusline", in `assets/logo/`.
+- **Help in colour, with the logo** ([DEC-2026-10-14-help-logo](#dec-2026-10-14-help-logo)):
+  help follows the same colour rules as the rest of neomail's output. The top-level help
+  (`neomail --help`, `neomail help`, bare `neomail`) opens with the terminal lockup of
+  `assets/logo/logo.txt` above the help, on a terminal only: piped help has no logo, and neither
+  has a command's own help. A terminal narrower than the lockup gets the mark alone, never a
+  wrapped logo.
 - **Agent kit** ([DEC-2026-10-11-agent-kit](#dec-2026-10-11-agent-kit)): paused by
   [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first). When it resumes, the workflow helpers
   (the script linter, the wait helpers, run continuation and the rest) become a project-agnostic
@@ -521,6 +527,20 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Owner's words:** "i like the split and status line logo"
 - **Ruling:** the "A neomail logo" bullet under [Project and delivery](#project-and-delivery):
   variation 05 replaces the original mark in `assets/logo/`.
+
+### <a id="dec-2026-10-14-help-logo"></a>DEC-2026-10-14-help-logo: help in colour, opening with the logo
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-13 and 2026-10-14 (f679d889:13187,
+  f679d889:13226, f679d889:15885), for issue #64.
+- **Owner's words:**
+  - "create an issue to add colors to the help output in neomail"
+  - "also have the neomail logo show as output when help is printed just like mise also has a
+    logo, that is where I got the inspiration from mise --help"
+  - Asked where the logo sits, with a preview of each layout: "Lockup above the help
+    (Recommended)", over the mark beside a new intro paragraph as mise lays it out.
+  - Asked whether help sent to a pipe or a file keeps the logo: "Terminal only (Recommended)".
+- **Ruling:** the "Help in colour, with the logo" bullet under
+  [Project and delivery](#project-and-delivery).
 
 ### <a id="dec-2026-10-11-architecture-retro"></a>DEC-2026-10-11-architecture-retro: rules against coupling and contradictions
 
