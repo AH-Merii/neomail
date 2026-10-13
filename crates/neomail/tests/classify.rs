@@ -1107,3 +1107,106 @@ fn the_help_says_yes_covers_the_daemon_only_without_an_earlier_yes() {
         assert!(flat.contains(part), "{part}: {flat}");
     }
 }
+
+/// `work` and an Outlook account `outlook` whose cache holds one message, with `extra` in the
+/// `[classify]` table.
+fn with_outlook(jev: &FakeJev, extra: &str) -> tempfile::TempDir {
+    let dir = data(jev, &three()[..1]);
+    write_config(
+        dir.path(),
+        &jev.url(),
+        &format!(
+            "{extra}\n[[accounts]]\nname = \"outlook\"\nusername = \"you@outlook.example\"\n\
+             oauth = {{ provider = \"microsoft\", client_id = \"00000000-0000-0000-0000-000000000000\" }}\n"
+        ),
+    );
+    let mut cache = Cache::open(&dir.path().join("cache.sqlite3")).unwrap();
+    let inbox = cache.reset_id_mailbox("outlook", "INBOX").unwrap();
+    let listed = nm_core::IdListed {
+        id: nm_core::RemoteId::new("AAA").unwrap(),
+        flags: Flags::default(),
+        received: Utc::now() - Duration::days(1),
+    };
+    let raw = &mail(
+        7,
+        1,
+        "news@paper.example",
+        "newsletters Weekly",
+        "This week.",
+    )
+    .raw;
+    cache
+        .store_id_messages(inbox.id, &[(&listed, raw.as_slice())], None)
+        .unwrap();
+    dir
+}
+
+/// The lines about Outlook categories on standard error.
+fn category_lines(o: &Output) -> Vec<String> {
+    stderr(o)
+        .lines()
+        .filter(|l| l.contains("categor") || l.contains("Outlook"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn categories_need_the_outlook_sign_in_and_a_failed_one_is_one_line_and_exit_1() {
+    let jev = FakeJev::start();
+    let dir = with_outlook(&jev, "");
+    let o = neomail(dir.path(), &["classify", "--yes"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(jev.count(), 2, "both accounts' mail is classified first");
+    // The tests have no keyring, so the sign-in cannot be read and Graph is never reached.
+    let lines = category_lines(&o);
+    assert_eq!(lines.len(), 1, "{}", stderr(&o));
+    assert!(
+        lines[0].starts_with("neomail: outlook: categories not written: ")
+            && lines[0].contains("keyring"),
+        "{}",
+        lines[0]
+    );
+    // Neither the subject nor the sender is named.
+    assert!(!stderr(&o).contains("Weekly") && !stderr(&o).contains("paper.example"));
+    // The results are stored, and listed without the prefix.
+    let listed = groups(dir.path(), &["--account", "outlook"]);
+    assert_eq!(listed[0].1, "newsletters");
+
+    // Still due, so the next run tries again without asking jev.
+    let o = neomail(dir.path(), &["classify", "--yes"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(category_lines(&o).len(), 1, "{}", stderr(&o));
+    assert_eq!(jev.count(), 2);
+}
+
+#[test]
+fn categories_are_not_written_when_turned_off_out_of_scope_or_estimating() {
+    let jev = FakeJev::start();
+    let dir = with_outlook(&jev, "");
+    // Classified, and its category still due: with no keyring, every run that reaches it says so.
+    let o = neomail(dir.path(), &["classify", "--yes"]);
+    assert_eq!(category_lines(&o).len(), 1, "{}", stderr(&o));
+    let work: Vec<String> = json(&neomail(
+        dir.path(),
+        &["list", "--json", "--account", "work"],
+    ))
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|m| m["id"].to_string())
+    .collect();
+    assert_eq!(work.len(), 1);
+    for args in [
+        &["classify", "--estimate"][..],
+        &["classify", "--yes", "--account", "work"],
+        &["classify", "--yes", "--again", work[0].as_str()],
+    ] {
+        let o = neomail(dir.path(), args);
+        assert!(o.status.success(), "{args:?}: {}", stderr(&o));
+        assert_eq!(category_lines(&o), Vec::<String>::new(), "{args:?}");
+    }
+    let dir = with_outlook(&jev, "labels = false\n");
+    let o = neomail(dir.path(), &["classify", "--yes"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(category_lines(&o), Vec::<String>::new());
+}

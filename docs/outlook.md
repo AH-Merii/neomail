@@ -85,8 +85,9 @@ still refresh this sign-in; see [Where things are kept](#where-things-are-kept))
 `offline_access` (a refresh token), and `openid profile email` (your address). The consent screen
 therefore asks to read and change your mail ("Read and write access to your mail") and to send
 mail as you. neomail needs
-the change part to mark messages read or unread (`neomail mark`) and to move them
-(`neomail archive`, `neomail delete`): Graph allows both only with `Mail.ReadWrite`
+the change part to mark messages read or unread (`neomail mark`), to move them
+(`neomail archive`, `neomail delete`) and to set their groups as categories
+([below](#groups-as-categories)): Graph allows each only with `Mail.ReadWrite`
 ([update message](https://learn.microsoft.com/en-us/graph/api/message-update),
 [move message](https://learn.microsoft.com/en-us/graph/api/message-move)). neomail never deletes a
 message for good, and never creates, renames or deletes a folder.
@@ -169,6 +170,61 @@ only for the messages Graph confirmed. A message Graph no longer has (404) fails
 removes it. Any other error stops the writes, and `mark` says the account's messages may not be
 marked: Graph keeps the changes it already made, the cache is left alone for all of them, and the
 next sync reads their state. There is no queue: run the command again.
+
+## Groups as categories
+
+Each classified message gets its group as an Outlook category: the label prefix followed by the
+group `neomail list --group` shows, such as `nm-receipts-invoices`
+([DEC-2026-10-13-categories](decisions.md#dec-2026-10-13-categories)). `neomail classify` writes
+them after it stores its results, and `neomail daemon` after each wake that synced
+([daemon.md](daemon.md#groups-as-outlook-categories)). There is no command of its own.
+
+- **What is written.** The effective group, worked out when the cache is read, so a category
+  changes when the group does: a `follow-up` that grows old becomes `nm-follow-up-old`, and a new
+  `other_below`, `classify --again` or a new prefix rewrites what they change. Nothing else is
+  written again: a category you remove or change in Outlook stays as you left it until the
+  message's group changes. Spam gets `nm-spam` and stays where it is; moving it to Junk is a later
+  slice's.
+- **What is kept.** For each message neomail reads its categories
+  (`GET /me/messages/{id}?$select=categories`), removes only its own (the prefix followed by one
+  of the eleven group names, ignoring case, or the exact name it wrote on that message before),
+  adds the new one, and sends the list back with `PATCH /me/messages/{id}` and
+  `{"categories": [...]}` only when it changed. Your other categories stay, in their order, a name
+  of yours such as `nm-project` included. The PATCH replaces the whole list
+  ([update message](https://learn.microsoft.com/en-us/graph/api/message-update): "The categories
+  associated with the message"), which is why neomail reads it first. A change you make in
+  Outlook between the two requests is lost.
+- **No new permission, and the master list is left alone.** Outlook applies a category "by
+  assigning the **displayName** property of the category to the **categories** collection of the
+  item" ([outlookCategory](https://learn.microsoft.com/en-us/graph/api/resources/outlookcategory)).
+  That is a message update, which needs `Mail.ReadWrite`, part of every sign-in since neomail
+  could mark mail. neomail never adds, colours or deletes entries in your master category list,
+  which would need `MailboxSettings.ReadWrite` and a new sign-in for every account
+  ([create category](https://learn.microsoft.com/en-us/graph/api/outlookuser-post-mastercategories)).
+  A sign-in that granted only `Mail.Read` writes nothing and says, once, to run `neomail account
+  login NAME`. Outlook still shows a name the master list does not hold: in a live check, Outlook
+  on the web showed each `nm-` category on its message as a plain grey chip.
+- **How much at once.** Up to 1,000 messages per account per `neomail classify` run and 100 per
+  daemon wake, at most four requests at once, with the same throttling waits as reads; the rest
+  is written next time. Writes take the account's lock, as `mark` does.
+- **When it fails.** What is still to write is worked out from the cache each time, so nothing is
+  queued: mail classified before neomail wrote categories, and writes that failed, are written on
+  the next run or wake. neomail records what it wrote on each message by the message's immutable
+  id, which stays the same when the message moves to another folder of the mailbox
+  ([immutable ids](https://learn.microsoft.com/en-us/graph/outlook-immutable-id)), so two copies
+  of one mail are written, and retried, each on its own. A write that keeps failing is tried again
+  on every run or wake; the daemon says so only when its counts change. A message Graph no longer
+  has (404) is skipped. A refused token or grant (401 or 403), or Graph still throttling after its
+  retries or out of reach, stops that account's writes, and the rest wait; the other accounts go
+  on. In the daemon the writes also stop at a time budget, so they never hold up the next sync.
+  `neomail classify` exits 1 when a category write or an account's sign-in failed; classifying,
+  syncing and notifying go on whatever happens. Lines about categories name the account only,
+  never a subject, a sender or a category of yours.
+
+`[classify] label_prefix` (default `nm-`, never empty) sets the prefix, and `labels = false`
+turns writing off: nothing more is written, and the categories already written stay on the
+messages. neomail itself never shows the prefix. The sync does not read categories back, and a
+category write does not make the next sync download the message again.
 
 ## Where archive and delete put a message
 
