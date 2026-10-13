@@ -81,6 +81,9 @@ the new entry.
 - **Where groups are stored:** as provider-native tags — Outlook categories, Gmail labels, Proton
   labels (`Labels/<name>` over Bridge IMAP). Mail stays where it is; nothing gets moved (the spam
   rule above is the only exception).
+- **Groups as Outlook categories** ([DEC-2026-10-13-categories](#dec-2026-10-13-categories),
+  proposed): the label prefix and the group name, written by `neomail classify` and the daemon,
+  never touching the user's own categories or asking for a new permission.
 - **Each email is classified once** (results cached locally with model id, probabilities and
   timestamp so thresholds can be re-tuned without re-calling the model).
 - **First run** ([DEC-2026-10-11-first-run](#dec-2026-10-11-first-run)): neomail classifies the last 365 days
@@ -785,6 +788,34 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux), and "Outlook asks for `Mail.Read` only, until
   triage (roadmap slice 8) needs to write" in
   [DEC-2026-10-12-outlook-defaults](#dec-2026-10-12-outlook-defaults).
+
+### <a id="dec-2026-10-13-categories"></a>DEC-2026-10-13-categories: groups as Outlook categories
+
+- **Status:** proposed by Claude on 2026-10-13, as the third of slice 10's four parts
+  ([DEC-2026-10-13-classify](#dec-2026-10-13-classify)).
+- **Proposal:**
+  - Each classified Outlook message gets one category: the label prefix followed by its effective
+    group, the group `neomail list --group` shows (`nm-receipts-invoices`). It is written again
+    when the effective group changes (by age, a new threshold, `--again` or a new prefix), and
+    only then.
+  - Only neomail's own categories change: the prefix followed by a group name, ignoring ASCII
+    case, or the exact name neomail last wrote on that message. The user's other categories stay,
+    in their order. A category the user removes or changes is left alone until the group changes.
+  - Categories are set on the message by name, which needs `Mail.ReadWrite`, already part of
+    every new sign-in since slice 8. neomail adds nothing to the master category list, so it asks
+    for no new permission; a sign-in without `Mail.ReadWrite` writes nothing and says which
+    command fixes it.
+  - `neomail classify` writes them after storing its results, and the daemon after it classifies
+    ([DEC-2026-10-13-daemon-classify](#dec-2026-10-13-daemon-classify)). What is still to write is
+    worked out from the cache, so mail classified before 10c and failed writes need no queue. A
+    `neomail classify` run writes at most 1,000 per account, a daemon wake at most 100.
+  - `[classify] label_prefix` (default `nm-`, never empty) and `labels` (default true; false
+    writes nothing) also serve 10d's Gmail and Proton labels
+    ([DEC-2026-10-13-labels](#dec-2026-10-13-labels)).
+  - Spam gets its category only; moving confident spam to Junk stays in 10d.
+- **Builds on:** [DEC-2026-10-13-labels](#dec-2026-10-13-labels),
+  [DEC-2026-10-13-classify](#dec-2026-10-13-classify) and
+  [DEC-2026-10-13-mark](#dec-2026-10-13-mark).
 
 ### <a id="dec-2026-10-13-archive-delete"></a>DEC-2026-10-13-archive-delete: archiving and deleting mail from the CLI
 
