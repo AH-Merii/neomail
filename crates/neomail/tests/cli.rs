@@ -1836,7 +1836,8 @@ fn redact_prints_the_masked_text_off_a_terminal() {
     assert!(o.status.success(), "{}", stderr(&o));
     assert_eq!(
         stdout(&o),
-        "Subject: Order <number> for <name>\n\n\
+        "Subject: Order <number> for <name>\n\
+         Signals: sender mail.example (personal) · mailing list: no · automated: no · reply: no\n\n\
          Hi <name>, your code: <code>. Call <phone> or see <link host=shop.example> today.\n\
          Write to <email>@mail.example or <email>.\n\
          Pay <amount> by 2026-01-16 at 10:30; 1,500 people asked the <name>.\n"
@@ -1857,7 +1858,9 @@ fn redact_html_long_and_bodyless_messages() {
     let out = stdout(&o);
     // The HTML part as text, as `neomail show` renders it.
     assert!(
-        out.starts_with("Subject: News\n\nHello **<name>**, call <phone>\n"),
+        out.starts_with(
+            "Subject: News\nSignals: sender mail.example (personal) · mailing list: no · automated: no · reply: no\n\nHello **<name>**, call <phone>\n"
+        ),
         "{out}"
     );
     assert!(!out.contains("<p>"), "{out}");
@@ -1867,7 +1870,10 @@ fn redact_html_long_and_bodyless_messages() {
         out.contains("[neomail: the body is cut here, at the 1500-character limit]"),
         "{out}"
     );
-    assert!(out.ends_with("Subject: Scan\n\n(no text body)\n"), "{out}");
+    assert!(
+        out.ends_with("Subject: Scan\nSignals: sender mail.example (personal) · mailing list: no · automated: no · reply: no\n\n(no text body)\n"),
+        "{out}"
+    );
 
     let v = json(&neomail(dir.path(), &["redact", "--json", &ids[2]]));
     let body = v["body"].as_str().unwrap();
@@ -1892,7 +1898,23 @@ fn redact_json_shape_is_stable() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["account", "body", "id", "masks", "subject", "truncated"]
+        [
+            "account",
+            "body",
+            "id",
+            "masks",
+            "signals",
+            "subject",
+            "truncated"
+        ]
+    );
+    // What is sent besides the text: the domain, never the local part or the name.
+    assert_eq!(
+        v["signals"],
+        serde_json::json!({
+            "domain": "mail.example", "kind": "personal", "mailing_list": false,
+            "automated": false, "reply": false
+        })
     );
     assert_eq!(v["id"].to_string(), ids[0]);
     assert_eq!(v["account"], "work");

@@ -53,8 +53,9 @@ the new entry.
   jev-style (System One) input must work (e.g. Cloudflare Clef, Ollama `/v1/systemone`, Kev,
   OpenRouter, Liquid d1; adapters for near-compatible APIs).
 - **API key:** `JEV_API_KEY` environment variable as a fallback; the OS keyring is the primary store
-  (`service=neomail`, `account=jev` in development). Users bring their own key; neomail never ships
-  one.
+  (service `neomail-jev`, one entry per backend host:
+  [DEC-2026-10-13-classify](#dec-2026-10-13-classify), proposed). Users bring their own key;
+  neomail never ships one.
 - **Each email belongs to exactly one group.**
 - **Default groups:**
 
@@ -92,6 +93,21 @@ the new entry.
 - **The redaction preview** is `neomail redact ID...`: the subject and the first 1,500 characters
   of the body, redacted as they will go to jev, offline
   ([DEC-2026-10-13-redact](#dec-2026-10-13-redact), proposed).
+- **Redaction aims at common mail** ([DEC-2026-10-13-redaction-aim](#dec-2026-10-13-redaction-aim)):
+  the rules cover the mail people most commonly get, not every possible input. A gap that only a
+  contrived input shows is no reason for another round of fixes.
+- **The sender's domain is sent** with each message's redacted subject and body excerpt, always
+  ([DEC-2026-10-13-classify-send](#dec-2026-10-13-classify-send)).
+- **Consent per backend host** ([DEC-2026-10-13-classify-send](#dec-2026-10-13-classify-send)):
+  before the first request to a host, `neomail classify` says on a terminal what is sent and
+  where, and asks once. The answer is remembered per host; a script consents with `--yes`. Without
+  consent, nothing is sent.
+- **The live check of classification** sends at most 20 jev requests, made-up messages only, each
+  request recorded in a spend ledger before it is sent
+  ([DEC-2026-10-13-classify-send](#dec-2026-10-13-classify-send)).
+- **Classifying from the CLI** is `neomail classify`, the first of slice 10's four parts; results are
+  stored per message and survive a mailbox rebuild
+  ([DEC-2026-10-13-classify](#dec-2026-10-13-classify), proposed).
 
 ## Data and storage
 
@@ -843,3 +859,59 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Builds on:** [DEC-2026-10-11-pii-rules](#dec-2026-10-11-pii-rules),
   [DEC-2026-10-11-redaction-gaps](#dec-2026-10-11-redaction-gaps) and
   [DEC-2026-10-11-redaction-default](#dec-2026-10-11-redaction-default).
+
+### <a id="dec-2026-10-13-redaction-aim"></a>DEC-2026-10-13-redaction-aim: redaction covers common mail first
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-13 (f679d889:10953).
+- **Owner's words:** "remember for the redaction the objective is not having 100% coverage, the
+  objective is to have coverage for the most commonly encountered emails"
+- **Ruling:** the "Redaction aims at common mail" bullet under
+  [Classification](#classification-jev).
+- **Builds on:** [DEC-2026-10-11-redaction-gaps](#dec-2026-10-11-redaction-gaps).
+
+### <a id="dec-2026-10-13-classify-send"></a>DEC-2026-10-13-classify-send: the sender's domain, consent, and the live check
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-13, answering three questions
+  (f679d889:11167).
+- **Owner's words:**
+  - Asked whether classification should also send the sender's domain (for example amazon.com):
+    "Always".
+  - Asked whether neomail should show what leaves the machine and ask once before the first
+    `neomail classify` sends anything: "Ask once per backend".
+  - Asked whether slice 10's live check may call jev with the owner's key, at most 20 requests on
+    made-up messages, logged to a spend ledger: "Yes, up to 20 calls".
+- **Ruling:** the "The sender's domain is sent", "Consent per backend host" and "The live check of
+  classification" bullets under [Classification](#classification-jev).
+- **Builds on:** [DEC-2026-10-11-jev-offline](#dec-2026-10-11-jev-offline) and
+  [DEC-2026-10-13-redact](#dec-2026-10-13-redact).
+
+### <a id="dec-2026-10-13-classify"></a>DEC-2026-10-13-classify: classifying cached mail from the CLI
+
+- **Status:** proposed by Claude on 2026-10-13, after the owner asked to keep "working on the next
+  features in the roadmap" (f679d889:10772). Roadmap slice 10 follows it.
+- **Proposal:**
+  - Slice 10 ships in four parts: 10a classifies cached mail and lists it by group from the CLI;
+    10b classifies as the daemon syncs; 10c stores groups as Outlook categories; 10d stores them as
+    Gmail and Proton labels, and moves confident spam to Junk.
+  - `neomail classify [ID...]` takes cached mail with no result from the last 365 days, newest
+    first, at most 1,000 messages, and estimates what the rest would cost
+    ([DEC-2026-10-11-first-run](#dec-2026-10-11-first-run)); `--all` does the rest.
+    `neomail key set|delete|status` keeps the key, and `neomail list --group G` lists a group.
+  - With the redacted excerpt and the sender's domain go four signals that identify nobody: whether
+    the sender is a role address (noreply@, orders@ …), and whether the mail comes from a mailing
+    list, is automated, or is a reply. They mark the commonest bulk and automated mail. The
+    address's local part and display names never go. nm-redact builds all of it, so only redacted
+    text and these fields can reach a request.
+  - One request per message: one choice question with the ten groups in a fixed order, `main`
+    first, and the model pinned to `jev-1.13.0`, so stored probabilities stay comparable.
+  - A result is keyed by account and Message-ID, or a hash of the message when it has none, so it
+    survives a mailbox rebuild (a new UIDVALIDITY) and no message is paid for twice. The effective
+    group (`other` below a confidence threshold, `follow-up-old` by age, `spam`) is worked out when
+    the cache is read, so thresholds can change without asking jev again.
+  - The key lives in the keyring under service `neomail-jev`, one entry per backend host, so it
+    can't share an entry with a mail account named "jev". `JEV_API_KEY` is the fallback.
+  - No new crate: every backend speaks one wire format, and the base URL is the seam. Plain HTTP
+    is allowed only to a loopback host, for local backends and the tests' fake jev.
+- **Builds on:** [DEC-2026-10-13-classify-send](#dec-2026-10-13-classify-send),
+  [DEC-2026-10-11-first-run](#dec-2026-10-11-first-run) and
+  [DEC-2026-10-11-jev-offline](#dec-2026-10-11-jev-offline).

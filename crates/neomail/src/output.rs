@@ -4,11 +4,12 @@
 use std::io::{self, Write};
 
 use chrono::{DateTime, Local, SecondsFormat, Utc};
-use nm_core::cache::{ListEntry, StoredMessage};
+use nm_core::cache::StoredMessage;
 use nm_core::parse::{Attachment, BodyKind, EmailAddress, ParsedMessage};
 use nm_core::{Flags, MessageId, Uid};
+use nm_core::{Group, Grouped};
 use nm_imap::Security;
-use nm_redact::{EXCERPT_CHARS, Excerpt, MaskCounts, Piece, Redacted};
+use nm_redact::{EXCERPT_CHARS, Excerpt, MaskCounts, Outgoing, Piece, Redacted, Signals};
 use serde::Serialize;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -31,10 +32,13 @@ pub struct ListItem<'a> {
     pub subject: Option<&'a str>,
     pub unread: bool,
     pub flags: &'a Flags,
+    /// The effective group, `None` (JSON `null`) until the message is classified.
+    pub group: Option<&'static str>,
 }
 
-impl<'a> From<&'a ListEntry> for ListItem<'a> {
-    fn from(e: &'a ListEntry) -> Self {
+impl<'a> From<&'a Grouped> for ListItem<'a> {
+    fn from(g: &'a Grouped) -> Self {
+        let e = &g.entry;
         Self {
             id: e.id,
             account: &e.account,
@@ -44,6 +48,7 @@ impl<'a> From<&'a ListEntry> for ListItem<'a> {
             subject: e.subject.as_deref(),
             unread: !e.flags.is_seen(),
             flags: &e.flags,
+            group: g.group.map(Group::name),
         }
     }
 }
@@ -100,12 +105,16 @@ pub struct RedactItem<'a> {
     /// Every kind with its count, zeros included, so the shape never changes.
     #[serde(serialize_with = "serialize_counts")]
     pub masks: MaskCounts,
+    /// What is sent besides the text.
+    #[serde(serialize_with = "serialize_signals")]
+    pub signals: &'a Signals,
     #[serde(skip)]
     excerpt: &'a Excerpt,
 }
 
 impl<'a> RedactItem<'a> {
-    pub fn new(stored: &'a StoredMessage, excerpt: &'a Excerpt) -> Self {
+    pub fn new(stored: &'a StoredMessage, outgoing: &'a Outgoing) -> Self {
+        let excerpt = outgoing.excerpt();
         Self {
             id: stored.id,
             account: &stored.account,
@@ -113,6 +122,7 @@ impl<'a> RedactItem<'a> {
             body: excerpt.body().as_str(),
             truncated: excerpt.truncated(),
             masks: excerpt.masks(),
+            signals: outgoing.signals(),
             excerpt,
         }
     }
@@ -125,6 +135,33 @@ fn serialize_counts<S: serde::Serializer>(c: &MaskCounts, s: S) -> Result<S::Ok,
         map.serialize_entry(kind.name(), &n)?;
     }
     map.end()
+}
+
+/// The signals as JSON, under the names the request uses: `domain`, `kind`, `mailing_list`,
+/// `automated` and `reply`.
+fn serialize_signals<S: serde::Serializer>(signals: &&Signals, s: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = s.serialize_map(Some(5))?;
+    map.serialize_entry("domain", &signals.domain())?;
+    map.serialize_entry("kind", signals.kind().name())?;
+    map.serialize_entry("mailing_list", &signals.mailing_list())?;
+    map.serialize_entry("automated", &signals.automated())?;
+    map.serialize_entry("reply", &signals.reply())?;
+    map.end()
+}
+
+/// The signals as one line for people: `Signals: sender acme.example (role) · mailing list: yes
+/// · automated: no · reply: no`.
+pub fn signals_line(signals: &Signals) -> String {
+    let yes = |b: bool| if b { "yes" } else { "no" };
+    format!(
+        "sender {} ({}) · mailing list: {} · automated: {} · reply: {}",
+        one_line(signals.domain().unwrap_or("no domain")),
+        signals.kind().name(),
+        yes(signals.mailing_list()),
+        yes(signals.automated()),
+        yes(signals.reply())
+    )
 }
 
 /// `neomail redact` for people and pipes: the subject and the body as they would be sent, with
@@ -144,6 +181,12 @@ pub fn write_redacted(out: &mut dyn Write, item: &RedactItem<'_>, paint: Paint) 
         "{} {}",
         paint.strong("Subject:"),
         styled(item.excerpt.subject(), one_line)
+    )?;
+    writeln!(
+        out,
+        "{} {}",
+        paint.strong("Signals:"),
+        signals_line(item.signals)
     )?;
     writeln!(out)?;
     if item.body.is_empty() {
@@ -245,12 +288,8 @@ fn plain_text(_: Paint, s: &str) -> String {
 
 /// `list` as TSV: id, unread (`*` or empty), date (RFC 3339 UTC, empty when unknown), account,
 /// from (`Name <address>`, the address, or empty), subject.
-pub fn write_list_plain(
-    out: &mut dyn Write,
-    entries: &[ListEntry],
-    paint: Paint,
-) -> io::Result<()> {
-    for e in entries {
+pub fn write_list_plain(out: &mut dyn Write, entries: &[Grouped], paint: Paint) -> io::Result<()> {
+    for e in entries.iter().map(|g| &g.entry) {
         let id = e.id.to_string();
         let unread = if e.flags.is_seen() { "" } else { "*" };
         let date = e
@@ -284,24 +323,37 @@ pub fn write_list_plain(
     Ok(())
 }
 
-/// One line per message: `id * date sender subject`, `*` marking unread, at most `width`
-/// columns (the terminal's).
+/// The widest group name, `receipts-invoices`.
+const GROUP_WIDTH: usize = 17;
+
+/// One line per message: `id * date group sender subject`, `*` marking unread and `-` an
+/// unclassified message, at most `width` columns (the terminal's). The group column is left out
+/// while nothing listed is classified.
 pub fn write_list(
     out: &mut dyn Write,
-    entries: &[ListEntry],
+    entries: &[Grouped],
     width: usize,
     paint: Paint,
 ) -> io::Result<()> {
     let id_width = entries
         .iter()
-        .map(|e| e.id.to_string().len())
+        .map(|g| g.entry.id.to_string().len())
         .max()
         .unwrap_or(1);
-    // id, mark, date and the gaps; the rest is shared by sender and subject.
-    let rest = width.saturating_sub(id_width + 1 + 1 + 1 + 10 + 2 + 2);
+    let grouped = entries.iter().any(|g| g.group.is_some());
+    let group_width = if grouped { GROUP_WIDTH + 2 } else { 0 };
+    // id, mark, date, group and the gaps; the rest is shared by sender and subject.
+    let rest = width.saturating_sub(id_width + 1 + 1 + 1 + 10 + 2 + 2 + group_width);
     let from_width = FROM_WIDTH.min(rest / 2);
     let subject_width = rest - from_width;
-    for e in entries {
+    for g in entries {
+        let e = &g.entry;
+        let group = if grouped {
+            let name = g.group.map_or("-", Group::name);
+            format!("{}  ", paint.account(&format!("{name:<GROUP_WIDTH$}")))
+        } else {
+            String::new()
+        };
         let unread = !e.flags.is_seen();
         let mark = if unread { "*" } else { " " };
         let date = e.date.map_or_else(
@@ -314,7 +366,7 @@ pub fn write_list(
         let subject = subject.trim_end();
         writeln!(
             out,
-            "{} {} {}  {}  {}",
+            "{} {} {}  {group}{}  {}",
             paint.id(&format!("{:>id_width$}", e.id)),
             paint.strong(mark),
             paint.date(&date),
@@ -692,10 +744,12 @@ fn fit(s: &str, width: usize, pad: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    use nm_core::cache::ListEntry;
+
     use super::*;
 
-    fn entry(id: i64, from: Option<(&str, &str)>, subject: &str, seen: bool) -> ListEntry {
-        ListEntry {
+    fn entry(id: i64, from: Option<(&str, &str)>, subject: &str, seen: bool) -> Grouped {
+        let entry = ListEntry {
             id: MessageId::new(id),
             account: "wo\trk".to_owned(),
             uid: Uid::new(1),
@@ -706,7 +760,8 @@ mod tests {
             }),
             subject: Some(subject.to_owned()),
             flags: Flags::new(if seen { vec![Flags::SEEN] } else { vec![] }),
-        }
+        };
+        Grouped { entry, group: None }
     }
 
     fn render(f: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> String {
@@ -745,6 +800,25 @@ mod tests {
             coloured.contains("\x1b[33m 7\x1b[0m \x1b[1m*\x1b[0m"),
             "{coloured:?}"
         );
+    }
+
+    #[test]
+    fn the_human_list_shows_a_group_column_once_anything_is_classified() {
+        let mut entries = [
+            entry(7, Some(("Ada", "ada@mail.example")), "Receipt", true),
+            entry(8, None, "Unsorted", true),
+        ];
+        let before = render(|o| write_list(o, &entries, 80, Paint::OFF));
+        assert!(!before.contains("receipts"), "{before}");
+        entries[0].group = Some(Group::ReceiptsInvoices);
+        let out = render(|o| write_list(o, &entries, 80, Paint::OFF));
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("  receipts-invoices  Ada"), "{out}");
+        assert!(
+            lines[1].contains(&format!("  -{}  ", " ".repeat(16))),
+            "{out}"
+        );
+        assert!(lines.iter().all(|l| l.width() <= 80), "{out}");
     }
 
     #[test]

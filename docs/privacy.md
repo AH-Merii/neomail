@@ -1,28 +1,77 @@
 # Privacy: what leaves your machine
 
-neomail keeps your mail on your machine. Syncing reads it from your provider into a local cache,
-and nothing else sends it anywhere today.
+neomail keeps your mail on your machine. Syncing reads it from your provider into a local cache.
+Only `neomail classify`, which you run, sends anything else anywhere.
 
-Classification into groups (planned) will send a short text per message to jev, the classifier.
-That text is redacted first, on your machine, by neomail's own rules: no model and no network
-call. `neomail redact ID...` shows that text for cached messages now, so you can see what would
-leave before anything does: `--json` gives it exactly, and the terminal and plain forms show it
-with `Subject: ` before the subject, a note where the body was cut, and control characters made
-safe. It reads the cache only and sends nothing.
+`neomail classify` sends a short text per message to jev, the classifier. That text is redacted
+first, on your machine, by neomail's own rules: no model and no network call. `neomail redact
+ID...` shows exactly what is sent for cached messages, so you can see what would leave before
+anything does: `--json` gives it exactly, and the terminal and plain forms show it with
+`Subject: ` before the subject, a `Signals:` line, a note where the body was cut, and control
+characters made safe. It reads the cache only and sends nothing.
+
+**Consent, once per backend.** Before the first request to a host, `neomail classify` says what
+will be sent, to which host and under whose terms, and asks yes or no. A yes is remembered for
+that host in `classify-consent` in the data directory (not in the cache, so deleting
+`cache.sqlite3` does not lose it, and not in your config file); `--yes` gives it from a script.
+Without a yes, nothing is sent. `neomail classify --estimate` never sends anything.
 
 ## What will be sent
 
-For each message, once classification lands:
+For each message, `neomail classify` sends one request to the classifier's host
+(`classify.url`, `api.typesafe.ai` by default), tried again up to twice on a rate limit or a
+server error, with your key as a Bearer token, holding only this:
 
 - **The subject**, redacted, whole.
 - **The start of the body**: the body as `neomail show` renders it (the plain-text part, else the
   HTML part as text), redacted whole, then cut to its first 1,500 characters. Redacting before
   cutting means a value cut in half at the edge cannot slip past its rule, and a cut never splits
   a placeholder. 1,500 characters is the excerpt size the PII benchmark measured
-  ([DEC-2026-10-11-pii-rules](decisions.md#dec-2026-10-11-pii-rules)).
+  ([DEC-2026-10-11-pii-rules](decisions.md#dec-2026-10-11-pii-rules)). Whether it was cut is sent
+  too.
+- **The sender's domain**: the part of the From address after the `@`, lower-cased (`acme.example`),
+  always ([DEC-2026-10-13-classify-send](decisions.md#dec-2026-10-13-classify-send)). It is sent
+  only when it is a domain name; an address literal such as `[192.0.2.1]` is not. A personal
+  domain, one that only you or one person uses, identifies its owner.
+- **Four signals**, each a yes or no, or one word: whether the sender is a role address (the
+  part before the `@` is one of `noreply`, `no-reply`, `donotreply`, `do-not-reply`, `info`,
+  `news`, `newsletter`, `support`, `help`, `billing`, `invoice`, `invoices`, `receipts`,
+  `orders`, `shipping`, `notifications`, `notification`, `alerts`, `marketing`, `hello`, `team`,
+  `jobs`, `careers`, `recruiting`, `account`, `accounts` or `security`, compared without case),
+  a person's address, or unknown (no From); whether the mail came from a mailing list
+  (List-Unsubscribe or List-Id); whether it is automated (Auto-Submitted other than `no`, or
+  Precedence bulk, list or junk); and whether it is a reply (In-Reply-To).
 
-Headers, addresses, attachments and the rest of the body are not part of this text. Slice 10 will
-decide which other fields go with it, and this page will say so when it does.
+The request never holds the part of the sender's address before the `@`, any other header (display
+names among them), attachments or the rest of the body. Names written in the subject and body are
+masked only as [What is masked](#what-is-masked) says, so a name its rules miss is sent as written.
+One type in nm-redact, `Outgoing`, holds exactly the list above, and the request is built from it
+alone ([architecture](architecture.md)).
+
+**What TypeSafe does with it.** jev is TypeSafe's model, and TypeSafe keeps and uses what it
+receives as its [privacy policy](https://www.typesafe.ai/legal/privacy-policy) and its
+[customer agreement](https://www.typesafe.ai/legal/mca) say. The privacy policy names no fixed
+period: TypeSafe keeps personal data "for as long as reasonably necessary to provide you with the
+Services, or otherwise in support of our business or commercial purposes". It "will not train or
+fine tune any artificial intelligence or machine learning models on your prompts or other
+Input", and "will not disclose any Input to a third party other than our service providers".
+Its model page says jev is not trained on customer requests or responses, and points enterprise
+customers to zero data retention
+([docs.typesafe.ai/models](https://docs.typesafe.ai/models#data-handling)).
+A local backend you name in `classify.url` (`http://127.0.0.1:…`) keeps everything on your
+machine.
+
+**Where answers are kept.** Each answer (the group jev chose, its confidence and probabilities,
+the model, the tokens it used and when) is stored in the local cache, `cache.sqlite3` in the data
+directory, keyed by account and Message-ID (a hash of the message without one), as soon as it
+arrives. It outlives a mailbox rebuild (a UIDVALIDITY change, which gives the mailbox's messages
+new ids), so the same mail is never sent twice unless you ask with `--again`. Deleting
+`cache.sqlite3` deletes the stored answers too, and the next run sends that mail again. Nothing is
+written to your mail server.
+
+**Where the key is kept.** `neomail key set` stores the key in the OS keyring (the Secret Service
+or the macOS keychain) under the service `neomail-jev`, one entry per backend host. Without one
+there, `JEV_API_KEY` is used. neomail never prints the key.
 
 ## What is masked
 

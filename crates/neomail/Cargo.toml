@@ -50,6 +50,8 @@ zbus-secret-service-keyring-store.workspace = true
 apple-native-keyring-store.workspace = true
 
 [dev-dependencies]
+# The classify tests empty message.msg_key, as a cache from before schema 5 has it.
+rusqlite.workspace = true
 tempfile.workspace = true
 # Paused time for the device code polling tests.
 tokio = { workspace = true, features = ["test-util"] }

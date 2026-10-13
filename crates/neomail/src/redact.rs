@@ -1,9 +1,9 @@
-//! The one builder of the text classification will send for a message: `neomail redact` prints
-//! it, and slice 10's request will take the same [`Excerpt`]. The rules live in nm-redact; this
+//! The one builder of what classification sends for a message: `neomail redact` prints it, and
+//! `neomail classify`'s request takes the same [`Outgoing`]. The rules live in nm-redact; this
 //! module only gathers what they need from the parsed message and the config.
 
 use nm_core::parse::{HTML_STRIPPED_NOTE, ParsedMessage};
-use nm_redact::{Excerpt, Known};
+use nm_redact::{Excerpt, HeaderFlags, Known, Outgoing};
 
 use crate::config::Config;
 
@@ -28,6 +28,21 @@ pub fn excerpt<A: AsRef<str>>(
         .strip_prefix(HTML_STRIPPED_NOTE)
         .map_or(parsed.body.as_str(), str::trim_start);
     Excerpt::new(parsed.subject.as_deref().unwrap_or(""), body, &known)
+}
+
+/// Everything classification sends for `parsed`: its [`excerpt`], and the signals nm-redact
+/// reads from the From address and three header flags.
+pub fn outgoing<A: AsRef<str>>(
+    parsed: &ParsedMessage,
+    owner_addresses: impl IntoIterator<Item = A>,
+) -> Outgoing {
+    let from = parsed.from.first().and_then(|a| a.address.as_deref());
+    let flags = HeaderFlags {
+        mailing_list: parsed.headers.mailing_list(),
+        automated: parsed.headers.automated(),
+        reply: parsed.headers.reply(),
+    };
+    Outgoing::new(excerpt(parsed, owner_addresses), from, flags)
 }
 
 /// The owner's addresses: every account's login name that is an address.
@@ -76,6 +91,32 @@ mod tests {
             e.body().as_str().trim_end(),
             "Mail <email> or <email>@mail.example"
         );
+    }
+
+    #[test]
+    fn outgoing_reads_each_signal_from_its_own_header() {
+        let parsed = |extra: &str| {
+            let raw = format!(
+                "From: Ada Lovelace <Orders@Shop.Example>\r\nTo: me@owner.example\r\n{extra}\
+                 Subject: Your order\r\n\r\nHi\r\n"
+            );
+            nm_core::parse::parse(raw.as_bytes()).unwrap()
+        };
+        let signals = |extra: &str| {
+            outgoing(&parsed(extra), ["me@owner.example"])
+                .signals()
+                .clone()
+        };
+        let plain = signals("");
+        assert_eq!(plain.domain(), Some("shop.example"));
+        assert_eq!(plain.kind(), nm_redact::SenderKind::Role);
+        assert!(!plain.mailing_list() && !plain.automated() && !plain.reply());
+        let list = signals("List-Id: <news.shop.example>\r\n");
+        assert!(list.mailing_list() && !list.automated() && !list.reply());
+        let auto = signals("Auto-Submitted: auto-generated\r\n");
+        assert!(!auto.mailing_list() && auto.automated() && !auto.reply());
+        let reply = signals("In-Reply-To: <a@shop.example>\r\n");
+        assert!(!reply.mailing_list() && !reply.automated() && reply.reply());
     }
 
     #[test]

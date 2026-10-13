@@ -342,8 +342,59 @@ fn a_v3_cache_is_migrated_without_cursors() {
         user_version(&Connection::open(&path).unwrap()),
         SCHEMA_VERSION
     );
-    assert_eq!(SCHEMA_VERSION, 4);
     // Reopening keeps the cursor.
     let cache = Cache::open(&path).unwrap();
     assert!(cache.cursor(home.id).unwrap().is_some());
+}
+
+#[test]
+fn a_v4_cache_gains_msg_key_and_the_classification_table_without_parsing_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.sqlite3");
+    let conn = Connection::open(&path).unwrap();
+    // Schema 4 is schema 3 plus mailbox.cursor.
+    let message = &V2_SCHEMA[V2_SCHEMA.find("CREATE TABLE message").unwrap()..];
+    conn.execute_batch(V3_MAILBOX).unwrap();
+    conn.execute_batch(message).unwrap();
+    conn.execute_batch("ALTER TABLE mailbox ADD COLUMN cursor TEXT CHECK (cursor <> '');")
+        .unwrap();
+    conn.pragma_update(None, "user_version", 4).unwrap();
+    conn.execute_batch(
+        "INSERT INTO mailbox (id, account, name, uid_validity, highest_uid, synced)
+             VALUES (1, 'work', 'INBOX', 7, 1, 1);
+         INSERT INTO message (mailbox_id, uid, flags, received, subject, raw)
+             VALUES (1, 1, '', 1000, 'one', CAST('Message-ID: <one@mail.example>' AS BLOB));",
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut cache = Cache::open(&path).unwrap();
+    let pending = cache.pending(None, false).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].msg_key, None, "the migration parses no row");
+    cache
+        .set_msg_key(pending[0].id, "one@mail.example")
+        .unwrap();
+    let result = nm_core::Classification {
+        choice: nm_core::Choice::Main,
+        confidence: 0.8,
+        probabilities: vec![(nm_core::Choice::Main, 0.8)],
+        model: "jev-1.13.0".into(),
+        request_version: 1,
+        input_tokens: None,
+        classified_at: chrono::DateTime::from_timestamp(2000, 0).unwrap(),
+    };
+    cache
+        .store_classification("work", "one@mail.example", &result)
+        .unwrap();
+    assert!(cache.pending(None, false).unwrap().is_empty());
+    drop(cache);
+
+    assert_eq!(user_version(&Connection::open(&path).unwrap()), 5);
+    assert_eq!(SCHEMA_VERSION, 5);
+    let cache = Cache::open(&path).unwrap();
+    assert_eq!(
+        cache.classification("work", "one@mail.example").unwrap(),
+        Some(result)
+    );
 }

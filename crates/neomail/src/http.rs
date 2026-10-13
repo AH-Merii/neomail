@@ -1,5 +1,6 @@
-//! The HTTP neomail needs: OAuth's form POSTs and Microsoft Graph's GETs, over TLS. [`Https`]
-//! speaks HTTP/1.1 over rustls (ring and the system's trust store through
+//! The HTTP neomail needs: OAuth's form POSTs, Microsoft Graph's GETs and the classifier's JSON
+//! POSTs, over TLS. Plain `http://` is allowed only to this machine (a local classifier, the
+//! tests' fake servers), and any port may be named. [`Https`] speaks HTTP/1.1 over rustls (ring and the system's trust store through
 //! rustls-platform-verifier, as for IMAP), so no HTTP client crate, OpenSSL or second TLS stack is
 //! pulled in. One connection per request (`Connection: close`); keep-alive is left for later.
 //!
@@ -36,7 +37,8 @@ const READ_CHUNK: usize = 64 * 1024;
 /// leaves it out.
 pub struct Response {
     pub status: u16,
-    /// `Retry-After` in seconds (RFC 9110 section 10.2.3); an HTTP date is ignored.
+    /// `retry-after-ms` in milliseconds, else `Retry-After` in seconds (RFC 9110 section
+    /// 10.2.3); an HTTP date is ignored.
     pub retry_after: Option<Duration>,
     pub body: Vec<u8>,
 }
@@ -116,7 +118,8 @@ impl Https {
         .await
     }
 
-    /// POSTs the JSON `body` to `url` with `headers`, refusing an answer larger than `max_body`.
+    /// POSTs the JSON `body` to `url` with `headers`, refusing a 2xx answer larger than
+    /// `max_body` and cutting any other status's body to it.
     pub async fn post_json(
         &self,
         url: &str,
@@ -135,11 +138,18 @@ impl Https {
     }
 
     async fn send(&self, request: Request<'_>) -> Result<Response> {
-        let (host, _) = split_https_url(request.url)?;
-        let connect = async {
-            let tcp = TcpStream::connect((host, 443))
+        let target = split_url(request.url)?;
+        let host = target.host;
+        let tcp = step(host, async {
+            TcpStream::connect((host, target.port))
                 .await
-                .with_context(|| format!("cannot connect to {host}"))?;
+                .with_context(|| format!("cannot connect to {host}"))
+        })
+        .await?;
+        if !target.tls {
+            return exchange(tcp, &request).await;
+        }
+        let handshake = async {
             let name = ServerName::try_from(host.to_owned())
                 .map_err(|_| anyhow!("{host:?} is not a valid server name"))?;
             TlsConnector::from(self.tls.clone())
@@ -147,7 +157,7 @@ impl Https {
                 .await
                 .with_context(|| format!("TLS handshake with {host} failed"))
         };
-        let tls = step(host, connect).await?;
+        let tls = step(host, handshake).await?;
         exchange(tls, &request).await
     }
 }
@@ -173,19 +183,90 @@ async fn step<T>(host: &str, work: impl Future<Output = Result<T>>) -> Result<T>
         .map_err(|_| anyhow!("{host} did not answer within {} s", TIMEOUT.as_secs()))?
 }
 
-/// The host and path of an `https://host/path?query` URL. No port, user or fragment, and the
-/// path is sent as it is, so it must be visible ASCII: Graph's next page links come encoded.
-fn split_https_url(url: &str) -> Result<(&str, &str)> {
+/// The host a URL names, lower-cased, if [`Https`] would send to it: an `https://` URL, or an
+/// `http://` one to this machine.
+pub fn url_host(url: &str) -> Result<String> {
+    Ok(split_url(url)?.host.to_ascii_lowercase())
+}
+
+/// Where a URL points, as [`split_url`] reads it.
+#[derive(Debug, PartialEq, Eq)]
+struct Target<'a> {
+    /// `https://`; plain `http://` only reaches a loopback host.
+    tls: bool,
+    /// The host to connect to, without an IPv6 literal's brackets.
+    host: &'a str,
+    port: u16,
+    /// The host and port as written, for the `Host` header.
+    authority: &'a str,
+    path: &'a str,
+}
+
+/// The hosts plain `http://` may reach: this machine only, so nothing sent in the clear leaves
+/// it (a local classifier, the tests' fake servers).
+const LOOPBACK: [&str; 3] = ["127.0.0.1", "::1", "localhost"];
+
+/// Reads an `https://host[:port]/path?query` URL, or an `http://` one to a [`LOOPBACK`] host. No
+/// user or fragment, and the path is sent as it is, so it must be visible ASCII: Graph's next page
+/// links come encoded.
+fn split_url(url: &str) -> Result<Target<'_>> {
     // Never quote the URL: a next page link is the server's text.
-    let rest = url.strip_prefix("https://").context("not an https URL")?;
-    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-    if host.is_empty() || host.contains([':', '@', '?', '#']) {
+    let (tls, rest) = match (url.strip_prefix("https://"), url.strip_prefix("http://")) {
+        (Some(rest), _) => (true, rest),
+        (None, Some(rest)) => (false, rest),
+        (None, None) => bail!("not an https URL"),
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    if authority.contains(['@', '?', '#']) {
         bail!("unsupported URL: the host must be a plain name");
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(inner) => {
+            let (host, after) = inner
+                .split_once(']')
+                .context("unsupported URL: an IPv6 address must end with ]")?;
+            if host.parse::<std::net::Ipv6Addr>().is_err() {
+                bail!("unsupported URL: the host must be a plain name");
+            }
+            (host, after)
+        }
+        None => match authority.find(':') {
+            Some(colon) => authority.split_at(colon),
+            None => (authority, ""),
+        },
+    };
+    let port = match port {
+        "" => {
+            if tls {
+                443
+            } else {
+                80
+            }
+        }
+        port => port
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .filter(|&p| p != 0)
+            .context("unsupported URL: the port must be a number from 1 to 65535")?,
+    };
+    if host.is_empty() || (!authority.starts_with('[') && host.contains(':')) {
+        bail!("unsupported URL: the host must be a plain name");
+    }
+    if !tls && !LOOPBACK.iter().any(|l| host.eq_ignore_ascii_case(l)) {
+        bail!(
+            "plain http:// is allowed only to this machine (127.0.0.1, [::1], localhost); use https://"
+        );
     }
     if !path.bytes().all(|b| b.is_ascii_graphic()) || path.contains('#') {
         bail!("unsupported URL: the path must be encoded, without a fragment");
     }
-    Ok((host, if path.is_empty() { "/" } else { path }))
+    Ok(Target {
+        tls,
+        host,
+        port,
+        authority,
+        path: if path.is_empty() { "/" } else { path },
+    })
 }
 
 /// A header name or value that could end the header early (CR, LF) or is not text.
@@ -202,9 +283,14 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     request: &Request<'_>,
 ) -> Result<Response> {
-    let (host, path) = split_https_url(request.url)?;
+    let Target {
+        host,
+        authority,
+        path,
+        ..
+    } = split_url(request.url)?;
     let mut head = format!(
-        "{} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: neomail/{}\r\n",
+        "{} {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: neomail/{}\r\n",
         request.method,
         env!("CARGO_PKG_VERSION"),
     );
@@ -265,6 +351,7 @@ fn parse_head(head: &[u8]) -> Result<Head> {
     let mut length = None;
     let mut chunked = false;
     let mut retry_after = None;
+    let mut retry_after_ms = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -280,6 +367,12 @@ fn parse_head(head: &[u8]) -> Result<Head> {
             chunked = value.to_ascii_lowercase().ends_with("chunked");
         } else if name.eq_ignore_ascii_case("retry-after") {
             retry_after = value.parse::<u64>().ok().map(Duration::from_secs);
+        } else if name.eq_ignore_ascii_case("retry-after-ms") {
+            retry_after_ms = value
+                .parse::<f64>()
+                .ok()
+                .filter(|ms| ms.is_finite() && *ms >= 0.0)
+                .map(|ms| Duration::from_secs_f64(ms.min(1e9) / 1000.0));
         }
     }
     // A 204 or 304 never has a body (RFC 9112 section 6.3, rule 1).
@@ -292,13 +385,15 @@ fn parse_head(head: &[u8]) -> Result<Head> {
     };
     Ok(Head {
         status,
-        retry_after,
+        // The finer of the two wins, wherever each comes in the head.
+        retry_after: retry_after_ms.or(retry_after),
         framing,
     })
 }
 
-/// Reads one response: the head, then the body as its framing says, refusing one larger than
-/// `max_body`. Each read is bounded by [`TIMEOUT`].
+/// Reads one response: the head, then the body as its framing says, refusing a 2xx body larger
+/// than `max_body`. Any other status's body is cut to `max_body` instead, so that a large error
+/// page (a proxy's 502, say) still reports its status. Each read is bounded by [`TIMEOUT`].
 async fn read_response<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     host: &str,
@@ -317,18 +412,23 @@ async fn read_response<R: AsyncBufRead + Unpin>(
     }
     let parsed = parse_head(head.strip_suffix(b"\r\n").unwrap_or(&head))?;
     let too_large = || anyhow!("the response is larger than {max_body} bytes");
+    // The connection closes after each response, so a cut body leaves nothing behind.
+    let cut = !(200..300).contains(&parsed.status);
     let mut body = Vec::new();
     match parsed.framing {
         Framing::Length(length) => {
-            if length > max_body {
+            if length > max_body && !cut {
                 return Err(too_large());
             }
-            read_body(reader, host, &mut body, length, false).await?;
+            read_body(reader, host, &mut body, length.min(max_body), false).await?;
         }
         Framing::Close => {
             read_body(reader, host, &mut body, max_body.saturating_add(1), true).await?;
             if body.len() > max_body {
-                return Err(too_large());
+                if !cut {
+                    return Err(too_large());
+                }
+                body.truncate(max_body);
             }
         }
         Framing::Chunked => loop {
@@ -351,7 +451,12 @@ async fn read_response<R: AsyncBufRead + Unpin>(
                 break;
             }
             if size > max_body - body.len() {
-                return Err(too_large());
+                if !cut {
+                    return Err(too_large());
+                }
+                let room = max_body - body.len();
+                read_body(reader, host, &mut body, room, false).await?;
+                break;
             }
             read_body(reader, host, &mut body, size, false).await?;
             if read_line(reader, host, 2).await? != b"\r\n" {
@@ -469,6 +574,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_error_body_over_the_cap_is_cut_and_keeps_its_status() {
+        for response in [
+            &b"HTTP/1.1 503 Busy\r\nContent-Length: 5\r\n\r\n12345"[..],
+            b"HTTP/1.1 503 Busy\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n123\r\n2\r\n45\r\n0\r\n\r\n",
+            b"HTTP/1.1 503 Busy\r\n\r\n12345",
+        ] {
+            let r = parse(response, 4).await.unwrap();
+            assert_eq!((r.status, r.body.as_slice()), (503, &b"1234"[..]));
+        }
+    }
+
+    #[tokio::test]
     async fn retry_after_is_read_in_seconds() {
         let r = parse(
             b"HTTP/1.1 429 Too Many\r\nRetry-After: 7\r\nContent-Length: 0\r\n\r\n",
@@ -490,26 +607,146 @@ mod tests {
         assert_eq!(r.retry_after, None);
     }
 
+    fn split(url: &str) -> (bool, &str, u16, &str, &str) {
+        let t = split_url(url).unwrap();
+        (t.tls, t.host, t.port, t.authority, t.path)
+    }
+
     #[test]
     fn urls_are_https_and_encoded() {
         assert_eq!(
-            split_https_url("https://oauth2.googleapis.com/token").unwrap(),
-            ("oauth2.googleapis.com", "/token")
+            split("https://oauth2.googleapis.com/token"),
+            (
+                true,
+                "oauth2.googleapis.com",
+                443,
+                "oauth2.googleapis.com",
+                "/token"
+            )
         );
         assert_eq!(
-            split_https_url("https://graph.microsoft.com/v1.0/me?$top=5&$x=a%20b").unwrap(),
-            ("graph.microsoft.com", "/v1.0/me?$top=5&$x=a%20b")
+            split("https://graph.microsoft.com/v1.0/me?$top=5&$x=a%20b"),
+            (
+                true,
+                "graph.microsoft.com",
+                443,
+                "graph.microsoft.com",
+                "/v1.0/me?$top=5&$x=a%20b"
+            )
+        );
+        assert_eq!(
+            split("https://jev.example:8443"),
+            (true, "jev.example", 8443, "jev.example:8443", "/")
+        );
+        assert_eq!(
+            split("https://[2001:db8::1]:9/x"),
+            (true, "2001:db8::1", 9, "[2001:db8::1]:9", "/x")
         );
         for bad in [
-            "http://oauth2.googleapis.com/token",
+            "ftp://h/",
             "https://a@b/",
-            "https://h:1/",
+            "https://h:0/",
+            "https://h:65536/",
+            "https://h:x/",
+            "https://h:/",
+            "https://[h]/",
+            "https://[::1/",
+            "https://a:b:1/",
+            "https:///x",
             "https://h/a b",
             "https://h/a\r\nX: y",
             "https://h/a#f",
         ] {
-            assert!(split_https_url(bad).is_err(), "{bad:?}");
+            assert!(split_url(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn plain_http_reaches_only_this_machine() {
+        assert_eq!(
+            split("http://127.0.0.1:4000/v1/systemone"),
+            (false, "127.0.0.1", 4000, "127.0.0.1:4000", "/v1/systemone")
+        );
+        assert_eq!(
+            split("http://[::1]:4000/"),
+            (false, "::1", 4000, "[::1]:4000", "/")
+        );
+        assert_eq!(
+            split("http://LocalHost/"),
+            (false, "LocalHost", 80, "LocalHost", "/")
+        );
+        for bad in [
+            "http://api.typesafe.ai/v1/systemone",
+            "http://127.0.0.2/",
+            "http://10.0.0.1:4000/",
+            "http://[::2]/",
+            "http://localhost.example/",
+            "http://0.0.0.0/",
+        ] {
+            let e = split_url(bad).unwrap_err().to_string();
+            assert!(
+                e.contains("plain http:// is allowed only to this machine"),
+                "{bad}: {e}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_after_ms_wins_over_retry_after() {
+        for head in [
+            &b"HTTP/1.1 429 x\r\nretry-after-ms: 250\r\nRetry-After: 7\r\nContent-Length: 0\r\n\r\n"[..],
+            b"HTTP/1.1 429 x\r\nRetry-After: 7\r\nretry-after-ms: 250.0\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            assert_eq!(parse(head, 0).await.unwrap().retry_after, Some(Duration::from_millis(250)));
+        }
+        let r = parse(
+            b"HTTP/1.1 429 x\r\nretry-after-ms: soon\r\nRetry-After: 7\r\nContent-Length: 0\r\n\r\n",
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.retry_after, Some(Duration::from_secs(7)));
+    }
+
+    #[tokio::test]
+    async fn a_request_over_plain_http_reaches_a_loopback_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                head.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = [0u8; 2];
+            stream.read_exact(&mut body).await.unwrap();
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n{\"a\"")
+                .await
+                .unwrap();
+            head
+        });
+        let https = Https::new().unwrap();
+        let url = format!("http://127.0.0.1:{port}/v1/systemone");
+        let r = https
+            .post_json(&url, &[("Authorization", "Bearer k")], b"{}", 10)
+            .await
+            .unwrap();
+        assert_eq!((r.status, r.body.as_slice()), (200, &b"{\"a\""[..]));
+        let head = server.await.unwrap();
+        assert!(
+            head.starts_with(&format!(
+                "POST /v1/systemone HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            )),
+            "{head}"
+        );
     }
 
     async fn serve_once(

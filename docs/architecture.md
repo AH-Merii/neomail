@@ -19,7 +19,7 @@ actions, then `neomail archive` and `neomail delete` for IMAP and Outlook accoun
 | `crates/nm-core` | Domain types, the `MailSource`, `IdSource` and `MailWriter` traits, the SQLite cache, the sync engines, the actions, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
 | `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap); its two writes, `store_seen` and `move_to`, and `list_folders`, with modified UTF-7 names decoded. | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
 | `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port; its two writes, `set_read` and `move_to`, and `folders`, the read behind `folder list`. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
-| `crates/nm-redact` | The PII redaction rules, how each placeholder is spelled, and `Excerpt`, the text classification will send. Pure: no I/O, no network, no config; `regex` is its only dependency. | One owner for what may leave the machine: the classifier (slice 10) takes an `Excerpt`, and the rules change without touching it. What MCP clients receive is decided when MCP lands, through the same rules. |
+| `crates/nm-redact` | The PII redaction rules, how each placeholder is spelled, `Excerpt`, the text classification sends, and `Outgoing`, that text with the signals that go with it. Pure: no I/O, no network, no config; `regex` is its only dependency. | One owner for what may leave the machine: the classifier's request (slice 10) takes an `Outgoing` and nothing else, and the rules change without touching it. What MCP clients receive is decided when MCP lands, through the same rules. |
 
 A new crate needs a reason of the same kind: a second implementation of a seam, or a heavy
 dependency to isolate.
@@ -136,7 +136,11 @@ a real keyring, and the CLI tests point D-Bus at a socket that does not exist. z
 blocking calls on a tokio runtime of its own, which panics inside another runtime, so `neomail
 sync` reads each account's password before it enters `block_on`. When the keyring cannot be
 reached the error says so and suggests `password_command`, adding a WSL note when
-`WSL_DISTRO_NAME` is set or `/proc/sys/fs/binfmt_misc/WSLInterop` exists.
+`WSL_DISTRO_NAME` is set or `/proc/sys/fs/binfmt_misc/WSLInterop` exists. The classifier's key has
+an entry of its own, service `neomail-jev` with the backend's host as the user, so it never meets
+a mail account named "jev"; `keyring::jev_key` takes that entry, else `JEV_API_KEY`, and a keyring
+that failed to open or to answer counts as having no key, so the variable still works without a
+Secret Service.
 
 Neither source is a trait: `PasswordSource` is a closed enum matched in one function, and
 keyring-core's `CredentialStore` already is the seam between platforms and the mock.
@@ -174,8 +178,10 @@ without a display (`browser::ssh_without_display`, a pure function of the enviro
 effort, and accepts on both within the same connection cap. **HTTP** (`neomail/src/http.rs`):
 `Https` writes HTTP/1.1 over the same rustls, ring and platform verifier as IMAP, so no HTTP client
 crate is needed: a form POST for OAuth (the `Http` seam, which the OAuth tests replace with a
-scripted fake) and a GET with request headers for Graph, each with a body cap, reading
-`Retry-After`, one connection per request, and a 60-second bound on each network step rather than
+scripted fake), a GET with request headers for Graph and a JSON POST for the classifier, each
+with a body cap, reading `Retry-After` (and `retry-after-ms`, which wins), one connection per
+request, any port, and plain `http://` only to this machine (`127.0.0.1`, `[::1]`, `localhost`:
+a local classifier, and the CLI tests' fake one), and a 60-second bound on each network step rather than
 the whole response.
 **The browser** is opened by `browser.rs` (`$BROWSER`, else `wslview` or `explorer.exe` on WSL,
 else `xdg-open`, never with `--no-browser`); the URL is always printed, and choosing the command
@@ -248,11 +254,25 @@ with looser modes (`neomail/src/main.rs`, `restrict_cache_files`). Tables:
   state. A NULL `uid_validity` marks a by-id mailbox, whose state is `seen_until` and `cursor`
   instead. `synced` is 0 from the mailbox's creation until a sync of it completes. `cursor` is the
   source's change cursor (Graph's delta link), NULL until a sync stores one;
-- `message (mailbox_id, uid, remote_id, flags, received, date, from_*, subject, raw)`: the
-  message source plus the few fields `list` needs, so listing never parses mail. Exactly one of
-  `uid` and `remote_id` is set (a `CHECK`), each unique per mailbox.
+- `message (mailbox_id, uid, remote_id, flags, received, date, from_*, subject, raw, msg_key)`:
+  the message source plus the few fields `list` needs, so listing never parses mail. Exactly one
+  of `uid` and `remote_id` is set (a `CHECK`), each unique per mailbox. `msg_key`
+  (`parse::msg_key`) is the Message-ID, else `sha256:` and the hex digest of `raw`: filled on
+  insert, NULL for a row cached before schema 5 until `classify` reaches it;
+- `classification (account, msg_key, choice, confidence, probabilities, model, request_version,
+  input_tokens, classified_at)`: one classifier answer per message, as given. It is keyed by
+  account and `msg_key`, not by `message.id`, because rebuilding a mailbox deletes its rows and
+  gives them new ids, and an answer must outlive that so no message is paid for twice.
 
-Schema 2 added the by-id columns, schema 3 `mailbox.synced` and schema 4 `mailbox.cursor`. Each
+The group a message lists under is worked out when the cache is read, in one place:
+`GroupRules::effective` (`nm-core/src/group.rs`), which `Cache::list_grouped` applies to each row
+before its `GroupFilter`. `spam` stays spam whatever the confidence; below `other_below` a choice
+lists as `other`; a `follow-up` older than `follow_up_old_days` lists as `follow-up-old`. Changing
+a threshold needs no new answer. `Cache::pending` lists the messages with no stored answer, newest
+first, for `classify` to choose from.
+
+Schema 2 added the by-id columns, schema 3 `mailbox.synced`, schema 4 `mailbox.cursor` and schema
+5 `message.msg_key` and the `classification` table. The step to 5 parses no row. Each
 step from 2 runs in one `BEGIN IMMEDIATE` transaction that reads the version again. A schema 2 cache
 gets `synced` with every existing mailbox counted as synced (a build without the column synced it);
 a schema 3 cache gets `cursor` empty, so its next sync lists and stores one. A schema 1 cache is
@@ -262,7 +282,7 @@ message), then one `BEGIN IMMEDIATE` transaction that reads the version again, c
 tables, copies every row with its id, drops the old tables, renames the new ones, restores the
 `message` id counter (copying would otherwise lower it to the highest id left, and a deleted newest
 id would be handed out again), recreates the index, requires an empty `PRAGMA foreign_key_check` and
-sets the version, straight to schema 3 with every mailbox synced. Foreign keys go back on
+sets the version, straight to the newest schema with every mailbox synced. Foreign keys go back on
 afterwards. Any failure rolls back to the untouched schema 1 (`nm-core/tests/migration.rs`).
 
 `PRAGMA user_version` holds the schema version. A new cache gets its schema and version in one
@@ -414,9 +434,51 @@ that no digit run of 4 or more (outside a link host or a date), no address's loc
 The caller's side is one function, `redact::excerpt` (`neomail/src/redact.rs`): it takes a
 `ParsedMessage` and the owner's addresses (every account's login that is an address, from the
 config), gathers the display names of From, To, Cc and Reply-To into a `Known`, and makes the
-`Excerpt` from the subject and the body as `neomail show` renders it. `neomail redact` prints that
-`Excerpt` (`output::RedactItem`, `output::write_redacted`), and slice 10's request will be built
-from the same call, so what the user previews is what is sent.
+`Excerpt` from the subject and the body as `neomail show` renders it. `redact::outgoing` wraps
+that `Excerpt` and the header flags into an `Outgoing`; `neomail redact` prints it
+(`output::RedactItem`, `output::write_redacted`, the signals as one line or a `signals` object)
+and `neomail classify` builds its request from the same call, so what the user previews is what
+is sent.
+
+**`Outgoing`** (`nm-redact/src/outgoing.rs`) is everything classification may send for one
+message: its `Excerpt` and its `Signals`. `Outgoing::new(excerpt, from_address, HeaderFlags)`
+keeps only the From address's domain, lower-cased and only when it is a domain name, and whether
+the local part names a role (`noreply`, `orders` … on a short exact list); the local part and
+display names are dropped there. `HeaderFlags` is three booleans the caller reads from
+`parse::Headers` (`nm-core/src/parse.rs`): a mailing list (List-Unsubscribe or List-Id), automated
+(Auto-Submitted other than `no`, or Precedence bulk, list or junk) and a reply (In-Reply-To).
+`Signals` has no public constructor, so a request that takes an `Outgoing` holds redacted text and
+these fields only.
+
+**jev's wire format** (`neomail/src/jev.rs`) is pure: `request_body(model, &Outgoing)` writes
+`POST {url}/v1/systemone`'s body, one choice question `group` with the ten options in a fixed
+order, `main` first, written straight to the output so no map sorts them; `parse_answer` checks a
+2xx answer (the choice is an option, every number a probability) and never quotes it in an error;
+`verdict` sorts a status into answer, retry (408, 429, 5xx, waiting as the server says up to 30 s,
+else 0.5 s doubling to 5 s with the caller's jitter), skip (422) and stop (401 and 403 with the key
+hint; anything else with at most 2 KiB of the body, control characters replaced). A message that
+uses its 3 tries on a retry status fails and stops the run, as an outage would cost every other
+message as many requests; a worker waiting to retry gives up once another has stopped the run.
+`REQUEST_VERSION` is stored with each answer and bumped whenever the question changes. Every
+backend speaks this one format; the base URL, `classify.url`, is the seam.
+
+**Classifying** (`neomail/src/classify.rs`) is the `classify` and `key` commands. `plan` picks the
+messages: the ids given (one that has a result is printed, not asked again, unless `--again`), else
+`Cache::pending` cut to the window (`--days`) and the cap (`--limit`), the rest counted for the
+estimate. Reading a message builds its `Outgoing` and request and records its `msg_key` (a row
+cached before schema 5 has none). The estimate's tokens per request are the average stored
+`input_tokens`, else the requests' characters divided by 4. Consent is one host per line in
+`classify-consent` in the data directory, outside the cache so a rebuild keeps it. The key is
+read before the tokio runtime starts (keyring.rs says why). `send` runs 4 workers on one
+current-thread runtime, each taking the next request off a shared queue, one connection per
+request; the main loop stores each answer with `Cache::store_classification` as it arrives,
+then prints it, so a stopped run resumes where it left off. A worker's `Stop` (401, 403, an
+unexpected status, an unreachable backend) stops the others taking new requests.
+
+Debug builds open a JSON file named by `NEOMAIL_TEST_KEYRING` instead of the OS keyring
+(`keyring/test_store.rs`), so the CLI tests can store a key in one process and read it in the
+next; release builds have no such path. The CLI tests (`neomail/tests/classify.rs`) run a fake
+jev on 127.0.0.1; `tests/live_jev.rs` is the one live check, off by default.
 
 ## How sync works
 

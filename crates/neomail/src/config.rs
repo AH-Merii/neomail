@@ -5,6 +5,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use nm_core::GroupRules;
 use nm_imap::{CertPin, ImapConfig, Security};
 use serde::Deserialize;
 
@@ -44,6 +45,19 @@ pub const GUIDE_URL: &str = "https://github.com/AH-Merii/neomail#try-it";
 
 /// What every "no config yet" message says next.
 pub const ADD_HINT: &str = "add one with `neomail account add`";
+
+/// The config for a command that works without one (`list`, `redact`, `classify`, `key`): `None`
+/// when the default file does not exist. With `strict`, a file the user named
+/// (`--config`, `NEOMAIL_CONFIG`) must exist, so a typo never quietly drops a setting.
+pub fn load_optional(explicit: Option<PathBuf>, strict: bool) -> Result<Option<Config>> {
+    let named = named_path(explicit.clone()).is_some();
+    let path = config_path(explicit)?;
+    if (strict && named) || exists(&path) {
+        Config::load(&path).map(Some)
+    } else {
+        Ok(None)
+    }
+}
 
 /// Whether the config file exists, without reading or parsing it.
 pub fn exists(path: &Path) -> bool {
@@ -195,6 +209,40 @@ pub enum PasswordSource {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub accounts: Vec<Account>,
+    pub classify: ClassifySettings,
+}
+
+/// The classifier jev's base URL when the config names none.
+pub const DEFAULT_CLASSIFY_URL: &str = "https://api.typesafe.ai";
+/// The model asked when the config names none: pinned, so stored probabilities stay comparable
+/// (DEC-2026-10-13-classify).
+pub const DEFAULT_CLASSIFY_MODEL: &str = "jev-1.13.0";
+
+/// The optional `[classify]` table: where the classifier is, which model, and the thresholds
+/// that turn its answers into groups.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassifySettings {
+    /// The backend's base URL, without a trailing `/`: `https://`, or `http://` to this machine.
+    pub url: String,
+    pub model: String,
+    pub rules: GroupRules,
+}
+
+impl Default for ClassifySettings {
+    fn default() -> Self {
+        ClassifySettings {
+            url: DEFAULT_CLASSIFY_URL.to_owned(),
+            model: DEFAULT_CLASSIFY_MODEL.to_owned(),
+            rules: GroupRules::default(),
+        }
+    }
+}
+
+impl ClassifySettings {
+    /// The backend's host, which the key's keyring entry and the consent are named after.
+    pub fn host(&self) -> Result<String> {
+        crate::http::url_host(&self.url)
+    }
 }
 
 #[derive(Deserialize)]
@@ -202,6 +250,51 @@ pub struct Config {
 struct RawConfig {
     #[serde(default)]
     accounts: Vec<RawAccount>,
+    classify: Option<RawClassify>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawClassify {
+    url: Option<String>,
+    model: Option<String>,
+    other_below: Option<f64>,
+    follow_up_old_days: Option<u32>,
+}
+
+/// Checks a `[classify]` table and fills in the defaults.
+fn classify_settings(raw: Option<RawClassify>) -> Result<ClassifySettings> {
+    let mut settings = ClassifySettings::default();
+    let Some(raw) = raw else {
+        return Ok(settings);
+    };
+    if let Some(url) = raw.url {
+        let url = url.trim().trim_end_matches('/').to_owned();
+        crate::http::url_host(&url).context("classify.url")?;
+        if url.contains('?') {
+            bail!("classify.url must not have a query: neomail adds /v1/systemone to it");
+        }
+        settings.url = url;
+    }
+    if let Some(model) = raw.model {
+        if model.trim().is_empty() {
+            bail!("classify.model is empty; remove it to use {DEFAULT_CLASSIFY_MODEL}");
+        }
+        settings.model = model.trim().to_owned();
+    }
+    if let Some(other_below) = raw.other_below {
+        if !(0.0..=1.0).contains(&other_below) {
+            bail!("classify.other_below must be from 0 to 1");
+        }
+        settings.rules.other_below = other_below;
+    }
+    if let Some(days) = raw.follow_up_old_days {
+        if days == 0 {
+            bail!("classify.follow_up_old_days must be at least 1");
+        }
+        settings.rules.follow_up_old_days = days;
+    }
+    Ok(settings)
 }
 
 #[derive(Deserialize)]
@@ -320,7 +413,10 @@ impl Config {
                 name,
             });
         }
-        Ok(Self { accounts })
+        Ok(Self {
+            accounts,
+            classify: classify_settings(raw.classify)?,
+        })
     }
 
     pub fn find(&self, name: &str) -> Option<&Account> {
@@ -956,5 +1052,62 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             ("imap.mail.example", 993, None)
         );
         assert_eq!(work.login, Login::Password(PasswordSource::Keyring));
+    }
+
+    #[test]
+    fn the_classify_table_is_optional_and_checked() {
+        let accounts = "[[accounts]]\nname = \"a\"\nusername = \"u\"\npassword_command = \"true\"\n\
+                        [accounts.imap]\nhost = \"h\"\n";
+        let c = Config::parse(accounts).unwrap();
+        assert_eq!(c.classify.url, "https://api.typesafe.ai");
+        assert_eq!(c.classify.model, "jev-1.13.0");
+        assert_eq!(
+            (
+                c.classify.rules.other_below,
+                c.classify.rules.follow_up_old_days
+            ),
+            (0.4, 90)
+        );
+        assert_eq!(c.classify.host().unwrap(), "api.typesafe.ai");
+
+        let c = Config::parse(&format!(
+            "{accounts}[classify]\nurl = \"http://127.0.0.1:8080/\"\nmodel = \"jev-preview\"\n\
+             other_below = 0.55\nfollow_up_old_days = 30\n"
+        ))
+        .unwrap();
+        assert_eq!(c.classify.url, "http://127.0.0.1:8080");
+        assert_eq!(c.classify.model, "jev-preview");
+        assert_eq!(
+            (
+                c.classify.rules.other_below,
+                c.classify.rules.follow_up_old_days
+            ),
+            (0.55, 30)
+        );
+        assert_eq!(c.classify.host().unwrap(), "127.0.0.1");
+        assert!(
+            Config::parse("[classify]\n").is_ok(),
+            "an empty table is the defaults"
+        );
+
+        for (bad, says) in [
+            ("url = \"http://jev.example\"", "classify.url"),
+            ("url = \"jev.example\"", "classify.url"),
+            (
+                "url = \"https://jev.example/x?y=1\"",
+                "must not have a query",
+            ),
+            ("model = \" \"", "classify.model is empty"),
+            ("other_below = 1.5", "from 0 to 1"),
+            ("other_below = -0.1", "from 0 to 1"),
+            ("follow_up_old_days = 0", "at least 1"),
+            ("threshold = 0.5", "unknown field"),
+        ] {
+            let e = format!(
+                "{:#}",
+                Config::parse(&format!("{accounts}[classify]\n{bad}\n")).unwrap_err()
+            );
+            assert!(e.contains(says), "{bad}: {e}");
+        }
     }
 }

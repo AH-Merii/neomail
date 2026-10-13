@@ -144,6 +144,21 @@ cert_sha256 = "AB:CD:…"   # 64 hex digits
 - Without `cert_sha256` the certificate is verified against the system's trust store. With it,
   only that exact certificate is accepted.
 
+An optional `[classify]` table sets up classification with jev; every key has a default:
+
+```toml
+[classify]
+url = "https://api.typesafe.ai"   # the backend's base URL; requests go to {url}/v1/systemone
+model = "jev-1.13.0"              # pinned, so stored confidences stay comparable
+other_below = 0.4                 # below this confidence a message lists as `other`
+follow_up_old_days = 90           # a `follow-up` older than this lists as `follow-up-old`
+```
+
+- `url` must be `https://`, except for a backend on this machine: `http://127.0.0.1`,
+  `http://[::1]` or `http://localhost`, with any port.
+- `other_below` (0 to 1) and `follow_up_old_days` (at least 1) apply when mail is listed, so
+  changing them needs no new answers. `spam` stays `spam` whatever its confidence.
+
 ### Passwords
 
 An account without `password_command` reads its password from the OS keyring: the Secret Service
@@ -204,7 +219,10 @@ The cache lives in `~/.local/share/neomail/` (`$XDG_DATA_HOME/neomail/`, or `NEO
 neomail sync                 # fetch new mail for every account: "work: 12 new, 1 updated, 0 removed"
 neomail list                 # newest first; * marks unread
 neomail show 42              # headers, body, attachments
-neomail redact 42            # the text classification will send, personal data masked
+neomail redact 42            # what classification sends for a message, personal data masked
+neomail key set              # store your jev key in the OS keyring (or set JEV_API_KEY)
+neomail classify             # sort the last year's mail into groups with jev, at most 1,000
+neomail list --group follow-up   # list one group's mail
 neomail mark read 42 43      # mark read on the server, then in the cache
 neomail archive 42           # move to the archive on the server, then drop from the cache
 neomail delete 43            # move to the trash; nothing is deleted for good
@@ -219,11 +237,32 @@ neomail move Receipts 44     # move to the folder Receipts on the server, then d
   or `all` on `list` and `sync`.
 - `neomail show 42 43` shows several messages; `neomail show 42 --raw` prints one message's source.
   On a terminal `show` goes through `$NEOMAIL_PAGER`, `$PAGER` or `less`; `--no-pager` turns it off.
-- `neomail redact ID...` prints what neomail will send to jev once classification lands: the
+- `neomail redact ID...` prints exactly what `neomail classify` sends for each message: the
   subject and the body's first 1,500 characters, with email addresses, links, phone, card and IBAN
   numbers, amounts, one-time codes, runs of 4 or more digits and the names in the headers replaced
-  by placeholders such as `<email>@acme.example` or `<name>`. It reads the cache only and sends
-  nothing. What it masks and what it misses: [docs/privacy.md](docs/privacy.md).
+  by placeholders such as `<email>@acme.example` or `<name>`, and a line of signals (the sender's
+  domain, whether the address is a role such as `orders@`, and whether the mail came through a
+  mailing list, was automated or is a reply). It reads the cache only and sends nothing. What it
+  masks and what it misses: [docs/privacy.md](docs/privacy.md).
+- `neomail key set` stores the classifier's key in the OS keyring (service `neomail-jev`, one entry
+  per backend host): typed without echo, or one line of standard input
+  (`pass show jev | neomail key set`). `neomail key status` says whether it comes from the
+  keyring or `JEV_API_KEY`, never the key; `neomail key delete` removes it. `--backend URL` names
+  another backend than `classify.url`.
+- `neomail classify` sends each cached message without a group, received in the last 365 days,
+  newest first and at most 1,000 (`--days N`, `--limit N`; `--all` takes every one), to jev and
+  stores its group. Before the first request to a backend it says what is sent and asks once;
+  `--yes` consents in a script. It prints each result as it arrives, then what was left out and
+  what the `neomail classify --all` it suggests would send and cost: every message still without
+  a group, or with `--again` every message again (TypeSafe charges $0.042 per million input
+  tokens).
+  `--estimate` prints that and sends nothing. A message is never asked about twice, even after a
+  mailbox rebuild (a UIDVALIDITY change), unless `--again`; deleting `cache.sqlite3` deletes the
+  stored results too. `neomail classify 42 57` classifies those messages.
+- `neomail list --group G` lists one group: `main`, `follow-up`, `follow-up-old`, `recruitment`,
+  `receipts-invoices`, `orders-shipping`, `newsletters`, `promotions`, `notifications`, `spam`,
+  `other`, or `unclassified`. On a terminal `list` shows each message's group once any is
+  classified; `--json` gives it as `group`.
 - `neomail mark read ID...` and `neomail mark unread ID...` change the read state on the server
   first, then in the cache, so `neomail list` shows it at once. Ids may be of several accounts.
   It needs the server: nothing is queued, and an account that cannot be reached keeps its
