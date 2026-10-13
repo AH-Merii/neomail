@@ -1,10 +1,11 @@
 //! `neomail daemon` and the account locks it shares with `neomail sync` and `neomail mark`, end
-//! to end. The only
-//! server is a closed port on 127.0.0.1, and only the children spawned here are signalled.
+//! to end. The only server is a closed port on 127.0.0.1, and only the children spawned here are
+//! signalled.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
 
 use std::io::{BufRead, BufReader};
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -46,8 +47,34 @@ fn closed_port_config(data: &Path) {
     .unwrap();
 }
 
+/// A spawned child, killed and reaped when it goes out of scope, so a test that fails half way
+/// never leaves a daemon running.
+struct Spawned(Child);
+
+impl Deref for Spawned {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl DerefMut for Spawned {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        // Child::kill does nothing once the child has been waited for, so a reused pid is safe.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Spawns with standard error piped and returns its lines as they come.
-fn spawn(mut c: Command) -> (Child, Receiver<String>) {
+fn spawn(mut c: Command) -> (Spawned, Receiver<String>) {
     let mut child = c
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -63,7 +90,7 @@ fn spawn(mut c: Command) -> (Child, Receiver<String>) {
             }
         }
     });
-    (child, lines)
+    (Spawned(child), lines)
 }
 
 /// The next line of standard error, which must come within [`PATIENCE`].
