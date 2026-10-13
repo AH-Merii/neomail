@@ -86,10 +86,13 @@ the new entry.
   never touching the user's own categories or asking for a new permission.
 - **Each email is classified once** (results cached locally with model id, probabilities and
   timestamp so thresholds can be re-tuned without re-calling the model).
-- **First run** ([DEC-2026-10-11-first-run](#dec-2026-10-11-first-run)): neomail classifies the last 365 days
-  automatically, newest first, without asking, capped at the newest 1,000 emails. It then shows an
-  estimate of what classifying all the remaining emails would cost (count, requests, time, money),
-  and the user can start that with one action. The window and the cap are configurable.
+- **Classify only when asked**
+  ([DEC-2026-10-14-classify-when-asked](#dec-2026-10-14-classify-when-asked)): mail goes to the
+  classifier only when the user asks for it, by running `neomail classify`, by a yes to a question
+  neomail asks first, or through the daemon once background classifying is switched on.
+  `neomail classify` takes cached mail from the last 365 days, newest first, at most 1,000
+  messages (`--days` and `--limit` change both), and estimates what the rest would cost (count,
+  requests, time, money); `--all` does the rest.
 - **Redaction uses our own rules** ([DEC-2026-10-11-pii-rules](#dec-2026-10-11-pii-rules)): the PII
   redaction that runs before text goes to jev is neomail's own rule redactor. No model is part of
   the default.
@@ -115,9 +118,11 @@ the new entry.
   group is the group's name after a prefix, `nm-` by default and configurable
   (`nm-receipts-invoices`). neomail never shows the prefix. Slice 10d's live check may create
   these labels on the test accounts and keeps them.
-- **The daemon classifies new mail** as it syncs, once the user has consented for the backend
-  and a key exists; mail from a first sync is left to slice 11
-  ([DEC-2026-10-13-daemon-classify](#dec-2026-10-13-daemon-classify), proposed).
+- **The daemon classifies new mail** as it syncs, only after the user switches it on with
+  `classify.daemon = true`. It is off by default, and no answer to a question switches it on
+  ([DEC-2026-10-14-classify-when-asked](#dec-2026-10-14-classify-when-asked)). It also needs a
+  key and the user's consent for the backend host. Mail from a first sync is left to
+  `neomail classify` ([DEC-2026-10-13-daemon-classify](#dec-2026-10-13-daemon-classify), proposed).
 
 ## Data and storage
 
@@ -351,7 +356,8 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 
 ### <a id="dec-2026-10-11-first-run"></a>DEC-2026-10-11-first-run: classify the last year on first run
 
-- **Status:** recorded. **Source:** owner, chat, 2026-10-11.
+- **Status:** superseded by [DEC-2026-10-14-classify-when-asked](#dec-2026-10-14-classify-when-asked).
+  **Source:** owner, chat, 2026-10-11.
 - **Supersedes:** `PROV-07`, the plan's provisional default P7, which asked before classifying more
   than 5,000 messages.
 - **Owner's words:** "yes do the first 365 automatically and the limit is capped to the first 1000
@@ -1031,3 +1037,19 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
     ([DEC-2026-10-12-daemon-notifications](#dec-2026-10-12-daemon-notifications)).
 - **Builds on:** [DEC-2026-10-13-classify](#dec-2026-10-13-classify) and
   [DEC-2026-10-13-classify-send](#dec-2026-10-13-classify-send).
+
+### <a id="dec-2026-10-14-classify-when-asked"></a>DEC-2026-10-14-classify-when-asked: classify only when asked
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-14 (f679d889:15467, f679d889:15474),
+  after Claude described slice 11 as classifying the last year on first sync without asking.
+- **Supersedes:** [DEC-2026-10-11-first-run](#dec-2026-10-11-first-run).
+- **Changes:** [DEC-2026-10-13-daemon-classify](#dec-2026-10-13-daemon-classify): background
+  classifying becomes opt-in.
+- **Owner's words:**
+  - "no I do not want it to classify anything without asking, it should ask and then classify or
+    only classify when asked.."
+  - "If I want autoclassify to run in the background I should explicitly enable that"
+- **Ruling:** the "Classify only when asked" and "The daemon classifies new mail" bullets under
+  [Classification](#classification-jev), and slice 11 in [the roadmap](roadmap.md).
+- **Retires:** `classify.daemon` defaulting to `true`, and the consent text's line that the daemon
+  then also sends each new message.
