@@ -123,6 +123,14 @@ pub enum Wake {
     Stop,
 }
 
+impl Wake {
+    /// Whether this wake syncs: a round, a resume, a push sync or an Outlook check. A watcher's
+    /// other news and a stop sync nothing, so they classify nothing either ([`after_sync`]).
+    pub fn syncs(&self) -> bool {
+        matches!(self, Wake::Timer | Wake::Resumed | Wake::Account(_))
+    }
+}
+
 /// How long an account wake waits for more: the wakes in that time make one sync.
 pub const SETTLE: Duration = Duration::from_secs(2);
 
@@ -687,10 +695,12 @@ pub fn notify_round<O: Write, E: Write>(
 }
 
 /// What a wake does after its syncs: `notify` the new mail first, so a notification never waits
-/// for the classifier, then `classify` it, and what waits from earlier wakes. Classifying only
-/// returns lines: however it fails, the next wake syncs and notifies as before. `cx` is what
-/// both read (the cache).
+/// for the classifier, then `classify` it, and what waits from earlier syncs. A wake that did not
+/// sync (`synced` false: a watcher's other news) classifies nothing, so the classifier's cap and
+/// budget hold per sync. Classifying only returns lines: however it fails, the next wake syncs
+/// and notifies as before. `cx` is what both read (the cache).
 pub fn after_sync<O: Write, E: Write, C>(
+    synced: bool,
     new_mail: &[NewMail],
     cx: &mut C,
     printer: &mut Printer<O, E>,
@@ -699,6 +709,9 @@ pub fn after_sync<O: Write, E: Write, C>(
 ) -> io::Result<()> {
     if !new_mail.is_empty() {
         notify(new_mail, cx, printer)?;
+    }
+    if !synced {
+        return Ok(());
     }
     for line in classify(new_mail, cx) {
         printer.print(&line)?;
@@ -795,6 +808,7 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
                 // tokens go too.
                 syncer.retain(&config.accounts);
             }
+            let synced = wake.syncs();
             let printed = printed.and_then(|()| {
                 let new_mail = on_wake(
                     wake,
@@ -806,8 +820,8 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
                     &mut printer,
                     |account| syncer.sync(account, &mut cache),
                 )?;
-                // A wake with no new mail still classifies what waits: `after_sync` and
-                // `Classifier::wake` skip what has nothing to do.
+                // A sync with no new mail still classifies what waits, and a wake that did not
+                // sync classifies nothing: `after_sync` and `Classifier::wake` skip the rest.
                 let notify =
                     |new_mail: &[NewMail], cache: &mut Cache, printer: &mut Printer<_, _>| {
                         // Outside `block_on`, like the syncs: `ready` and `send` run the runtime
@@ -842,7 +856,14 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
                 let classify = |new_mail: &[NewMail], cache: &mut Cache| {
                     classifier.wake(new_mail, &wake, cache, &mut access)
                 };
-                after_sync(&new_mail, &mut cache, &mut printer, notify, classify)
+                after_sync(
+                    synced,
+                    &new_mail,
+                    &mut cache,
+                    &mut printer,
+                    notify,
+                    classify,
+                )
             });
             if let Err(e) = printed {
                 // Standard output is gone (a closed pipe): nothing more can be reported.
@@ -1444,7 +1465,7 @@ and 2 more"
             ]
         };
         p.out.clear();
-        after_sync(&new_mail, &mut order, &mut p, notify, classify).unwrap();
+        after_sync(true, &new_mail, &mut order, &mut p, notify, classify).unwrap();
         assert_eq!(order, ["notify 1", "classify work:1 work:2"]);
         assert_eq!(
             String::from_utf8(p.out.clone()).unwrap(),
@@ -1466,7 +1487,7 @@ and 2 more"
             order.push("classify".to_owned());
             Vec::new()
         };
-        after_sync(&[], &mut order, &mut p, notify, classify).unwrap();
+        after_sync(true, &[], &mut order, &mut p, notify, classify).unwrap();
         assert_eq!(order, ["classify"]);
     }
 

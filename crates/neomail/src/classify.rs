@@ -71,8 +71,10 @@ pub struct Args {
     /// Print what a run would send and cost, and send nothing
     #[arg(long)]
     pub estimate: bool,
-    /// Consent to sending to the backend without being asked (remembered, as a typed yes is;
-    /// `neomail daemon` then also classifies new mail unless classify.daemon = false)
+    /// Consent to sending to the backend without being asked. With no earlier yes for the host
+    /// it is remembered, as a typed yes is, and `neomail daemon` then also classifies new mail
+    /// unless classify.daemon = false; an earlier yes from before the daemon classified covers
+    /// the daemon only after a yes to its question on a terminal
     #[arg(long)]
     pub yes: bool,
     #[command(flatten)]
@@ -287,9 +289,9 @@ fn daemon_text(host: &str) -> String {
     format!(
         "You agreed to send to {host} from `neomail classify`. `neomail daemon` can now also send\n\
          each new message as it arrives, the same request as `neomail classify` sends\n\
-         (classify.daemon = false turns that off). This run sends either way; a no keeps your\n\
-         earlier consent for `neomail classify` only, and this question comes back on the next\n\
-         run on a terminal.\n"
+         (classify.daemon = false turns that off). Your answer does not change this run; a no\n\
+         keeps your earlier consent for `neomail classify` only, and this question comes back on\n\
+         the next run on a terminal.\n"
     )
 }
 
@@ -299,8 +301,7 @@ fn daemon_text(host: &str) -> String {
 /// A yes from before the daemon classified ([`Consent::Classify`]) still lets this run send,
 /// and is never turned into the daemon's consent without its question: with `yes` or without a
 /// terminal nothing is asked or written, and with `classify.daemon = false` (`daemon`) nothing
-/// is asked either. Otherwise `ask` puts the question that names the daemon, and a no is not
-/// remembered, so it is asked again on the next run on a terminal.
+/// is asked either. Otherwise `ask` puts the question that names the daemon ([`offer_daemon`]).
 ///
 /// `ask` shows a text and a prompt and returns the answer.
 fn ensure_consent(
@@ -312,16 +313,10 @@ fn ensure_consent(
     messages: usize,
     ask: &mut dyn FnMut(&str, &str) -> Result<String>,
 ) -> Result<bool> {
-    let agreed = |answer: String| matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes");
     match consent(data_dir, host)? {
         Consent::Daemon => Ok(true),
         Consent::Classify => {
-            if !yes && daemon && input.can_prompt() {
-                let prompt = format!("Let `neomail daemon` send new mail to {host} too? [y/N] ");
-                if agreed(ask(&daemon_text(host), &prompt)?) {
-                    remember_consent(data_dir, host)?;
-                }
-            }
+            offer_daemon(data_dir, host, yes, daemon, input, ask)?;
             Ok(true)
         }
         Consent::None if yes => {
@@ -335,7 +330,7 @@ fn ensure_consent(
         ))),
         Consent::None => {
             let prompt = format!("Send to {host}? [y/N] ");
-            if agreed(ask(&consent_text(host, messages), &prompt)?) {
+            if agreed(&ask(&consent_text(host, messages), &prompt)?) {
                 remember_consent(data_dir, host)?;
                 Ok(true)
             } else {
@@ -343,6 +338,50 @@ fn ensure_consent(
             }
         }
     }
+}
+
+fn agreed(answer: &str) -> bool {
+    matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// To a user whose yes is from before the daemon classified, on a terminal, without `yes` and
+/// with `classify.daemon` on: `ask` the question that names the daemon, and remember a yes.
+/// Whatever the answer, the run goes on as its earlier yes allows: a no, or an answer that never
+/// comes (end of input), is not remembered, so the question comes back on the next run on a
+/// terminal.
+fn offer_daemon(
+    data_dir: &Path,
+    host: &str,
+    yes: bool,
+    daemon: bool,
+    input: Input,
+    ask: &mut dyn FnMut(&str, &str) -> Result<String>,
+) -> Result<()> {
+    if yes || !daemon || !input.can_prompt() {
+        return Ok(());
+    }
+    let prompt = format!("Let `neomail daemon` send new mail to {host} too? [y/N] ");
+    if ask(&daemon_text(host), &prompt).is_ok_and(|answer| agreed(&answer)) {
+        remember_consent(data_dir, host)?;
+    }
+    Ok(())
+}
+
+/// A run with nothing to send still offers the daemon's question to a yes from before the daemon
+/// classified ([`offer_daemon`]): otherwise a user whose mail is all classified is never asked.
+/// It asks nothing for any other consent, and sends nothing.
+fn offer_daemon_alone(
+    data_dir: &Path,
+    host: &str,
+    yes: bool,
+    daemon: bool,
+    input: Input,
+    ask: &mut dyn FnMut(&str, &str) -> Result<String>,
+) -> Result<()> {
+    if consent(data_dir, host)? == Consent::Classify {
+        offer_daemon(data_dir, host, yes, daemon, input, ask)?;
+    }
+    Ok(())
 }
 
 /// Shows `text` on standard error and asks `prompt` on the terminal.
@@ -748,8 +787,15 @@ pub fn run(
                 return Err(e);
             }
         };
-    } else if plan.known.is_empty() && plan.failures.is_empty() {
-        eprintln!("neomail: nothing to classify");
+    } else {
+        if plan.known.is_empty() && plan.failures.is_empty() {
+            eprintln!("neomail: nothing to classify");
+        }
+        if input.can_prompt() {
+            let data_dir = config::data_dir()?;
+            let (yes, daemon) = (args.yes, settings.daemon);
+            offer_daemon_alone(&data_dir, &host, yes, daemon, input, &mut ask_terminal)?;
+        }
     }
     printer.finish()?;
     if outcome.classified > 0 || outcome.failed > 0 {
@@ -1595,7 +1641,7 @@ mod tests {
         for part in [
             "`neomail daemon` can now also send each new message as it arrives",
             "classify.daemon = false turns that off",
-            "This run sends either way",
+            "Your answer does not change this run",
             "this question comes back on the next run on a terminal",
             "Let `neomail daemon` send new mail to api.typesafe.ai too? [y/N]",
         ] {
@@ -1611,6 +1657,56 @@ mod tests {
         let (_dir, data) = consent_file("api.typesafe.ai\n");
         assert!(ensure_consent(&data, host, false, false, ON, 3, &mut never).unwrap());
         assert_eq!(consent(&data, host).unwrap(), Consent::Classify);
+    }
+
+    #[test]
+    fn closing_input_at_the_daemon_question_is_a_no_and_the_run_still_sends() {
+        let host = "api.typesafe.ai";
+        let (_dir, data) = consent_file("api.typesafe.ai\n");
+        let mut asked = 0;
+        let mut closed = |_: &str, _: &str| -> Result<String> {
+            asked += 1;
+            anyhow::bail!("standard input closed")
+        };
+        assert!(ensure_consent(&data, host, false, true, ON, 3, &mut closed).unwrap());
+        assert_eq!(asked, 1);
+        let file = std::fs::read_to_string(data.join(CONSENT_FILE)).unwrap();
+        assert_eq!(file, "api.typesafe.ai\n");
+    }
+
+    #[test]
+    fn with_nothing_to_send_a_consent_from_before_the_daemon_is_still_asked_about_it() {
+        let host = "api.typesafe.ai";
+        let (_dir, data) = consent_file("api.typesafe.ai\n");
+        let mut asked = Vec::new();
+        let mut yes = answering("y", &mut asked);
+        offer_daemon_alone(&data, host, false, true, ON, &mut yes).unwrap();
+        drop(yes);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].ends_with("[y/N] "), "{asked:?}");
+        assert_eq!(consent(&data, host).unwrap(), Consent::Daemon);
+
+        // A no keeps the old consent.
+        let (_dir, data) = consent_file("api.typesafe.ai\n");
+        let mut asked = Vec::new();
+        let mut no = answering("n", &mut asked);
+        offer_daemon_alone(&data, host, false, true, ON, &mut no).unwrap();
+        assert_eq!(consent(&data, host).unwrap(), Consent::Classify);
+
+        // Asked nothing: no consent at all, the daemon's already, --yes, classify.daemon =
+        // false, or no terminal.
+        for (lines, yes, daemon, input) in [
+            ("", false, true, ON),
+            ("api.typesafe.ai daemon\n", false, true, ON),
+            ("api.typesafe.ai\n", true, true, ON),
+            ("api.typesafe.ai\n", false, false, ON),
+            ("api.typesafe.ai\n", false, true, OFF),
+        ] {
+            let (_dir, data) = consent_file(lines);
+            offer_daemon_alone(&data, host, yes, daemon, input, &mut never).unwrap();
+            let file = std::fs::read_to_string(data.join(CONSENT_FILE)).unwrap_or_default();
+            assert_eq!(file, lines);
+        }
     }
 
     #[test]

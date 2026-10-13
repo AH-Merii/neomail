@@ -600,6 +600,8 @@ and the D-Bus call is tested against a zbus server on a socket pair.
 **Classifying in the daemon** (`neomail/src/classify/daemon.rs`) comes after the notifications,
 in the same wake: `daemon::after_sync` notifies first and then calls the classifier, which only
 returns lines, so a notification never waits for jev and no classifying failure reaches the sync.
+Only a wake that synced calls it (`Wake::syncs`: a round, a resume or an account wake); a
+watcher's other news does not, so the classifier's cap and budget hold per sync.
 It takes the same `NewMail` as the notifications, so a first sync or a rebuild is never sent.
 `Classifier` owns the daemon's rules: the gate (`classify.daemon`, then a key, then the consent
 `neomail classify` stored for the host, in 10a's order; only a `HOST daemon` line, written by the

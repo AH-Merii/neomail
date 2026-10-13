@@ -19,24 +19,26 @@ that host in `classify-consent` in the data directory (not in the cache, so dele
 `cache.sqlite3` does not lose it, and not in your config file); `--yes` gives it from a script,
 without showing the question. Without a yes, nothing is sent. `neomail classify --estimate` never
 sends anything. To withdraw a yes, delete the host's line (or the whole file) from
-`classify-consent`: `neomail classify` then asks again, and a running daemon stops at its next
-round with new mail and says why.
+`classify-consent`: `neomail classify` then asks again, and a running daemon stops the next time
+it syncs with mail to classify and says why.
 
-A yes, or `--yes`, also covers `neomail daemon`; the question and `neomail classify --help` say
-so. From then on the daemon also sends
-each new message to that host as it arrives, unless `classify.daemon = false` is in your config.
+A yes, or `--yes` with no earlier yes for the host, also covers `neomail daemon`; the question
+and `neomail classify --help` say so. From then on the daemon also sends each new message to that
+host as it arrives, unless `classify.daemon = false` is in your config.
 A yes given before the daemon classified answered a question that did not mention it, so it
 covers `neomail classify` only, and `neomail classify --yes` sends on it without turning it into
-the daemon's. `neomail classify` on a terminal then asks whether the daemon may send too: that
-run sends on the earlier yes whatever the answer, and a no keeps that yes for `neomail classify`
-only and is asked again on the next run on a terminal. With `classify.daemon = false` it does not
-ask. The daemon waits until that question gets a yes. The daemon never asks itself. Without a yes for the host, or
+the daemon's. `neomail classify` on a terminal then asks whether the daemon may send too, also
+when it has nothing to send: the answer does not change that run, which sends on the earlier yes,
+and a no (or closing the input) keeps that yes for `neomail classify` only and is asked again on
+the next run on a terminal. With `classify.daemon = false` or `--yes` it does not ask. The daemon
+waits until that question gets a yes. The daemon never asks itself. Without a yes for the host, or
 without a key, it sends nothing and says once why classifying is off. `classify.daemon = false`
-stops it from the next round without a restart, as the config is read again each round. So does
-`neomail key delete`, unless `JEV_API_KEY` is set in the daemon's environment, which it then
-falls back to. It sends mail received in the last 365 days only, never an account's first sync,
-and at most 100 messages each time it syncs (a round, a push sync or an Outlook check), each
-tried up to three times. A 402 (no credit left) pauses it for an hour, or until the key changes.
+stops it from the next round without a restart, as the config is read again each round.
+`neomail key delete` stops it the next time it syncs with mail to classify, unless `JEV_API_KEY`
+is set in the daemon's environment, which it then falls back to. It sends mail received in the
+last 365 days only, never an account's first sync, and at most 100 messages each time it syncs (a
+round, a push sync or an Outlook check), each tried up to three times; the rest wait for the next
+time it syncs. A 402 (no credit left) pauses it for an hour, or until the key changes.
 
 ## What will be sent
 

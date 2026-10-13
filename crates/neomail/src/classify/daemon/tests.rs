@@ -391,7 +391,7 @@ fn a_run_that_stops_puts_its_messages_back_for_the_next_wake() {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
             lines[0].starts_with("err neomail daemon: classifying stopped: ")
-                && lines[0].ends_with("; 6 messages wait for the next round"),
+                && lines[0].ends_with("; 6 messages wait for the next sync"),
             "{lines:?}"
         );
         assert!(c.waiting());
@@ -606,7 +606,7 @@ fn a_wake_sends_at_most_its_share_and_the_next_wake_sends_the_rest() {
     let new = w.arrive("INBOX", &many(150));
     assert_eq!(
         w.wake(&mut c, &new, &mut access),
-        ["out work: classified 100 (main 100), 50 wait for the next round"]
+        ["out work: classified 100 (main 100), 50 wait for the next sync"]
     );
     assert_eq!(w.jev.count(), PER_WAKE);
     assert_eq!(
@@ -615,6 +615,83 @@ fn a_wake_sends_at_most_its_share_and_the_next_wake_sends_the_rest() {
     );
     assert_eq!(w.jev.count(), 150);
     assert!(new[0].ids.iter().all(|id| w.stored(*id)));
+}
+
+/// One daemon wake after its syncs, as `neomail daemon` runs it: `after_sync` with the wake's
+/// own answer to whether it synced. Returns standard output.
+fn daemon_wake(
+    w: &mut World,
+    c: &mut Classifier,
+    access: &mut Fixed,
+    wake: crate::daemon::Wake,
+    new: &[NewMail],
+) -> String {
+    let mut printer = crate::daemon::Printer {
+        out: Vec::new(),
+        err: Vec::new(),
+        clock: || "12:00:00".to_owned(),
+    };
+    let owners = [OWNER];
+    let classifying = Wake {
+        settings: &w.settings,
+        owners: &owners,
+        runtime: &w.runtime,
+        stop: &w.stop,
+        budget: w.budget,
+        now: w.now,
+    };
+    let notify = |_: &[NewMail], _: &mut Cache, _: &mut crate::daemon::Printer<_, _>| Ok(());
+    let classify =
+        |new: &[NewMail], cache: &mut Cache| c.wake(new, &classifying, cache, &mut *access);
+    crate::daemon::after_sync(
+        wake.syncs(),
+        new,
+        &mut w.cache,
+        &mut printer,
+        notify,
+        classify,
+    )
+    .unwrap();
+    String::from_utf8(printer.out).unwrap()
+}
+
+#[test]
+fn a_watcher_wake_sends_nothing_and_the_next_sync_sends_what_waits() {
+    use crate::push::{Event, Kind};
+    let mut w = World::new();
+    let mut access = granted();
+    let mut c = Classifier::new(&w.settings, &mut access);
+    let new = w.arrive("INBOX", &many(150));
+    let out = daemon_wake(
+        &mut w,
+        &mut c,
+        &mut access,
+        crate::daemon::Wake::Timer,
+        &new,
+    );
+    assert!(out.ends_with("50 wait for the next sync\n"), "{out}");
+    assert_eq!(w.jev.count(), PER_WAKE);
+    // A watcher's other news syncs nothing, so 50 waiting messages are not sent.
+    for kind in [
+        Kind::On,
+        Kind::NoIdle,
+        Kind::Failed("x".to_owned()),
+        Kind::Ended,
+    ] {
+        let event = Event {
+            account: "work".to_owned(),
+            generation: 1,
+            kind,
+        };
+        let wake = crate::daemon::Wake::Watch(event);
+        assert_eq!(daemon_wake(&mut w, &mut c, &mut access, wake, &[]), "");
+        assert_eq!(w.jev.count(), PER_WAKE);
+    }
+    // A push sync with no new mail sends them.
+    let wake = crate::daemon::Wake::Account("work".to_owned());
+    let out = daemon_wake(&mut w, &mut c, &mut access, wake, &[]);
+    assert_eq!(out, "12:00:00 work: classified 50 (main 50)\n");
+    assert_eq!(w.jev.count(), 150);
 }
 
 #[test]
@@ -829,8 +906,8 @@ fn a_wake_out_of_time_starts_no_request_and_the_next_wake_sends_what_waits() {
     assert_eq!(
         w.wake(&mut c, &new, &mut access),
         [
-            "err neomail daemon: classifying stopped: out of time for this round; 3 messages wait \
-          for the next round"
+            "err neomail daemon: classifying stopped: out of time for this sync; 3 messages wait \
+          for the next sync"
         ]
     );
     assert_eq!(w.jev.count(), 0);
@@ -862,8 +939,8 @@ fn a_retry_that_would_wait_past_the_budget_leaves_the_rest_for_the_next_wake() {
     assert_eq!(
         lines,
         [
-            "err neomail daemon: classifying stopped: out of time for this round; 10 messages wait \
-          for the next round"
+            "err neomail daemon: classifying stopped: out of time for this sync; 10 messages wait \
+          for the next sync"
         ]
     );
     // One request per worker at most: none starts after jev asked for a wait past the budget.

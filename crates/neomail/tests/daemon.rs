@@ -363,7 +363,8 @@ fn the_help_names_both_key_sources_the_old_consent_and_the_cap_per_sync() {
         "there is a key (`neomail key set` or JEV_API_KEY)",
         "A consent given before neomail daemon classified covers `neomail classify` only: run \
          `neomail classify` on a terminal to give it again",
-        "at most 100 messages each time it syncs (a round, a push sync or an Outlook check)",
+        "at most 100 messages each time it syncs (a round, a push sync or an Outlook check); \
+         the rest wait for the next time it syncs",
     ] {
         assert!(flat.contains(part), "{part}: {help}");
     }

@@ -958,7 +958,7 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   - A refused key pauses classifying until the key changes. A 402 (no credit left) pauses it for
     an hour, or until the key changes. An answer that would come back every time (one that isn't
     jev's, or a status such as 400 or 404) pauses it until `classify.url` or `classify.model`
-    changes. A stopped run puts its messages back for the next time.
+    changes. A restart ends any pause. A stopped run puts its messages back for the next time.
   - Notifications don't change: they never wait for a group
     ([DEC-2026-10-12-daemon-notifications](#dec-2026-10-12-daemon-notifications)).
 - **Builds on:** [DEC-2026-10-13-classify](#dec-2026-10-13-classify) and

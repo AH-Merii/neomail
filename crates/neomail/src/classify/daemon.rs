@@ -4,8 +4,10 @@
 //! sends only with a key and the consent `neomail classify` stored for the backend's host, and
 //! otherwise says once why classifying is off.
 //!
-//! A wake sends at most [`PER_WAKE`] requests and starts none once its [`budget`] is spent; the rest
-//! wait in memory for the next wake, as do the messages of a run that stopped. A stop that
+//! The daemon wakes the classifier only after a wake that synced ([`crate::daemon::after_sync`]):
+//! a round, a resume, a push sync or an Outlook check. A wake sends at most [`PER_WAKE`] requests
+//! and starts none once its [`budget`] is spent; the rest wait in memory for the next sync, as do
+//! the messages of a run that stopped. A stop that
 //! would happen again on every wake pauses classifying instead: a refused key until the key
 //! read differs, an answer that is not jev's or a 4xx such as 404 until `classify.url` or
 //! `classify.model` does, and a 402 (no credit left) for [`CREDIT_PAUSE`] or until the key
@@ -260,7 +262,7 @@ impl Classifier {
                 format!("{n} messages wait")
             };
             lines.push(Line::Error(format!(
-                "neomail daemon: classifying stopped: {why}; {waits} for the next round"
+                "neomail daemon: classifying stopped: {why}; {waits} for the next sync"
             )));
             self.last_stop = Some(why);
         }
@@ -433,7 +435,7 @@ impl Classifier {
             None
         } else {
             // A message that ran out of tries, or whose result could not be stored, waits for
-            // the next round: it did not fail.
+            // the next sync: it did not fail.
             if !halted {
                 self.requeue(asked.into_iter().filter(|(_, id)| retry.contains(id)));
             }
@@ -441,7 +443,7 @@ impl Classifier {
                 (Some(e), _) => Some(format!("{e:#}")),
                 // Left unasked with no stop of its own or the daemon's: the deadline.
                 (None, None) if !halted && !retry.is_empty() => {
-                    Some("out of time for this round".to_owned())
+                    Some("out of time for this sync".to_owned())
                 }
                 (None, stopped) => stopped,
             }
@@ -533,7 +535,7 @@ impl Tally {
             .retain(|_, c| !c.groups.is_empty() || !c.failed.is_empty());
     }
 
-    /// `work: classified 3 (newsletters 2, main 1), 1 failed, 20 wait for the next round`.
+    /// `work: classified 3 (newsletters 2, main 1), 1 failed, 20 wait for the next sync`.
     fn lines(&self, queue: &VecDeque<(String, MessageId)>) -> Vec<Line> {
         self.accounts
             .iter()
@@ -554,7 +556,7 @@ impl Tally {
                 }
                 let waiting = queue.iter().filter(|(a, _)| a == account).count();
                 if waiting > 0 {
-                    line.push_str(&format!(", {waiting} wait for the next round"));
+                    line.push_str(&format!(", {waiting} wait for the next sync"));
                 }
                 Line::Report(line)
             })
