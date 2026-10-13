@@ -187,13 +187,14 @@ them after it stores its results, and `neomail daemon` after each wake that sync
   slice's.
 - **What is kept.** For each message neomail reads its categories
   (`GET /me/messages/{id}?$select=categories`), removes only its own (the prefix followed by one
-  of the eleven group names, ignoring case, or the exact name it wrote on that message before),
-  adds the new one, and sends the list back with `PATCH /me/messages/{id}` and
-  `{"categories": [...]}` only when it changed. Your other categories stay, in their order, a name
-  of yours such as `nm-project` included. The PATCH replaces the whole list
-  ([update message](https://learn.microsoft.com/en-us/graph/api/message-update): "The categories
-  associated with the message"), which is why neomail reads it first. A change you make in
-  Outlook between the two requests is lost.
+  of the eleven group names, ignoring ASCII case, or the exact name it wrote on that message
+  before), adds the new one, and sends the list back with `PATCH /me/messages/{id}` and
+  `{"categories": [...]}` only when it changed
+  ([update message](https://learn.microsoft.com/en-us/graph/api/message-update)). Your other
+  categories stay, in their order, a name of yours such as `nm-project` included. The PATCH
+  replaces the whole list: in a live check, a PATCH whose list left a name out removed that name
+  from the message. That is why neomail reads the list first. A change you make in Outlook
+  between the two requests is lost.
 - **No new permission, and the master list is left alone.** Outlook applies a category "by
   assigning the **displayName** property of the category to the **categories** collection of the
   item" ([outlookCategory](https://learn.microsoft.com/en-us/graph/api/resources/outlookcategory)).
@@ -216,7 +217,9 @@ them after it stores its results, and `neomail daemon` after each wake that sync
   on every run or wake; the daemon says so only when its counts change. A message Graph no longer
   has (404) is skipped. A refused token or grant (401 or 403), or Graph still throttling after its
   retries or out of reach, stops that account's writes, and the rest wait; the other accounts go
-  on. In the daemon the writes also stop at a time budget, so they never hold up the next sync.
+  on. In the daemon the writes also stop at a time budget (60 seconds, or the interval when that
+  is shorter), so they hold up the next sync by little more than that, and accounts not reached
+  by then wait for the next wake.
   `neomail classify` exits 1 when a category write or an account's sign-in failed; classifying,
   syncing and notifying go on whatever happens. Lines about categories name the account only,
   never a subject, a sender or a category of yours.
