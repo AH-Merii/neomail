@@ -380,7 +380,10 @@ neomail list --jsonl | jq -ac 'select(.unread) | .subject'      # unread subject
 ```
 
 Colour follows `--color auto|always|never`, then `NO_COLOR` (no styling at all), then
-`CLICOLOR_FORCE` and `CLICOLOR`. JSON and `--raw` output are never coloured.
+`CLICOLOR_FORCE` and `CLICOLOR`. JSON and `--raw` output are never coloured. Help follows the
+same rules, and on a terminal the top-level help (`neomail --help`, `neomail help`, bare
+`neomail`) opens with the logo, the mark alone on a terminal narrower than 59 columns, and no
+logo below 21.
 
 Shell completions:
 
