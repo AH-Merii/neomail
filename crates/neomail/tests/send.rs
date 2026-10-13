@@ -516,7 +516,8 @@ fn a_copy_in_sent_that_fails_still_exits_0_with_a_warning() {
 
 /// Once the server has the message, standard output that cannot be written (here /dev/full, so
 /// ENOSPC) is a warning naming the message, and the exit is 0: a script that retries on exit 1
-/// must not send it twice.
+/// must not send it twice. Linux only: macOS has no /dev/full.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_sent_message_whose_output_cannot_be_written_still_exits_0() {
     let smtp = FakeSmtp::start(&[]);
