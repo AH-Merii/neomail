@@ -1,0 +1,21 @@
+[package]
+name = "sort-animation"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+description = "Prototype: live sorting animation concepts for neomail's jev classifier"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Standalone: keeps this prototype out of any future root workspace.
+[workspace]
+
+[dependencies]
+ratatui = "0.30.2"
+crossterm = "0.29"
+# 0.25.2 depends on ratatui ^0.30.2 / ratatui-core ^0.1.2 (verified on crates.io).
+tachyonfx = { version = "0.25.2", default-features = false, features = ["std-duration"] }
+
+[profile.release]
+debug = false
+opt-level = 3
