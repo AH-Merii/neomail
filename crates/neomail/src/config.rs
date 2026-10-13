@@ -226,6 +226,9 @@ pub struct ClassifySettings {
     pub url: String,
     pub model: String,
     pub rules: GroupRules,
+    /// Whether `neomail daemon` classifies new mail; it still needs a key and the consent
+    /// `neomail classify` stores (DEC-2026-10-13-daemon-classify).
+    pub daemon: bool,
 }
 
 impl Default for ClassifySettings {
@@ -234,6 +237,7 @@ impl Default for ClassifySettings {
             url: DEFAULT_CLASSIFY_URL.to_owned(),
             model: DEFAULT_CLASSIFY_MODEL.to_owned(),
             rules: GroupRules::default(),
+            daemon: true,
         }
     }
 }
@@ -260,6 +264,7 @@ struct RawClassify {
     model: Option<String>,
     other_below: Option<f64>,
     follow_up_old_days: Option<u32>,
+    daemon: Option<bool>,
 }
 
 /// Checks a `[classify]` table and fills in the defaults.
@@ -293,6 +298,9 @@ fn classify_settings(raw: Option<RawClassify>) -> Result<ClassifySettings> {
             bail!("classify.follow_up_old_days must be at least 1");
         }
         settings.rules.follow_up_old_days = days;
+    }
+    if let Some(daemon) = raw.daemon {
+        settings.daemon = daemon;
     }
     Ok(settings)
 }
@@ -1069,12 +1077,17 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             (0.4, 90)
         );
         assert_eq!(c.classify.host().unwrap(), "api.typesafe.ai");
+        assert!(
+            c.classify.daemon,
+            "the daemon classifies unless told not to"
+        );
 
         let c = Config::parse(&format!(
             "{accounts}[classify]\nurl = \"http://127.0.0.1:8080/\"\nmodel = \"jev-preview\"\n\
-             other_below = 0.55\nfollow_up_old_days = 30\n"
+             other_below = 0.55\nfollow_up_old_days = 30\ndaemon = false\n"
         ))
         .unwrap();
+        assert!(!c.classify.daemon);
         assert_eq!(c.classify.url, "http://127.0.0.1:8080");
         assert_eq!(c.classify.model, "jev-preview");
         assert_eq!(
@@ -1102,6 +1115,7 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             ("other_below = -0.1", "from 0 to 1"),
             ("follow_up_old_days = 0", "at least 1"),
             ("threshold = 0.5", "unknown field"),
+            ("daemon = \"no\"", "invalid type"),
         ] {
             let e = format!(
                 "{:#}",

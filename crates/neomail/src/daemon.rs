@@ -9,7 +9,8 @@
 //! the same wake.
 //!
 //! After a round, each account that got new mail in it gets one desktop notification
-//! ([`notify_round`], through [`crate::notify`]).
+//! ([`notify_round`], through [`crate::notify`]). Then the new mail is classified
+//! ([`crate::classify::daemon`]), so a notification never waits for the classifier.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -22,15 +23,16 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use nm_core::cache::ListEntry;
-use nm_core::{MessageId, SyncReport};
+use nm_core::{Cache, MessageId, SyncReport};
 use tokio::runtime::Runtime;
 use tokio::time::Instant;
 
+use crate::classify::{self, daemon::Classifier};
 use crate::config::{self, Account, Config};
 use crate::notify::{self, NewMail, Notification, Notifier};
 use crate::push::{self, Push, WatchLogin};
 use crate::sync::{PASSWORD_COMMAND_TIMEOUT, Synced, Syncer, report_line};
-use crate::{lock, output};
+use crate::{lock, output, redact};
 
 /// The default interval between the starts of two rounds.
 pub const DEFAULT_INTERVAL: &str = "5m";
@@ -226,6 +228,11 @@ impl Stop {
 
     pub fn requested(&self) -> bool {
         self.requested.load(Ordering::SeqCst)
+    }
+
+    /// The flag a signal sets, for work that runs inside the runtime (the classifier's requests).
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.requested)
     }
 
     /// Waits until `due` has passed, an account woken through `wakes` has settled, a watcher
@@ -679,6 +686,26 @@ pub fn notify_round<O: Write, E: Write>(
     Ok(())
 }
 
+/// What a wake does after its syncs: `notify` the new mail first, so a notification never waits
+/// for the classifier, then `classify` it, and what waits from earlier wakes. Classifying only
+/// returns lines: however it fails, the next wake syncs and notifies as before. `cx` is what
+/// both read (the cache).
+pub fn after_sync<O: Write, E: Write, C>(
+    new_mail: &[NewMail],
+    cx: &mut C,
+    printer: &mut Printer<O, E>,
+    notify: impl FnOnce(&[NewMail], &mut C, &mut Printer<O, E>) -> io::Result<()>,
+    classify: impl FnOnce(&[NewMail], &mut C) -> Vec<Line>,
+) -> io::Result<()> {
+    if !new_mail.is_empty() {
+        notify(new_mail, cx, printer)?;
+    }
+    for line in classify(new_mail, cx) {
+        printer.print(&line)?;
+    }
+    Ok(())
+}
+
 /// The config of the next round: the file read again, or the last good one when it cannot be
 /// read, with the reason reported once per distinct error.
 fn reload(path: &Path, last: &mut Config, reported: &mut Option<String>) -> Option<Line> {
@@ -721,12 +748,18 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
     let stop = Stop::on_signals()?;
     let runtime = crate::account::runtime()?;
     let mut notifier = Notifier::start(&runtime, no_notify);
+    let mut access = classify::daemon::System {
+        data_dir: data_dir.clone(),
+    };
+    let mut classifier = Classifier::new(&config.classify, &mut access);
     let count = config.accounts.len();
     eprintln!(
-        "neomail daemon: syncing {count} account{} every {interval}, {}; Ctrl-C stops",
+        "neomail daemon: syncing {count} account{} every {interval}, {}, {}; Ctrl-C stops",
         if count == 1 { "" } else { "s" },
-        notifier.status()
+        notifier.status(),
+        classifier.status()
     );
+    let halt = stop.flag();
     let mut syncer = Syncer::new(
         &runtime,
         nm_core::sync::DEFAULT_LIMIT,
@@ -773,27 +806,43 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
                     &mut printer,
                     |account| syncer.sync(account, &mut cache),
                 )?;
-                if new_mail.is_empty() {
-                    return Ok(());
-                }
-                // Outside `block_on`, like the syncs: `ready` and `send` run the runtime
-                // themselves.
-                match notifier.ready(&runtime) {
-                    notify::Ready::Off => return Ok(()),
-                    notify::Ready::Found => printer.print(&Line::Error(format!(
-                        "neomail daemon: {}",
-                        notify::Status::On
-                    )))?,
-                    notify::Ready::On => {}
-                }
-                notify_round(
-                    &new_mail,
-                    &stop,
-                    |ids| Ok(cache.newest_of(ids, notify::SHOWN)?),
-                    |n| notifier.send(&runtime, n),
-                    &mut reports,
-                    &mut printer,
-                )
+                // A wake with no new mail still classifies what waits: `after_sync` and
+                // `Classifier::wake` skip what has nothing to do.
+                let notify =
+                    |new_mail: &[NewMail], cache: &mut Cache, printer: &mut Printer<_, _>| {
+                        // Outside `block_on`, like the syncs: `ready` and `send` run the runtime
+                        // themselves.
+                        match notifier.ready(&runtime) {
+                            notify::Ready::Off => return Ok(()),
+                            notify::Ready::Found => printer.print(&Line::Error(format!(
+                                "neomail daemon: {}",
+                                notify::Status::On
+                            )))?,
+                            notify::Ready::On => {}
+                        }
+                        notify_round(
+                            new_mail,
+                            &stop,
+                            |ids| Ok(cache.newest_of(ids, notify::SHOWN)?),
+                            |n| notifier.send(&runtime, n),
+                            &mut reports,
+                            printer,
+                        )
+                    };
+                let owners = redact::owner_addresses(&config);
+                let wake = classify::daemon::Wake {
+                    settings: &config.classify,
+                    owners: &owners,
+                    runtime: &runtime,
+                    stop: &halt,
+                    budget: classify::daemon::budget(interval.duration()),
+                    now: chrono::Utc::now(),
+                };
+                // Outside `block_on` too: the key is read from the keyring.
+                let classify = |new_mail: &[NewMail], cache: &mut Cache| {
+                    classifier.wake(new_mail, &wake, cache, &mut access)
+                };
+                after_sync(&new_mail, &mut cache, &mut printer, notify, classify)
             });
             if let Err(e) = printed {
                 // Standard output is gone (a closed pipe): nothing more can be reported.
@@ -1358,6 +1407,67 @@ Sender 3: Message 3
 and 2 more"
         );
         assert!(p.err.is_empty());
+    }
+
+    #[test]
+    fn new_mail_is_notified_before_it_is_classified_and_a_first_sync_is_neither() {
+        let stop = Stop::new().unwrap();
+        let mut reports = Reports::default();
+        let mut p = printer();
+        let all = accounts(&["work", "new"]);
+        let new_mail = round(&all, unlocked, &stop, &mut reports, &mut p, |a| Synced {
+            report: Ok(match a.name.as_str() {
+                "work" => added(false, &[1, 2]),
+                // Its first sync: slice 11's first run classifies it, not the daemon.
+                _ => added(true, &[7, 8]),
+            }),
+            partial: SyncReport::default(),
+            warnings: Vec::new(),
+            watch: None,
+        })
+        .unwrap();
+        let mut order: Vec<String> = Vec::new();
+        let notify = |new: &[NewMail], order: &mut Vec<String>, _: &mut Printer<_, _>| {
+            order.push(format!("notify {}", new.len()));
+            Ok(())
+        };
+        let classify = |new: &[NewMail], order: &mut Vec<String>| {
+            let ids: Vec<String> = new
+                .iter()
+                .flat_map(|n| n.ids.iter().map(|id| format!("{}:{id}", n.account)))
+                .collect();
+            order.push(format!("classify {}", ids.join(" ")));
+            // However classifying went, it is only lines.
+            vec![
+                Line::Error("neomail daemon: classifying stopped: x; 2 messages wait".to_owned()),
+                Line::Report("work: classified 0".to_owned()),
+            ]
+        };
+        p.out.clear();
+        after_sync(&new_mail, &mut order, &mut p, notify, classify).unwrap();
+        assert_eq!(order, ["notify 1", "classify work:1 work:2"]);
+        assert_eq!(
+            String::from_utf8(p.out.clone()).unwrap(),
+            "12:00:00 work: classified 0\n"
+        );
+        let err = String::from_utf8(p.err.clone()).unwrap();
+        assert!(
+            err.contains("neomail daemon: classifying stopped: x; 2 messages wait"),
+            "{err}"
+        );
+
+        // A wake with no new mail notifies nothing, and still classifies what waits.
+        order.clear();
+        let notify = |_: &[NewMail], order: &mut Vec<String>, _: &mut Printer<_, _>| {
+            order.push("notify".to_owned());
+            Ok(())
+        };
+        let classify = |_: &[NewMail], order: &mut Vec<String>| {
+            order.push("classify".to_owned());
+            Vec::new()
+        };
+        after_sync(&[], &mut order, &mut p, notify, classify).unwrap();
+        assert_eq!(order, ["classify"]);
     }
 
     #[test]

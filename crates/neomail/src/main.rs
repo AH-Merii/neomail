@@ -118,7 +118,8 @@ Examples:
 Each message costs one request to classify.url (https://api.typesafe.ai by default), tried again
 up to twice on a rate limit or a server error, with its redacted subject and body excerpt, the
 sender's domain and four signals: exactly what `neomail redact ID` shows. Before the first
-request to a host, neomail says what will be sent and asks once; --yes consents for a script. A
+request to a host, neomail says what will be sent and asks once; --yes consents for a script.
+That consent also lets `neomail daemon` classify new mail (classify.daemon = false turns it off). A
 result is stored as soon as it arrives and is never asked for again unless --again: a stopped
 run resumes where it left off. Exit 1 when a message failed or the run stopped. What is sent and
 kept:
@@ -347,7 +348,12 @@ enum Command {
     },
     /// Keep every account's cache current: sync them all now and then every interval, until Ctrl-C or SIGTERM
     #[cfg(unix)]
-    #[command(after_help = "Guide: https://github.com/AH-Merii/neomail/blob/main/docs/daemon.md")]
+    #[command(
+        after_help = "It also classifies new mail as it arrives, with the request `neomail classify` sends, once \
+`neomail classify` has your consent for the backend and a key is stored; it never asks. \
+`classify.daemon = false` in the config turns that off.\n\n\
+Guide: https://github.com/AH-Merii/neomail/blob/main/docs/daemon.md"
+    )]
     Daemon {
         /// Time between the starts of two rounds: digits followed by s, m or h, from 30s to 24h
         #[arg(long, value_name = "DURATION", default_value = daemon::DEFAULT_INTERVAL, value_parser = daemon::parse_interval)]

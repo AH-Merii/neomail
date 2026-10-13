@@ -14,7 +14,11 @@ use std::time::Duration;
 /// Long enough for a slow CI runner; only reached when something is wrong.
 const PATIENCE: Duration = Duration::from_secs(60);
 
-/// The binary with its data and config in `data`, no keyring and no network but 127.0.0.1.
+/// The start line's words on classifying when there is no jev key.
+const NO_KEY: &str = "classifying off: no jev key (run `neomail key set` or set JEV_API_KEY)";
+
+/// The binary with its data and config in `data`, no keyring, no jev key and no network but
+/// 127.0.0.1.
 fn command(data: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_neomail"));
     c.args(args)
@@ -23,6 +27,8 @@ fn command(data: &Path, args: &[&str]) -> Command {
         .env("HOME", data)
         .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
         .env("BROWSER", "true")
+        .env_remove("JEV_API_KEY")
+        .env_remove("NEOMAIL_TEST_KEYRING")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("NO_COLOR")
@@ -127,7 +133,8 @@ fn a_failing_daemon_reports_once_keeps_running_refuses_a_second_and_stops_on_sig
     assert_eq!(
         next_line(&mut daemon, &lines),
         format!(
-            "neomail daemon: syncing 1 account every 30 seconds, {notifications}; Ctrl-C stops"
+            "neomail daemon: syncing 1 account every 30 seconds, {notifications}, {NO_KEY}; \
+             Ctrl-C stops"
         )
     );
     let failure = next_line(&mut daemon, &lines);
@@ -176,8 +183,70 @@ fn no_notify_says_so_at_start() {
     daemon.wait().unwrap();
     assert_eq!(
         start,
-        "neomail daemon: syncing 1 account every 30 seconds, notifications off (--no-notify); \
-         Ctrl-C stops"
+        format!(
+            "neomail daemon: syncing 1 account every 30 seconds, notifications off (--no-notify), \
+             {NO_KEY}; Ctrl-C stops"
+        )
+    );
+}
+
+#[test]
+fn the_start_line_says_classifying_is_on_only_with_a_key_and_the_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    closed_port_config(data);
+    // The backend is a closed port too: nothing is sent, as there is no new mail.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let mut config = std::fs::read_to_string(data.join("config.toml")).unwrap();
+    config.push_str(&format!(
+        "\n[classify]\nurl = \"http://127.0.0.1:{port}\"\n"
+    ));
+    std::fs::write(data.join("config.toml"), config).unwrap();
+    let start = |data: &Path| {
+        let args = ["daemon", "--interval", "30s", "--no-notify"];
+        let mut c = command(data, &args);
+        c.env("JEV_API_KEY", "made-up-key");
+        let (mut daemon, lines) = spawn(c);
+        let start = next_line(&mut daemon, &lines);
+        terminate(&daemon);
+        daemon.wait().unwrap();
+        start
+    };
+    let head =
+        "neomail daemon: syncing 1 account every 30 seconds, notifications off (--no-notify)";
+    assert_eq!(
+        start(data),
+        format!(
+            "{head}, classifying off: 127.0.0.1 needs your consent once; run `neomail classify` \
+             on a terminal; Ctrl-C stops"
+        )
+    );
+    // A yes from before the daemon classified answered a question that never named it.
+    std::fs::write(data.join("classify-consent"), "127.0.0.1\n").unwrap();
+    assert_eq!(
+        start(data),
+        format!(
+            "{head}, classifying off: 127.0.0.1 needs your consent once; run `neomail classify` \
+             on a terminal; Ctrl-C stops"
+        )
+    );
+    // What `neomail classify` stores once the user agrees.
+    std::fs::write(data.join("classify-consent"), "127.0.0.1 daemon\n").unwrap();
+    assert_eq!(
+        start(data),
+        format!("{head}, classifying new mail with 127.0.0.1; Ctrl-C stops")
+    );
+    std::fs::write(
+        data.join("config.toml"),
+        std::fs::read_to_string(data.join("config.toml")).unwrap() + "daemon = false\n",
+    )
+    .unwrap();
+    assert_eq!(
+        start(data),
+        format!("{head}, classifying off (classify.daemon = false); Ctrl-C stops")
     );
 }
 

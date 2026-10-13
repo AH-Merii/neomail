@@ -1,7 +1,10 @@
 //! `neomail classify` and `neomail key`: choose the cached messages to classify, ask once per
 //! backend host before anything is sent, run the requests four at a time, store each result as
 //! it arrives, and estimate what is left. The wire format is jev.rs's; what is sent is built by
-//! redact.rs from nm-redact's [`Outgoing`](nm_redact::Outgoing) alone.
+//! redact.rs from nm-redact's [`Outgoing`](nm_redact::Outgoing) alone. `neomail daemon` sends
+//! the same requests through [`send`], under the consent `neomail classify` stored ([`daemon`]).
+
+pub(crate) mod daemon;
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
@@ -9,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -67,7 +71,8 @@ pub struct Args {
     /// Print what a run would send and cost, and send nothing
     #[arg(long)]
     pub estimate: bool,
-    /// Consent to sending to the backend without being asked (remembered, as a typed yes is)
+    /// Consent to sending to the backend without being asked (remembered, as a typed yes is;
+    /// `neomail daemon` then also classifies new mail unless classify.daemon = false)
     #[arg(long)]
     pub yes: bool,
     #[command(flatten)]
@@ -201,17 +206,39 @@ fn settings(config: Option<PathBuf>) -> Result<ClassifySettings> {
         .unwrap_or_default())
 }
 
-/// Whether the user agreed to send to `host`.
-fn consented(data_dir: &Path, host: &str) -> Result<bool> {
-    let path = data_dir.join(CONSENT_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(text.lines().any(|line| line.trim() == host)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
-    }
+/// What the user agreed to for a host, as the consent file records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Consent {
+    None,
+    /// A yes from before the daemon classified (slice 10a), a line with the host alone: its
+    /// question never mentioned the daemon, so it covers `neomail classify` only.
+    Classify,
+    /// A yes to the question that says the daemon also sends new mail: `HOST daemon`.
+    Daemon,
 }
 
-/// Remembers that the user agreed to send to `host`.
+/// What the user agreed to for `host`.
+pub(crate) fn consent(data_dir: &Path, host: &str) -> Result<Consent> {
+    let path = data_dir.join(CONSENT_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Consent::None),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let mut given = Consent::None;
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let this = match words[..] {
+            [h] if h == host => Consent::Classify,
+            [h, "daemon"] if h == host => Consent::Daemon,
+            _ => Consent::None,
+        };
+        given = given.max(this);
+    }
+    Ok(given)
+}
+
+/// Remembers that the user agreed to send to `host`, to the question that names the daemon.
 fn remember_consent(data_dir: &Path, host: &str) -> Result<()> {
     crate::create_private_dir(data_dir)?;
     let path = data_dir.join(CONSENT_FILE);
@@ -222,7 +249,7 @@ fn remember_consent(data_dir: &Path, host: &str) -> Result<()> {
     let mut file = options
         .open(&path)
         .with_context(|| format!("cannot create {}", path.display()))?;
-    writeln!(file, "{host}").with_context(|| format!("cannot write {}", path.display()))
+    writeln!(file, "{host} daemon").with_context(|| format!("cannot write {}", path.display()))
 }
 
 /// What is said before the first request to `host`.
@@ -249,12 +276,16 @@ fn consent_text(host: &str, messages: usize) -> String {
          Of the sender's address only the domain is sent. No other header and no attachment is\n\
          sent.\n\
          {keeps}\n\
-         `neomail redact ID` shows exactly what is sent for a message.\n"
+         `neomail redact ID` shows exactly what is sent for a message.\n\
+         Once you agree, `neomail daemon` also sends each new message as it arrives, unless\n\
+         classify.daemon = false.\n"
     )
 }
 
 /// Asks once per host, unless `yes`; a yes is remembered. Without a terminal or with
-/// `--no-input`, and no earlier yes, it is a usage error and nothing is sent.
+/// `--no-input`, and no earlier yes, it is a usage error and nothing is sent. A yes from before
+/// the daemon classified ([`Consent::Classify`]) still lets this run send without a terminal,
+/// but on one the question, which now names the daemon, is asked again once.
 fn ensure_consent(
     data_dir: &Path,
     host: &str,
@@ -262,7 +293,8 @@ fn ensure_consent(
     input: Input,
     messages: usize,
 ) -> Result<bool> {
-    if consented(data_dir, host)? {
+    let given = consent(data_dir, host)?;
+    if given == Consent::Daemon {
         return Ok(true);
     }
     if yes {
@@ -270,6 +302,9 @@ fn ensure_consent(
         return Ok(true);
     }
     if !input.can_prompt() {
+        if given == Consent::Classify {
+            return Ok(true);
+        }
         return Err(usage(format!(
             "nothing was sent: {host} needs your consent once; run `neomail classify` on a \
              terminal, or pass --yes ({})",
@@ -287,11 +322,11 @@ fn ensure_consent(
 }
 
 /// One message to ask about: where its result goes, and the request, built before any is sent.
-struct Job {
-    id: MessageId,
-    account: String,
+pub(crate) struct Job {
+    pub(crate) id: MessageId,
+    pub(crate) account: String,
     msg_key: String,
-    received: Option<DateTime<Utc>>,
+    pub(crate) received: Option<DateTime<Utc>>,
     /// The original subject, for the terminal's line; never sent.
     subject: String,
     request: Vec<u8>,
@@ -317,10 +352,10 @@ struct Plan {
     left: Vec<MessageId>,
 }
 
-/// What [`plan`] needs to read a message.
-struct Reader<'a> {
-    owners: &'a [&'a str],
-    model: &'a str,
+/// What [`plan`] and [`job_for`] need to read a message.
+pub(crate) struct Reader<'a> {
+    pub(crate) owners: &'a [&'a str],
+    pub(crate) model: &'a str,
 }
 
 impl Reader<'_> {
@@ -417,6 +452,28 @@ fn plan(
         }
     }
     Ok(plan)
+}
+
+/// The job for one message of a sync's new mail, or `None` when it costs nothing to leave: it
+/// is gone or unreadable, it arrived before `cutoff` (or nobody knows when), it already has a
+/// result, or `seen` already holds its copy in another mailbox. `plan`'s rules for one message.
+pub(crate) fn job_for(
+    cache: &mut Cache,
+    id: MessageId,
+    reader: &Reader<'_>,
+    cutoff: DateTime<Utc>,
+    seen: &mut std::collections::HashSet<(String, String)>,
+) -> Result<Option<Job>> {
+    let Ok(job) = reader.read(cache, id)? else {
+        return Ok(None);
+    };
+    if job.received.is_none_or(|r| r < cutoff)
+        || cache.classification(&job.account, &job.msg_key)?.is_some()
+        || !seen.insert((job.account.clone(), job.msg_key.clone()))
+    {
+        return Ok(None);
+    }
+    Ok(Some(job))
 }
 
 /// Input tokens per request, and how that was worked out.
@@ -626,7 +683,24 @@ pub fn run(
             eprintln!("neomail: nothing was sent");
             return Ok(ExitCode::from(EXIT_FAILURE));
         }
-        outcome = match send(&settings, &key, plan.jobs, &mut cache, &mut printer, now) {
+        let runtime = crate::account::runtime()?;
+        let halt = Arc::new(AtomicBool::new(false));
+        let sent = send(
+            &settings,
+            &key,
+            plan.jobs,
+            &mut cache,
+            &mut printer,
+            now,
+            &runtime,
+            &halt,
+            None,
+        );
+        let sent = sent.and_then(|mut sent| match sent.error.take() {
+            Some(e) => Err(e),
+            None => Ok(sent),
+        });
+        outcome = match sent {
             Ok(outcome) => outcome,
             Err(e) => {
                 // --json still prints the results that were stored. After a failed print this
@@ -948,13 +1022,77 @@ impl<'a> Printer<'a> {
     }
 }
 
+/// Where [`send`] reports each message as it settles: the terminal's [`Printer`], or the
+/// daemon's tally. An error stops the run, as a failure to store a result does.
+pub(crate) trait Sink {
+    fn result(
+        &mut self,
+        job: &Job,
+        result: &Classification,
+        rules: &GroupRules,
+        now: DateTime<Utc>,
+    ) -> Result<()>;
+    fn failed(&mut self, job: &Job, why: &str) -> Result<()>;
+    /// `done` of `total` messages settled.
+    fn progress(&mut self, _done: usize, _total: usize) {}
+}
+
+impl Sink for Printer<'_> {
+    fn result(
+        &mut self,
+        job: &Job,
+        result: &Classification,
+        rules: &GroupRules,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        Printer::result(
+            self,
+            job.id,
+            &job.account,
+            &job.subject,
+            job.received,
+            result,
+            rules,
+            now,
+        )
+    }
+
+    fn failed(&mut self, job: &Job, why: &str) -> Result<()> {
+        Printer::failed(self, job.id, &job.account, why)
+    }
+
+    fn progress(&mut self, done: usize, total: usize) {
+        Printer::progress(self, done, total);
+    }
+}
+
 /// How a run went.
 #[derive(Debug, Default)]
-struct Outcome {
-    classified: usize,
-    failed: usize,
+pub(crate) struct Outcome {
+    pub(crate) classified: usize,
+    pub(crate) failed: usize,
     /// Why the run stopped early, if it did.
-    stopped: Option<String>,
+    pub(crate) stopped: Option<String>,
+    /// Whether its stop would happen again on every run until something changes.
+    pub(crate) repeats: Option<Repeats>,
+    /// The messages that neither got a stored result nor failed on their own (a 422): the run
+    /// stopped before or while asking about them. Asking again later may well succeed.
+    pub(crate) retry: Vec<MessageId>,
+    /// The first error storing or printing a result, which stopped the run. The rest of the
+    /// outcome still holds, so a caller knows what was settled.
+    pub(crate) error: Option<anyhow::Error>,
+}
+
+/// What must change before a stop stops happening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Repeats {
+    /// jev refused the key (401 or 403).
+    Key,
+    /// The backend answered 2xx with something that is not jev's, or a status that is no rate
+    /// limit, no server error and no invalid request (a 400 or a 404, say): it would answer
+    /// every request to `classify.url` for `classify.model` the same. 402 is left out, as
+    /// running out of credit is put right without changing a setting.
+    Settings,
 }
 
 /// What the workers share. The requests are built; the workers only send them.
@@ -964,29 +1102,69 @@ struct Shared {
     authorization: String,
     requests: Vec<Vec<u8>>,
     queue: Mutex<VecDeque<usize>>,
+    /// The run's own stop: a message failed the way every other would.
     stop: AtomicBool,
+    /// The caller's stop (the daemon's SIGINT or SIGTERM): no request starts after it, a retry's
+    /// wait ends, and the requests in flight are abandoned.
+    halt: Arc<AtomicBool>,
+    /// The caller's time limit (the daemon's, per wake): no request starts after it and no
+    /// retry waits past it, but a request in flight is answered and stored, as it cost a request.
+    deadline: Option<Instant>,
+}
+
+impl Shared {
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+            || self.halt.load(Ordering::SeqCst)
+            || self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+}
+
+/// How often a request in flight or a retry's wait looks at the caller's stop.
+const HALT_CHECK: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Ends once `halt` is set.
+async fn halted(halt: &AtomicBool) {
+    while !halt.load(Ordering::SeqCst) {
+        tokio::time::sleep(HALT_CHECK).await;
+    }
 }
 
 enum Event {
     Answered(usize, Answer),
     Failed(usize, String),
-    Stop(String),
-    /// A message failed in a way every other message would too, so the run stops: it ran out
-    /// of tries on a retry status (a rate limit or an outage that outlasts one message's tries
-    /// would cost every other message as many requests), or a 2xx answer is not jev's.
+    /// Every other request would fail the same way, and so would the next run's, unless
+    /// `Repeats` says what changes that.
+    Stop(String, Option<Repeats>),
+    /// A message ran out of tries on a retry status, so the run stops: a rate limit or an
+    /// outage that outlasts one message's tries would cost every other message as many
+    /// requests. The message is asked again later.
     GaveUp(usize, String),
+    /// A 2xx answer is not jev's: the message failed, and the run stops, as every other
+    /// request to this backend would be answered the same.
+    NotJev(usize, String),
     /// The run had already stopped, so this message was left unasked.
     Stopped,
+    /// jev asked for a wait that ends past the caller's deadline: the message and every one
+    /// after it are left for later, as each would be asked to wait as well.
+    OutOfTime,
 }
 
-/// Sends the requests, [`CONCURRENCY`] at a time, storing each result as soon as it arrives.
-fn send(
+/// Sends the requests, [`CONCURRENCY`] at a time, storing each result as soon as it arrives and
+/// reporting it to `sink`. Runs `runtime` itself, so it is called outside `block_on`. Once
+/// `halt` is set or `deadline` has passed no request starts (see [`Shared`]); the messages left
+/// unasked come back in [`Outcome::retry`].
+#[allow(clippy::too_many_arguments, reason = "a run's inputs")]
+pub(crate) fn send(
     settings: &ClassifySettings,
     key: &Secret,
     mut jobs: Vec<Job>,
     cache: &mut Cache,
-    printer: &mut Printer<'_>,
+    sink: &mut dyn Sink,
     now: DateTime<Utc>,
+    runtime: &tokio::runtime::Runtime,
+    halt: &Arc<AtomicBool>,
+    deadline: Option<Instant>,
 ) -> Result<Outcome> {
     let total = jobs.len();
     let shared = Arc::new(Shared {
@@ -999,8 +1177,11 @@ fn send(
             .collect(),
         queue: Mutex::new((0..total).collect()),
         stop: AtomicBool::new(false),
+        halt: Arc::clone(halt),
+        deadline,
     });
-    let runtime = crate::account::runtime()?;
+    // Whether each message got a stored result or failed on its own: the rest are `retry`.
+    let mut settled = vec![false; total];
     runtime.block_on(async {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         for _ in 0..CONCURRENCY.min(total) {
@@ -1014,7 +1195,7 @@ fn send(
         let mut error: Option<anyhow::Error> = None;
         let mut print_failed = false;
         let stop = &shared.stop;
-        printer.progress(0, total);
+        sink.progress(0, total);
         while let Some(event) = rx.recv().await {
             // Once printing failed (a closed pipe), nothing more is printed.
             let print = !print_failed;
@@ -1036,50 +1217,64 @@ fn send(
                         continue;
                     }
                     outcome.classified += 1;
+                    settled[i] = true;
                     if print {
-                        let printed = printer.result(
-                            job.id,
-                            &job.account,
-                            &job.subject,
-                            job.received,
-                            &result,
-                            &settings.rules,
-                            now,
-                        );
+                        let printed = sink.result(job, &result, &settings.rules, now);
                         print_failed |= printed.is_err();
                         keep(&mut error, stop, printed);
                     }
                 }
                 Event::Failed(i, why) => {
                     outcome.failed += 1;
+                    settled[i] = true;
                     if print {
-                        let printed = printer.failed(jobs[i].id, &jobs[i].account, &why);
+                        let printed = sink.failed(&jobs[i], &why);
                         print_failed |= printed.is_err();
                         keep(&mut error, stop, printed);
                     }
                 }
-                Event::Stop(why) => {
+                Event::Stop(why, repeats) => {
+                    if outcome.stopped.is_none() {
+                        outcome.repeats = repeats;
+                    }
+                    outcome.stopped.get_or_insert(why);
+                }
+                Event::NotJev(i, why) => {
+                    outcome.failed += 1;
+                    settled[i] = true;
+                    if print {
+                        let printed = sink.failed(&jobs[i], &why);
+                        print_failed |= printed.is_err();
+                        keep(&mut error, stop, printed);
+                    }
+                    if outcome.stopped.is_none() {
+                        outcome.repeats = Some(Repeats::Settings);
+                    }
                     outcome.stopped.get_or_insert(why);
                 }
                 Event::GaveUp(i, why) => {
                     outcome.failed += 1;
                     if print {
-                        let printed = printer.failed(jobs[i].id, &jobs[i].account, &why);
+                        let printed = sink.failed(&jobs[i], &why);
                         print_failed |= printed.is_err();
                         keep(&mut error, stop, printed);
                     }
                     outcome.stopped.get_or_insert(why);
                 }
-                Event::Stopped => {}
+                Event::Stopped | Event::OutOfTime => {}
             }
             if error.is_none() {
-                printer.progress(outcome.classified + outcome.failed, total);
+                sink.progress(outcome.classified + outcome.failed, total);
             }
         }
-        match error {
-            Some(e) => Err(e),
-            None => Ok(outcome),
-        }
+        outcome.retry = jobs
+            .iter()
+            .zip(&settled)
+            .filter(|(_, settled)| !**settled)
+            .map(|(job, _)| job.id)
+            .collect();
+        outcome.error = error;
+        Ok(outcome)
     })
 }
 
@@ -1093,11 +1288,14 @@ fn keep(error: &mut Option<anyhow::Error>, stop: &AtomicBool, done: Result<()>) 
 
 /// Takes requests off the queue until it is empty or the run stops.
 async fn worker(shared: Arc<Shared>, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
-    while !shared.stop.load(Ordering::Relaxed) {
+    while !shared.stopped() {
         let next = shared.queue.lock().ok().and_then(|mut q| q.pop_front());
         let Some(i) = next else { break };
         let event = ask(&shared, i).await;
-        if matches!(event, Event::Stop(_) | Event::GaveUp(..)) {
+        if matches!(
+            event,
+            Event::Stop(..) | Event::GaveUp(..) | Event::NotJev(..) | Event::OutOfTime
+        ) {
             shared.stop.store(true, Ordering::Relaxed);
         }
         if tx.send(event).is_err() {
@@ -1114,19 +1312,20 @@ async fn ask(shared: &Shared, i: usize) -> Event {
     ];
     let mut attempt = 1;
     loop {
-        let sent = shared
-            .http
-            .post_json(
-                &shared.endpoint,
-                &headers,
-                &shared.requests[i],
-                jev::MAX_ANSWER,
-            )
-            .await;
+        let post = shared.http.post_json(
+            &shared.endpoint,
+            &headers,
+            &shared.requests[i],
+            jev::MAX_ANSWER,
+        );
+        let sent = tokio::select! {
+            sent = post => sent,
+            () = halted(&shared.halt) => return Event::Stopped,
+        };
         let response = match sent {
             Ok(response) => response,
             // The backend cannot be reached: every other request would fail the same way.
-            Err(e) => return Event::Stop(format!("{e:#}")),
+            Err(e) => return Event::Stop(format!("{e:#}"), None),
         };
         let status = response.status;
         match jev::verdict(
@@ -1141,13 +1340,20 @@ async fn ask(shared: &Shared, i: usize) -> Event {
                     Ok(answer) => Event::Answered(i, answer),
                     // Most likely classify.url names some other service: every other message
                     // would be sent to it for nothing.
-                    Err(e) => Event::GaveUp(i, format!("the backend's answer is not jev's: {e}")),
+                    Err(e) => Event::NotJev(i, format!("the backend's answer is not jev's: {e}")),
                 };
             }
             Verdict::Retry(wait) if attempt < jev::MAX_TRIES => {
-                tokio::time::sleep(wait).await;
+                // A wait past the deadline would end in no request: the message waits instead.
+                if shared.deadline.is_some_and(|d| Instant::now() + wait >= d) {
+                    return Event::OutOfTime;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    () = halted(&shared.halt) => return Event::Stopped,
+                }
                 // Another worker may have stopped the run while this one waited.
-                if shared.stop.load(Ordering::Relaxed) {
+                if shared.stopped() {
                     return Event::Stopped;
                 }
                 attempt += 1;
@@ -1162,13 +1368,17 @@ async fn ask(shared: &Shared, i: usize) -> Event {
                 return Event::Failed(i, "jev refused the request as invalid (422)".to_owned());
             }
             Verdict::StopKey => {
-                return Event::Stop(format!(
-                    "jev refused the key ({status}): {}",
-                    keyring::NO_JEV_KEY.trim_start_matches("no jev key: ")
-                ));
+                return Event::Stop(
+                    format!(
+                        "jev refused the key ({status}): {}",
+                        keyring::NO_JEV_KEY.trim_start_matches("no jev key: ")
+                    ),
+                    Some(Repeats::Key),
+                );
             }
             Verdict::Stop { status, body } => {
-                return Event::Stop(format!("jev answered {status}: {body}"));
+                let repeats = (status != 402).then_some(Repeats::Settings);
+                return Event::Stop(format!("jev answered {status}: {body}"), repeats);
             }
         }
     }
@@ -1243,6 +1453,31 @@ mod tests {
         assert!(ensure_consent(&data, "api.typesafe.ai", true, input, 3).unwrap());
         assert!(ensure_consent(&data, "api.typesafe.ai", false, input, 3).unwrap());
         assert!(ensure_consent(&data, "127.0.0.1", false, input, 3).is_err());
+        assert_eq!(consent(&data, "api.typesafe.ai").unwrap(), Consent::Daemon);
+    }
+
+    #[test]
+    fn a_yes_from_before_the_daemon_covers_neomail_classify_but_not_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join(CONSENT_FILE), "api.typesafe.ai\n").unwrap();
+        assert_eq!(
+            consent(&data, "api.typesafe.ai").unwrap(),
+            Consent::Classify
+        );
+        let input = Input {
+            terminal: false,
+            no_input: false,
+        };
+        assert!(ensure_consent(&data, "api.typesafe.ai", false, input, 3).unwrap());
+        assert_eq!(
+            consent(&data, "api.typesafe.ai").unwrap(),
+            Consent::Classify,
+            "no question was asked, so none was answered"
+        );
+        let mut system = daemon::System { data_dir: data };
+        assert!(!daemon::Access::consented(&mut system, "api.typesafe.ai").unwrap());
     }
 
     #[test]
@@ -1268,6 +1503,8 @@ mod tests {
             TYPESAFE_PRIVACY,
             TYPESAFE_TERMS,
             "`neomail redact ID`",
+            "`neomail daemon` also sends each new message as it arrives, unless classify.daemon \
+             = false",
         ] {
             assert!(flat.contains(&part.to_lowercase()), "{part}: {text}");
         }
