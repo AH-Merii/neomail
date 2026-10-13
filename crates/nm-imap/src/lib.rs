@@ -1,5 +1,6 @@
 //! The IMAP [`MailSource`]: TLS or STARTTLS over rustls, then read-only IMAP on INBOX; and the
-//! one write, [`store_seen`], which sets or clears `\Seen` and never expunges.
+//! two writes: [`store_seen`], which sets or clears `\Seen`, and [`move_to`], which moves
+//! messages from INBOX to the archive or the trash. Neither ever expunges.
 
 mod tls;
 mod watch;
@@ -11,12 +12,12 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_imap::types::{Fetch, Flag};
+use async_imap::types::{Fetch, Flag, Name, NameAttribute};
 use async_imap::{Client, Session};
 use futures_util::TryStreamExt;
 use nm_core::{
-    FetchedMessage, Flags, ListedMessage, MailSource, MailboxStatus, Uid, UidFlags, UidValidity,
-    Written,
+    FetchedMessage, Flags, Folder, ListedMessage, MailSource, MailboxStatus, Moved, Uid, UidFlags,
+    UidValidity, Written,
 };
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
@@ -153,6 +154,19 @@ pub enum ImapError {
          run `neomail sync` first"
     )]
     UidValidityChanged,
+    #[error(
+        "the server does not support IMAP MOVE (RFC 6851), which neomail needs to move mail; \
+         nothing was moved, so use another mail app for this account"
+    )]
+    NoMove,
+    #[error(
+        "the server has no {} folder: no mailbox has the {} attribute (RFC 6154); nothing was \
+         moved. If the folder is hidden from IMAP (Gmail: Settings, Labels, Show in IMAP), show \
+         it and try again; otherwise use another mail app for this account",
+        .0,
+        role_attributes(*.0)
+    )]
+    NoFolder(Folder),
     #[error("timed out during {0}")]
     Timeout(&'static str),
     #[error("the server closed the connection")]
@@ -249,6 +263,72 @@ async fn store_seen_on<T: Transport>(
     result
 }
 
+/// Moves `uids` from INBOX to the mailbox with the role `to`, after checking that INBOX's
+/// UIDVALIDITY is still `uid_validity`, with `UID MOVE` (RFC 6851). The destination is the
+/// mailbox [`destination`] picks from LIST's special-use attributes (RFC 6154); a server without
+/// one, or without the MOVE capability, gets an error and nothing moves.
+///
+/// Which UIDs moved is confirmed by `UID FETCH`: a UID INBOX has before the MOVE and no longer
+/// has after it moved; a UID it does not have before is gone ("a non-existent unique identifier
+/// is ignored without any error message", RFC 3501 section 6.4.8); one it still has after is not
+/// confirmed. Never sends EXPUNGE, CLOSE, COPY, CREATE, RENAME, DELETE or a STORE of `\Deleted`:
+/// the session ends with LOGOUT.
+pub async fn move_to(
+    config: &ImapConfig,
+    login: Login<'_>,
+    uid_validity: UidValidity,
+    uids: &[Uid],
+    to: Folder,
+) -> Result<Moved<Uid>, ImapError> {
+    let tls = tls::client_config(config.cert_pin).map_err(ImapError::TlsConfig)?;
+    let client = open(config, tls).await?;
+    let session = log_in(client, &config.username, login).await?;
+    move_on(session, uid_validity, uids, to).await
+}
+
+/// [`move_to`] on a logged-in session, which it logs out. Shared with the wire tests.
+async fn move_on<T: Transport>(
+    session: Session<T>,
+    uid_validity: UidValidity,
+    uids: &[Uid],
+    to: Folder,
+) -> Result<Moved<Uid>, ImapError> {
+    let mut source = ImapSource { session, exists: 0 };
+    let result = source.move_uids(uid_validity, uids, to).await;
+    source.logout().await;
+    result
+}
+
+/// The attributes that mark a mailbox as the folder with the role `to`, in order of preference.
+fn role_attributes(to: Folder) -> &'static str {
+    match to {
+        Folder::Archive => "\\Archive or \\All",
+        Folder::Trash => "\\Trash",
+    }
+}
+
+/// The mailbox that holds the role `to`, from LIST's answer: for the archive, the first with
+/// `\Archive`, else the first with `\All` ("all messages in the user's message store", RFC 6154
+/// section 2: Gmail's `[Gmail]/All Mail`); for the trash, the first with `\Trash`. A
+/// `\Noselect` mailbox and INBOX never qualify.
+fn destination(names: &[Name], to: Folder) -> Option<String> {
+    let usable = |n: &&Name| {
+        !n.name().eq_ignore_ascii_case("INBOX")
+            && !n.attributes().contains(&NameAttribute::NoSelect)
+    };
+    let with = |attribute: NameAttribute<'static>| {
+        names
+            .iter()
+            .filter(usable)
+            .find(|n| n.attributes().contains(&attribute))
+            .map(|n| n.name().to_owned())
+    };
+    match to {
+        Folder::Archive => with(NameAttribute::Archive).or_else(|| with(NameAttribute::All)),
+        Folder::Trash => with(NameAttribute::Trash),
+    }
+}
+
 /// The SHA-256 of the certificate the server at `config` presents, for the user to compare and
 /// pin (Proton Mail Bridge uses a self-signed one). The certificate is not trusted for anything:
 /// the connection is closed after the handshake (and the greeting), without logging in.
@@ -318,17 +398,7 @@ impl<T: Transport> ImapSource<T> {
         uids: &[Uid],
         seen: bool,
     ) -> Result<Written<Uid>, ImapError> {
-        let op = "SELECT INBOX";
-        let mailbox = step(op, self.session.select("INBOX"))
-            .await?
-            .map_err(|source| ImapError::Command { op, source })?;
-        let found = mailbox
-            .uid_validity
-            .and_then(UidValidity::new)
-            .ok_or(ImapError::NoUidValidity)?;
-        if found != uid_validity {
-            return Err(ImapError::UidValidityChanged);
-        }
+        self.select_inbox(uid_validity).await?;
         if uids.is_empty() {
             return Ok(Written::default());
         }
@@ -372,6 +442,81 @@ impl<T: Transport> ImapSource<T> {
         Ok(written)
     }
 
+    /// Checks MOVE, finds the destination, SELECTs INBOX read-write, checks its UIDVALIDITY,
+    /// then moves and confirms. See [`move_to`].
+    async fn move_uids(
+        &mut self,
+        uid_validity: UidValidity,
+        uids: &[Uid],
+        to: Folder,
+    ) -> Result<Moved<Uid>, ImapError> {
+        let op = "CAPABILITY";
+        let capabilities = step(op, self.session.capabilities())
+            .await?
+            .map_err(|source| ImapError::Command { op, source })?;
+        if !capabilities.has_str("MOVE") {
+            return Err(ImapError::NoMove);
+        }
+        let op = "LIST";
+        let stream = step(op, self.session.list(Some(""), Some("*")))
+            .await?
+            .map_err(|source| ImapError::Command { op, source })?;
+        let names = collect(op, stream).await?;
+        let folder = destination(&names, to).ok_or(ImapError::NoFolder(to))?;
+        self.select_inbox(uid_validity).await?;
+        let mut moved = Moved {
+            folder,
+            moved: Vec::new(),
+            gone: Vec::new(),
+        };
+        if uids.is_empty() {
+            return Ok(moved);
+        }
+        let before = self.present("UID FETCH", uids).await?;
+        moved.gone = uids
+            .iter()
+            .copied()
+            .filter(|u| !before.contains(u))
+            .collect();
+        if before.is_empty() {
+            return Ok(moved);
+        }
+        let op = "UID MOVE";
+        step(op, self.session.uid_mv(uid_set(&before), &moved.folder))
+            .await?
+            .map_err(|source| ImapError::Command { op, source })?;
+        let after = self.present("UID FETCH", &before).await?;
+        moved.moved = before.into_iter().filter(|u| !after.contains(u)).collect();
+        Ok(moved)
+    }
+
+    /// Which of `uids` INBOX has now, in the order asked.
+    async fn present(&mut self, op: &'static str, uids: &[Uid]) -> Result<Vec<Uid>, ImapError> {
+        let set = uid_set(uids);
+        let found = self.uid_flags(op, Cmd::Uid(&set)).await?;
+        Ok(uids
+            .iter()
+            .copied()
+            .filter(|u| found.iter().any(|f| f.uid == *u))
+            .collect())
+    }
+
+    /// SELECTs INBOX read-write and checks that its UIDVALIDITY is still `uid_validity`.
+    async fn select_inbox(&mut self, uid_validity: UidValidity) -> Result<(), ImapError> {
+        let op = "SELECT INBOX";
+        let mailbox = step(op, self.session.select("INBOX"))
+            .await?
+            .map_err(|source| ImapError::Command { op, source })?;
+        let found = mailbox
+            .uid_validity
+            .and_then(UidValidity::new)
+            .ok_or(ImapError::NoUidValidity)?;
+        if found != uid_validity {
+            return Err(ImapError::UidValidityChanged);
+        }
+        Ok(())
+    }
+
     async fn uid_flags(
         &mut self,
         op: &'static str,
@@ -413,10 +558,11 @@ impl<T: Transport> ImapSource<T> {
     }
 }
 
-/// Collects a FETCH's responses, bounding the wait for each one rather than the whole transfer.
-async fn collect<S>(op: &'static str, stream: S) -> Result<Vec<Fetch>, ImapError>
+/// Collects a FETCH's (or LIST's) responses, bounding the wait for each one rather than the whole
+/// transfer.
+async fn collect<S, I>(op: &'static str, stream: S) -> Result<Vec<I>, ImapError>
 where
-    S: futures_util::Stream<Item = Result<Fetch, async_imap::error::Error>>,
+    S: futures_util::Stream<Item = Result<I, async_imap::error::Error>>,
 {
     let mut stream = std::pin::pin!(stream);
     let mut out = Vec::new();

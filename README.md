@@ -11,7 +11,8 @@ A fast, modal terminal email client for Outlook, Gmail and Proton Mail.
 > (`neomail sync`, `neomail list`, `neomail show`): over IMAP with passwords (an app password,
 > Proton Mail Bridge) or, for Gmail, OAuth sign-in through your own Google client; and Outlook or
 > Hotmail through Microsoft Graph, signed in through your own Microsoft Entra app. `neomail mark`
-> marks mail read or unread; otherwise nothing changes on the server. There is no TUI yet.
+> marks mail read or unread, and `neomail archive` and `neomail delete` move mail out of the INBOX;
+> otherwise nothing changes on the server. There is no TUI yet.
 
 ## Try it
 
@@ -191,6 +192,8 @@ neomail sync                 # fetch new mail for every account: "work: 12 new, 
 neomail list                 # newest first; * marks unread
 neomail show 42              # headers, body, attachments
 neomail mark read 42 43      # mark read on the server, then in the cache
+neomail archive 42           # move to the archive on the server, then drop from the cache
+neomail delete 43            # move to the trash; nothing is deleted for good
 ```
 
 - `neomail sync --account work --limit 100`: the first sync takes the 500 messages that arrived
@@ -206,16 +209,27 @@ neomail mark read 42 43      # mark read on the server, then in the cache
   messages as they were. It waits for a sync of the same account (`neomail daemon`'s) to finish.
   An Outlook account added before neomail could change mail needs `neomail account login NAME`
   once ([docs/outlook.md](docs/outlook.md)).
+- `neomail archive ID...` moves messages from the INBOX to their account's archive, and
+  `neomail delete ID...` to its trash: neomail never deletes a message for good and never empties
+  the trash. On IMAP, neomail finds the folder from the special-use attributes in the server's LIST
+  answer (`\Archive`, else `\All` such as Gmail's All Mail, and `\Trash`); an account without one
+  fails and nothing moves. The server moves the message first, then it leaves the cache, so
+  `neomail list` no longer shows it. Like `mark`, it needs the server, works across accounts and
+  waits for a sync of the same account. Outlook archives to the folder Outlook's own Archive uses
+  and deletes to Deleted Items. Where each puts a message:
+  [docs/gmail.md](docs/gmail.md#archive-and-delete) and
+  [docs/outlook.md](docs/outlook.md#where-archive-and-delete-put-a-message).
 - `--json` and `--jsonl` print JSON for scripts; see [docs/json.md](docs/json.md) for the shapes,
   the plain columns and the exit codes.
 
 On a terminal, listings are aligned columns. In a pipe, or with `--plain`, they are tab-separated:
-one message per line, the id first, nothing cut off. `show -` and `mark read|unread -` read ids
-from standard input:
+one message per line, the id first, nothing cut off. `show -`, `mark read|unread -`, `archive -`
+and `delete -` read ids from standard input:
 
 ```sh
 neomail list | fzf -m | neomail show -                          # pick messages, read them
 neomail list | fzf -m | neomail mark read -                     # pick messages, mark them read
+neomail list | fzf -m | neomail archive -                       # pick messages, archive them
 neomail list --color always | fzf --ansi -m | neomail show -    # the same, in colour
 neomail list | cut -f1,6                                        # id and subject
 neomail list --jsonl | jq -ac 'select(.unread) | .subject'      # unread subjects, ASCII-escaped

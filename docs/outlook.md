@@ -1,10 +1,10 @@
 # Outlook with your own Entra app
 
 neomail reads Outlook, Outlook.com and Hotmail mail through Microsoft Graph, marks it read or
-unread there, and signs in with
-OAuth, through a Microsoft Entra app registration that **you** create. It ships with no app of its
-own ([decisions](decisions.md#accounts-and-providers)): an app registration is what Microsoft
-grants access to, so with your own, no one else's app ever holds access to your mail.
+unread, archives it or moves it to Deleted Items there, and signs in with OAuth, through a
+Microsoft Entra app registration that **you** create. It ships with no app of its own
+([decisions](decisions.md#accounts-and-providers)): an app registration is what Microsoft grants
+access to, so with your own, no one else's app ever holds access to your mail.
 
 The setup takes about ten minutes, once. `neomail account add outlook` prints the same steps in
 short. The wording below follows Microsoft's
@@ -82,9 +82,11 @@ for `Mail.ReadWrite` (to read your mail and change it), `Mail.Read` (so an earli
 still refresh this sign-in; see [Where things are kept](#where-things-are-kept)),
 `offline_access` (a refresh token), and `openid profile email` (your address). The consent screen
 therefore asks to read and change your mail ("Read and write access to your mail"). neomail needs
-the change part to mark messages read or unread (`neomail mark`): Graph allows that only with
-`Mail.ReadWrite` ([update message](https://learn.microsoft.com/en-us/graph/api/message-update)).
-neomail never deletes or moves a message.
+the change part to mark messages read or unread (`neomail mark`) and to move them
+(`neomail archive`, `neomail delete`): Graph allows both only with `Mail.ReadWrite`
+([update message](https://learn.microsoft.com/en-us/graph/api/message-update),
+[move message](https://learn.microsoft.com/en-us/graph/api/message-move)). neomail never deletes a
+message for good, and never creates, renames or deletes a folder.
 
 ### Accounts added before neomail could mark mail
 
@@ -92,8 +94,9 @@ Earlier versions asked for `Mail.Read` only. Such an account keeps syncing exact
 neomail keeps asking Microsoft for `Mail.Read` when it refreshes that sign-in, because a refresh
 may ask only for the scopes the sign-in asked for or fewer
 ([authorization code flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow)).
-`neomail mark` on it fails without changing anything and says to run `neomail account login NAME`.
-Do that once, accept the new permission, and the account can mark mail.
+`neomail mark`, `archive` or `delete` on it fails without changing anything and says to run
+`neomail account login NAME`.
+Do that once, accept the new permission, and the account can change mail.
 
 neomail tells the two apart by the `mail_grant` it keeps with the refresh token in the keyring
 (below): `read-write` for a sign-in that granted `Mail.ReadWrite`, `read` for one that granted only
@@ -152,6 +155,32 @@ removes it. Any other error stops the writes, and `mark` says the account's mess
 marked: Graph keeps the changes it already made, the cache is left alone for all of them, and the
 next sync reads their state. There is no queue: run the command again.
 
+## Where archive and delete put a message
+
+`neomail archive ID...` moves each message to the folder Graph calls `archive`: the one
+Outlook's one-click Archive moves to. `neomail delete ID...` moves it to `deleteditems`, the
+Deleted Items folder, where a deleted message goes. Both are Graph's well-known folder names,
+which work whatever the mailbox's language
+([mailFolder](https://learn.microsoft.com/en-us/graph/api/resources/mailfolder)). The archive is
+not Exchange Online's separate Archive Mailbox feature (same page). Neither command deletes a
+message for good, and neomail never empties Deleted Items.
+
+Each command first reads that folder (`GET /me/mailFolders/archive?$select=id` or
+`.../deleteditems?...`). A mailbox without it fails with "the mailbox has no "archive" folder",
+and nothing moves. Then each message gets `POST /me/messages/{id}/move` with
+`{"destinationId": "archive"}` or `{"destinationId": "deleteditems"}`, at most four at once, with
+the same immutable ids and throttling waits as `mark`
+([move message](https://learn.microsoft.com/en-us/graph/api/message-move)). `201 Created` is
+moved, and that message's row leaves the cache. A 404 is a message Graph no longer has: it fails,
+and the next sync removes it. Checking the folder first is what makes a 404 mean the message,
+not a missing folder. Any other error stops the moves, as for `mark`: Graph keeps the moves it
+already made, the cache is left alone, and the next sync finds those messages gone from the
+INBOX. `--json` names the folder by its well-known name: `archive` or `deleteditems`.
+
+Graph moves a message by its id, wherever it is now. A message you moved out of the INBOX
+elsewhere since the last sync is therefore moved again, from that folder. Run `neomail sync`
+first if you have been sorting mail in another app.
+
 ## How mail is read
 
 `neomail sync` reads the INBOX through Graph, read-only: it lists messages
@@ -202,10 +231,13 @@ and leave it out.
   policy blocks the app ([Graph errors](https://learn.microsoft.com/en-us/graph/errors)). During
   `account add`, the sign-in has already granted mail access, so it is one of the others; nothing
   was saved. For a saved account, run `neomail account login NAME` and accept the permission to
-  read (and, for `neomail mark`, change) your email first.
+  read (and, for `neomail mark`, `archive` and `delete`, change) your email first.
 - **"this account's sign-in lets neomail read mail but not change it":** the account was added
   before neomail could mark mail, or the consent granted only `Mail.Read`. Run
   `neomail account login NAME`; nothing was changed.
+- **"the mailbox has no "archive" folder in Microsoft Graph":** the mailbox has no folder for
+  Outlook's one-click Archive, so nothing was moved. Archive those messages in Outlook on the
+  web.
 - **"the app registration is not multitenant" or "is for Microsoft Entra accounts only":** the
   supported account types in step 2 are wrong. Register the app again with the right type, and
   use its client ID.

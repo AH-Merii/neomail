@@ -13,7 +13,7 @@ pub mod source;
 pub mod sync;
 pub mod types;
 
-pub use action::{Action, MailWriter, Written};
+pub use action::{Action, Change, Folder, MailWriter, Moved, Written};
 pub use cache::{Cache, CacheError, Located, MessageKey};
 pub use id_source::{IdSource, sync_inbox_by_id, sync_inbox_by_id_with_progress};
 pub use source::MailSource;

@@ -116,6 +116,24 @@ impl Https {
         .await
     }
 
+    /// POSTs the JSON `body` to `url` with `headers`, refusing an answer larger than `max_body`.
+    pub async fn post_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> Result<Response> {
+        self.send(Request {
+            method: "POST",
+            url,
+            headers,
+            body: Some(("application/json", body)),
+            max_body,
+        })
+        .await
+    }
+
     async fn send(&self, request: Request<'_>) -> Result<Response> {
         let (host, _) = split_https_url(request.url)?;
         let connect = async {

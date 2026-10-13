@@ -8,7 +8,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use nm_core::{Cache, Cursor, Flags, IdChange, IdSource, RemoteId, sync_inbox_by_id};
+use nm_core::{Cache, Cursor, Flags, Folder, IdChange, IdSource, RemoteId, sync_inbox_by_id};
 use nm_graph::{GraphError, GraphSource, MAX_JSON, MAX_MIME, Reply, Transport, TransportError};
 use serde_json::{Value, json};
 
@@ -92,6 +92,10 @@ impl FakeGraph {
                 Some(m) => reply(200, raw(&m.id).into_bytes()),
                 None => json_reply(404, &json!({"error": {"code": "ErrorItemNotFound"}})),
             };
+        }
+        if let Some(name @ ("archive" | "deleteditems")) = path.strip_prefix("/me/mailFolders/") {
+            assert_eq!(query, "$select=id");
+            return json_reply(200, &json!({ "id": format!("{name}-id") }));
         }
         if path == "/me/mailFolders/inbox" {
             return json_reply(
@@ -189,6 +193,24 @@ impl Transport for FakeGraph {
         };
         Ok(self.answer(seen, || self.serve_patch(url, &body)).await)
     }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> Result<Reply, TransportError> {
+        let body: Value = serde_json::from_slice(body).unwrap();
+        let seen = Seen {
+            method: "POST",
+            url: url.to_owned(),
+            body: Some(body.clone()),
+            headers: owned(headers),
+            max_body,
+        };
+        Ok(self.answer(seen, || self.serve_move(url)).await)
+    }
 }
 
 fn owned(headers: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -224,6 +246,22 @@ impl FakeGraph {
                 200,
                 &json!({"id": m.id, "isRead": body["isRead"], "subject": "s", "body": {"content": "x"}}),
             ),
+            None => json_reply(404, &json!({"error": {"code": "ErrorItemNotFound"}})),
+        }
+    }
+}
+
+impl FakeGraph {
+    /// A message's move: 201 with the moved message, or 404 for an id it lacks.
+    fn serve_move(&self, url: &str) -> Reply {
+        let segment = url
+            .strip_prefix(&format!("{API}/me/messages/"))
+            .and_then(|p| p.strip_suffix("/move"))
+            .unwrap();
+        assert!(!segment.contains(['/', '?']), "{url}");
+        let wanted = decode(segment);
+        match self.messages.iter().find(|m| m.id == wanted) {
+            Some(m) => json_reply(201, &json!({"id": m.id, "body": {"content": "x"}})),
             None => json_reply(404, &json!({"error": {"code": "ErrorItemNotFound"}})),
         }
     }
@@ -940,4 +978,127 @@ async fn set_read_retries_throttling_and_fails_on_403_without_other_requests() {
     let s = source(FakeGraph::new([1]).script([reply(500, Vec::new())]));
     let e = s.set_read(&ids([1]), true).await.unwrap_err();
     assert_eq!(e.to_string(), "Microsoft Graph answered HTTP 500");
+}
+
+fn headers() -> [(String, String); 3] {
+    [
+        ("Authorization".to_owned(), format!("Bearer {TOKEN}")),
+        ("Prefer".to_owned(), "IdType=\"ImmutableId\"".to_owned()),
+        ("Accept".to_owned(), "application/json".to_owned()),
+    ]
+}
+
+#[tokio::test]
+async fn move_to_checks_the_folder_then_posts_each_message_to_its_well_known_name() {
+    for (to, name) in [
+        (Folder::Archive, "archive"),
+        (Folder::Trash, "deleteditems"),
+    ] {
+        let s = source(FakeGraph::new(1..=6));
+        let moved = s.move_to(&ids(1..=6), to).await.unwrap();
+        assert_eq!(moved.folder, name);
+        assert_eq!(moved.moved, ids(1..=6));
+        assert!(moved.gone.is_empty());
+        let fake = transport(&s);
+        assert_eq!(fake.max_in_flight.get(), 4);
+        let seen = fake.seen.borrow();
+        assert_eq!(seen.len(), 7);
+        // The folder first, read-only: it shows the mailbox has it before anything moves.
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(
+            seen[0].url,
+            format!("{API}/me/mailFolders/{name}?$select=id")
+        );
+        assert_eq!(seen[0].headers, headers());
+        assert_eq!(seen[0].max_body, MAX_JSON);
+        let mut urls: Vec<&str> = seen[1..].iter().map(|s| s.url.as_str()).collect();
+        urls.sort_unstable();
+        let mut want: Vec<String> = (1..=6)
+            .map(|n| format!("{API}/me/messages/AAMkAGI2%2FTg%2B{n}%3D/move"))
+            .collect();
+        want.sort_unstable();
+        assert_eq!(urls, want);
+        for request in &seen[1..] {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.body, Some(json!({ "destinationId": name })));
+            assert_eq!(request.headers, headers());
+            // The answer is the whole message, its body included.
+            assert_eq!(request.max_body, MAX_MIME);
+        }
+    }
+}
+
+#[tokio::test]
+async fn move_to_reports_a_404_as_gone_and_a_missing_folder_moves_nothing() {
+    // The fake has no message 2, so its move answers 404.
+    let s = source(FakeGraph::new([1, 3]));
+    let moved = s.move_to(&ids([1, 2, 3]), Folder::Trash).await.unwrap();
+    assert_eq!(moved.moved, ids([1, 3]));
+    assert_eq!(moved.gone, ids([2]));
+
+    // A 404 for the folder is no folder, not gone messages: no move is sent.
+    let s = source(FakeGraph::new([1]).script([json_reply(
+        404,
+        &json!({"error": {"code": "ErrorItemNotFound"}}),
+    )]));
+    let e = s.move_to(&ids([1]), Folder::Archive).await.unwrap_err();
+    assert!(matches!(e, GraphError::NoFolder("archive")), "{e:?}");
+    assert_eq!(
+        e.to_string(),
+        "the mailbox has no \"archive\" folder in Microsoft Graph"
+    );
+    assert_eq!(transport(&s).seen.borrow().len(), 1);
+
+    // No ids, no requests.
+    let s = source(FakeGraph::new([1]));
+    let moved = s.move_to(&[], Folder::Archive).await.unwrap();
+    assert!(moved.moved.is_empty() && moved.gone.is_empty());
+    assert!(transport(&s).seen.borrow().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn move_to_retries_throttling_and_fails_on_403_and_other_answers() {
+    // The folder check passes, then the move is throttled twice before Graph moves it.
+    let folder = json_reply(200, &json!({"id": "archive-id"}));
+    let s =
+        source(FakeGraph::new([1]).script([folder, throttled(429, Some(3)), throttled(503, None)]));
+    let start = tokio::time::Instant::now();
+    let moved = s.move_to(&ids([1]), Folder::Archive).await.unwrap();
+    assert_eq!(start.elapsed(), Duration::from_secs(3 + 2));
+    assert_eq!(moved.moved, ids([1]));
+    {
+        let seen = transport(&s).seen.borrow();
+        assert_eq!(seen.len(), 4);
+        assert!(
+            seen[1..]
+                .iter()
+                .all(|s| s.method == "POST" && s.url.ends_with("Tg%2B1%3D/move"))
+        );
+    }
+
+    // A Mail.Read sign-in: Graph refuses the move, and nothing else is sent.
+    let s = source(FakeGraph::new([1]).script([
+        json_reply(200, &json!({"id": "archive-id"})),
+        json_reply(
+            403,
+            &json!({"error": {"code": "ErrorAccessDenied", "message": TOKEN}}),
+        ),
+    ]));
+    let e = s.move_to(&ids([1]), Folder::Archive).await.unwrap_err();
+    assert!(matches!(e, GraphError::Forbidden), "{e:?}");
+    assert!(!format!("{e:?} {e}").contains("not-a-real-token"));
+    assert_eq!(transport(&s).seen.borrow().len(), 2);
+
+    // Only 201 is moved: any other answer is an error, so no row leaves the cache.
+    for status in [200, 500] {
+        let s = source(FakeGraph::new([1]).script([
+            json_reply(200, &json!({"id": "archive-id"})),
+            reply(status, Vec::new()),
+        ]));
+        let e = s.move_to(&ids([1]), Folder::Trash).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!("Microsoft Graph answered HTTP {status}")
+        );
+    }
 }
