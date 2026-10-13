@@ -1,8 +1,9 @@
 //! Turning RFC 822 source into what `list` and `show` print. Never panics on bad mail.
 
 use chrono::{DateTime, Utc};
-use mail_parser::{Address, MessageParser, MessagePart, MimeHeaders};
+use mail_parser::{Address, Message, MessageParser, MessagePart, MimeHeaders};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 /// Width that HTML bodies are wrapped to when converted to text.
 const HTML_WRAP: usize = 80;
@@ -49,6 +50,89 @@ pub struct Summary {
     pub date: Option<DateTime<Utc>>,
     pub from: Option<EmailAddress>,
     pub subject: Option<String>,
+    /// The Message-ID header, without its angle brackets.
+    pub message_id: Option<String>,
+}
+
+/// The key a classification result is stored under (with the account): the Message-ID when the
+/// message has one, else `sha256:` and the hex digest of the whole source. Unlike the cache's
+/// own id, it stays the same when a mailbox is rebuilt and the message fetched again.
+pub fn msg_key(message_id: Option<&str>, raw: &[u8]) -> String {
+    match message_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => id.to_owned(),
+        None => {
+            let digest = Sha256::digest(raw);
+            let mut key = String::with_capacity(7 + digest.len() * 2);
+            key.push_str("sha256:");
+            for byte in digest {
+                key.push_str(&format!("{byte:02x}"));
+            }
+            key
+        }
+    }
+}
+
+/// The headers that tell bulk, automated and reply mail apart, as classification reads them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Headers {
+    /// Message-ID, without its angle brackets.
+    pub message_id: Option<String>,
+    pub list_unsubscribe: bool,
+    pub list_id: bool,
+    /// Auto-Submitted's value (RFC 3834), trimmed.
+    pub auto_submitted: Option<String>,
+    /// Precedence's value, trimmed.
+    pub precedence: Option<String>,
+    pub in_reply_to: bool,
+}
+
+impl Headers {
+    /// List-Unsubscribe or List-Id is present (RFC 2369, RFC 2919).
+    pub fn mailing_list(&self) -> bool {
+        self.list_unsubscribe || self.list_id
+    }
+
+    /// Auto-Submitted is present and not `no` (RFC 3834 section 5), or Precedence is `bulk`,
+    /// `list` or `junk`. Compared without case; a parameter after `;` is ignored.
+    pub fn automated(&self) -> bool {
+        let keyword = |v: &str| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        };
+        let auto = self
+            .auto_submitted
+            .as_deref()
+            .is_some_and(|v| keyword(v) != "no");
+        let bulk = self
+            .precedence
+            .as_deref()
+            .is_some_and(|v| matches!(keyword(v).as_str(), "bulk" | "list" | "junk"));
+        auto || bulk
+    }
+
+    /// In-Reply-To is present.
+    pub fn reply(&self) -> bool {
+        self.in_reply_to
+    }
+
+    fn of(msg: &Message<'_>) -> Self {
+        let present = |name: &str| msg.header_raw(name).is_some();
+        let value = |name: &str| {
+            msg.header_raw(name)
+                .map(|v| v.split_whitespace().collect::<Vec<_>>().join(" "))
+        };
+        Headers {
+            message_id: msg.message_id().map(str::to_owned),
+            list_unsubscribe: present("List-Unsubscribe"),
+            list_id: present("List-Id"),
+            auto_submitted: value("Auto-Submitted"),
+            precedence: value("Precedence"),
+            in_reply_to: present("In-Reply-To"),
+        }
+    }
 }
 
 /// Which part the body text came from.
@@ -87,6 +171,7 @@ pub struct ParsedMessage {
     pub body_kind: BodyKind,
     pub body: String,
     pub attachments: Vec<Attachment>,
+    pub headers: Headers,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +191,7 @@ pub fn summarize(raw: &[u8]) -> Summary {
             .from()
             .and_then(|a| addresses(Some(a)).into_iter().next()),
         subject: msg.subject().map(str::to_owned),
+        message_id: msg.message_id().map(str::to_owned),
     }
 }
 
@@ -158,6 +244,7 @@ pub fn parse(raw: &[u8]) -> Result<ParsedMessage, ParseError> {
         body_kind,
         body,
         attachments,
+        headers: Headers::of(&msg),
     })
 }
 
@@ -428,5 +515,64 @@ Subject: Hi\r\n\r\nBody.\r\n";
             let _ = parse(junk);
             let _ = summarize(junk);
         }
+    }
+
+    fn headers(extra: &str) -> Headers {
+        let raw = format!("From: a@mail.example\r\n{extra}Subject: s\r\n\r\nbody\r\n");
+        parse(raw.as_bytes()).unwrap().headers
+    }
+
+    #[test]
+    fn a_list_header_marks_a_mailing_list() {
+        assert!(!headers("").mailing_list());
+        assert!(headers("List-Unsubscribe: <https://list.example/u>\r\n").mailing_list());
+        assert!(headers("list-id: News <news.list.example>\r\n").mailing_list());
+    }
+
+    #[test]
+    fn auto_submitted_other_than_no_or_a_bulk_precedence_marks_automated_mail() {
+        for extra in [
+            "Auto-Submitted: auto-generated\r\n",
+            "auto-submitted: Auto-Replied; owner-email=x\r\n",
+            "Precedence: bulk\r\n",
+            "Precedence: LIST\r\n",
+            "Precedence: junk\r\n",
+        ] {
+            assert!(headers(extra).automated(), "{extra}");
+        }
+        for extra in [
+            "",
+            "Auto-Submitted: no\r\n",
+            "Auto-Submitted: No ; comment\r\n",
+            "Precedence: first-class\r\n",
+        ] {
+            assert!(!headers(extra).automated(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn in_reply_to_marks_a_reply() {
+        assert!(!headers("References: <a@mail.example>\r\n").reply());
+        assert!(headers("In-Reply-To: <a@mail.example>\r\n").reply());
+    }
+
+    #[test]
+    fn msg_key_is_the_message_id_else_a_hash_of_the_source() {
+        let h = headers("Message-ID: <abc.123@mail.example>\r\n");
+        assert_eq!(h.message_id.as_deref(), Some("abc.123@mail.example"));
+        assert_eq!(
+            summarize(b"Message-ID: <abc.123@mail.example>\r\n\r\nx").message_id,
+            h.message_id
+        );
+        assert_eq!(
+            msg_key(h.message_id.as_deref(), b"any"),
+            "abc.123@mail.example"
+        );
+        // sha256("abc"), FIPS 180-2 appendix B.1.
+        assert_eq!(
+            msg_key(None, b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(msg_key(Some("  "), b"abc"), msg_key(None, b"abc"));
     }
 }

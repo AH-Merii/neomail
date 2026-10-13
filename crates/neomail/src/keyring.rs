@@ -1,7 +1,9 @@
 //! The OS keyring: the Secret Service over D-Bus on Linux (zbus, pure Rust), the login keychain
 //! on macOS. A password account's entry has the service `neomail` and the account name as the
 //! user; an OAuth account's has the service `neomail-oauth` and holds its client secret (if any)
-//! and refresh token as JSON, so the two kinds can never overwrite each other.
+//! and refresh token as JSON, so the two kinds can never overwrite each other. The classifier's
+//! key has the service `neomail-jev` and the backend's host as the user, so it never shares an
+//! entry with a mail account, even one named "jev".
 //!
 //! Errors are written here rather than passed through: keyring-core's `BadEncoding` and
 //! `BadDataFormat` carry the stored bytes, so they are never formatted with `{:?}`.
@@ -14,12 +16,58 @@ use keyring_core::{CredentialStore, Entry, Error};
 use serde::{Deserialize, Serialize};
 
 use crate::oauth::{MailGrant, Secret};
+#[cfg(debug_assertions)]
+mod test_store;
 use crate::secret::Password;
 
 /// The keyring service passwords are stored under.
 pub const SERVICE: &str = "neomail";
 /// The keyring service OAuth sign-ins are stored under.
 pub const OAUTH_SERVICE: &str = "neomail-oauth";
+
+/// The keyring service classifier keys are stored under, one entry per backend host.
+pub const JEV_SERVICE: &str = "neomail-jev";
+
+/// The environment variable that holds the classifier key when the keyring has none.
+pub const JEV_ENV: &str = "JEV_API_KEY";
+
+/// Where the classifier key came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    Keyring,
+    Env,
+}
+
+impl KeySource {
+    /// For `neomail key status` and messages: never the key itself.
+    pub fn describe(self) -> &'static str {
+        match self {
+            KeySource::Keyring => "the OS keyring",
+            KeySource::Env => JEV_ENV,
+        }
+    }
+}
+
+/// The classifier key for `host`: the keyring's entry, else `env` (the value of [`JEV_ENV`],
+/// empty counting as unset). A keyring that failed to open (`None`) or fails to answer counts as
+/// having no key, so `JEV_API_KEY` still works where there is no Secret Service. `None` when
+/// neither has one.
+pub fn jev_key(
+    keyring: Option<&Keyring>,
+    host: &str,
+    env: Option<String>,
+) -> Option<(Secret, KeySource)> {
+    keyring
+        .and_then(|k| k.get_jev_key(host).ok().flatten())
+        .map(|key| (key, KeySource::Keyring))
+        .or_else(|| {
+            env.filter(|v| !v.trim().is_empty())
+                .map(|v| (Secret::new(v.trim().to_owned()), KeySource::Env))
+        })
+}
+
+/// What `neomail classify` says when there is no key.
+pub const NO_JEV_KEY: &str = "no jev key: run `neomail key set` or set JEV_API_KEY";
 
 /// An OAuth account's keyring entry: the user's client secret (a public client has none) and,
 /// once signed in, the refresh token and what the sign-in grants. Stored as JSON; `Debug` is
@@ -99,6 +147,14 @@ impl Keyring {
 
     fn open_for(service: &str) -> Result<Self> {
         let wsl = is_wsl();
+        #[cfg(debug_assertions)]
+        if let Some(path) = std::env::var_os(test_store::ENV).filter(|p| !p.is_empty()) {
+            return Ok(Self::with_store(
+                test_store::Store::shared(path.into()),
+                "the test keyring",
+                wsl,
+            ));
+        }
         match platform_store() {
             Ok(store) => Ok(Self::with_store(store, PLATFORM_NAME, wsl)),
             Err(e) => Err(error(&e, service, "", wsl)),
@@ -167,6 +223,31 @@ impl Keyring {
         self.delete_entry(OAUTH_SERVICE, account)
     }
 
+    /// The classifier key for the backend `host`, or `None` when there is none.
+    pub fn get_jev_key(&self, host: &str) -> Result<Option<Secret>> {
+        match self.entry(JEV_SERVICE, host)?.get_password() {
+            Ok(key) => Ok(Some(Secret::new(key))),
+            Err(Error::NoEntry) => Ok(None),
+            Err(e) => Err(error(&e, JEV_SERVICE, host, self.wsl)),
+        }
+    }
+
+    pub fn set_jev_key(&self, host: &str, key: &Secret) -> Result<()> {
+        self.entry(JEV_SERVICE, host)?
+            .set_password(key.expose())
+            .map_err(|e| error(&e, JEV_SERVICE, host, self.wsl))
+    }
+
+    /// Deletes the classifier key for `host`. `false` when there was none.
+    pub fn delete_jev_key(&self, host: &str) -> Result<bool> {
+        self.delete_entry(JEV_SERVICE, host)
+    }
+
+    /// Like [`Keyring::open`], with the hint for the classifier key when it is unavailable.
+    pub fn open_for_jev() -> Result<Self> {
+        Self::open_for(JEV_SERVICE)
+    }
+
     fn delete_entry(&self, service: &str, account: &str) -> Result<bool> {
         match self.entry(service, account)?.delete_credential() {
             Ok(()) => Ok(true),
@@ -233,6 +314,9 @@ fn error(e: &Error, service: &str, account: &str, wsl: bool) -> anyhow::Error {
     };
     // Keep it on one line: a D-Bus error can span several.
     let detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    if service == JEV_SERVICE {
+        return anyhow!("the OS keyring is unavailable ({detail}); set {JEV_ENV} instead");
+    }
     if service == OAUTH_SERVICE {
         let wsl_hint = if wsl {
             "; WSL often has no Secret Service: run one such as gnome-keyring"
@@ -436,5 +520,72 @@ mod tests {
             let message = format!("{:#} {:?}", k.get("work").unwrap_err(), k.get("work"));
             assert!(!message.contains(SECRET), "{message}");
         }
+    }
+
+    #[test]
+    fn the_jev_key_is_per_host_and_apart_from_a_mail_account_named_jev() {
+        let (k, _) = mock_keyring(false);
+        k.set("jev", &Password::new("mail-password".into()))
+            .unwrap();
+        assert!(k.get_jev_key("api.typesafe.ai").unwrap().is_none());
+        k.set_jev_key("api.typesafe.ai", &Secret::new(SECRET.into()))
+            .unwrap();
+        assert_eq!(
+            k.get_jev_key("api.typesafe.ai").unwrap().unwrap().expose(),
+            SECRET
+        );
+        assert!(
+            k.get_jev_key("127.0.0.1").unwrap().is_none(),
+            "keys are per host"
+        );
+        assert_eq!(k.get("jev").unwrap().expose(), "mail-password");
+        assert!(k.delete_jev_key("api.typesafe.ai").unwrap());
+        assert!(!k.delete_jev_key("api.typesafe.ai").unwrap());
+        assert_eq!(k.get("jev").unwrap().expose(), "mail-password");
+    }
+
+    #[test]
+    fn the_keyring_comes_first_then_the_environment_and_a_failing_keyring_has_no_key() {
+        let host = "api.typesafe.ai";
+        let source = |k: Option<&Keyring>, env: Option<&str>| {
+            jev_key(k, host, env.map(str::to_owned)).map(|(key, s)| (key.expose().to_owned(), s))
+        };
+        let (k, store) = mock_keyring(false);
+        assert_eq!(source(Some(&k), None), None);
+        assert_eq!(
+            source(Some(&k), Some("  ")),
+            None,
+            "an empty variable is unset"
+        );
+        assert_eq!(
+            source(None, Some("env-key")),
+            Some(("env-key".into(), KeySource::Env))
+        );
+        k.set_jev_key(host, &Secret::new(SECRET.into())).unwrap();
+        assert_eq!(
+            source(Some(&k), Some("env-key")),
+            Some((SECRET.into(), KeySource::Keyring))
+        );
+        fail_next_in(
+            &store,
+            JEV_SERVICE,
+            host,
+            Error::NoStorageAccess("locked".into()),
+        );
+        assert_eq!(
+            source(Some(&k), Some("env-key")),
+            Some(("env-key".into(), KeySource::Env))
+        );
+        fail_next_in(
+            &store,
+            JEV_SERVICE,
+            host,
+            Error::NoStorageAccess("no bus".into()),
+        );
+        let message = format!("{:#}", k.get_jev_key(host).unwrap_err());
+        assert_eq!(
+            message,
+            "the OS keyring is unavailable (no bus); set JEV_API_KEY instead"
+        );
     }
 }

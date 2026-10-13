@@ -38,13 +38,20 @@ An array, newest first. Empty when nothing is cached.
     "from": { "name": "Ada Lovelace", "address": "ada@mail.example" },
     "subject": "Hello there",
     "unread": true,
-    "flags": []
+    "flags": [],
+    "group": "follow-up"
   }
 ]
 ```
 
 `date` is the message's Date header, or the server's arrival time when the header is missing.
-`from` and `subject` are `null` when the message has none.
+`from` and `subject` are `null` when the message has none. `group` is the message's group once
+`neomail classify` has stored a result for it, else `null`: one of `main`, `follow-up`,
+`follow-up-old`, `recruitment`, `receipts-invoices`, `orders-shipping`, `newsletters`,
+`promotions`, `notifications`, `spam` and `other`. It is worked out when the list is read: `spam`
+when jev chose spam; `other` when jev's confidence is below `classify.other_below`; `follow-up-old`
+for a `follow-up` received more than `classify.follow_up_old_days` ago; else jev's choice.
+`--group G` lists only that group, and `--group unclassified` only the messages with `null`.
 
 ## `neomail account list --json`
 
@@ -131,7 +138,7 @@ naming its line number, and nothing is shown. `--raw` takes exactly one id.
 
 ## `neomail redact ID...`
 
-The text neomail will send to jev for classification, with personal data masked
+Exactly what `neomail classify` sends to jev for each message, with personal data masked
 ([privacy.md](privacy.md) lists the rules and placeholders). It reads the cache only. Ids are
 taken as `neomail show` takes them, `-` included. `--json` prints one object for one id given on
 the command line, else an array in the order asked; `--jsonl` prints one object per line.
@@ -147,6 +154,10 @@ Unknown or unreadable messages are left out and reported on standard error.
   "masks": {
     "email": 0, "link": 1, "iban": 0, "card": 0, "amount": 0,
     "code": 0, "phone": 1, "number": 1, "name": 2
+  },
+  "signals": {
+    "domain": "shop.example", "kind": "role",
+    "mailing_list": false, "automated": true, "reply": false
   }
 }
 ```
@@ -159,9 +170,16 @@ Unknown or unreadable messages are left out and reported on standard error.
 - `masks` counts the placeholders in `subject` and `body` by kind. Every kind is present, zeros
   included; the keys are `email`, `link`, `iban`, `card`, `amount`, `code`, `phone`, `number` and
   `name`.
+- `signals` is what is sent besides the text. `domain` is the From address's domain, lower-cased,
+  or `null` without one. `kind` is `role` when the part before the @ is one of a short list
+  (`noreply`, `orders`, `support` ... [privacy.md](privacy.md) has it), `personal` for any other
+  address, and `unknown` without one. `mailing_list` is `true` when List-Unsubscribe or List-Id
+  is present; `automated` when Auto-Submitted is present and not `no`, or Precedence is `bulk`,
+  `list` or `junk`; `reply` when In-Reply-To is present.
 
-Without `--json` or `--jsonl`, `redact` prints `Subject: ` and the subject, a blank line, then the
-body; `(no text body)` stands for an empty one, and a line
+Without `--json` or `--jsonl`, `redact` prints `Subject: ` and the subject, a line
+`Signals: sender shop.example (role) · mailing list: no · automated: yes · reply: no`, a blank
+line, then the body; `(no text body)` stands for an empty one, and a line
 `[neomail: the body is cut here, at the 1500-character limit]` follows a cut one; a mask that would
 cross the limit is left out whole, so the body can end a little before it. Several messages are
 separated by a `── message ID ──` line as in `neomail show`. On a terminal the placeholders are
@@ -312,6 +330,59 @@ not be moved to Receipts"), are `archive`'s, except that a message the server di
 the INBOX says only to run `neomail sync`, not to try again: a move into a label, such as Proton
 Bridge's `Labels/...`, may only add the label, so it would stay in the INBOX again.
 
+## `neomail classify`
+
+One object per message asked about, in the order the answers arrive; with ids given, a message
+that already has a result is printed from the cache first and not asked again. `--json` prints an
+array at the end, `--jsonl` one object per line as each answer arrives.
+
+```json
+{
+  "id": 42,
+  "account": "work",
+  "group": "orders-shipping",
+  "choice": "orders-shipping",
+  "confidence": 0.93,
+  "probabilities": { "main": 0.01, "follow-up": 0.0, "orders-shipping": 0.95, "other": 0.01 },
+  "model": "jev-1.13.0"
+}
+```
+
+- `choice` is jev's answer, one of the ten options (every group but `follow-up-old`), and
+  `confidence` jev's confidence from 0 to 1 ([jev's docs](https://docs.typesafe.ai/confidence.md)).
+- `group` is the group the message lists under, worked out as for `list`'s `group`.
+- `probabilities` holds the options jev gave a probability, in the request's order.
+- `model` is the model id the answer named.
+- A message that failed has `error` (one line), and `null` for `group`, `choice`, `confidence`,
+  `probabilities` and `model`.
+
+On a terminal each result is one line, `ID ACCOUNT GROUP CONFIDENCE SUBJECT`, with progress on
+standard error; `--plain` (the default off a terminal) prints `ID`, `ACCOUNT`, `GROUP` and
+`CONFIDENCE` (two decimals) as TSV. A failed message is a line on standard error there. After a
+run, standard error says how many were classified and, without `--all`, what was left outside the
+window or the cap: messages, requests and estimated input tokens, the cost for api.typesafe.ai,
+and how the tokens were estimated.
+
+`--estimate` sends nothing. With `--json` it prints one object:
+
+```json
+{
+  "messages": 1000, "requests": 1000, "input_tokens": 520000, "cost_usd": 0.02184,
+  "tokens_from": "measured",
+  "left": { "messages": 2400, "requests": 2400, "input_tokens": 1248000, "cost_usd": 0.052416 }
+}
+```
+
+`tokens_from` is `measured` (the average `input_tokens` of stored results) or `characters` (the
+requests' characters divided by 4), `null` when there is nothing to estimate. `cost_usd` is `null`
+for a backend other than api.typesafe.ai.
+
+## `neomail key set|delete|status`
+
+`key set` and `key delete` print one line saying what was stored or deleted, and where.
+`key status` prints `HOST: the key comes from the OS keyring` or `... from JEV_API_KEY`, never
+the key, and exits 1 with `HOST: no jev key: ...` when there is none.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -319,8 +390,8 @@ Bridge's `Labels/...`, may only add the label, so it would stay in the INBOX aga
 | 0 | Success. `list` with nothing cached also succeeds, printing `[]` with `--json`. |
 | 0 | Also when the reader of standard output goes away early (`neomail list \| head -1`, quitting the pager): neomail stops quietly. |
 | 0 | `daemon` stopped by SIGINT or SIGTERM. A failing account does not stop it. |
-| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others; `redact` the same, after printing the others. `mark` exits 1 if any id was unknown, gone from the server, not confirmed or of an account that failed, after marking the others. `archive` and `delete` exit 1 the same way, after moving the others; an account without an archive or trash folder is an account that failed. `move` exits 1 the same way; an account without the folder named is an account that failed. `folder list` exits 1 if any account failed, after listing the others. A second `daemon` for the same data directory exits 1. |
-| 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s, `redact -`'s, `mark -`'s, `archive -`'s, `delete -`'s or `move -`'s input without an id; `-` mixed with ids (`show`, `redact`, `mark`, `archive`, `delete`, `move`); `move` without a folder or without ids; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help; `daemon` without a config file or accounts (the start lines) or with an invalid config. |
+| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others; `redact` the same, after printing the others. `mark` exits 1 if any id was unknown, gone from the server, not confirmed or of an account that failed, after marking the others. `archive` and `delete` exit 1 the same way, after moving the others; an account without an archive or trash folder is an account that failed. `move` exits 1 the same way; an account without the folder named is an account that failed. `folder list` exits 1 if any account failed, after listing the others. A second `daemon` for the same data directory exits 1. `classify` exits 1 when any message failed or an id was unknown, when the run stopped (a refused key, a status it cannot retry, the backend out of reach; the results received are kept), without a key, or when consent was refused at the prompt; it exits 0 when everything asked was classified or there was nothing to do. `key status` exits 1 when there is no key. |
+| 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s, `redact -`'s, `classify -`'s, `mark -`'s, `archive -`'s, `delete -`'s or `move -`'s input without an id; `-` mixed with ids (`show`, `redact`, `classify`, `mark`, `archive`, `delete`, `move`); `move` without a folder or without ids; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help; `daemon` without a config file or accounts (the start lines) or with an invalid config; `classify` that would send to a backend it has no consent for, without a terminal or with `--no-input`, and without `--yes`; `list --group` with an unknown group; `classify` ids with `--account`, `--days`, `--limit` or `--all`; `key set --no-input` with nothing on standard input. |
 
 Errors go to standard error, in these forms:
 

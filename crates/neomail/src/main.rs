@@ -4,12 +4,14 @@
 
 mod account;
 mod browser;
+mod classify;
 mod config;
 #[cfg(unix)]
 mod daemon;
 mod folders;
 mod graph;
 mod http;
+mod jev;
 mod keyring;
 mod lock;
 #[cfg(unix)]
@@ -57,6 +59,9 @@ Examples:
   neomail list | fzf -m | neomail show -
                                     Pick messages with fzf, then read them
   neomail redact 42                 See message 42 as a classifier would, personal data masked
+  neomail key set                   Store your jev key in the OS keyring
+  neomail classify                  Sort the last year's cached mail into groups with jev
+  neomail list --group follow-up    List the mail that needs a reply
   neomail mark read 42 43           Mark messages 42 and 43 read, on the server too
   neomail archive 42                Move message 42 to its account's archive
   neomail folder list               List each account's folders
@@ -73,14 +78,47 @@ Examples:
                                     Pick messages with fzf, then print them masked
   neomail redact --json 42          Print the text and the mask counts as JSON
 
-This is the text neomail will send for classification: the subject, and the body's first 1500
-characters after masking. Email addresses, links, phone, card and IBAN numbers, amounts,
-one-time codes, runs of 4 or more digits and the names in the headers become placeholders such
-as <email>@acme.example or <name>; postal addresses and names in no header are not masked. The
-owner's addresses (the config's logins) are masked whole: without the default config there are
-none, and a --config or NEOMAIL_CONFIG file that is missing is an error. It reads the cache
-only: nothing is sent or changed. Exit 1 when any id was unknown or unreadable. What is masked
-and what is not:
+This is what `neomail classify` sends: the subject, the body's first 1500 characters after
+masking, and one line of signals (the sender's domain, whether the address is a role such as
+orders@, and whether the mail came through a mailing list, was automated or is a reply). Email
+addresses, links, phone, card and IBAN numbers, amounts, one-time codes, runs of 4 or more
+digits and the names in the headers become placeholders such as <email>@acme.example or <name>;
+postal addresses and names in no header are not masked. The owner's addresses (the config's
+logins) are masked whole: without the default config there are none, and a --config or
+NEOMAIL_CONFIG file that is missing is an error. It reads the cache only: nothing is sent or
+changed. Exit 1 when any id was unknown or unreadable. What is masked and what is not:
+https://github.com/AH-Merii/neomail/blob/main/docs/privacy.md";
+
+const LIST_EXAMPLES: &str = "\
+Examples:
+  neomail list                      The 50 newest messages of every account
+  neomail list --account work --limit all
+                                    Every cached message of one account
+  neomail list --group follow-up    The mail that needs a reply, once `neomail classify` ran
+  neomail list --group unclassified --plain | cut -f1 | neomail classify -
+                                    Classify the listed messages that have no group yet
+
+Groups: main, follow-up, follow-up-old, recruitment, receipts-invoices, orders-shipping,
+newsletters, promotions, notifications, spam, other. A follow-up older than
+classify.follow_up_old_days (90) lists as follow-up-old, and an answer below
+classify.other_below (0.4) confidence as other.";
+
+const CLASSIFY_EXAMPLES: &str = "\
+Examples:
+  neomail key set                   Store your jev key first (or set JEV_API_KEY)
+  neomail classify --estimate       See what a run would send and cost; nothing is sent
+  neomail classify                  Classify the last 365 days, newest first, at most 1,000
+  neomail classify --all            Classify every cached message without a group
+  neomail classify 42 57            Classify two messages
+  neomail classify --again 42       Ask again for a message that already has a group
+  neomail classify --yes --json     In a script: consent given, results as JSON
+
+Each message costs one request to classify.url (https://api.typesafe.ai by default), with its
+redacted subject and body excerpt, the sender's domain and four signals: exactly what
+`neomail redact ID` shows. Before the first request to a host, neomail says what will be sent
+and asks once; --yes consents for a script. A result is stored as soon as it arrives and is
+never asked for again unless --again: a stopped run resumes where it left off. Exit 1 when a
+message failed or the run stopped. What is sent and kept:
 https://github.com/AH-Merii/neomail/blob/main/docs/privacy.md";
 
 const MARK_EXAMPLES: &str = "\
@@ -316,6 +354,7 @@ enum Command {
         no_notify: bool,
     },
     /// List cached messages, newest first ('*' marks unread)
+    #[command(after_help = LIST_EXAMPLES)]
     List {
         /// List only this account
         #[arg(long, value_name = "NAME")]
@@ -323,6 +362,9 @@ enum Command {
         /// The most messages to list, or all
         #[arg(long, value_name = "N|all", value_parser = parse_limit, default_value_t = Limit::Count(NonZeroU32::MIN.saturating_add(49)))]
         limit: Limit,
+        /// List only this group's messages (`neomail classify` sorts them), or unclassified
+        #[arg(long, value_name = "GROUP", value_parser = parse_group)]
+        group: Option<nm_core::GroupFilter>,
         #[command(flatten)]
         format: ListingFormat,
     },
@@ -345,6 +387,15 @@ enum Command {
         ids: Vec<IdArg>,
         #[command(flatten)]
         format: RedactFormat,
+    },
+    /// Sort cached mail into groups with the classifier jev: the last year's, newest first, at most 1,000
+    #[command(after_help = CLASSIFY_EXAMPLES)]
+    Classify(classify::Args),
+    /// Store, delete or check the classifier's API key, kept in the OS keyring
+    #[command(after_help = classify::KEY_EXAMPLES)]
+    Key {
+        #[command(subcommand)]
+        command: classify::KeyCommand,
     },
     /// Mark messages read or unread, on the server and in the cache, by the ids from `neomail list`
     #[command(after_help = MARK_EXAMPLES)]
@@ -439,6 +490,17 @@ enum FolderCommand {
         #[command(flatten)]
         format: ListingFormat,
     },
+}
+
+/// `list --group`: a group's name, or `unclassified`.
+fn parse_group(s: &str) -> Result<nm_core::GroupFilter, String> {
+    if s == "unclassified" {
+        return Ok(nm_core::GroupFilter::Unclassified);
+    }
+    s.parse().map(nm_core::GroupFilter::Is).map_err(|_| {
+        let names: Vec<_> = nm_core::Group::ALL.iter().map(|g| g.name()).collect();
+        format!("expected one of {}, unclassified", names.join(", "))
+    })
 }
 
 fn parse_folder_name(s: &str) -> Result<nm_core::FolderName, String> {
@@ -781,20 +843,33 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
         Command::List {
             account,
             limit,
+            group,
             format,
         } => {
+            // The thresholds that turn stored answers into groups; a missing file has none.
+            let rules = config::load_optional(cli.config.clone(), false)?
+                .map(|c| c.classify.rules)
+                .unwrap_or_default();
             let entries = match open_cache(false)? {
                 Some(cache) => {
                     if let Some(name) = account.as_deref() {
                         check_cached_account(&cache, name)?;
                     }
-                    cache.list(account.as_deref(), limit.get().get())?
+                    cache.list_grouped(
+                        account.as_deref(),
+                        group.unwrap_or(nm_core::GroupFilter::Any),
+                        limit.get().get(),
+                        &rules,
+                        chrono::Utc::now(),
+                    )?
                 }
                 None if account.is_some() => bail!("{}", no_cache_hint(cli.config)),
                 None => Vec::new(),
             };
             let mode = format.mode(terminal);
-            if entries.is_empty() && matches!(mode, Mode::Human | Mode::Plain) {
+            if entries.is_empty() && group.is_some() && matches!(mode, Mode::Human | Mode::Plain) {
+                eprintln!("neomail: no cached messages in that group");
+            } else if entries.is_empty() && matches!(mode, Mode::Human | Mode::Plain) {
                 let hint = match no_cache_hint(cli.config) {
                     h if h.starts_with("nothing") => {
                         "no cached messages; run `neomail sync` first".to_owned()
@@ -824,6 +899,11 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
             let mode = Mode::choose(format.plain, format.json, format.jsonl, terminal);
             redact(&ids, mode, cli.config, colors, &mut out)?
         }
+        Command::Classify(args) => {
+            let ids = read_ids(&args.ids)?;
+            classify::run(&args, ids, cli.config, input, terminal, colors, &mut out)?
+        }
+        Command::Key { command } => classify::key(&command, cli.config, input, &mut out)?,
         Command::Mark { state, ids, format } => run_action(
             state.action(),
             &ids,
@@ -1133,13 +1213,7 @@ fn redact(
     };
     // The owner's addresses come from the config. Without the default one there are none to mask
     // whole, but a config the user named must load: a typo never quietly drops the owner rule.
-    let named = config::named_path(config.clone()).is_some();
-    let path = config::config_path(config)?;
-    let config = if named || config::exists(&path) {
-        Some(Config::load(&path)?)
-    } else {
-        None
-    };
+    let config = config::load_optional(config, true)?;
     let owners = config
         .as_ref()
         .map(redact::owner_addresses)
@@ -1155,8 +1229,8 @@ fn redact(
         };
         match nm_core::parse::parse(&stored.raw) {
             Ok(parsed) => {
-                let excerpt = redact::excerpt(&parsed, &owners);
-                messages.push((stored, excerpt));
+                let outgoing = redact::outgoing(&parsed, &owners);
+                messages.push((stored, outgoing));
             }
             Err(_) => failures.push(format!(
                 "message {id} cannot be read; see `neomail show --raw {id}`"
@@ -1165,7 +1239,7 @@ fn redact(
     }
     let items = messages
         .iter()
-        .map(|(stored, excerpt)| output::RedactItem::new(stored, excerpt));
+        .map(|(stored, outgoing)| output::RedactItem::new(stored, outgoing));
     match mode {
         Mode::Jsonl => output::write_jsonl(out, items)?,
         Mode::Json => {

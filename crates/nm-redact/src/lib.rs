@@ -30,7 +30,10 @@ use std::collections::HashSet;
 use std::fmt;
 use std::ops::Range;
 
+mod outgoing;
 mod rules;
+
+pub use outgoing::{HeaderFlags, Outgoing, ROLE_LOCAL_PARTS, SenderKind, Signals};
 
 /// How many characters (Unicode scalar values) of the redacted body an [`Excerpt`] keeps: the
 /// excerpt size the PII benchmark measured (DEC-2026-10-11-pii-rules in `docs/decisions.md`).

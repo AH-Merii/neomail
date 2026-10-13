@@ -1,11 +1,13 @@
 //! The local SQLite cache: one file holding every account's cached INBOX.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+use crate::group::{Choice, Group, GroupRules};
 use crate::parse::{self, EmailAddress};
 use crate::types::{
     Cursor, FetchedMessage, Flags, IdListed, MessageId, RemoteId, Uid, UidFlags, UidValidity,
@@ -13,9 +15,9 @@ use crate::types::{
 
 /// The schema this build writes. A cache with a newer version is refused, not guessed at; an
 /// older one is migrated by [`Cache::open`].
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
-/// The tables of schema 4, named `mailbox{suffix}` and `message{suffix}`: the migration from 1
+/// The `mailbox` and `message` tables of schema 5, named `mailbox{suffix}` and `message{suffix}`: the migration from 1
 /// creates them under temporary names first. `message` refers to `mailbox` by its final name.
 fn tables(suffix: &str) -> String {
     format!(
@@ -54,6 +56,9 @@ CREATE TABLE message{suffix} (
     from_address TEXT,
     subject      TEXT,
     raw          BLOB    NOT NULL,
+    -- What a classification result is stored under (parse::msg_key). Filled on insert; NULL for
+    -- a row cached before schema 5 until `neomail classify` reaches it.
+    msg_key      TEXT CHECK (msg_key <> ''),
     UNIQUE (mailbox_id, uid),
     UNIQUE (mailbox_id, remote_id),
     CHECK ((uid IS NULL) <> (remote_id IS NULL))
@@ -62,10 +67,31 @@ CREATE TABLE message{suffix} (
     )
 }
 
+/// Classification results (schema 5). Keyed by account and [`parse::msg_key`], not by
+/// `message.id`: rebuilding a mailbox deletes its messages and gives them new ids, and a result
+/// must outlive that so the same mail is never classified (and paid for) twice.
+const CLASSIFICATION: &str = "
+CREATE TABLE classification (
+    account         TEXT    NOT NULL,
+    msg_key         TEXT    NOT NULL CHECK (msg_key <> ''),
+    -- The classifier's choice: one of group::Choice's names.
+    choice          TEXT    NOT NULL,
+    confidence      REAL    NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+    -- Every option's probability, a JSON object.
+    probabilities   TEXT    NOT NULL,
+    -- The model id the answer named.
+    model           TEXT    NOT NULL,
+    request_version INTEGER NOT NULL,
+    input_tokens    INTEGER,
+    classified_at   INTEGER NOT NULL,
+    PRIMARY KEY (account, msg_key)
+);
+";
+
 const INDEX: &str =
     "CREATE INDEX message_order ON message (COALESCE(received, date, 0) DESC, id DESC);";
 
-/// Schema 1 to 4, after the tables of 4 exist as `mailbox_v2` and `message_v2`: copy every row
+/// Schema 1 to 5, after the tables of 5 exist as `mailbox_v2` and `message_v2`: copy every row
 /// with its id (a mailbox as synced, as [`MIGRATE_V2`] does), drop the old tables, rename the new
 /// ones and recreate the index (which went with the old `message`).
 /// <https://www.sqlite.org/lang_altertable.html#otheralter>
@@ -93,6 +119,12 @@ UPDATE mailbox SET synced = 1;
 /// Schema 3 to 4: `mailbox.cursor`. Every mailbox starts without one, so its next sync lists as
 /// before and stores one.
 const MIGRATE_V3: &str = "ALTER TABLE mailbox ADD COLUMN cursor TEXT CHECK (cursor <> '');";
+
+/// Schema 4 to 5: `message.msg_key` and the [`CLASSIFICATION`] table. No row is parsed here:
+/// `neomail classify` fills the key of an older row when it reaches it.
+fn migrate_v4() -> String {
+    format!("ALTER TABLE message ADD COLUMN msg_key TEXT CHECK (msg_key <> '');\n{CLASSIFICATION}")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
@@ -161,6 +193,61 @@ pub struct StoredMessage {
     pub raw: Vec<u8>,
 }
 
+/// Which messages [`Cache::list_grouped`] keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupFilter {
+    Any,
+    /// Messages whose effective group is this one.
+    Is(Group),
+    /// Messages with no stored classification.
+    Unclassified,
+}
+
+impl GroupFilter {
+    fn admits(self, group: Option<Group>) -> bool {
+        match self {
+            GroupFilter::Any => true,
+            GroupFilter::Is(g) => group == Some(g),
+            GroupFilter::Unclassified => group.is_none(),
+        }
+    }
+}
+
+/// One row of `neomail list` with its group: `None` until the message is classified.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Grouped {
+    pub entry: ListEntry,
+    pub group: Option<Group>,
+}
+
+/// A message `neomail classify` may ask about: [`Cache::pending`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    pub id: MessageId,
+    pub account: String,
+    /// `None` for a row cached before schema 5; [`Cache::set_msg_key`] records it.
+    pub msg_key: Option<String>,
+    /// When the message arrived (else its Date header), for the window.
+    pub received: Option<DateTime<Utc>>,
+}
+
+/// A stored classification result: the classifier's answer for one message, as it gave it. The
+/// group it lists under is derived from it on reading ([`GroupRules::effective`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Classification {
+    pub choice: Choice,
+    /// The classifier's confidence, 0 to 1.
+    pub confidence: f64,
+    /// Each option's probability, in [`Choice::ALL`] order.
+    pub probabilities: Vec<(Choice, f64)>,
+    /// The model id the answer named.
+    pub model: String,
+    /// The request's version (`REQUEST_VERSION` in `crates/neomail/src/jev.rs`).
+    pub request_version: u32,
+    pub input_tokens: Option<u64>,
+    pub classified_at: DateTime<Utc>,
+}
+
 /// Where a cached message lives, for an action to reach it on its server: [`Cache::locate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Located {
@@ -202,6 +289,7 @@ impl Cache {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if schema_version(&tx)? == 0 {
                 tx.execute_batch(&tables(""))?;
+                tx.execute_batch(CLASSIFICATION)?;
                 tx.execute_batch(INDEX)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
@@ -215,6 +303,9 @@ impl Cache {
         }
         if schema_version(&conn)? == 3 {
             migrate_step(&mut conn, 3, MIGRATE_V3)?;
+        }
+        if schema_version(&conn)? == 4 {
+            migrate_step(&mut conn, 4, &migrate_v4())?;
         }
         conn.pragma_update(None, "foreign_keys", true)?;
         match schema_version(&conn)? {
@@ -380,12 +471,13 @@ impl Cache {
                 // An upsert, not INSERT OR REPLACE: REPLACE deletes the row and inserts a new
                 // one, which would give an already cached message a new id.
                 "INSERT INTO message
-                 (mailbox_id, uid, flags, received, date, from_name, from_address, subject, raw)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 (mailbox_id, uid, flags, received, date, from_name, from_address, subject, raw,
+                  msg_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT (mailbox_id, uid) DO UPDATE SET
                      flags = excluded.flags, received = excluded.received, date = excluded.date,
                      from_name = excluded.from_name, from_address = excluded.from_address,
-                     subject = excluded.subject, raw = excluded.raw
+                     subject = excluded.subject, raw = excluded.raw, msg_key = excluded.msg_key
                  RETURNING id",
             )?;
             for m in messages {
@@ -403,6 +495,7 @@ impl Cache {
                         from_address,
                         s.subject,
                         m.raw,
+                        parse::msg_key(s.message_id.as_deref(), &m.raw),
                     ],
                     |r| r.get(0),
                 )?;
@@ -530,12 +623,12 @@ impl Cache {
             let mut insert = tx.prepare(
                 "INSERT INTO message
                  (mailbox_id, remote_id, flags, received, date, from_name, from_address, subject,
-                  raw)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                  raw, msg_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT (mailbox_id, remote_id) DO UPDATE SET
                      flags = excluded.flags, received = excluded.received, date = excluded.date,
                      from_name = excluded.from_name, from_address = excluded.from_address,
-                     subject = excluded.subject, raw = excluded.raw
+                     subject = excluded.subject, raw = excluded.raw, msg_key = excluded.msg_key
                  RETURNING id",
             )?;
             for (listed, raw) in messages {
@@ -553,6 +646,7 @@ impl Cache {
                         from_address,
                         s.subject,
                         raw,
+                        parse::msg_key(s.message_id.as_deref(), raw),
                     ],
                     |r| r.get(0),
                 )?;
@@ -792,6 +886,197 @@ impl Cache {
         })
         .transpose()
     }
+
+    /// Cached messages with their [`Group`], newest first, from one account or all of them,
+    /// keeping only those `filter` admits. The group is worked out here, by
+    /// [`GroupRules::effective`], so thresholds can change without asking the classifier again.
+    pub fn list_grouped(
+        &self,
+        account: Option<&str>,
+        filter: GroupFilter,
+        limit: u32,
+        rules: &GroupRules,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Grouped>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, b.account, m.uid, COALESCE(m.date, m.received), m.from_name,
+                    m.from_address, m.subject, m.flags, COALESCE(m.received, m.date),
+                    c.choice, c.confidence
+             FROM message m JOIN mailbox b ON b.id = m.mailbox_id
+             LEFT JOIN classification c ON c.account = b.account AND c.msg_key = m.msg_key
+             WHERE ?1 IS NULL OR b.account = ?1
+             ORDER BY COALESCE(m.received, m.date, 0) DESC, m.id DESC",
+        )?;
+        let mut rows = stmt.query(params![account])?;
+        let mut found = Vec::new();
+        while found.len() < usize::try_from(limit).unwrap_or(usize::MAX) {
+            let Some(r) = rows.next()? else { break };
+            let received: Option<i64> = r.get(8)?;
+            let group = match (r.get::<_, Option<String>>(9)?, r.get::<_, Option<f64>>(10)?) {
+                (Some(choice), Some(confidence)) => Some(rules.effective(
+                    Choice::from_name(&choice).ok_or(CacheError::Corrupt("choice"))?,
+                    confidence,
+                    received.and_then(|t| DateTime::from_timestamp(t, 0)),
+                    now,
+                )),
+                _ => None,
+            };
+            if !filter.admits(group) {
+                continue;
+            }
+            let entry = list_entry((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))?;
+            found.push(Grouped { entry, group });
+        }
+        Ok(found)
+    }
+
+    /// Every cached message with no stored classification (with `again`, every message), from
+    /// one account or all of them, newest first. A message cached before schema 5 has no
+    /// [`msg_key`](Pending::msg_key) yet and counts as unclassified: no result can name it.
+    pub fn pending(&self, account: Option<&str>, again: bool) -> Result<Vec<Pending>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, b.account, m.msg_key, COALESCE(m.received, m.date)
+             FROM message m JOIN mailbox b ON b.id = m.mailbox_id
+             LEFT JOIN classification c ON c.account = b.account AND c.msg_key = m.msg_key
+             WHERE (?1 IS NULL OR b.account = ?1) AND (?2 OR c.msg_key IS NULL)
+             ORDER BY COALESCE(m.received, m.date, 0) DESC, m.id DESC",
+        )?;
+        let rows = stmt.query_map(params![account, again], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, account, msg_key, received) = row?;
+            Ok(Pending {
+                id: MessageId::new(id),
+                account,
+                msg_key,
+                received: received.and_then(|t| DateTime::from_timestamp(t, 0)),
+            })
+        })
+        .collect()
+    }
+
+    /// Records a message's [`msg_key`](parse::msg_key), for a row cached before schema 5.
+    pub fn set_msg_key(&mut self, id: MessageId, msg_key: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE message SET msg_key = ?2 WHERE id = ?1",
+            params![id.get(), msg_key],
+        )?;
+        Ok(())
+    }
+
+    /// The stored result for `account`'s message `msg_key`, if any.
+    pub fn classification(&self, account: &str, msg_key: &str) -> Result<Option<Classification>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT choice, confidence, probabilities, model, request_version, input_tokens,
+                        classified_at
+                 FROM classification WHERE account = ?1 AND msg_key = ?2",
+                params![account, msg_key],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, f64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                        r.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(choice, confidence, probabilities, model, version, tokens, at)| {
+                let probabilities: BTreeMap<String, f64> = serde_json::from_str(&probabilities)
+                    .map_err(|_| CacheError::Corrupt("probabilities"))?;
+                let mut probabilities = probabilities
+                    .into_iter()
+                    .map(|(name, p)| Choice::from_name(&name).map(|c| (c, p)))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(CacheError::Corrupt("probabilities"))?;
+                probabilities.sort_by_key(|(c, _)| *c);
+                Ok(Classification {
+                    choice: Choice::from_name(&choice).ok_or(CacheError::Corrupt("choice"))?,
+                    confidence,
+                    probabilities,
+                    model,
+                    request_version: u32::try_from(version)
+                        .map_err(|_| CacheError::Corrupt("request_version"))?,
+                    input_tokens: tokens
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|_| CacheError::Corrupt("input_tokens"))?,
+                    classified_at: time_from_db(at)?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    /// Stores a result for `account`'s message `msg_key`, replacing one stored before (only
+    /// `neomail classify --again` asks again).
+    pub fn store_classification(
+        &mut self,
+        account: &str,
+        msg_key: &str,
+        result: &Classification,
+    ) -> Result<()> {
+        let probabilities: BTreeMap<&str, f64> = result
+            .probabilities
+            .iter()
+            .map(|(c, p)| (c.name(), *p))
+            .collect();
+        let probabilities = serde_json::to_string(&probabilities)
+            .map_err(|_| CacheError::Corrupt("probabilities"))?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO classification
+             (account, msg_key, choice, confidence, probabilities, model, request_version,
+              input_tokens, classified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                account,
+                msg_key,
+                result.choice.name(),
+                result.confidence,
+                probabilities,
+                result.model,
+                result.request_version,
+                result
+                    .input_tokens
+                    .map(i64::try_from)
+                    .transpose()
+                    .ok()
+                    .flatten(),
+                result.classified_at.timestamp(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The average `input_tokens` of the stored results that report it, for the estimate.
+    pub fn average_input_tokens(&self) -> Result<Option<f64>> {
+        Ok(self.conn.query_row(
+            "SELECT AVG(input_tokens) FROM classification WHERE input_tokens IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?)
+    }
 }
 
 fn schema_version(conn: &Connection) -> Result<i64> {
@@ -833,6 +1118,7 @@ fn migrate_v1(conn: &mut Connection) -> Result<()> {
             [seq],
         )?;
     }
+    tx.execute_batch(CLASSIFICATION)?;
     tx.execute_batch(INDEX)?;
     let dangling = tx
         .prepare("PRAGMA foreign_key_check")?
@@ -1118,5 +1404,180 @@ mod tests {
             .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         assert!(matches!(Cache::open(&path), Err(CacheError::TooNew { .. })));
+    }
+
+    fn result(choice: Choice, confidence: f64) -> Classification {
+        Classification {
+            choice,
+            confidence,
+            probabilities: vec![(Choice::Main, 1.0 - confidence), (choice, confidence)],
+            model: "jev-1.13.0".into(),
+            request_version: 1,
+            input_tokens: Some(300),
+            classified_at: DateTime::from_timestamp(1_000, 0).unwrap(),
+        }
+    }
+
+    fn groups(
+        cache: &Cache,
+        filter: GroupFilter,
+        rules: &GroupRules,
+    ) -> Vec<(String, Option<Group>)> {
+        let now = DateTime::from_timestamp(100 * 86_400, 0).unwrap();
+        cache
+            .list_grouped(None, filter, 100, rules, now)
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.entry.subject.unwrap(), g.group))
+            .collect()
+    }
+
+    fn key_of(cache: &Cache, subject: &str) -> (String, String) {
+        let p = cache
+            .pending(None, true)
+            .unwrap()
+            .into_iter()
+            .find(|p| {
+                cache
+                    .get(p.id)
+                    .unwrap()
+                    .unwrap()
+                    .raw
+                    .ends_with(format!("{subject}\r\n\r\nhi\r\n").as_bytes())
+            })
+            .unwrap();
+        (p.account, p.msg_key.unwrap())
+    }
+
+    #[test]
+    fn a_result_survives_a_rebuild_of_the_mailbox() {
+        let mut cache = Cache::open_in_memory().unwrap();
+        let mb = cache
+            .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
+            .unwrap();
+        cache
+            .insert_messages(mb.id, &[msg(1, 1, "a"), msg(2, 2, "b")])
+            .unwrap();
+        let (account, key) = key_of(&cache, "a");
+        cache
+            .store_classification(&account, &key, &result(Choice::Newsletters, 0.9))
+            .unwrap();
+        let rules = GroupRules::default();
+        assert_eq!(
+            groups(&cache, GroupFilter::Any, &rules),
+            [("b".into(), None), ("a".into(), Some(Group::Newsletters))]
+        );
+
+        let mb = cache
+            .reset_mailbox("work", "INBOX", UidValidity::new(2).unwrap())
+            .unwrap();
+        cache
+            .insert_messages(mb.id, &[msg(7, 1, "a"), msg(8, 2, "b")])
+            .unwrap();
+        assert_eq!(
+            groups(&cache, GroupFilter::Any, &rules),
+            [("b".into(), None), ("a".into(), Some(Group::Newsletters))]
+        );
+        let pending = cache.pending(None, false).unwrap();
+        assert_eq!(pending.len(), 1, "only b is left to classify");
+        assert_eq!(
+            cache.pending(None, true).unwrap().len(),
+            2,
+            "--again takes both"
+        );
+        assert_eq!(
+            cache.classification("work", &key).unwrap(),
+            Some(result(Choice::Newsletters, 0.9))
+        );
+        assert_eq!(
+            cache.classification("home", &key).unwrap(),
+            None,
+            "results are per account"
+        );
+    }
+
+    #[test]
+    fn list_grouped_filters_on_the_effective_group() {
+        let mut cache = Cache::open_in_memory().unwrap();
+        let mb = cache
+            .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
+            .unwrap();
+        let day = 86_400;
+        cache
+            .insert_messages(
+                mb.id,
+                &[
+                    msg(1, day, "old"),
+                    msg(2, 50 * day, "unsure"),
+                    msg(3, 99 * day, "new"),
+                    msg(4, 99 * day, "none"),
+                ],
+            )
+            .unwrap();
+        for (subject, choice, confidence) in [
+            ("old", Choice::FollowUp, 0.9),
+            ("unsure", Choice::Promotions, 0.3),
+            ("new", Choice::FollowUp, 0.9),
+        ] {
+            let (account, key) = key_of(&cache, subject);
+            cache
+                .store_classification(&account, &key, &result(choice, confidence))
+                .unwrap();
+        }
+        let rules = GroupRules::default();
+        let subjects = |filter| -> Vec<String> {
+            groups(&cache, filter, &rules)
+                .into_iter()
+                .map(|(s, _)| s)
+                .collect()
+        };
+        assert_eq!(subjects(GroupFilter::Is(Group::FollowUpOld)), ["old"]);
+        assert_eq!(subjects(GroupFilter::Is(Group::FollowUp)), ["new"]);
+        assert_eq!(subjects(GroupFilter::Is(Group::Other)), ["unsure"]);
+        assert_eq!(
+            subjects(GroupFilter::Is(Group::Promotions)),
+            Vec::<String>::new()
+        );
+        assert_eq!(subjects(GroupFilter::Unclassified), ["none"]);
+        let loose = GroupRules {
+            other_below: 0.2,
+            follow_up_old_days: 365,
+        };
+        assert_eq!(
+            groups(&cache, GroupFilter::Any, &loose)
+                .into_iter()
+                .filter_map(|(_, g)| g)
+                .collect::<Vec<_>>(),
+            [Group::FollowUp, Group::Promotions, Group::FollowUp],
+            "new thresholds apply without a new answer"
+        );
+        let now = DateTime::from_timestamp(100 * day, 0).unwrap();
+        let limited = cache
+            .list_grouped(None, GroupFilter::Is(Group::FollowUpOld), 1, &rules, now)
+            .unwrap();
+        assert_eq!(limited.len(), 1, "the limit counts kept rows only");
+    }
+
+    #[test]
+    fn a_row_without_a_msg_key_is_pending_until_classify_records_its_key() {
+        let mut cache = Cache::open_in_memory().unwrap();
+        let mb = cache
+            .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
+            .unwrap();
+        cache.insert_messages(mb.id, &[msg(1, 1, "a")]).unwrap();
+        let (_, key) = key_of(&cache, "a");
+        cache
+            .store_classification("work", &key, &result(Choice::Main, 0.9))
+            .unwrap();
+        cache
+            .conn
+            .execute("UPDATE message SET msg_key = NULL", [])
+            .unwrap();
+        let pending = cache.pending(Some("work"), false).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].msg_key, None);
+        cache.set_msg_key(pending[0].id, &key).unwrap();
+        assert!(cache.pending(Some("work"), false).unwrap().is_empty());
+        assert_eq!(cache.average_input_tokens().unwrap(), Some(300.0));
     }
 }
