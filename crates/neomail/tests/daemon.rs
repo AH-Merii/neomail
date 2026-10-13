@@ -11,11 +11,19 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
+use nm_core::{Cache, FetchedMessage, Flags, Uid, UidValidity};
+
+#[path = "support/fake_jev.rs"]
+mod fake_jev;
+use fake_jev::FakeJev;
+
 /// Long enough for a slow CI runner; only reached when something is wrong.
 const PATIENCE: Duration = Duration::from_secs(60);
 
 /// The start line's words on classifying when there is no jev key.
 const NO_KEY: &str = "classifying off: no jev key (run `neomail key set` or set JEV_API_KEY)";
+/// The start line's words on classifying while the config does not switch it on.
+const OFF: &str = "classifying off (`daemon = true` under [classify] in the config turns it on)";
 
 /// The binary with its data and config in `data`, the debug build's file keyring there (empty,
 /// so never the system's), no jev key and no network but 127.0.0.1.
@@ -133,7 +141,7 @@ fn a_failing_daemon_reports_once_keeps_running_refuses_a_second_and_stops_on_sig
     assert_eq!(
         next_line(&mut daemon, &lines),
         format!(
-            "neomail daemon: syncing 1 account every 30 seconds, {notifications}, {NO_KEY}; \
+            "neomail daemon: syncing 1 account every 30 seconds, {notifications}, {OFF}; \
              Ctrl-C stops"
         )
     );
@@ -185,13 +193,35 @@ fn no_notify_says_so_at_start() {
         start,
         format!(
             "neomail daemon: syncing 1 account every 30 seconds, notifications off (--no-notify), \
-             {NO_KEY}; Ctrl-C stops"
+             {OFF}; Ctrl-C stops"
         )
     );
 }
 
+/// The daemon's start line with `data`'s config, with a jev key when `key`.
+fn start_line(data: &Path, key: bool) -> String {
+    let mut c = command(data, &["daemon", "--interval", "30s", "--no-notify"]);
+    if key {
+        c.env("JEV_API_KEY", "made-up-key");
+    }
+    let (mut daemon, lines) = spawn(c);
+    let start = next_line(&mut daemon, &lines);
+    terminate(&daemon);
+    daemon.wait().unwrap();
+    start
+}
+
+/// Appends `text` to `data`'s config.
+fn append_config(data: &Path, text: &str) {
+    let config = std::fs::read_to_string(data.join("config.toml")).unwrap();
+    std::fs::write(data.join("config.toml"), config + text).unwrap();
+}
+
+const HEAD: &str =
+    "neomail daemon: syncing 1 account every 30 seconds, notifications off (--no-notify)";
+
 #[test]
-fn the_start_line_says_classifying_is_on_only_with_a_key_and_the_consent() {
+fn the_start_line_says_classifying_is_on_only_when_switched_on_with_a_key_and_the_consent() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path();
     closed_port_config(data);
@@ -200,54 +230,74 @@ fn the_start_line_says_classifying_is_on_only_with_a_key_and_the_consent() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
     };
-    let mut config = std::fs::read_to_string(data.join("config.toml")).unwrap();
-    config.push_str(&format!(
-        "\n[classify]\nurl = \"http://127.0.0.1:{port}\"\n"
-    ));
-    std::fs::write(data.join("config.toml"), config).unwrap();
-    let start = |data: &Path| {
-        let args = ["daemon", "--interval", "30s", "--no-notify"];
-        let mut c = command(data, &args);
-        c.env("JEV_API_KEY", "made-up-key");
-        let (mut daemon, lines) = spawn(c);
-        let start = next_line(&mut daemon, &lines);
-        terminate(&daemon);
-        daemon.wait().unwrap();
-        start
-    };
-    let head =
-        "neomail daemon: syncing 1 account every 30 seconds, notifications off (--no-notify)";
-    assert_eq!(
-        start(data),
-        format!(
-            "{head}, classifying off: 127.0.0.1 needs your consent once; run `neomail classify` \
-             on a terminal; Ctrl-C stops"
-        )
+    append_config(
+        data,
+        &format!("\n[classify]\nurl = \"http://127.0.0.1:{port}\"\n"),
     );
-    // A yes from before the daemon classified answered a question that never named it.
-    std::fs::write(data.join("classify-consent"), "127.0.0.1\n").unwrap();
-    assert_eq!(
-        start(data),
-        format!(
-            "{head}, classifying off: 127.0.0.1 needs your consent once; run `neomail classify` \
-             on a terminal; Ctrl-C stops"
-        )
-    );
-    // What `neomail classify` stores once the user agrees.
+    // A key and a yes are not enough: the config has not switched it on.
     std::fs::write(data.join("classify-consent"), "127.0.0.1 daemon\n").unwrap();
     assert_eq!(
-        start(data),
-        format!("{head}, classifying new mail with 127.0.0.1; Ctrl-C stops")
+        start_line(data, true),
+        format!("{HEAD}, {OFF}; Ctrl-C stops")
     );
-    std::fs::write(
-        data.join("config.toml"),
-        std::fs::read_to_string(data.join("config.toml")).unwrap() + "daemon = false\n",
-    )
-    .unwrap();
+
+    append_config(data, "daemon = true\n");
+    let needs_consent = format!(
+        "{HEAD}, classifying off: 127.0.0.1 needs your consent once; run `neomail classify` on \
+         a terminal; Ctrl-C stops"
+    );
+    std::fs::remove_file(data.join("classify-consent")).unwrap();
+    assert_eq!(start_line(data, true), needs_consent);
+    std::fs::write(data.join("classify-consent"), "localhost\n").unwrap();
+    assert_eq!(start_line(data, true), needs_consent);
+    // Any yes `neomail classify` stored for the host: the host alone, as it stores it now, or
+    // with `daemon`, as it stored it while its question named the daemon.
+    for consent in ["127.0.0.1\n", "127.0.0.1 daemon\n"] {
+        std::fs::write(data.join("classify-consent"), consent).unwrap();
+        assert_eq!(
+            start_line(data, true),
+            format!("{HEAD}, classifying new mail with 127.0.0.1; Ctrl-C stops"),
+            "{consent:?}"
+        );
+    }
     assert_eq!(
-        start(data),
-        format!("{head}, classifying off (classify.daemon = false); Ctrl-C stops")
+        start_line(data, false),
+        format!("{HEAD}, {NO_KEY}; Ctrl-C stops")
     );
+}
+
+#[test]
+fn a_yes_to_neomail_classify_does_not_switch_the_daemon_on() {
+    let jev = FakeJev::start();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    closed_port_config(data);
+    append_config(data, &format!("\n[classify]\nurl = \"{}\"\n", jev.url()));
+    let mut cache = Cache::open(&data.join("cache.sqlite3")).unwrap();
+    let inbox = cache
+        .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
+        .unwrap();
+    let raw = "Message-ID: <m1@acme.example>\r\nFrom: orders@shop.example\r\n\
+               To: you@example.com\r\nSubject: Your order\r\n\r\nShipped.\r\n";
+    let message = FetchedMessage {
+        uid: Uid::new(1).unwrap(),
+        flags: Flags::new(Vec::<String>::new()),
+        received: Some(chrono::Utc::now()),
+        raw: raw.as_bytes().to_vec(),
+    };
+    cache.insert_messages(inbox.id, &[message]).unwrap();
+    drop(cache);
+    let o = command(data, &["classify", "--yes"])
+        .env("JEV_API_KEY", "made-up-key")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(jev.count(), 1);
+    assert_eq!(
+        start_line(data, true),
+        format!("{HEAD}, {OFF}; Ctrl-C stops")
+    );
+    assert_eq!(jev.count(), 1);
 }
 
 #[test]
@@ -353,16 +403,19 @@ fn without_accounts_or_with_a_bad_interval_the_daemon_is_a_usage_error() {
 }
 
 #[test]
-fn the_help_names_both_key_sources_the_old_consent_and_the_cap_per_sync() {
+fn the_help_names_the_switch_both_key_sources_the_cap_per_sync_and_the_categories() {
     let dir = tempfile::tempdir().unwrap();
     let o = command(dir.path(), &["daemon", "--help"]).output().unwrap();
     assert!(o.status.success());
     let help = String::from_utf8(o.stdout).unwrap();
     let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
     for part in [
+        "Classifying in the background is off until `daemon = true` under [classify] in the \
+         config switches it on",
+        "While it is off, the daemon sends nothing to the classifier and writes no groups",
         "there is a key (`neomail key set` or JEV_API_KEY)",
-        "A consent given before neomail daemon classified covers `neomail classify` only: run \
-         `neomail classify` on a terminal to give it again",
+        "After classifying, it writes each Outlook message's group as a category; \
+         `classify.labels = false` turns that off",
         "at most 100 messages each time it syncs (a round, a push sync or an Outlook check); \
          the rest wait for the next time it syncs",
     ] {

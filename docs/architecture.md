@@ -654,9 +654,11 @@ returns lines, so a notification never waits for jev and no classifying failure 
 Only a wake that synced calls it (`Wake::syncs`: a round, a resume or an account wake); a
 watcher's other news does not, so the classifier's cap and budget hold per sync.
 It takes the same `NewMail` as the notifications, so a first sync or a rebuild is never sent.
-`Classifier` owns the daemon's rules: the gate (`classify.daemon`, then a key, then the consent
-`neomail classify` stored for the host, in 10a's order; only a `HOST daemon` line, written by the
-question that names the daemon, counts, not 10a's bare `HOST`), the in-memory queue that holds what is
+`Classifier` owns the daemon's rules: the gate (the switch `classify.daemon`, off by default, then
+a key, then any yes `neomail classify` stored for the host, a bare `HOST` line or an older
+`HOST daemon` one;
+[DEC-2026-10-14-classify-when-asked](decisions.md#dec-2026-10-14-classify-when-asked)), the
+in-memory queue that holds what is
 over 100 messages a wake or what a stopped run put back (dropped, with a count in the state line,
 when classifying turns off or pauses, but kept while the keyring fails to answer or a 402 pauses it), the pause after a
 stop that would come back at every wake (`Outcome::repeats`: the SHA-256 of a refused key, or
@@ -686,7 +688,9 @@ stops the daemon's requests without a restart. The tests run the
 
 **Groups as categories** (`neomail/src/classify/labels.rs`) run after `neomail classify` stores
 its results (`labels::cli_pass`, up to 1,000 per account, waiting for the account's lock) and
-after the daemon's classifier in the same wake (up to 100, skipping a locked account). Both go
+after the daemon's classifier in the same wake (up to 100, skipping a locked account), but only
+while `classify.daemon` is on: `daemon.rs`'s `background_groups` skips the daemon's writes while
+the switch is off. Both go
 through `write_labels`, which owns the cap, the lock, the grant check and the per-account error
 rules, and returns outcomes rather than errors, so a failure never reaches classifying, the sync
 or the notifications. It writes in chunks of four and stores each confirmed name with

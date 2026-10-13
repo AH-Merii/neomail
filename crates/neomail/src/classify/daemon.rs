@@ -1,8 +1,10 @@
-//! `neomail daemon`'s classifying (DEC-2026-10-13-daemon-classify): after a wake's sync and
-//! notifications, each account's new mail goes to the backend through the same [`job_for`] and
-//! [`send`] as `neomail classify`, so the two send the same requests. The daemon never asks: it
-//! sends only with a key and the consent `neomail classify` stored for the backend's host, and
-//! otherwise says once why classifying is off.
+//! `neomail daemon`'s classifying (DEC-2026-10-13-daemon-classify): once the config switches it
+//! on with `classify.daemon = true` (off by default, DEC-2026-10-14-classify-when-asked), after a
+//! wake's sync and notifications, each account's new mail goes to the backend through the same
+//! [`job_for`] and [`send`] as `neomail classify`, so the two send the same requests. The daemon
+//! never asks: it sends only with a key and the consent `neomail classify` stored for the
+//! backend's host, and otherwise says once why classifying is off. While the switch is off it
+//! reads no key and sends nothing.
 //!
 //! The daemon wakes the classifier only after a wake that synced ([`crate::daemon::after_sync`]):
 //! a round, a resume, a push sync or an Outlook check. A wake sends at most [`PER_WAKE`] requests
@@ -50,14 +52,17 @@ pub fn budget(interval: Duration) -> Duration {
     BUDGET.min(interval)
 }
 
+/// How the start line says background classifying is switched on.
+const DISABLED_HOW: &str = "`daemon = true` under [classify] in the config turns it on";
+
 /// Where the key and the consent come from: the keyring or `JEV_API_KEY`, and the consent file,
 /// for the daemon ([`System`]); fixed answers for the tests, which open no keyring.
 pub trait Access {
     /// The key for `host`, read anew; an error when the keyring fails to answer and
     /// `JEV_API_KEY` is not set, which is not the same as having no key.
     fn key(&mut self, host: &str) -> Result<Option<Secret>>;
-    /// Whether `neomail classify` stored the user's consent for `host`, to the question that
-    /// says the daemon sends new mail too.
+    /// Whether `neomail classify` stored the user's consent for `host`, whatever version stored
+    /// it: with the switch on, any yes for the host counts.
     fn consented(&mut self, host: &str) -> Result<bool>;
 }
 
@@ -88,9 +93,7 @@ impl Access for System {
     }
 
     fn consented(&mut self, host: &str) -> Result<bool> {
-        // Only a yes to the question that names the daemon: a yes from before it classified
-        // answered a question about `neomail classify` alone.
-        Ok(super::consent(&self.data_dir, host)? == super::Consent::Daemon)
+        super::consented(&self.data_dir, host)
     }
 }
 
@@ -116,7 +119,7 @@ impl State {
     fn phrase(&self) -> String {
         match self {
             State::On(host) => format!("classifying new mail with {host}"),
-            State::Disabled => "classifying off (classify.daemon = false)".to_owned(),
+            State::Disabled => format!("classifying off ({DISABLED_HOW})"),
             State::NoKey => format!(
                 "classifying off: no jev key ({})",
                 keyring::NO_JEV_KEY.trim_start_matches("no jev key: ")
@@ -320,6 +323,8 @@ impl Classifier {
             return lines;
         }
         if !wake.settings.daemon {
+            // A key read while the switch was on is not held while it is off.
+            self.key = None;
             self.report(State::Disabled, &mut lines);
             return lines;
         }

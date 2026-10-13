@@ -9,7 +9,8 @@
 //! the same wake.
 //!
 //! After a round, each account that got new mail in it gets one desktop notification
-//! ([`notify_round`], through [`crate::notify`]). Then the new mail is classified
+//! ([`notify_round`], through [`crate::notify`]). Then, once `classify.daemon = true` switches
+//! background classifying on (it is off by default), the new mail is classified
 //! ([`crate::classify::daemon`]), so a notification never waits for the classifier, and each
 //! Outlook message's group is written as a category ([`crate::classify::labels`]).
 
@@ -29,7 +30,7 @@ use tokio::runtime::Runtime;
 use tokio::time::Instant;
 
 use crate::classify::{self, daemon::Classifier, labels};
-use crate::config::{self, Account, Config};
+use crate::config::{self, Account, ClassifySettings, Config};
 use crate::notify::{self, NewMail, Notification, Notifier};
 use crate::push::{self, Push, WatchLogin};
 use crate::sync::{PASSWORD_COMMAND_TIMEOUT, Synced, Syncer, report_line};
@@ -720,6 +721,24 @@ pub fn after_sync<O: Write, E: Write, C>(
     Ok(())
 }
 
+/// What a wake that synced does with groups in the background: `classify` new mail, then `write`
+/// groups to the server (Outlook categories). Only `classify` runs while `classify.daemon` is off:
+/// it then says so once, reads no key and sends nothing; nothing is written, as `neomail
+/// classify` writes groups in its own run (DEC-2026-10-14-classify-when-asked). `cx` is what
+/// both use (the cache).
+fn background_groups<C>(
+    settings: &ClassifySettings,
+    cx: &mut C,
+    classify: impl FnOnce(&mut C) -> Vec<Line>,
+    write: impl FnOnce(&mut C) -> Vec<Line>,
+) -> Vec<Line> {
+    let mut lines = classify(cx);
+    if settings.daemon {
+        lines.extend(write(cx));
+    }
+    lines
+}
+
 /// The config of the next round: the file read again, or the last good one when it cannot be
 /// read, with the reason reported once per distinct error.
 fn reload(path: &Path, last: &mut Config, reported: &mut Option<String>) -> Option<Line> {
@@ -855,22 +874,29 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
                     budget: classify::daemon::budget(interval.duration()),
                     now: chrono::Utc::now(),
                 };
-                // Outside `block_on` too: the key is read from the keyring. Then the groups go to
-                // Outlook as categories, on every wake that synced: what is due changes with age
-                // too, and a failure there is only lines. The writes get a budget of their own,
-                // as classifying does, so a throttled Graph cannot hold up the next round.
+                // Outside `block_on` too: the key is read from the keyring. Then, while
+                // classify.daemon is on, the groups go to Outlook as categories, on every wake
+                // that synced: what is due changes with age too, and a failure there is only
+                // lines. The writes get a budget of their own, as classifying does, so a
+                // throttled Graph holds up the next round by little more than that budget.
                 let classify = |new_mail: &[NewMail], cache: &mut Cache| {
-                    let mut lines = classifier.wake(new_mail, &wake, cache, &mut access);
-                    let accounts: Vec<&Account> = config.accounts.iter().collect();
-                    let pass = labels::Pass::wake(&config.classify, &halt, wake.budget, wake.now);
-                    lines.extend(labels::daemon_wake(
+                    background_groups(
+                        &config.classify,
                         cache,
-                        &accounts,
-                        &pass,
-                        &mut label_writer,
-                        &mut label_reports,
-                    ));
-                    lines
+                        |cache| classifier.wake(new_mail, &wake, cache, &mut access),
+                        |cache| {
+                            let accounts: Vec<&Account> = config.accounts.iter().collect();
+                            let settings = &config.classify;
+                            let pass = labels::Pass::wake(settings, &halt, wake.budget, wake.now);
+                            labels::daemon_wake(
+                                cache,
+                                &accounts,
+                                &pass,
+                                &mut label_writer,
+                                &mut label_reports,
+                            )
+                        },
+                    )
                 };
                 after_sync(
                     synced,
@@ -1444,6 +1470,35 @@ Sender 3: Message 3
 and 2 more"
         );
         assert!(p.err.is_empty());
+    }
+
+    #[test]
+    fn groups_are_written_in_the_background_only_once_classify_daemon_switches_it_on() {
+        let on = ClassifySettings {
+            daemon: true,
+            ..ClassifySettings::default()
+        };
+        // The classifier always hears of the wake: switched off, it says so and sends nothing.
+        for (settings, want) in [
+            (ClassifySettings::default(), &["classify"][..]),
+            (on, &["classify", "write"][..]),
+        ] {
+            let mut order = Vec::new();
+            let lines = background_groups(
+                &settings,
+                &mut order,
+                |order| {
+                    order.push("classify");
+                    vec![Line::Report("work: classified 1".to_owned())]
+                },
+                |order| {
+                    order.push("write");
+                    vec![Line::Report("outlook: 1 category written".to_owned())]
+                },
+            );
+            assert_eq!(order, want, "daemon = {}", settings.daemon);
+            assert_eq!(lines.len(), want.len());
+        }
     }
 
     #[test]

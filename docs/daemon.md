@@ -15,7 +15,7 @@ neomail daemon --interval 1m    # digits followed by s, m or h, from 30s to 24h
 It prints one line when it starts, then stays in the foreground:
 
 ```text
-neomail daemon: syncing 2 accounts every 5 minutes, notifications on, classifying new mail with api.typesafe.ai; Ctrl-C stops
+neomail daemon: syncing 2 accounts every 5 minutes, notifications on, classifying off (`daemon = true` under [classify] in the config turns it on); Ctrl-C stops
 ```
 
 The notifications part is explained under [Notifications](#notifications), the classifying part
@@ -302,23 +302,33 @@ Then `SVDIR=~/.config/service sv up neomail` (or `SVDIR=~/service`) starts it ag
 
 ## Classifying
 
-After each sync's notifications (a round, a push sync or an Outlook check), the daemon sends that
-sync's new mail to the classifier, one request per message, and stores each answer, so `neomail list --group` and `neomail list --json`
-show the group without running `neomail classify`. The request is the one `neomail classify`
-sends, built by the same code: `neomail redact ID` shows exactly what leaves for a message, and
-[privacy.md](privacy.md) says what is sent and what never is.
+Classifying in the background is off until you switch it on in the config:
+
+```toml
+[classify]
+daemon = true
+```
+
+While it is off, the daemon sends nothing to the classifier, does not read the jev key for it, and
+writes no groups to the server; `neomail classify` still classifies what you ask it to and writes
+the groups in its own run. A yes to `neomail classify`'s consent question, or `--yes`, does not
+switch it on.
+
+Once it is on, after each sync's notifications (a round, a push sync or an Outlook check), the
+daemon sends that sync's new mail to the classifier, one request per message, and stores each
+answer, so `neomail list --group` and `neomail list --json` show the group without running
+`neomail classify`. The request is the one `neomail classify` sends, built by the same code:
+`neomail redact ID` shows exactly what leaves for a message, and [privacy.md](privacy.md) says
+what is sent and what never is.
 
 The daemon never asks for anything. It sends only when all of these hold, and its start line says
 which applies:
 
-- `classifying new mail with HOST`: the `[classify]` backend's host has your consent, given once
-  to `neomail classify`, and there is a key (`neomail key set`, or `JEV_API_KEY`). A yes given
-  before the daemon classified answered a question that did not mention it, so it does not count
-  here, and `neomail classify --yes` does not turn it into one. `neomail classify` on a terminal
-  asks whether the daemon may send too, also when it has nothing to send; your answer does not
-  change that run, which sends on your earlier yes. A no, or closing the input, keeps that yes
-  for `neomail classify` only and is asked again on its next run on a terminal. With
-  `classify.daemon = false` or `--yes` it does not ask;
+- `classifying new mail with HOST`: the switch is on, the `[classify]` backend's host has your
+  consent, given once to `neomail classify` (a yes from any version of neomail counts), and
+  there is a key (`neomail key set`, or `JEV_API_KEY`);
+- ``classifying off (`daemon = true` under [classify] in the config turns it on)``: the switch is
+  off, as it is by default;
 - ``classifying off: no jev key (run `neomail key set` or set JEV_API_KEY)``;
 - ``classifying off: cannot read the jev key from the keyring: WHY``: the keyring failed to
   answer (the Secret Service restarting, say) and `JEV_API_KEY` is not set. Unlike the other
@@ -327,13 +337,7 @@ which applies:
   `neomail classify` asks before its first request to HOST, then classifies up to 1000 messages
   from the last 365 days, one request each; `neomail classify --limit 1` gives the consent for
   one request. When every message already has a group, `neomail classify` sends nothing and does
-  not ask: `neomail classify --again --limit 1` asks, and classifies the newest message again;
-- `classifying off (classify.daemon = false)`: you turned it off in the config:
-
-  ```toml
-  [classify]
-  daemon = false
-  ```
+  not ask: `neomail classify --again --limit 1` asks, and classifies the newest message again.
 
 While classifying is off, the daemon looks again each time it syncs new mail. When the key or the
 consent appears it prints `neomail daemon: classifying on (HOST)` and classifies from that sync
@@ -341,11 +345,13 @@ on. Mail that arrived while it was off is not sent then; `neomail classify` stil
 classifying turns off or pauses while messages wait for the next time it syncs, they are dropped
 too (unless a 402 paused it, see below), and the line says how many:
 ``…; N waiting messages are left to `neomail classify` ``. The key and the consent are read again
-each time it syncs with mail to classify, and the config at every round. `classify.daemon = false`
-stops it from the next round, without a restart. `neomail key delete` and `neomail key set` take
-effect the next time it syncs with mail to classify, unless `JEV_API_KEY` is set in the daemon's
-environment: the daemon then falls back to it. The keyring was unlocked when the daemon started,
-so this rarely asks you to unlock it again.
+each time it syncs with mail to classify, and the config at every round: switching
+`classify.daemon` on or off takes effect from the next round (5 minutes by default), without a
+restart. A push sync or an Outlook check before that round uses the config read at the last one.
+`neomail key delete` and `neomail key set` take effect the next time it syncs with mail to
+classify, unless `JEV_API_KEY` is set in the daemon's environment: the daemon then falls back
+to it. The keyring was unlocked when the daemon started, so this rarely asks you to unlock it
+again.
 
 Which mail is sent:
 
@@ -402,14 +408,14 @@ message, and it is paid for twice.
 
 ### Groups as Outlook categories
 
-After classifying, each wake that synced writes the groups of Outlook accounts' classified mail
-as categories, as `neomail classify` does
+While the switch is on, after classifying, each wake that synced writes the groups of Outlook
+accounts' classified mail as categories, as `neomail classify` does
 ([outlook.md](outlook.md#groups-as-categories)): whatever is due, not only this wake's new mail,
 so mail classified earlier and a `follow-up` that grows old get theirs too. It writes at most 100
-per account per wake, and the rest at the next. Gmail and Proton accounts get nothing yet. This
-changes mail on the server even with `[classify] daemon = false`, which stops only classifying;
-`labels = false` stops the writes. An account the daemon writes to prints one line on standard
-output when it wrote some, or when its failed or waiting counts changed:
+per account per wake, and the rest at the next. Gmail and Proton accounts get nothing yet. With
+`[classify] daemon` off (the default) the daemon writes nothing; with it on, `labels = false`
+stops the writes. An account the daemon writes to prints one line on standard output when it
+wrote some, or when its failed or waiting counts changed:
 
 ```text
 14:05:00 outlook: 12 categories written, 1 failed (tried again next wake), 30 wait for the next wake
@@ -424,13 +430,15 @@ sign-in, or Graph still throttling after its retries or out of reach, ends that 
 for the wake and says once `neomail: outlook: categories not written: WHY`; the rest wait for the
 next wake. A refused token is fetched afresh at the next wake, with nothing to run. A warning
 from the sign-in, such as a new refresh token that could not be saved, is printed like the sync's
-and only when it differs from the account's last one. The writes stop starting when their budget is spent, as classifying
-does (60 seconds, or the interval when that is shorter, counted from when the writes start), and
-writes still in flight then are dropped and tried again next wake. However a write fails,
-classifying, the sync and the notifications go on as before. `[classify] labels =
-false` turns writing off from the next round, and `label_prefix` sets the prefix. The writes use
-their own copy of the account's access token, refreshed as the sync's is, and only while a
-category is due. Ctrl-C or SIGTERM ends the writes after the four in flight.
+and only when it differs from the account's last one. The writes stop starting when their
+budget is spent, as classifying does (60 seconds, or the interval when that is shorter, counted
+from when the writes start), and writes still in flight then are dropped and tried again next
+wake. So a wake's writes can delay the next sync by little more than that budget, and accounts
+not reached by then wait for the next wake. However a write fails, classifying, the sync and the
+notifications go on as before. `[classify] labels = false` turns writing off from the next
+round, and `label_prefix` sets the prefix. The writes use their own copy of the account's access
+token, refreshed as the sync's is, and only while a category is due. Ctrl-C or SIGTERM ends the
+writes after the four in flight.
 
 ## What the output means
 

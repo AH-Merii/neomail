@@ -168,7 +168,7 @@ url = "https://api.typesafe.ai"   # the backend's base URL; requests go to {url}
 model = "jev-1.13.0"              # pinned, so stored confidences stay comparable
 other_below = 0.4                 # below this confidence a message lists as `other`
 follow_up_old_days = 90           # a `follow-up` older than this lists as `follow-up-old`
-daemon = true                     # `neomail daemon` classifies new mail once you have consented
+daemon = false                    # true: `neomail daemon` classifies new mail in the background
 label_prefix = "nm-"              # Outlook categories are named nm-newsletters and so on
 labels = true                     # false: write no group to the server
 ```
@@ -392,14 +392,15 @@ arrives. Outlook accounts are checked every minute through Graph's delta query, 
 push for a program on your computer. To run it as a systemd, OpenRC or runit user service, and for
 what its output means, see [docs/daemon.md](docs/daemon.md).
 
-Once you have agreed to classification through `neomail classify` and stored a key, the daemon also
-classifies new mail as it arrives, with the same request, at most 100 messages each time it syncs
-(a round, a push sync or an Outlook check), so `neomail list --group` stays current. It never asks
-for consent itself, and leaves an account's first sync to `neomail classify`;
-`classify.daemon = false` turns it off ([docs/daemon.md](docs/daemon.md#classifying)). After
-classifying it writes Outlook accounts' groups as categories, at most 100 per account each time
-([docs/daemon.md](docs/daemon.md#groups-as-outlook-categories)). That changes mail on the server
-even with `classify.daemon = false`; `classify.labels = false` turns it off.
+The daemon classifies nothing unless you switch it on with `daemon = true` under `[classify]` in
+the config ([docs/daemon.md](docs/daemon.md#classifying)). Once it is on, and you have agreed to
+classification through `neomail classify` and stored a key, it classifies new mail as it
+arrives, with the same request, at most 100 messages each time it syncs (a round, a push sync or
+an Outlook check), so `neomail list --group` stays current. It never asks for consent itself, and
+leaves an account's first sync to `neomail classify`. After classifying it writes Outlook
+accounts' groups as categories, at most 100 per account each time
+([docs/daemon.md](docs/daemon.md#groups-as-outlook-categories)); `classify.labels = false` turns
+that off. While the switch is off it writes no groups either.
 
 How it fits together: [docs/architecture.md](docs/architecture.md).
 

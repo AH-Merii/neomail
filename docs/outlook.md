@@ -176,7 +176,8 @@ next sync reads their state. There is no queue: run the command again.
 Each classified message gets its group as an Outlook category: the label prefix followed by the
 group `neomail list --group` shows, such as `nm-receipts-invoices`
 ([DEC-2026-10-13-categories](decisions.md#dec-2026-10-13-categories)). `neomail classify` writes
-them after it stores its results, and `neomail daemon` after each wake that synced
+them after it stores its results, and, once `daemon = true` under `[classify]` switches background
+classifying on, `neomail daemon` after each wake that synced
 ([daemon.md](daemon.md#groups-as-outlook-categories)). There is no command of its own.
 
 - **What is written.** The effective group, worked out when the cache is read, so a category

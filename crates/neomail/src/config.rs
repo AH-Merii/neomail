@@ -327,8 +327,9 @@ pub struct ClassifySettings {
     pub url: String,
     pub model: String,
     pub rules: GroupRules,
-    /// Whether `neomail daemon` classifies new mail; it still needs a key and the consent
-    /// `neomail classify` stores (DEC-2026-10-13-daemon-classify).
+    /// Whether `neomail daemon` classifies new mail and writes groups to the server in the
+    /// background: off unless the config sets it (DEC-2026-10-14-classify-when-asked). Once on,
+    /// it still needs a key and the consent `neomail classify` stores.
     pub daemon: bool,
     /// The prefix of a group's name on the server, `nm-` by default; never shown inside neomail
     /// (DEC-2026-10-13-labels).
@@ -343,7 +344,7 @@ impl Default for ClassifySettings {
             url: DEFAULT_CLASSIFY_URL.to_owned(),
             model: DEFAULT_CLASSIFY_MODEL.to_owned(),
             rules: GroupRules::default(),
-            daemon: true,
+            daemon: false,
             label_prefix: LabelPrefix::default(),
             labels: true,
         }
@@ -1451,19 +1452,19 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
         );
         assert_eq!(c.classify.host().unwrap(), "api.typesafe.ai");
         assert!(
-            c.classify.daemon,
-            "the daemon classifies unless told not to"
+            !c.classify.daemon,
+            "the daemon classifies only when the config says so"
         );
         assert_eq!(c.classify.label_prefix.as_str(), "nm-");
         assert!(c.classify.labels, "groups are written unless told not to");
 
         let c = Config::parse(&format!(
             "{accounts}[classify]\nurl = \"http://127.0.0.1:8080/\"\nmodel = \"jev-preview\"\n\
-             other_below = 0.55\nfollow_up_old_days = 30\ndaemon = false\n\
+             other_below = 0.55\nfollow_up_old_days = 30\ndaemon = true\n\
              label_prefix = \"neo/\"\nlabels = false\n"
         ))
         .unwrap();
-        assert!(!c.classify.daemon);
+        assert!(c.classify.daemon);
         assert_eq!(c.classify.label_prefix.as_str(), "neo/");
         assert!(!c.classify.labels);
         assert_eq!(c.classify.url, "http://127.0.0.1:8080");
