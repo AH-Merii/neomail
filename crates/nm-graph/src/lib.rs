@@ -1,6 +1,7 @@
 //! Microsoft Graph as an [`IdSource`]: the INBOX of an Outlook, Hotmail or Microsoft 365 mailbox,
 //! read through Graph's REST API (<https://learn.microsoft.com/en-us/graph/api/user-list-messages>).
-//! It writes a message's read state ([`GraphSource::set_read`]) and moves a message to the archive
+//! It writes a message's read state ([`GraphSource::set_read`]) and its categories
+//! ([`GraphSource::set_categories`]), and moves a message to the archive
 //! or the trash ([`GraphSource::move_to`]).
 //!
 //! It also sends mail ([`GraphSource::send`]).
@@ -37,6 +38,9 @@
 //!   [`MAX_TRIES`] tries (<https://learn.microsoft.com/en-us/graph/throttling>).
 //! - A read state is written with `PATCH /me/messages/{id}` and `{"isRead": ...}`, which needs
 //!   Mail.ReadWrite (<https://learn.microsoft.com/en-us/graph/api/message-update>).
+//! - A message's categories are set by name with a GET of `categories`, then a `PATCH
+//!   /me/messages/{id}` of the merged list, which needs Mail.ReadWrite too; nothing here touches
+//!   the master category list (<https://learn.microsoft.com/en-us/graph/api/resources/outlookcategory>).
 //! - A move is `POST /me/messages/{id}/move` with a well-known folder name as `destinationId`,
 //!   which also needs Mail.ReadWrite and answers `201 Created`
 //!   (<https://learn.microsoft.com/en-us/graph/api/message-move>). Nothing here deletes a message
@@ -59,6 +63,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use nm_core::compose::Outgoing;
+use nm_core::label::{LabelPrefix, merge};
 use nm_core::{
     Cursor, Destination, Flags, FolderName, IdChange, IdChanges, IdFetched, IdListed, IdSource,
     ListedFolder, Moved, RemoteId, Role, Written,
@@ -869,6 +874,109 @@ impl<T: Transport> GraphSource<T> {
             )),
             404 => Ok(None),
             _ => Err(status_error(&reply)),
+        }
+    }
+}
+
+/// A group to set on a message as an Outlook category: [`GraphSource::set_categories`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryEdit {
+    pub id: RemoteId,
+    /// The category the message should carry: the prefix and its group's name.
+    pub want: String,
+    /// The category neomail wrote on it last, if any: neomail's even under another prefix.
+    pub last: Option<String>,
+}
+
+/// What became of one [`CategoryEdit`].
+#[derive(Debug)]
+pub enum CategoryResult {
+    /// The categories were changed with a PATCH.
+    Set,
+    /// The message carried the category already, and nothing of neomail's to remove: no PATCH.
+    Already,
+    /// Graph no longer has the message (404).
+    Gone,
+    /// The request failed. [`GraphError::Unauthorized`] and [`GraphError::Forbidden`] end the
+    /// pass: the edits after them are not tried, and are left out of the answer.
+    Failed(GraphError),
+}
+
+#[derive(Deserialize)]
+struct Categorized {
+    categories: Option<Vec<String>>,
+}
+
+impl<T: Transport> GraphSource<T> {
+    /// Sets each message's Outlook category: `GET /me/messages/{id}?$select=categories`, then
+    /// [`nm_core::label::merge`] keeps every category that is not neomail's, and only a list that
+    /// changed is sent back with `PATCH /me/messages/{id}` and `{"categories": [...]}`
+    /// (<https://learn.microsoft.com/en-us/graph/api/message-update>), which needs
+    /// Mail.ReadWrite. A category is applied by its name alone; the master category list is not
+    /// touched (<https://learn.microsoft.com/en-us/graph/api/resources/outlookcategory>). At most
+    /// [`CONCURRENT_FETCHES`] messages at once, each with Graph's retry rules.
+    ///
+    /// One message's failure never stops the others, except 401 and 403, which stop the pass:
+    /// the token or the grant is wrong for every message. The answer is in `edits`' order.
+    pub async fn set_categories(
+        &self,
+        prefix: &LabelPrefix,
+        edits: &[CategoryEdit],
+    ) -> Vec<(RemoteId, CategoryResult)> {
+        let mut answers = stream::iter(edits.iter().enumerate())
+            .map(|(i, edit)| async move { (i, self.set_categories_one(prefix, edit).await) })
+            .buffer_unordered(CONCURRENT_FETCHES);
+        let mut results: Vec<Option<CategoryResult>> = edits.iter().map(|_| None).collect();
+        while let Some((i, result)) = answers.next().await {
+            let refused = matches!(
+                result,
+                CategoryResult::Failed(GraphError::Unauthorized | GraphError::Forbidden)
+            );
+            results[i] = Some(result);
+            if refused {
+                break;
+            }
+        }
+        edits
+            .iter()
+            .zip(results)
+            .filter_map(|(edit, result)| result.map(|r| (edit.id.clone(), r)))
+            .collect()
+    }
+
+    async fn set_categories_one(
+        &self,
+        prefix: &LabelPrefix,
+        edit: &CategoryEdit,
+    ) -> CategoryResult {
+        let url = format!("{API}/me/messages/{}", encode_segment(edit.id.as_str()));
+        let reply = match self
+            .get(&format!("{url}?$select=categories"), true, MAX_JSON)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(e) => return CategoryResult::Failed(e),
+        };
+        let current = match reply.status {
+            200 => match serde_json::from_slice::<Categorized>(&reply.body) {
+                Ok(c) => c.categories.unwrap_or_default(),
+                Err(_) => return CategoryResult::Failed(GraphError::Malformed),
+            },
+            404 => return CategoryResult::Gone,
+            _ => return CategoryResult::Failed(status_error(&reply)),
+        };
+        let Some(merged) = merge(&current, prefix, edit.last.as_deref(), &edit.want) else {
+            return CategoryResult::Already;
+        };
+        let body = serde_json::json!({ "categories": merged }).to_string();
+        // The answer is the whole message, its body included, as for set_read.
+        match self.patch(&url, body.as_bytes(), MAX_MIME).await {
+            Ok(reply) => match reply.status {
+                200 | 204 => CategoryResult::Set,
+                404 => CategoryResult::Gone,
+                _ => CategoryResult::Failed(status_error(&reply)),
+            },
+            Err(e) => CategoryResult::Failed(e),
         }
     }
 }

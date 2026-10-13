@@ -400,6 +400,38 @@ or a timeout, has no stored answer, so its message is asked about again later an
 for twice. If `neomail classify` runs at the same time as the daemon, both may ask about the same
 message, and it is paid for twice.
 
+### Groups as Outlook categories
+
+After classifying, each wake that synced writes the groups of Outlook accounts' classified mail
+as categories, as `neomail classify` does
+([outlook.md](outlook.md#groups-as-categories)): whatever is due, not only this wake's new mail,
+so mail classified earlier and a `follow-up` that grows old get theirs too. It writes at most 100
+per account per wake, and the rest at the next. Gmail and Proton accounts get nothing yet. This
+changes mail on the server even with `[classify] daemon = false`, which stops only classifying;
+`labels = false` stops the writes. An account the daemon writes to prints one line on standard
+output when it wrote some, or when its failed or waiting counts changed:
+
+```text
+14:05:00 outlook: 12 categories written, 1 failed (tried again next wake), 30 wait for the next wake
+```
+
+Writes take the account's lock: an account `neomail sync` or `mark` holds is skipped for that
+wake. A sign-in that grants only `Mail.Read` sends nothing; standard error says once
+``neomail: outlook: groups are not written to Outlook: run `neomail account login outlook` to let
+neomail change mail``, and again only after the account wrote without it or the reason changed;
+a wake that skipped the account for its lock changes nothing. A refused token or grant, a failed
+sign-in, or Graph still throttling after its retries or out of reach, ends that account's writes
+for the wake and says once `neomail: outlook: categories not written: WHY`; the rest wait for the
+next wake. A refused token is fetched afresh at the next wake, with nothing to run. A warning
+from the sign-in, such as a new refresh token that could not be saved, is printed like the sync's
+and only when it differs from the account's last one. The writes stop starting when their budget is spent, as classifying
+does (60 seconds, or the interval when that is shorter, counted from when the writes start), and
+writes still in flight then are dropped and tried again next wake. However a write fails,
+classifying, the sync and the notifications go on as before. `[classify] labels =
+false` turns writing off from the next round, and `label_prefix` sets the prefix. The writes use
+their own copy of the account's access token, refreshed as the sync's is, and only while a
+category is due. Ctrl-C or SIGTERM ends the writes after the four in flight.
+
 ## What the output means
 
 Each account's first successful sync after the daemon starts prints a line, even with nothing
@@ -415,7 +447,7 @@ starts with the local time, then the line `neomail sync` prints:
 14:35:00 home: 0 new, 0 updated, 0 removed
 ```
 
-Changes and the classifying results go to standard output; failures, warnings, the push lines and
+Changes, the classifying results and the categories written go to standard output; failures, warnings, the push lines and
 the classifying state lines go to standard error. One
 account failing never stops the others. A failure or warning that repeats the account's last one is
 not printed again; the account's next success is printed even with nothing new, so you can see it

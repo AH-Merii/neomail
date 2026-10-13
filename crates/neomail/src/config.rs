@@ -5,8 +5,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use nm_core::GroupRules;
 use nm_core::compose::Mailbox;
+use nm_core::{GroupRules, LabelPrefix};
 use nm_imap::smtp::SmtpConfig;
 use nm_imap::{CertPin, ImapConfig, Security};
 use serde::Deserialize;
@@ -330,6 +330,11 @@ pub struct ClassifySettings {
     /// Whether `neomail daemon` classifies new mail; it still needs a key and the consent
     /// `neomail classify` stores (DEC-2026-10-13-daemon-classify).
     pub daemon: bool,
+    /// The prefix of a group's name on the server, `nm-` by default; never shown inside neomail
+    /// (DEC-2026-10-13-labels).
+    pub label_prefix: LabelPrefix,
+    /// Whether groups are written to the server: Outlook categories (DEC-2026-10-13-categories).
+    pub labels: bool,
 }
 
 impl Default for ClassifySettings {
@@ -339,6 +344,8 @@ impl Default for ClassifySettings {
             model: DEFAULT_CLASSIFY_MODEL.to_owned(),
             rules: GroupRules::default(),
             daemon: true,
+            label_prefix: LabelPrefix::default(),
+            labels: true,
         }
     }
 }
@@ -366,6 +373,8 @@ struct RawClassify {
     other_below: Option<f64>,
     follow_up_old_days: Option<u32>,
     daemon: Option<bool>,
+    label_prefix: Option<String>,
+    labels: Option<bool>,
 }
 
 /// Checks a `[classify]` table and fills in the defaults.
@@ -402,6 +411,13 @@ fn classify_settings(raw: Option<RawClassify>) -> Result<ClassifySettings> {
     }
     if let Some(daemon) = raw.daemon {
         settings.daemon = daemon;
+    }
+    if let Some(prefix) = raw.label_prefix {
+        settings.label_prefix = LabelPrefix::new(&prefix)
+            .map_err(|e| anyhow::anyhow!("classify.label_prefix {e}; remove it to use nm-"))?;
+    }
+    if let Some(labels) = raw.labels {
+        settings.labels = labels;
     }
     Ok(settings)
 }
@@ -1438,13 +1454,18 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             c.classify.daemon,
             "the daemon classifies unless told not to"
         );
+        assert_eq!(c.classify.label_prefix.as_str(), "nm-");
+        assert!(c.classify.labels, "groups are written unless told not to");
 
         let c = Config::parse(&format!(
             "{accounts}[classify]\nurl = \"http://127.0.0.1:8080/\"\nmodel = \"jev-preview\"\n\
-             other_below = 0.55\nfollow_up_old_days = 30\ndaemon = false\n"
+             other_below = 0.55\nfollow_up_old_days = 30\ndaemon = false\n\
+             label_prefix = \"neo/\"\nlabels = false\n"
         ))
         .unwrap();
         assert!(!c.classify.daemon);
+        assert_eq!(c.classify.label_prefix.as_str(), "neo/");
+        assert!(!c.classify.labels);
         assert_eq!(c.classify.url, "http://127.0.0.1:8080");
         assert_eq!(c.classify.model, "jev-preview");
         assert_eq!(
@@ -1473,6 +1494,15 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             ("follow_up_old_days = 0", "at least 1"),
             ("threshold = 0.5", "unknown field"),
             ("daemon = \"no\"", "invalid type"),
+            (
+                "label_prefix = \"\"",
+                "classify.label_prefix must not be empty",
+            ),
+            (
+                "label_prefix = \"nm\\t\"",
+                "must not hold control characters",
+            ),
+            ("labels = \"yes\"", "invalid type"),
         ] {
             let e = format!(
                 "{:#}",

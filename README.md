@@ -169,12 +169,16 @@ model = "jev-1.13.0"              # pinned, so stored confidences stay comparabl
 other_below = 0.4                 # below this confidence a message lists as `other`
 follow_up_old_days = 90           # a `follow-up` older than this lists as `follow-up-old`
 daemon = true                     # `neomail daemon` classifies new mail once you have consented
+label_prefix = "nm-"              # Outlook categories are named nm-newsletters and so on
+labels = true                     # false: write no group to the server
 ```
 
 - `url` must be `https://`, except for a backend on this machine: `http://127.0.0.1`,
   `http://[::1]` or `http://localhost`, with any port.
 - `other_below` (0 to 1) and `follow_up_old_days` (at least 1) apply when mail is listed, so
   changing them needs no new answers. `spam` stays `spam` whatever its confidence.
+- `label_prefix` must not be empty. neomail never shows it: `list --group` takes and prints the
+  bare group.
 
 ### Passwords
 
@@ -281,6 +285,13 @@ neomail forward 42 --to ada@example.com                          # forward its t
   stored results too. Stopping a run during a request, or running it while the daemon classifies,
   can pay for one message twice ([docs/daemon.md](docs/daemon.md#classifying)).
   `neomail classify 42 57` classifies those messages.
+  Then each classified Outlook message gets its group as an Outlook category (`nm-newsletters`),
+  up to 1,000 per account, keeping your own categories; a line such as `neomail: outlook: 37
+  categories written` says how many. It needs a sign-in that lets neomail change mail, writes
+  again only when a message's group changes, and exits 1 when a write or an account's sign-in
+  failed
+  ([docs/outlook.md](docs/outlook.md#groups-as-categories)). Gmail and Proton labels are not
+  written yet.
 - `neomail list --group G` lists one group: `main`, `follow-up`, `follow-up-old`, `recruitment`,
   `receipts-invoices`, `orders-shipping`, `newsletters`, `promotions`, `notifications`, `spam`,
   `other`, or `unclassified`. On a terminal `list` shows each message's group once any is
@@ -385,7 +396,10 @@ Once you have agreed to classification through `neomail classify` and stored a k
 classifies new mail as it arrives, with the same request, at most 100 messages each time it syncs
 (a round, a push sync or an Outlook check), so `neomail list --group` stays current. It never asks
 for consent itself, and leaves an account's first sync to `neomail classify`;
-`classify.daemon = false` turns it off ([docs/daemon.md](docs/daemon.md#classifying)).
+`classify.daemon = false` turns it off ([docs/daemon.md](docs/daemon.md#classifying)). After
+classifying it writes Outlook accounts' groups as categories, at most 100 per account each time
+([docs/daemon.md](docs/daemon.md#groups-as-outlook-categories)). That changes mail on the server
+even with `classify.daemon = false`; `classify.labels = false` turns it off.
 
 How it fits together: [docs/architecture.md](docs/architecture.md).
 

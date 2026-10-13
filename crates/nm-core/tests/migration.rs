@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use nm_core::cache::{MailboxKind, SCHEMA_VERSION};
-use nm_core::{Cache, FetchedMessage, Flags, Uid, UidValidity};
+use nm_core::{Cache, FetchedMessage, Flags, GroupRules, LabelPrefix, RemoteId, Uid, UidValidity};
 use rusqlite::Connection;
 
 /// The schema 1 DDL, exactly as nm-core wrote it. Never edit: it stands for caches on disk.
@@ -112,6 +112,17 @@ fn rows_and_ids_are_kept_and_the_next_id_is_fresh() {
         work.synced,
         "a mailbox from before `synced` counts as synced"
     );
+    // Straight to the current schema, the label table included: it reads and stores.
+    let now = chrono::DateTime::from_timestamp(2000, 0).unwrap();
+    let (rules, prefix) = (GroupRules::default(), LabelPrefix::default());
+    assert_eq!(
+        cache
+            .labels_due(None, None, &rules, &prefix, now, 10)
+            .unwrap(),
+        (vec![], 0)
+    );
+    let id = RemoteId::new("id-1").unwrap();
+    cache.store_label("work", &id, "nm-main", now).unwrap();
 
     // Id 5 was deleted before the migration; it is not handed out again.
     cache.insert_messages(work.id, &[msg(4)]).unwrap();
@@ -390,8 +401,8 @@ fn a_v4_cache_gains_msg_key_and_the_classification_table_without_parsing_its_row
     assert!(cache.pending(None, false).unwrap().is_empty());
     drop(cache);
 
-    assert_eq!(user_version(&Connection::open(&path).unwrap()), 5);
-    assert_eq!(SCHEMA_VERSION, 5);
+    assert_eq!(user_version(&Connection::open(&path).unwrap()), 6);
+    assert_eq!(SCHEMA_VERSION, 6);
     let cache = Cache::open(&path).unwrap();
     assert_eq!(
         cache.classification("work", "one@mail.example").unwrap(),

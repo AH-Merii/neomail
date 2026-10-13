@@ -8,11 +8,15 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use nm_core::LabelPrefix;
 use nm_core::{
     Cache, Cursor, Destination, Flags, Folder, FolderName, IdChange, IdSource, RemoteId, Role,
     sync_inbox_by_id,
 };
-use nm_graph::{GraphError, GraphSource, MAX_JSON, MAX_MIME, Reply, Transport, TransportError};
+use nm_graph::{
+    CategoryEdit, CategoryResult, GraphError, GraphSource, MAX_JSON, MAX_MIME, Reply, Transport,
+    TransportError,
+};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "eyJ0eXAi.not-a-real-token";
@@ -32,6 +36,8 @@ struct Message {
     id: String,
     read: bool,
     received: Option<DateTime<Utc>>,
+    /// Its Outlook categories, as a GET of `categories` answers them.
+    categories: Vec<String>,
 }
 
 /// One request as the fake saw it.
@@ -79,6 +85,7 @@ impl FakeGraph {
                     id: id(n),
                     read: n % 2 == 0,
                     received: Some(at(n)),
+                    categories: Vec::new(),
                 })
                 .collect(),
             page_size: 1000,
@@ -146,6 +153,12 @@ impl FakeGraph {
         json_reply(200, &page)
     }
 
+    fn categories(mut self, n: u32, names: &[&str]) -> Self {
+        let m = self.messages.iter_mut().find(|m| m.id == id(n)).unwrap();
+        m.categories = names.iter().map(|s| (*s).to_owned()).collect();
+        self
+    }
+
     fn script(self, replies: impl IntoIterator<Item = Reply>) -> Self {
         self.script.borrow_mut().extend(replies);
         self
@@ -165,6 +178,16 @@ impl FakeGraph {
             let wanted = decode(segment);
             return match self.messages.iter().find(|m| m.id == wanted) {
                 Some(m) => reply(200, raw(&m.id).into_bytes()),
+                None => json_reply(404, &json!({"error": {"code": "ErrorItemNotFound"}})),
+            };
+        }
+        if let Some(segment) = path.strip_prefix("/me/messages/")
+            && query == "$select=categories"
+        {
+            assert!(!segment.contains('/'), "{url}");
+            let wanted = decode(segment);
+            return match self.messages.iter().find(|m| m.id == wanted) {
+                Some(m) => json_reply(200, &json!({"id": m.id, "categories": m.categories})),
                 None => json_reply(404, &json!({"error": {"code": "ErrorItemNotFound"}})),
             };
         }
@@ -1601,4 +1624,188 @@ async fn a_send_graph_never_answered_may_have_been_sent() {
             "{err}"
         );
     }
+}
+
+fn edit(n: u32, want: &str, last: Option<&str>) -> CategoryEdit {
+    CategoryEdit {
+        id: RemoteId::new(id(n)).unwrap(),
+        want: want.to_owned(),
+        last: last.map(str::to_owned),
+    }
+}
+
+/// Each result as `(n, what)`, in the answer's order.
+fn outcomes(results: &[(RemoteId, CategoryResult)]) -> Vec<(u32, String)> {
+    results
+        .iter()
+        .map(|(rid, r)| {
+            let n = (1..=99).find(|n| id(*n) == rid.as_str()).unwrap();
+            let what = match r {
+                CategoryResult::Set => "set".to_owned(),
+                CategoryResult::Already => "already".to_owned(),
+                CategoryResult::Gone => "gone".to_owned(),
+                CategoryResult::Failed(e) => format!("failed: {e}"),
+            };
+            (n, what)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn set_categories_reads_then_patches_only_a_changed_list_keeping_the_users() {
+    let fake = FakeGraph::new(1..=6)
+        .categories(1, &["Red", "nm-main", "nm-project"])
+        .categories(2, &["nm-spam", "Blue"]);
+    let s = source(fake);
+    let mut edits = vec![
+        edit(1, "nm-spam", Some("nm-main")),
+        edit(2, "nm-spam", Some("nm-spam")),
+    ];
+    edits.extend((3..=6).map(|n| edit(n, "nm-newsletters", None)));
+    let results = s.set_categories(&LabelPrefix::default(), &edits).await;
+    let mut want = vec![(1, "set".to_owned()), (2, "already".to_owned())];
+    want.extend((3..=6).map(|n| (n, "set".to_owned())));
+    assert_eq!(outcomes(&results), want);
+
+    let fake = transport(&s);
+    assert_eq!(fake.max_in_flight.get(), 4);
+    let seen = fake.seen.borrow();
+    // A GET for each, a PATCH for each but message 2.
+    assert_eq!(seen.len(), 6 + 5, "{seen:?}");
+    let message = |n: u32| format!("{API}/me/messages/AAMkAGI2%2FTg%2B{n}%3D");
+    for n in 1..=6 {
+        assert_eq!(
+            seen.iter()
+                .filter(
+                    |r| r.method == "GET" && r.url == format!("{}?$select=categories", message(n))
+                )
+                .count(),
+            1,
+            "{n}"
+        );
+    }
+    let patches: Vec<(&str, &Value)> = seen
+        .iter()
+        .filter(|r| r.method == "PATCH")
+        .map(|r| (r.url.as_str(), r.body.as_ref().unwrap()))
+        .collect();
+    assert!(!patches.iter().any(|(url, _)| *url == message(2)));
+    let body_of = |n: u32| {
+        patches
+            .iter()
+            .find(|(url, _)| *url == message(n))
+            .unwrap()
+            .1
+    };
+    // The user's categories stay in their order, their own nm- name included.
+    assert_eq!(
+        body_of(1),
+        &json!({"categories": ["Red", "nm-project", "nm-spam"]})
+    );
+    assert_eq!(body_of(3), &json!({"categories": ["nm-newsletters"]}));
+    for request in seen.iter() {
+        assert_eq!(request.headers, headers(), "{}", request.url);
+        let max = if request.method == "PATCH" {
+            MAX_MIME
+        } else {
+            MAX_JSON
+        };
+        assert_eq!(request.max_body, max);
+    }
+}
+
+#[tokio::test]
+async fn a_message_graph_no_longer_has_is_gone_and_one_failure_never_stops_the_others() {
+    // The fake has no message 2: its GET answers 404.
+    let s = source(FakeGraph::new([1, 3]));
+    let edits = [1, 2, 3].map(|n| edit(n, "nm-main", None));
+    let results = s.set_categories(&LabelPrefix::default(), &edits).await;
+    assert_eq!(
+        outcomes(&results),
+        [(1, "set".into()), (2, "gone".into()), (3, "set".into())]
+    );
+
+    // A 404 on the PATCH is gone too; a 500 or a malformed answer fails that message only.
+    for (script, says) in [
+        (
+            vec![
+                json_reply(200, &json!({"categories": []})),
+                json_reply(404, &json!({})),
+            ],
+            "gone",
+        ),
+        (
+            vec![reply(500, b"{\"error\":{\"code\":\"x\"}}".to_vec())],
+            "failed: Microsoft Graph answered HTTP 500 (x)",
+        ),
+        (
+            vec![reply(200, b"not json".to_vec())],
+            "failed: Microsoft Graph's answer is not the expected JSON",
+        ),
+        (
+            vec![
+                json_reply(200, &json!({"categories": []})),
+                reply(500, Vec::new()),
+            ],
+            "failed: Microsoft Graph answered HTTP 500",
+        ),
+    ] {
+        let s = source(FakeGraph::new([1]).script(script));
+        let results = s
+            .set_categories(&LabelPrefix::default(), &[edit(1, "nm-main", None)])
+            .await;
+        assert_eq!(outcomes(&results), [(1, says.to_owned())]);
+    }
+}
+
+#[tokio::test]
+async fn a_refused_token_or_grant_stops_the_pass() {
+    for (status, says) in [
+        (401, "failed: access token refused"),
+        (
+            403,
+            "failed: Microsoft Graph refused access to the mailbox (HTTP 403)",
+        ),
+    ] {
+        let s = source(FakeGraph::new(1..=6).script([json_reply(
+            status,
+            &json!({"error": {"code": "ErrorAccessDenied", "message": TOKEN}}),
+        )]));
+        let edits: Vec<CategoryEdit> = (1..=6).map(|n| edit(n, "nm-main", None)).collect();
+        let results = s.set_categories(&LabelPrefix::default(), &edits).await;
+        let found = outcomes(&results);
+        // The first answer refuses; the requests in flight are dropped and none starts.
+        assert_eq!(found.len(), 1, "the pass stopped: {found:?}");
+        assert_eq!(found[0].1, says);
+        let seen = transport(&s).seen.borrow();
+        for n in [5, 6] {
+            assert!(
+                !seen.iter().any(|r| r.url.contains(&format!("Tg%2B{n}%3D"))),
+                "message {n} was never asked about"
+            );
+        }
+        assert!(!format!("{results:?}").contains("not-a-real-token"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn set_categories_retries_throttling() {
+    let s = source(FakeGraph::new([1]).script([
+        throttled(429, Some(3)),
+        json_reply(200, &json!({"categories": ["Red"]})),
+        throttled(503, None),
+    ]));
+    let start = tokio::time::Instant::now();
+    let results = s
+        .set_categories(&LabelPrefix::default(), &[edit(1, "nm-main", None)])
+        .await;
+    assert_eq!(outcomes(&results), [(1, "set".to_owned())]);
+    assert_eq!(start.elapsed(), Duration::from_secs(3 + 1));
+    let seen = transport(&s).seen.borrow();
+    let methods: Vec<&str> = seen.iter().map(|r| r.method).collect();
+    assert_eq!(methods, ["GET", "GET", "PATCH", "PATCH"]);
+    assert_eq!(
+        seen[3].body,
+        Some(json!({"categories": ["Red", "nm-main"]}))
+    );
 }

@@ -127,8 +127,10 @@ That consent also lets `neomail daemon` classify new mail (classify.daemon = fal
 but --yes gives it only when there is no earlier yes for the host: a yes from before the daemon
 classified needs the daemon's question, asked on a terminal even when there is nothing to send. A
 result is stored as soon as it arrives and is never asked for again unless --again: a stopped
-run resumes where it left off. Exit 1 when a message failed or the run stopped. What is sent and
-kept:
+run resumes where it left off. Then each classified Outlook message gets its group as a category
+(classify.label_prefix, nm- by default; classify.labels = false turns it off), up to 1,000 per
+account, keeping your own categories. Exit 1 when a message failed, a category write or an
+account's sign-in for it failed, or the run stopped. What is sent and kept:
 https://github.com/AH-Merii/neomail/blob/main/docs/privacy.md";
 
 const MARK_EXAMPLES: &str = "\

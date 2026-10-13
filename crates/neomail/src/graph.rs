@@ -1,18 +1,22 @@
 //! Microsoft Graph wiring: `nm_graph`'s [`Transport`] over neomail's [`Https`], the read-only
 //! check `account add outlook` runs before anything is saved, the sync of a Graph account, and
 //! the writes: marking its messages read or unread, and moving them to the archive, the trash or
-//! a folder the user names; the listing of its folders; and sending mail with sendMail.
+//! a folder the user names, and setting each classified message's group as a category; the
+//! listing of its folders; and sending mail with sendMail.
 
 use std::io;
 use std::num::NonZeroU32;
 
 use anyhow::{Result, anyhow};
+use nm_core::LabelPrefix;
 use nm_core::compose::Outgoing;
 use nm_core::{
     Cache, Destination, ListedFolder, Moved, RemoteId, SyncError, SyncReport, Written,
     sync_inbox_by_id_with_progress,
 };
-use nm_graph::{GraphError, GraphSource, Reply, Transport, TransportError};
+use nm_graph::{
+    CategoryEdit, CategoryResult, GraphError, GraphSource, Reply, Transport, TransportError,
+};
 
 use crate::http::Https;
 use crate::oauth::Secret;
@@ -159,6 +163,24 @@ pub async fn move_to(
         .move_to(ids, to)
         .await
         .map_err(|e| explain_write(e, account))
+}
+
+/// Sets each message's group as an Outlook category ([`GraphSource::set_categories`]). The
+/// grant is the caller's to check first ([`may_write_categories`]): a Mail.Read sign-in sends
+/// nothing, and is a warning there rather than a failure.
+pub async fn set_categories(
+    token: &AccessToken,
+    prefix: &LabelPrefix,
+    edits: &[CategoryEdit],
+) -> Result<Vec<(RemoteId, CategoryResult)>> {
+    Ok(GraphSource::new(Https::new()?, token.expose())
+        .set_categories(prefix, edits)
+        .await)
+}
+
+/// Whether `token`'s sign-in lets neomail write categories: Mail.ReadWrite, as every write.
+pub fn may_write_categories(token: &AccessToken) -> bool {
+    token.grant.can_write()
 }
 
 /// The folders of a Graph account, read-only: any mail grant can list them.

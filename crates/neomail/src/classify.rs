@@ -5,6 +5,7 @@
 //! the same requests through [`send`], under the consent `neomail classify` stored ([`daemon`]).
 
 pub(crate) mod daemon;
+pub(crate) mod labels;
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
@@ -843,7 +844,11 @@ pub fn run(
             per.map_or(String::new(), |p| format!(" (tokens from {})", p.basis())),
         );
     }
-    let failed = outcome.failed > 0 || outcome.stopped.is_some();
+    // Groups as Outlook categories: this run's results and whatever is still due from before.
+    let ids: Vec<MessageId> = ids.into_iter().map(MessageId::new).collect();
+    let account = args.account.as_deref();
+    let labels_failed = labels::cli_pass(&mut cache, loaded.as_ref(), account, &ids, colors)?;
+    let failed = outcome.failed > 0 || outcome.stopped.is_some() || labels_failed;
     finish_failures(&plan.failures, colors, failed)
 }
 

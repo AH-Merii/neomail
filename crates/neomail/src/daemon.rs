@@ -10,7 +10,8 @@
 //!
 //! After a round, each account that got new mail in it gets one desktop notification
 //! ([`notify_round`], through [`crate::notify`]). Then the new mail is classified
-//! ([`crate::classify::daemon`]), so a notification never waits for the classifier.
+//! ([`crate::classify::daemon`]), so a notification never waits for the classifier, and each
+//! Outlook message's group is written as a category ([`crate::classify::labels`]).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -27,7 +28,7 @@ use nm_core::{Cache, MessageId, SyncReport};
 use tokio::runtime::Runtime;
 use tokio::time::Instant;
 
-use crate::classify::{self, daemon::Classifier};
+use crate::classify::{self, daemon::Classifier, labels};
 use crate::config::{self, Account, Config};
 use crate::notify::{self, NewMail, Notification, Notifier};
 use crate::push::{self, Push, WatchLogin};
@@ -765,6 +766,8 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
         data_dir: data_dir.clone(),
     };
     let mut classifier = Classifier::new(&config.classify, &mut access);
+    let mut label_writer = labels::GraphWriter::skipping(&runtime, &data_dir);
+    let mut label_reports = labels::Reports::default();
     let count = config.accounts.len();
     eprintln!(
         "neomail daemon: syncing {count} account{} every {interval}, {}, {}; Ctrl-C stops",
@@ -852,9 +855,22 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
                     budget: classify::daemon::budget(interval.duration()),
                     now: chrono::Utc::now(),
                 };
-                // Outside `block_on` too: the key is read from the keyring.
+                // Outside `block_on` too: the key is read from the keyring. Then the groups go to
+                // Outlook as categories, on every wake that synced: what is due changes with age
+                // too, and a failure there is only lines. The writes get a budget of their own,
+                // as classifying does, so a throttled Graph cannot hold up the next round.
                 let classify = |new_mail: &[NewMail], cache: &mut Cache| {
-                    classifier.wake(new_mail, &wake, cache, &mut access)
+                    let mut lines = classifier.wake(new_mail, &wake, cache, &mut access);
+                    let accounts: Vec<&Account> = config.accounts.iter().collect();
+                    let pass = labels::Pass::wake(&config.classify, &halt, wake.budget, wake.now);
+                    lines.extend(labels::daemon_wake(
+                        cache,
+                        &accounts,
+                        &pass,
+                        &mut label_writer,
+                        &mut label_reports,
+                    ));
+                    lines
                 };
                 after_sync(
                     synced,
