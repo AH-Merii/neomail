@@ -96,7 +96,9 @@ Examples:
                                     Every cached message of one account
   neomail list --group follow-up    The mail that needs a reply, once `neomail classify` ran
   neomail list --group unclassified --plain | cut -f1 | neomail classify -
-                                    Classify the listed messages that have no group yet
+                                    Classify the listed messages that have no group yet; as
+                                    standard input holds the ids, nothing can be asked: the
+                                    backend's consent must be given once on a terminal first
 
 Groups: main, follow-up, follow-up-old, recruitment, receipts-invoices, orders-shipping,
 newsletters, promotions, notifications, spam, other. A follow-up older than
@@ -113,12 +115,13 @@ Examples:
   neomail classify --again 42       Ask again for a message that already has a group
   neomail classify --yes --json     In a script: consent given, results as JSON
 
-Each message costs one request to classify.url (https://api.typesafe.ai by default), with its
-redacted subject and body excerpt, the sender's domain and four signals: exactly what
-`neomail redact ID` shows. Before the first request to a host, neomail says what will be sent
-and asks once; --yes consents for a script. A result is stored as soon as it arrives and is
-never asked for again unless --again: a stopped run resumes where it left off. Exit 1 when a
-message failed or the run stopped. What is sent and kept:
+Each message costs one request to classify.url (https://api.typesafe.ai by default), tried again
+up to twice on a rate limit or a server error, with its redacted subject and body excerpt, the
+sender's domain and four signals: exactly what `neomail redact ID` shows. Before the first
+request to a host, neomail says what will be sent and asks once; --yes consents for a script. A
+result is stored as soon as it arrives and is never asked for again unless --again: a stopped
+run resumes where it left off. Exit 1 when a message failed or the run stopped. What is sent and
+kept:
 https://github.com/AH-Merii/neomail/blob/main/docs/privacy.md";
 
 const MARK_EXAMPLES: &str = "\

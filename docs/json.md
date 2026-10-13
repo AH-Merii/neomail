@@ -359,9 +359,12 @@ array at the end, `--jsonl` one object per line as each answer arrives.
 On a terminal each result is one line, `ID ACCOUNT GROUP CONFIDENCE SUBJECT`, with progress on
 standard error; `--plain` (the default off a terminal) prints `ID`, `ACCOUNT`, `GROUP` and
 `CONFIDENCE` (two decimals) as TSV. A failed message is a line on standard error there. After a
-run, standard error says how many were classified and, without `--all`, what was left outside the
-window or the cap: messages, requests and estimated input tokens, the cost for api.typesafe.ai,
-and how the tokens were estimated.
+run, standard error says how many were classified and, without `--all`, how many messages were
+left outside the window or the cap, and what `neomail classify --all` would then send: every
+message without a group, those of the run that failed or were never asked included (with
+`--again`, `neomail classify --all --again`, which asks about every message again). It gives that
+command's messages, requests (before any retry) and estimated input tokens, the cost for
+api.typesafe.ai, and how the tokens were estimated.
 
 `--estimate` sends nothing. With `--json` it prints one object:
 
@@ -375,7 +378,9 @@ and how the tokens were estimated.
 
 `tokens_from` is `measured` (the average `input_tokens` of stored results) or `characters` (the
 requests' characters divided by 4), `null` when there is nothing to estimate. `cost_usd` is `null`
-for a backend other than api.typesafe.ai.
+for a backend other than api.typesafe.ai. `left` is what is outside the window or the cap; the
+terminal and plain forms add what `neomail classify --all` (or `--all --again`) would send
+instead of this run, both parts together.
 
 ## `neomail key set|delete|status`
 
@@ -390,8 +395,8 @@ the key, and exits 1 with `HOST: no jev key: ...` when there is none.
 | 0 | Success. `list` with nothing cached also succeeds, printing `[]` with `--json`. |
 | 0 | Also when the reader of standard output goes away early (`neomail list \| head -1`, quitting the pager): neomail stops quietly. |
 | 0 | `daemon` stopped by SIGINT or SIGTERM. A failing account does not stop it. |
-| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others; `redact` the same, after printing the others. `mark` exits 1 if any id was unknown, gone from the server, not confirmed or of an account that failed, after marking the others. `archive` and `delete` exit 1 the same way, after moving the others; an account without an archive or trash folder is an account that failed. `move` exits 1 the same way; an account without the folder named is an account that failed. `folder list` exits 1 if any account failed, after listing the others. A second `daemon` for the same data directory exits 1. `classify` exits 1 when any message failed or an id was unknown, when the run stopped (a refused key, a status it cannot retry, the backend out of reach; the results received are kept), without a key, or when consent was refused at the prompt; it exits 0 when everything asked was classified or there was nothing to do. `key status` exits 1 when there is no key. |
-| 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s, `redact -`'s, `classify -`'s, `mark -`'s, `archive -`'s, `delete -`'s or `move -`'s input without an id; `-` mixed with ids (`show`, `redact`, `classify`, `mark`, `archive`, `delete`, `move`); `move` without a folder or without ids; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help; `daemon` without a config file or accounts (the start lines) or with an invalid config; `classify` that would send to a backend it has no consent for, without a terminal or with `--no-input`, and without `--yes`; `list --group` with an unknown group; `classify` ids with `--account`, `--days`, `--limit` or `--all`; `key set --no-input` with nothing on standard input. |
+| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others; `redact` the same, after printing the others. `mark` exits 1 if any id was unknown, gone from the server, not confirmed or of an account that failed, after marking the others. `archive` and `delete` exit 1 the same way, after moving the others; an account without an archive or trash folder is an account that failed. `move` exits 1 the same way; an account without the folder named is an account that failed. `folder list` exits 1 if any account failed, after listing the others. A second `daemon` for the same data directory exits 1. `classify` exits 1 when any message failed or an id was unknown, when the run stopped (a refused key, a status it cannot retry, the backend out of reach; the results received are kept), without a key, or when consent was refused at the prompt; it exits 0 when everything asked was classified or there was nothing to do. `key status` exits 1 when there is no key; `key set` exits 1 when the key read is empty or blank, and stores nothing. |
+| 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s, `redact -`'s, `classify -`'s, `mark -`'s, `archive -`'s, `delete -`'s or `move -`'s input without an id; `-` mixed with ids (`show`, `redact`, `classify`, `mark`, `archive`, `delete`, `move`); `move` without a folder or without ids; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help; `daemon` without a config file or accounts (the start lines) or with an invalid config; `classify` that would send to a backend it has no consent for, without a terminal or with `--no-input`, and without `--yes`; `list --group` with an unknown group; `classify` ids with `--account`, `--days`, `--limit` or `--all`; `key set --no-input` with nothing on standard input; `key` with a `--backend` that is not a usable URL. |
 
 Errors go to standard error, in these forms:
 

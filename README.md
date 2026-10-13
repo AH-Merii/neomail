@@ -253,7 +253,9 @@ neomail move Receipts 44     # move to the folder Receipts on the server, then d
   newest first and at most 1,000 (`--days N`, `--limit N`; `--all` takes every one), to jev and
   stores its group. Before the first request to a backend it says what is sent and asks once;
   `--yes` consents in a script. It prints each result as it arrives, then what was left out and
-  what classifying it would cost (TypeSafe charges $0.042 per million input tokens).
+  what the `neomail classify --all` it suggests would send and cost: every message still without
+  a group, or with `--again` every message again (TypeSafe charges $0.042 per million input
+  tokens).
   `--estimate` prints that and sends nothing. A message is never asked about twice, even after a
   mailbox rebuild (a UIDVALIDITY change), unless `--again`; deleting `cache.sqlite3` deletes the
   stored results too. `neomail classify 42 57` classifies those messages.

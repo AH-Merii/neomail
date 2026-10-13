@@ -121,11 +121,19 @@ pub fn key(
     let (KeyCommand::Set { backend }
     | KeyCommand::Delete { backend }
     | KeyCommand::Status { backend }) = command;
-    let url = match backend {
-        Some(url) => url.trim().trim_end_matches('/').to_owned(),
-        None => settings(config)?.url,
+    let (url, host) = match backend {
+        Some(url) => {
+            let url = url.trim().trim_end_matches('/').to_owned();
+            // A value given on the command line that cannot be used is bad usage, as for clap's.
+            let host = http::url_host(&url).map_err(|e| usage(format!("--backend: {e:#}")))?;
+            (url, host)
+        }
+        None => {
+            let settings = settings(config)?;
+            let host = settings.host().context("classify.url")?;
+            (settings.url, host)
+        }
     };
-    let host = http::url_host(&url).context("--backend")?;
     match command {
         KeyCommand::Set { .. } => {
             // Before the key is typed: no one should type it only to learn it cannot be stored.
@@ -138,7 +146,12 @@ pub fn key(
                 }
                 key => key?,
             };
-            store.set_jev_key(&host, &Secret::new(key.trim().to_owned()))?;
+            // As an empty line is (secret.rs): a blank entry would shadow JEV_API_KEY.
+            let key = key.trim();
+            if key.is_empty() {
+                bail!("the key is empty; nothing was stored");
+            }
+            store.set_jev_key(&host, &Secret::new(key.to_owned()))?;
             writeln!(
                 out,
                 "Stored the jev key for {host} in {} (service {:?}, entry {host:?}).",
@@ -223,7 +236,8 @@ fn consent_text(host: &str, messages: usize) -> String {
         format!("{host} keeps what it receives as its own terms say.")
     };
     format!(
-        "neomail classify sends one request per message to {host}, {messages} now. Each holds:\n\
+        "neomail classify sends one request per message to {host}, {messages} now, tried again\n\
+         up to twice on a rate limit or a server error. Each holds:\n\
          \x20 - the subject and the body's first 1500 characters, with the part of each email\n\
          \x20   address before the @, links (their host stays), phone, card and IBAN numbers,\n\
          \x20   amounts, one-time codes, runs of 4 or more digits and the names in the headers\n\
@@ -232,7 +246,8 @@ fn consent_text(host: &str, messages: usize) -> String {
          \x20 - the sender's domain (a personal domain identifies its owner);\n\
          \x20 - whether the sender is a role address (orders@, noreply@ ...), and whether the mail\n\
          \x20   came through a mailing list, was automated, or is a reply.\n\
-         Never the sender's name or the part of the address before the @.\n\
+         Never the display names from the headers or the part of the sender's address before\n\
+         the @; a name in the body that is in no header is sent as written.\n\
          {keeps}\n\
          `neomail redact ID` shows exactly what is sent for a message.\n"
     )
@@ -466,8 +481,25 @@ fn estimate(messages: usize, per: Option<PerRequest>, priced: bool) -> Estimate 
     }
 }
 
+/// What following [`take_all_command`] would send, `messages` requests' worth: it is quoted
+/// whole, never only the part this run left out.
+fn take_all(args: &Args, messages: usize, per: Option<PerRequest>, priced: bool) -> String {
+    let what = if args.again {
+        "ask about every message again"
+    } else {
+        "send every message without a group"
+    };
+    format!(
+        "`{}` would {what}: {}",
+        take_all_command(args),
+        describe(&estimate(messages, per, priced))
+    )
+}
+
 /// The command that takes what this run left out: the same selection without the window
-/// or the cap, so following it never widens the run to other accounts.
+/// or the cap, so following it never widens the run to other accounts. It sends every message
+/// of the selection that has no result yet, those this run failed or never asked included;
+/// with `--again`, every message of the selection again.
 fn take_all_command(args: &Args) -> String {
     let mut command = String::from("neomail classify --all");
     if let Some(account) = args.account.as_deref() {
@@ -559,21 +591,13 @@ pub fn run(
     let priced = host == TYPESAFE_HOST;
     let todo = estimate(plan.jobs.len(), per, priced);
     let left = estimate(plan.left.len(), per, priced);
-    let left_line = (!plan.left.is_empty()).then(|| {
-        format!(
-            "left outside the {}-day window or the {}-message cap: {}{}; run \
-             `{}` to classify them",
-            args.days,
-            thousands(u64::from(args.limit)),
-            describe(&left),
-            per.map_or(String::new(), |p| format!(" (tokens from {})", p.basis())),
-            take_all_command(args),
-        )
-    });
     if args.estimate {
-        write_estimate(out, mode, &todo, &left, per, &take_all_command(args))?;
+        // Nothing is sent, so the command would send this run's messages too.
+        let take = take_all(args, todo.messages + left.messages, per, priced);
+        write_estimate(out, mode, &todo, &left, per, &take)?;
         return finish_failures(&plan.failures, colors, false);
     }
+    let asked = plan.jobs.len();
     let mut printer = Printer::new(mode, out, colors);
     for known in &plan.known {
         printer.result(
@@ -602,7 +626,15 @@ pub fn run(
             eprintln!("neomail: nothing was sent");
             return Ok(ExitCode::from(EXIT_FAILURE));
         }
-        outcome = send(&settings, &key, plan.jobs, &mut cache, &mut printer, now)?;
+        outcome = match send(&settings, &key, plan.jobs, &mut cache, &mut printer, now) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // --json still prints the results that were stored. After a failed print this
+                // fails too, and the first error is the one to report (a closed pipe is quiet).
+                let _ = printer.finish();
+                return Err(e);
+            }
+        };
     } else if plan.known.is_empty() && plan.failures.is_empty() {
         eprintln!("neomail: nothing to classify");
     }
@@ -626,8 +658,31 @@ pub fn run(
             if outcome.classified == 1 { "" } else { "s" }
         );
     }
-    if let Some(line) = &left_line {
-        eprintln!("neomail: {line}");
+    if !plan.left.is_empty() {
+        // This run's messages that have no result yet: they failed, or the run stopped first.
+        let unfinished = asked - outcome.classified;
+        let (sends, also) = match (args.again, unfinished) {
+            // --again asks about every message again, this run's included.
+            (true, _) => (asked + plan.left.len(), String::new()),
+            (false, 0) => (plan.left.len(), String::new()),
+            (false, n) => (
+                plan.left.len() + n,
+                format!(
+                    ", and {n} that failed or {} not asked",
+                    if n == 1 { "was" } else { "were" }
+                ),
+            ),
+        };
+        eprintln!(
+            "neomail: left outside the {}-day window or the {}-message cap: {} message{}{also}; \
+             {}{}",
+            args.days,
+            thousands(u64::from(args.limit)),
+            thousands(plan.left.len() as u64),
+            if plan.left.len() == 1 { "" } else { "s" },
+            take_all(args, sends, per, priced),
+            per.map_or(String::new(), |p| format!(" (tokens from {})", p.basis())),
+        );
     }
     let failed = outcome.failed > 0 || outcome.stopped.is_some();
     finish_failures(&plan.failures, colors, failed)
@@ -699,9 +754,10 @@ fn write_estimate(
             if left.messages > 0 {
                 writeln!(
                     out,
-                    "left outside the window or the cap (`{take_all}` takes them): {}",
+                    "left outside the window or the cap: {}",
                     describe(left)
                 )?;
+                writeln!(out, "{take_all}")?;
             }
             if let Some(p) = per {
                 writeln!(out, "tokens from: {}", p.basis())?;
@@ -952,8 +1008,14 @@ fn send(
         }
         drop(tx);
         let mut outcome = Outcome::default();
+        // The first error storing or printing a result. It stops the run, but the answers
+        // already on their way are still stored: each cost a request.
+        let mut error: Option<anyhow::Error> = None;
+        let stop = &shared.stop;
         printer.progress(0, total);
         while let Some(event) = rx.recv().await {
+            // Once printing failed (a closed pipe), nothing more is printed.
+            let print = error.is_none();
             match event {
                 Event::Answered(i, answer) => {
                     let job = &jobs[i];
@@ -966,36 +1028,62 @@ fn send(
                         input_tokens: answer.input_tokens,
                         classified_at: Utc::now(),
                     };
-                    cache.store_classification(&job.account, &job.msg_key, &result)?;
+                    let stored = cache.store_classification(&job.account, &job.msg_key, &result);
+                    if let Err(e) = stored {
+                        keep(&mut error, stop, Err(e.into()));
+                        continue;
+                    }
                     outcome.classified += 1;
-                    printer.result(
-                        job.id,
-                        &job.account,
-                        &job.subject,
-                        job.received,
-                        &result,
-                        &settings.rules,
-                        now,
-                    )?;
+                    if print {
+                        let printed = printer.result(
+                            job.id,
+                            &job.account,
+                            &job.subject,
+                            job.received,
+                            &result,
+                            &settings.rules,
+                            now,
+                        );
+                        keep(&mut error, stop, printed);
+                    }
                 }
                 Event::Failed(i, why) => {
                     outcome.failed += 1;
-                    printer.failed(jobs[i].id, &jobs[i].account, &why)?;
+                    if print {
+                        let printed = printer.failed(jobs[i].id, &jobs[i].account, &why);
+                        keep(&mut error, stop, printed);
+                    }
                 }
                 Event::Stop(why) => {
                     outcome.stopped.get_or_insert(why);
                 }
                 Event::GaveUp(i, why) => {
                     outcome.failed += 1;
-                    printer.failed(jobs[i].id, &jobs[i].account, &why)?;
+                    if print {
+                        let printed = printer.failed(jobs[i].id, &jobs[i].account, &why);
+                        keep(&mut error, stop, printed);
+                    }
                     outcome.stopped.get_or_insert(why);
                 }
                 Event::Stopped => {}
             }
-            printer.progress(outcome.classified + outcome.failed, total);
+            if error.is_none() {
+                printer.progress(outcome.classified + outcome.failed, total);
+            }
         }
-        Ok(outcome)
+        match error {
+            Some(e) => Err(e),
+            None => Ok(outcome),
+        }
     })
+}
+
+/// Keeps the first error storing or printing a result, and stops the run on it.
+fn keep(error: &mut Option<anyhow::Error>, stop: &AtomicBool, done: Result<()>) {
+    if let Err(e) = done {
+        stop.store(true, Ordering::Relaxed);
+        error.get_or_insert(e);
+    }
 }
 
 /// Takes requests off the queue until it is empty or the run stops.
@@ -1163,8 +1251,10 @@ mod tests {
             .to_lowercase();
         for part in [
             "to api.typesafe.ai, 12 now",
+            "tried again up to twice on a rate limit or a server error",
             "the sender's domain",
-            "never the sender's name",
+            "never the display names from the headers or the part of the sender's address before \
+             the @; a name in the body that is in no header is sent as written",
             "the part of each email address before the @",
             "links (their host stays)",
             "phone, card and IBAN numbers, amounts, one-time codes, runs of 4 or more digits",
@@ -1175,6 +1265,8 @@ mod tests {
         ] {
             assert!(flat.contains(&part.to_lowercase()), "{part}: {text}");
         }
+        // A name in the body that no header holds is sent.
+        assert!(!flat.contains("never the sender's name"), "{text}");
         assert!(!consent_text("127.0.0.1", 1).contains(TYPESAFE_TERMS));
     }
 }

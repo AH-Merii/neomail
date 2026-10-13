@@ -48,10 +48,10 @@ impl KeySource {
     }
 }
 
-/// The classifier key for `host`: the keyring's entry, else `env` (the value of [`JEV_ENV`],
-/// empty counting as unset). A keyring that failed to open (`None`) or fails to answer counts as
-/// having no key, so `JEV_API_KEY` still works where there is no Secret Service. `None` when
-/// neither has one.
+/// The classifier key for `host`: the keyring's entry, else `env` (the value of [`JEV_ENV`]),
+/// a blank value counting as unset in either. A keyring that failed to open (`None`) or fails to
+/// answer counts as having no key, so `JEV_API_KEY` still works where there is no Secret Service.
+/// `None` when neither has one.
 pub fn jev_key(
     keyring: Option<&Keyring>,
     host: &str,
@@ -59,6 +59,7 @@ pub fn jev_key(
 ) -> Option<(Secret, KeySource)> {
     keyring
         .and_then(|k| k.get_jev_key(host).ok().flatten())
+        .filter(|key| !key.expose().trim().is_empty())
         .map(|key| (key, KeySource::Keyring))
         .or_else(|| {
             env.filter(|v| !v.trim().is_empty())
@@ -587,5 +588,21 @@ mod tests {
             message,
             "the OS keyring is unavailable (no bus); set JEV_API_KEY instead"
         );
+    }
+
+    #[test]
+    fn a_blank_keyring_entry_counts_as_unset_and_never_shadows_the_environment() {
+        let host = "api.typesafe.ai";
+        for blank in ["", " ", "\t\n"] {
+            let (k, _) = mock_keyring(false);
+            k.set_jev_key(host, &Secret::new(blank.into())).unwrap();
+            let found = jev_key(Some(&k), host, Some("env-key".into()));
+            assert_eq!(
+                found.map(|(key, s)| (key.expose().to_owned(), s)),
+                Some(("env-key".into(), KeySource::Env)),
+                "{blank:?}"
+            );
+            assert!(jev_key(Some(&k), host, None).is_none(), "{blank:?}");
+        }
     }
 }

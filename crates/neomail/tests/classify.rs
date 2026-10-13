@@ -705,7 +705,7 @@ fn the_window_and_the_cap_choose_the_newest_and_the_rest_is_estimated() {
     assert!(err.contains("2 messages, 2 requests"), "{err}");
     assert!(err.contains("characters divided by 4"), "{err}");
     assert!(
-        err.contains("run `neomail classify --all` to classify them"),
+        err.contains("`neomail classify --all` would send every message without a group"),
         "{err}"
     );
 
@@ -716,7 +716,7 @@ fn the_window_and_the_cap_choose_the_newest_and_the_rest_is_estimated() {
     let o = neomail(dir.path(), &["classify", "--all"]);
     assert!(o.status.success(), "{}", stderr(&o));
     assert_eq!(jev.count(), 4);
-    assert!(!stderr(&o).contains("--all` to classify"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("`neomail classify"), "{}", stderr(&o));
 }
 
 #[test]
@@ -821,7 +821,7 @@ fn the_hint_for_what_was_left_keeps_the_account_and_again() {
     );
     assert!(o.status.success(), "{}", stderr(&o));
     assert!(
-        stdout(&o).contains("`neomail classify --all --account work` takes them"),
+        stdout(&o).contains("`neomail classify --all --account work` would send"),
         "{}",
         stdout(&o)
     );
@@ -831,7 +831,7 @@ fn the_hint_for_what_was_left_keeps_the_account_and_again() {
     );
     assert!(o.status.success(), "{}", stderr(&o));
     assert!(
-        stderr(&o).contains("run `neomail classify --all --account work` to classify them"),
+        stderr(&o).contains("`neomail classify --all --account work` would send"),
         "{}",
         stderr(&o)
     );
@@ -848,10 +848,127 @@ fn the_hint_for_what_was_left_keeps_the_account_and_again() {
         ],
     );
     assert!(
-        stdout(&o).contains("`neomail classify --all --account work --again` takes them"),
+        stdout(&o).contains(
+            "`neomail classify --all --account work --again` would ask about every message again"
+        ),
         "{}",
         stdout(&o)
     );
+}
+
+/// The `neomail classify --all ...` command a hint names, as arguments after `neomail`, and the
+/// requests the hint says it sends: the first count after the command.
+fn hint(text: &str) -> (Vec<String>, usize) {
+    let start = 1 + text
+        .find("`neomail classify --all")
+        .unwrap_or_else(|| panic!("no command in: {text}"));
+    let end = start + text[start..].find('`').unwrap();
+    let command = text[start..end].split_whitespace().skip(1);
+    let words: Vec<&str> = text[end..].split_whitespace().collect();
+    let count = words
+        .windows(2)
+        .find(|w| w[1].starts_with("request"))
+        .unwrap_or_else(|| panic!("no count in: {text}"))[0];
+    (
+        command.map(str::to_owned).collect(),
+        count.replace(',', "").parse().unwrap(),
+    )
+}
+
+/// A run whose hint is followed.
+struct HintCase {
+    case: &'static str,
+    messages: Vec<FetchedMessage>,
+    /// Every message is classified once before the run.
+    classified: bool,
+    /// The fake's replies for the run.
+    replies: Vec<Reply>,
+    args: &'static [&'static str],
+    /// The count the hint must quote, where it does not depend on timing.
+    expected: Option<usize>,
+}
+
+#[test]
+fn the_command_a_hint_names_sends_as_many_requests_as_the_hint_says() {
+    let cases = [
+        HintCase {
+            case: "--again",
+            messages: three(),
+            classified: true,
+            replies: vec![],
+            args: &["classify", "--again", "--limit", "1"],
+            expected: Some(3),
+        },
+        HintCase {
+            case: "--estimate --again",
+            messages: three(),
+            classified: true,
+            replies: vec![],
+            args: &["classify", "--estimate", "--again", "--limit", "1"],
+            expected: Some(3),
+        },
+        HintCase {
+            case: "--estimate",
+            messages: three(),
+            classified: false,
+            replies: vec![],
+            args: &["classify", "--estimate", "--limit", "1"],
+            expected: Some(3),
+        },
+        HintCase {
+            case: "a 422",
+            messages: three(),
+            classified: false,
+            replies: vec![Reply::status(422, r#"{"detail":"bad"}"#)],
+            args: &["classify", "--limit", "2"],
+            expected: Some(2),
+        },
+        HintCase {
+            case: "a stopped run",
+            messages: many(12),
+            classified: false,
+            replies: vec![Reply::status(402, "out of credit")],
+            args: &["classify", "--limit", "8"],
+            expected: None,
+        },
+    ];
+    for HintCase {
+        case,
+        messages,
+        classified,
+        replies,
+        args,
+        expected,
+    } in cases
+    {
+        let jev = FakeJev::start();
+        let dir = data(&jev, &messages);
+        if classified {
+            let o = neomail(dir.path(), &["classify", "--yes"]);
+            assert!(o.status.success(), "{case}: {}", stderr(&o));
+        }
+        jev.play(replies);
+        let o = neomail(dir.path(), &[args, &["--yes"]].concat());
+        let text = if args.contains(&"--estimate") {
+            stdout(&o)
+        } else {
+            stderr(&o)
+        };
+        let (command, quoted) = hint(&text);
+        if let Some(expected) = expected {
+            assert_eq!(quoted, expected, "{case}: {text}");
+        }
+        let before = jev.count();
+        let command: Vec<&str> = command.iter().map(String::as_str).collect();
+        // --yes only consents: it changes nothing that is sent.
+        let o = neomail(dir.path(), &[&command[..], &["--yes"]].concat());
+        assert!(o.status.success(), "{case}: {command:?}: {}", stderr(&o));
+        assert_eq!(
+            jev.count() - before,
+            quoted,
+            "{case}: {command:?} after: {text}"
+        );
+    }
 }
 
 #[test]
@@ -1063,4 +1180,96 @@ fn without_a_key_nothing_is_sent() {
         stderr(&o)
     );
     assert_eq!(jev.count(), 0);
+}
+
+/// `neomail ARGS` with the debug build's file keyring in `dir`, `input` on standard input, and no
+/// JEV_API_KEY.
+fn with_keyring(dir: &Path, args: &[&str], input: &str) -> Output {
+    let mut child = command(dir, args)
+        .env("NEOMAIL_TEST_KEYRING", dir.join("test-keyring.json"))
+        .env_remove("JEV_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(input.as_bytes());
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn a_blank_key_is_refused_and_jev_api_key_still_counts() {
+    let jev = FakeJev::start();
+    let dir = data(&jev, &three()[..1]);
+    for blank in ["   \n", "\t\n", " "] {
+        let o = with_keyring(dir.path(), &["key", "set"], blank);
+        assert_eq!(o.status.code(), Some(1), "{blank:?}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("the key is empty; nothing was stored"),
+            "{blank:?}: {}",
+            stderr(&o)
+        );
+        assert!(!stdout(&o).contains("Stored"), "{blank:?}: {}", stdout(&o));
+    }
+    let o = with_keyring(dir.path(), &["key", "status"], "");
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    // With nothing stored, JEV_API_KEY's key is the one sent.
+    let o = command(dir.path(), &["classify", "--yes"])
+        .env("NEOMAIL_TEST_KEYRING", dir.path().join("test-keyring.json"))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    let captured = jev.captured.lock().unwrap();
+    assert_eq!(
+        captured[0].authorization.as_deref(),
+        Some(format!("Bearer {KEY}").as_str())
+    );
+}
+
+#[test]
+fn an_invalid_backend_is_bad_usage_for_every_key_command() {
+    let jev = FakeJev::start();
+    let dir = data(&jev, &three()[..1]);
+    for command in ["set", "delete", "status"] {
+        for backend in ["ftp://jev.example", "http://jev.example", "not a url"] {
+            let o = with_keyring(dir.path(), &["key", command, "--backend", backend], "k\n");
+            assert_eq!(
+                o.status.code(),
+                Some(2),
+                "{command} {backend}: {}",
+                stderr(&o)
+            );
+            assert!(
+                stderr(&o).contains("--backend"),
+                "{command} {backend}: {}",
+                stderr(&o)
+            );
+            assert!(!stdout(&o).contains("Stored"), "{command} {backend}");
+        }
+    }
+}
+
+#[test]
+fn a_closed_output_ends_quietly_and_every_answer_that_arrived_is_stored() {
+    let jev = FakeJev::start();
+    let dir = data(&jev, &many(12));
+    let mut child = command(dir.path(), &["classify", "--yes", "--plain"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The reader is gone before the first result (`neomail classify --plain | head -0`), so
+    // printing it fails with EPIPE while other answers are still on their way.
+    drop(child.stdout.take());
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stderr(&o), "");
+    let sent = jev.count();
+    assert_eq!(
+        groups(dir.path(), &["--group", "unclassified"]).len(),
+        12 - sent,
+        "{sent} requests answered"
+    );
 }

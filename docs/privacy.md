@@ -19,8 +19,8 @@ Without a yes, nothing is sent. `neomail classify --estimate` never sends anythi
 ## What will be sent
 
 For each message, `neomail classify` sends one request to the classifier's host
-(`classify.url`, `api.typesafe.ai` by default), with your key as a Bearer token, holding only
-this:
+(`classify.url`, `api.typesafe.ai` by default), tried again up to twice on a rate limit or a
+server error, with your key as a Bearer token, holding only this:
 
 - **The subject**, redacted, whole.
 - **The start of the body**: the body as `neomail show` renders it (the plain-text part, else the
@@ -42,8 +42,9 @@ this:
   (List-Unsubscribe or List-Id); whether it is automated (Auto-Submitted other than `no`, or
   Precedence bulk, list or junk); and whether it is a reply (In-Reply-To).
 
-The part of the sender's address before the `@`, every display name, the other headers,
-attachments and the rest of the body are never sent. One type in nm-redact, `Outgoing`, holds
+The part of the sender's address before the `@`, the display names from the headers, the other
+headers, attachments and the rest of the body are never sent. A name in the subject or body that
+is in no header is sent as written (see What is masked). One type in nm-redact, `Outgoing`, holds
 exactly the list above, and the request is built from it alone
 ([architecture](architecture.md)).
 
