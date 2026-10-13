@@ -6,9 +6,11 @@
 //! Tokens and the client secret are [`Secret`]s, whose `Debug` is redacted; errors never quote
 //! them, nor a token endpoint's response body.
 
+pub mod check;
 pub mod device;
 pub mod loopback;
 mod provider;
+pub mod steps;
 #[cfg(test)]
 mod tests;
 
@@ -22,11 +24,74 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use self::loopback::Listener;
-pub use self::provider::{ClientKind, GOOGLE, MICROSOFT, MailApi, PROVIDERS, Provider, provider};
+pub use self::provider::{
+    ClientKind, GOOGLE, HINT_7000218, MICROSOFT, MailApi, PROVIDERS, Provider, provider,
+};
 use crate::http::Http;
 
 /// How long the browser has to come back to the loopback listener.
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// A sign-in that ended before any token request, with what the provider said, so `account add`
+/// can name the setup step to change.
+#[derive(Debug)]
+pub enum SignInError {
+    /// Nothing came back in time; the message says how long neomail waited. A provider shows
+    /// some errors on its own page and never sends them back (RFC 6749 section 4.1.2.1).
+    TimedOut(String),
+    /// The user, or a policy, declined: `access_denied` on the redirect, or a declined device
+    /// code. `description` is the provider's, when it sent one.
+    Declined {
+        message: &'static str,
+        description: Option<String>,
+    },
+    /// The redirect carried another error code (RFC 6749 section 4.1.2.1).
+    Redirected {
+        error: String,
+        description: Option<String>,
+    },
+    /// The tokens came, but without a mail scope: the message says what to tick.
+    NoMailGrant(String),
+}
+
+impl SignInError {
+    /// Microsoft's AADSTS number at the start of the description, if any.
+    pub fn aadsts(&self) -> Option<u64> {
+        let description = match self {
+            Self::Declined { description, .. } | Self::Redirected { description, .. } => {
+                description.as_deref()?
+            }
+            Self::TimedOut(_) | Self::NoMailGrant(_) => return None,
+        };
+        let digits = description.strip_prefix("AADSTS")?;
+        let end = digits
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digits.len());
+        digits[..end].parse().ok()
+    }
+}
+
+impl fmt::Display for SignInError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (text, description) = match self {
+            Self::TimedOut(message) | Self::NoMailGrant(message) => return f.write_str(message),
+            Self::Declined {
+                message,
+                description,
+            } => ((*message).to_owned(), description),
+            Self::Redirected { error, description } => (
+                format!("the sign-in failed in the browser: {error}"),
+                description,
+            ),
+        };
+        match description {
+            Some(d) => write!(f, "{text} ({d})"),
+            None => f.write_str(&text),
+        }
+    }
+}
+
+impl std::error::Error for SignInError {}
 
 /// A token or client secret. `Debug` is redacted so it cannot leak through `{:?}`.
 #[derive(Clone, PartialEq, Eq)]
@@ -275,7 +340,7 @@ pub async fn exchange_code<H: Http>(
 /// token, and an address in the ID token.
 fn check_sign_in(provider: &Provider, tokens: TokenResponse) -> Result<SignedIn> {
     if !grants_mail(provider, tokens.scope.as_deref()) {
-        bail!(
+        return Err(SignInError::NoMailGrant(format!(
             "{} did not grant mail access ({}); sign in again and, if the consent screen shows \
              a checkbox for mail access, tick it",
             provider.name,
@@ -285,7 +350,8 @@ fn check_sign_in(provider: &Provider, tokens: TokenResponse) -> Result<SignedIn>
                 .map(|s| format!("{}{s}", provider.scope_prefix))
                 .collect::<Vec<_>>()
                 .join(" or ")
-        );
+        ))
+        .into());
     }
     let refresh_token = tokens
         .refresh_token
@@ -437,6 +503,11 @@ pub async fn revoke<H: Http>(http: &H, provider: &Provider, token: &Secret) -> R
 #[derive(Debug)]
 pub struct EndpointError {
     pub code: String,
+    /// Microsoft's numeric codes (the AADSTS numbers); empty for Google.
+    pub codes: Vec<u64>,
+    /// The server's `error_description`, cleaned. Google's wording is not documented, so it is
+    /// only a hint (<https://developers.google.com/identity/protocols/oauth2/native-app>).
+    pub description: Option<String>,
     message: String,
     hint: Option<&'static str>,
 }
@@ -486,9 +557,14 @@ fn endpoint_error(provider: &Provider, body: &[u8], status: u16) -> anyhow::Erro
         return anyhow!("HTTP status {status}");
     };
     let clean = |s: &str| printable(s, 200);
-    let message = match e.error_description.as_deref().map(clean) {
-        Some(d) if !d.is_empty() => format!("{}: {d}", clean(&e.error)),
-        _ => clean(&e.error),
+    let description = e
+        .error_description
+        .as_deref()
+        .map(clean)
+        .filter(|d| !d.is_empty());
+    let message = match &description {
+        Some(d) => format!("{}: {d}", clean(&e.error)),
+        None => clean(&e.error),
     };
     let coded = e.error_codes.iter().find_map(|code| {
         provider
@@ -499,6 +575,8 @@ fn endpoint_error(provider: &Provider, body: &[u8], status: u16) -> anyhow::Erro
     });
     let mut error = EndpointError {
         code: e.error,
+        codes: e.error_codes,
+        description,
         message,
         hint: coded,
     };

@@ -11,12 +11,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 
-use super::Secret;
+use super::{Secret, SignInError};
 
 /// The most a request's head may hold. A redirect is well under 4 KiB.
 const MAX_REQUEST: usize = 16 * 1024;
@@ -38,10 +38,10 @@ pub struct Listener {
 pub enum Request {
     /// The redirect with a code and the right state.
     Code(Secret),
-    /// The redirect saying the user declined.
-    Denied,
-    /// The redirect with another error code (RFC 6749 section 4.1.2.1).
-    Error(String),
+    /// The redirect saying the user declined, with the error description if any.
+    Denied(Option<String>),
+    /// The redirect with another error code (RFC 6749 section 4.1.2.1) and its description.
+    Error(String, Option<String>),
     /// The redirect with the right state but neither a code nor an error.
     NoCode,
     /// A redirect whose state is missing or wrong.
@@ -85,10 +85,10 @@ impl Listener {
         tokio::time::timeout(timeout, self.accept_until_done(state))
             .await
             .map_err(|_| {
-                anyhow!(
+                anyhow::Error::new(SignInError::TimedOut(format!(
                     "no sign-in came back within {} minutes; run the command again",
                     timeout.as_secs() / 60
-                )
+                )))
             })?
     }
 
@@ -115,8 +115,16 @@ impl Listener {
             };
             match request {
                 Request::Code(code) => return Ok(code),
-                Request::Denied => bail!("access was declined in the browser; nothing was saved"),
-                Request::Error(e) => bail!("the sign-in failed in the browser: {e}"),
+                Request::Denied(description) => {
+                    return Err(SignInError::Declined {
+                        message: "access was declined in the browser; nothing was saved",
+                        description,
+                    }
+                    .into());
+                }
+                Request::Error(error, description) => {
+                    return Err(SignInError::Redirected { error, description }.into());
+                }
                 Request::NoCode => bail!("the sign-in redirect carried no authorization code"),
                 Request::WrongState | Request::Stray => continue,
             }
@@ -147,8 +155,8 @@ async fn handle(mut stream: TcpStream, state: Arc<str>) -> Request {
             "200 OK",
             "Signed in. You can close this tab and return to the terminal.",
         ),
-        Request::Denied => ("200 OK", "Sign-in cancelled. You can close this tab."),
-        Request::Error(_) | Request::NoCode => {
+        Request::Denied(_) => ("200 OK", "Sign-in cancelled. You can close this tab."),
+        Request::Error(..) | Request::NoCode => {
             ("400 Bad Request", "Sign-in failed; see the terminal.")
         }
         Request::WrongState => (
@@ -243,16 +251,15 @@ pub fn parse_request(head: &[u8], state: &str) -> Request {
         return Request::WrongState;
     }
     if let Some(error) = param("error") {
+        // Microsoft puts its AADSTS code and text here; another local page could too, so it is
+        // only ever shown, cleaned and cut short.
+        let description = param("error_description")
+            .map(|d| super::printable(&d, 300))
+            .filter(|d| !d.is_empty());
         return if error == "access_denied" {
-            Request::Denied
+            Request::Denied(description)
         } else {
-            Request::Error(
-                error
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .take(100)
-                    .collect(),
-            )
+            Request::Error(super::printable(&error, 100), description)
         };
     }
     match param("code") {

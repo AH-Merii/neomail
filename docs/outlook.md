@@ -6,78 +6,58 @@ Microsoft Entra app registration that **you** create. It ships with no app of it
 ([decisions](decisions.md#accounts-and-providers)): an app registration is what Microsoft grants
 access to, so with your own, no one else's app ever holds access to your mail.
 
-The setup takes about ten minutes, once. `neomail account add outlook` prints the same steps in
-short. The wording below follows Microsoft's
-[app registration guide](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)
-and [redirect URI guide](https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-redirect-uri).
-
-## 1. A directory for a personal account
-
-A work or school account already belongs to a directory (tenant): skip this step. A personal
-account (Outlook.com, Hotmail) needs one first: create a free
-[Azure account](https://azure.microsoft.com/pricing/purchase-options/azure-account) with it.
-Microsoft asks for a phone number and a credit or debit card "for identity verification"; it
-charges nothing at sign-up, but may place a small verification hold on the card (same page).
-
-*Why:* an app registration lives in a directory. Microsoft lists "an Azure account that has an
-active subscription" as the prerequisite and suggests the account's **Default Directory**
-([guide](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)).
-For a new tenant, Microsoft points customers on a free tenant to the same
-[free account](https://learn.microsoft.com/en-us/entra/fundamentals/create-new-tenant). Neither
-page says what happens to the directory or the registration when the subscription ends.
-
-## 2. Register the app
-
-Sign in at <https://entra.microsoft.com>, go to **Entra ID > App registrations** and select
-**New registration**. Give it any name, for example "neomail". Under **Supported account types**
-choose **Any Entra ID Tenant + Personal Microsoft accounts**, then **Register**.
-
-*Why:* this account type lets both work or school and personal addresses sign in with the one
-registration.
-
-## 3. Add the redirect URI
-
-In the app, under **Manage**, select **Authentication**, then **Add Redirect URI**, and the
-**Mobile and desktop applications** tile. Under **Custom redirect URIs** enter
-`http://localhost` and select **Configure**.
-
-*Why:* after you sign in, Microsoft sends the browser back to `http://localhost`, where neomail
-waits. Microsoft ignores the port of a localhost redirect URI, so neomail can listen on any free
-port ([redirect URI rules](https://learn.microsoft.com/en-us/entra/identity-platform/reply-url)).
-neomail listens on 127.0.0.1 and, where the machine has it, on `[::1]` on the same port, since a
-browser may resolve `localhost` to either. Microsoft prefers `127.0.0.1`, but its portal refuses
-`http://127.0.0.1`, so `localhost` keeps the setup to the portal.
-
-## 4. Allow public client flows
-
-On the same **Authentication** page, under **Advanced settings**, set **Allow public client
-flows** to **Yes**, then select **Save**
-([desktop app configuration](https://learn.microsoft.com/en-us/entra/identity-platform/scenario-desktop-app-configuration)).
-
-*Why:* the device code sign-in (below) is a public client flow. Microsoft recommends leaving the
-setting off unless the app is a public client that uses such a flow, as neomail is
-([public client flows](https://learn.microsoft.com/en-us/entra/identity-platform/msal-client-applications)).
-
-## 5. Copy the Application (client) ID
-
-The app's **Overview** page shows the **Application (client) ID**. Copy it. There is no client
-secret to create.
-
-*Why:* neomail runs on your machine, so it cannot keep a secret; Microsoft calls such an app a
-public client, and a public client has no secret.
-
 ## Add the account
 
 ```sh
-neomail account add outlook        # asks for the address and the client ID, then signs in
+neomail account add outlook
 neomail sync --account outlook
 ```
 
-Off a terminal, or with `--no-input`, pass `--email` and `--client-id`. Before anything is saved,
-neomail reads the INBOX's message count through Graph, once, to check the sign-in can read mail;
-`--no-check` skips that. A failed sign-in or check saves nothing.
+On a terminal, `account add outlook` takes you through the setup one step at a time. Each step
+says what to do, why it exists and which page to open; `<` goes back a step. It first asks
+whether the account is personal (Outlook.com, Hotmail) or work or school (`--account-type`), and
+how you will sign in (`--device-code`), and shows only the steps that apply:
 
-The browser opens on Microsoft's sign-in page; `--no-browser` only prints the URL. neomail asks
+- **Personal accounts only: a directory.** An app registration lives in a directory (tenant), and
+  a personal account has none until you sign up for the free
+  [Azure account](https://azure.microsoft.com/pricing/purchase-options/azure-account), which asks
+  for a phone number and a card ([tenant quickstart](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-create-new-tenant)).
+  Neither page says what happens to the registration when the subscription ends.
+- **Register the app** at <https://entra.microsoft.com> with **Any Entra ID Tenant + Personal
+  Microsoft accounts**, not the suggested single tenant: neomail signs in through Microsoft's
+  `common` endpoint ([app registration guide](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)).
+- **Browser sign-in only: the redirect URI** `http://localhost` under **Mobile and desktop
+  applications**. Microsoft ignores the port of a localhost redirect URI, so neomail can listen on
+  any free port, on 127.0.0.1 and, where it can, `[::1]`
+  ([redirect URI rules](https://learn.microsoft.com/en-us/entra/identity-platform/reply-url)).
+- **Device code sign-in only: Allow public client flows.** The device code sign-in sends no
+  redirect URI, so this setting alone tells Microsoft the app is a public client
+  ([AADSTS7000218](https://learn.microsoft.com/en-us/troubleshoot/entra/entra-id/app-integration/confidential-client-application-authentication-error-aadsts7000218)).
+- **Work or school accounts only: approval.** Microsoft's pages disagree on whether you can allow
+  mail access yourself: [one](https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/configure-user-consent)
+  says a user can by default, [another](https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/manage-app-consent-policies)
+  that the default for new tenants keeps users from allowing `Mail.Read` and `Mail.ReadWrite`.
+  If the sign-in asks for an admin's approval, ask your IT admin.
+- **Your address and a name**, then neomail checks that the name is free, that the config file
+  can take it and that the keyring opens.
+- **The Application (client) ID** from the app's Overview page. It must be a GUID. There is no
+  secret: neomail runs on your machine, so it cannot keep one.
+
+neomail then asks Microsoft about the client ID before you sign in, with a device code request
+that is never shown or used: an unknown ID sends you back to that step. Then you sign in
+(`--no-browser` only prints the URL), and neomail reads the INBOX's message count through Graph,
+once. Nothing reaches the keyring or the config file until all of that has worked, with one
+exception: a sign-in left in the keyring under that name with no account in the config is deleted
+right before the new sign-in (Microsoft has no endpoint to revoke it), and if the sign-in or the
+Graph check then fails, nothing replaces it. `--no-check` skips the client check and the Graph
+check, not the sign-in. An error Microsoft sends back names
+its step; a sign-in that times out names the steps whose mistakes Microsoft shows only on its own
+page (the redirect URI, AADSTS50011, and the supported account types, AADSTS50194).
+
+Off a terminal, or with `--no-input`, the advice steps are skipped: pass `--email` and
+`--client-id` (and `--account-type work` for a work or school account).
+
+neomail asks
 for `Mail.ReadWrite` (to read your mail and change it), `Mail.Send` (to send mail as you, with
 [sendMail](https://learn.microsoft.com/en-us/graph/api/user-sendmail), which also keeps the copy
 in Sent Items), `Mail.Read` (so an earlier version can
@@ -357,9 +337,11 @@ and leave it out.
   Outlook's one-click Archive, so nothing was moved. Archive those messages in Outlook on the
   web.
 - **"the app registration is not multitenant" or "is for Microsoft Entra accounts only":** the
-  supported account types in step 2 are wrong. Register the app again with the right type, and
+  supported account types are wrong. Register the app again with the right type, and
   use its client ID.
-- **"public client flows are off":** step 4.
+- **"counts as a confidential client":** for the device code sign-in, Allow public client flows
+  is off; for the browser sign-in, the redirect URI is under Web instead of Mobile and desktop
+  applications.
 - **"you signed in as …, not …":** the browser used another Microsoft account. Sign in with the
   address you gave, or add the other one as its own account.
 - **"the saved Microsoft sign-in expired or was revoked":** Microsoft ends a sign-in unused for 90

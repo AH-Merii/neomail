@@ -677,6 +677,15 @@ fn password_and_oauth_commands_refuse_the_other_kind_of_account() {
 /// No Secret Service on the bus: every OAuth command fails in one line before any sign-in
 /// starts (no URL is printed, so no browser could open). Linux only, like the test above.
 #[cfg(target_os = "linux")]
+/// The lines of a one-line error: `account add` gmail and outlook run a setup wizard, which
+/// names the failed step on the first line and says nothing was written on the second.
+fn one_error_lines<S: AsRef<str>>(args: &[S]) -> usize {
+    match args {
+        [a, b, ..] if a.as_ref() == "account" && b.as_ref() == "add" => 2,
+        _ => 1,
+    }
+}
+
 #[test]
 fn oauth_commands_without_a_keyring_fail_before_signing_in() {
     let dir = tempfile::tempdir().unwrap();
@@ -705,7 +714,7 @@ fn oauth_commands_without_a_keyring_fail_before_signing_in() {
         assert!(out.is_empty(), "{args:?}: {out}");
         assert!(err.contains("the OS keyring is unavailable ("), "{err}");
         assert!(err.contains("OAuth sign-ins are kept only there"), "{err}");
-        assert_eq!(err.lines().count(), 1, "{err}");
+        assert_eq!(err.lines().count(), one_error_lines(args), "{err}");
         assert!(!err.contains(FAKE_PASSWORD), "{err}");
         assert!(!err.contains("accounts.google.com"), "{err}");
     }
@@ -741,7 +750,7 @@ fn oauth_commands_without_a_keyring_fail_before_signing_in() {
             err.contains("the OS keyring is unavailable ("),
             "{args:?}: {err}"
         );
-        assert_eq!(err.lines().count(), 1, "{err}");
+        assert_eq!(err.lines().count(), one_error_lines(&args), "{err}");
         assert!(!err.contains("microsoft"), "{err}");
     }
     assert_eq!(

@@ -10,6 +10,7 @@ mod config;
 mod daemon;
 mod folders;
 mod graph;
+mod help;
 mod http;
 mod jev;
 mod keyring;
@@ -27,6 +28,7 @@ mod setup;
 mod style;
 mod sync;
 mod triage;
+mod wizard;
 
 use std::ffi::OsString;
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
@@ -35,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use nm_core::{Cache, MessageId};
 use nm_imap::{CertPin, Security};
 
@@ -215,18 +217,40 @@ Examples:
       --username you@example.com --host imap.example.com
   neomail account add gmail --email you@example.com \\
       --client-id 1234-abc.apps.googleusercontent.com
-  neomail account add outlook --email you@outlook.example \\
+  neomail account add gmail --project my-project-42
+  neomail account add outlook --account-type work --email you@example.com \\
       --client-id 00000000-0000-0000-0000-000000000000 --device-code
 
 Secrets are never flags: they are prompted for without echo, read as one line of standard input,
-or come from --password-command.";
+or come from --password-command.
+
+gmail-app-password goes one step at a time on a terminal: whether the account can have an app
+password, 2-Step Verification, creating the app password, then the name and address (type < to
+go back). The keyring and the config are checked before the app password is asked, spaces in a
+pasted one are removed, and the IMAP login and an SMTP login that sends nothing are checked
+before anything is written. Off a terminal or with --no-input it skips the advice steps and needs
+--username:
+https://github.com/AH-Merii/neomail/blob/main/docs/gmail-app-password.md
+
+gmail and outlook go one step at a time on a terminal too, from no Google Cloud project or no
+Entra app to a signed-in client, each step with why it exists and the page to open. outlook shows
+only the steps for the account type and the sign-in method. The keyring and the config are
+checked before the client secret is asked; the client ID (and Google's secret) is checked with
+Google or Microsoft before the sign-in; Gmail's IMAP and SMTP logins and Outlook's Graph mailbox
+are checked after it, before anything is written (--no-check skips those two checks), except a
+sign-in left in the keyring under that name with no account in the config: it is revoked (Google)
+and deleted right before the new sign-in, since revoking it afterwards would end the new one too,
+and nothing replaces it if a later step fails. A failure names the step to change. Off a terminal or with --no-input they need --email and --client-id:
+https://github.com/AH-Merii/neomail/blob/main/docs/gmail.md
+https://github.com/AH-Merii/neomail/blob/main/docs/outlook.md";
 
 #[derive(Parser)]
 #[command(
     name = "neomail",
     version,
     about = "neomail: a terminal email client",
-    after_help = TOP_EXAMPLES
+    after_help = TOP_EXAMPLES,
+    styles = help::styles()
 )]
 struct Cli {
     /// Config file [env: NEOMAIL_CONFIG] [default: $XDG_CONFIG_HOME/neomail/config.toml]
@@ -551,7 +575,7 @@ enum ConfigCommand {
 enum AccountCommand {
     /// Add an account: a provider menu on a terminal, flags for everything else
     #[command(after_help = ADD_EXAMPLES)]
-    Add(AddCommand),
+    Add(Box<AddCommand>),
     /// List the configured accounts (reads only the config: no keyring, no network)
     List {
         #[command(flatten)]
@@ -599,7 +623,7 @@ struct AddCommand {
     /// gmail, outlook: the address to sign in with
     #[arg(long, value_name = "ADDR")]
     email: Option<String>,
-    /// gmail, outlook: your OAuth client's ID (gmail's secret is prompted for, or read from stdin; outlook has none)
+    /// gmail, outlook: your OAuth client's ID; checked with Google or Microsoft before the sign-in (gmail's secret is prompted for, or read from stdin; outlook has none)
     #[arg(long, value_name = "ID")]
     client_id: Option<String>,
     /// gmail, outlook: print the sign-in URL without opening a browser
@@ -608,6 +632,12 @@ struct AddCommand {
     /// outlook: sign in with a code on another device (automatic over SSH without a display)
     #[arg(long)]
     device_code: bool,
+    /// gmail: your Google Cloud project's ID, so the setup's console links open that project
+    #[arg(long, value_name = "ID")]
+    project: Option<String>,
+    /// outlook: personal (Outlook.com, Hotmail) or work (work or school); picks the setup steps shown [default: personal]
+    #[arg(long, value_name = "TYPE")]
+    account_type: Option<AccountTypeArg>,
     /// imap, proton, gmail-app-password: the login name (usually the address)
     #[arg(long, value_name = "USER")]
     username: Option<String>,
@@ -635,7 +665,7 @@ struct AddCommand {
     /// imap, proton: the server certificate's SHA-256 to pin (64 hex digits, colons allowed)
     #[arg(long, value_name = "HEX", value_parser = parse_pin)]
     cert_sha256: Option<CertPin>,
-    /// imap, proton, gmail-app-password, outlook: skip the read-only check before the config is written
+    /// Skip the read-only login check before the config is written; gmail and outlook also skip the client check before the sign-in
     #[arg(long)]
     no_check: bool,
 }
@@ -667,7 +697,7 @@ impl AddProvider {
         match self {
             Self::Gmail => "gmail",
             Self::Outlook => oauth::MICROSOFT.setup.default_name,
-            Self::GmailAppPassword => setup::GMAIL_APP_PASSWORD.id,
+            Self::GmailAppPassword => wizard::gmail::GMAIL_APP_PASSWORD.id,
             Self::Proton => setup::PROTON.id,
             Self::Imap => setup::IMAP.id,
         }
@@ -680,6 +710,23 @@ impl AddProvider {
             Self::GmailAppPassword => "Gmail with an app password (needs 2-Step Verification)",
             Self::Proton => "Proton Mail, through Proton Mail Bridge",
             Self::Imap => "any IMAP server, with a password",
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AccountTypeArg {
+    /// Outlook.com, Hotmail or Live
+    Personal,
+    /// An address your organisation gave you
+    Work,
+}
+
+impl AccountTypeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Personal => oauth::steps::PERSONAL,
+            Self::Work => oauth::steps::WORK,
         }
     }
 }
@@ -724,9 +771,9 @@ pub fn usage(message: impl Into<String>) -> anyhow::Error {
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
-    let cli = match Cli::try_parse_from(&args) {
+    let cli = match parse(&args) {
         Ok(cli) => cli,
-        Err(e) => return clap_exit(&e, color_flag(&args)),
+        Err(e) => return clap_exit(&e, &args),
     };
     // The one colour choice per stream, passed down from here.
     let colors = Colors::new(
@@ -747,20 +794,39 @@ fn main() -> ExitCode {
     }
 }
 
+/// The command line as help shows it: each command's examples headed like clap's headings.
+fn cli_command() -> clap::Command {
+    help::headed(Cli::command())
+}
+
+/// [`Parser::try_parse_from`] on [`cli_command`], so the help it prints has those headings.
+fn parse(args: &[OsString]) -> Result<Cli, clap::Error> {
+    let mut matches = cli_command().try_get_matches_from(args)?;
+    Cli::from_arg_matches_mut(&mut matches).map_err(|e| e.format(&mut cli_command()))
+}
+
 /// Prints clap's help, version or usage error, coloured by the same rules as everything else
-/// (`--color` read from the raw arguments, since they did not parse).
-fn clap_exit(e: &clap::Error, flag: Option<ColorWhen>) -> ExitCode {
+/// (`--color` read from the raw arguments, since they did not parse). The top-level help opens
+/// with the logo on a terminal.
+fn clap_exit(e: &clap::Error, args: &[OsString]) -> ExitCode {
     let to_stdout = !e.use_stderr();
-    let terminal = if to_stdout {
-        io::stdout().is_terminal()
+    let stream = if to_stdout {
+        help::Stream::Stdout
     } else {
-        io::stderr().is_terminal()
+        help::Stream::Stderr
     };
+    let color = style::decide(color_flag(args), style::env_var, stream.is_terminal())
+        != style::Decision::Off;
     let styled = e.render();
-    let text = if style::decide(flag, style::env_var, terminal) == style::Decision::Off {
-        styled.to_string()
-    } else {
+    let text = if color {
         styled.ansi().to_string()
+    } else {
+        styled.to_string()
+    };
+    let text = if is_top_level_help(e, args) {
+        help::with_logo(stream.logo(color), &text)
+    } else {
+        text
     };
     // A closed pipe (`neomail --help | head -1`) is not an error.
     let _ = if to_stdout {
@@ -769,6 +835,24 @@ fn clap_exit(e: &clap::Error, flag: Option<ColorWhen>) -> ExitCode {
         io::stderr().lock().write_all(text.as_bytes())
     };
     ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(EXIT_USAGE))
+}
+
+/// Whether `e` shows the top-level help (`neomail --help`, `-h`, `neomail help`) rather than a
+/// command's: its text is the top-level help's, under the name clap took from `args[0]`.
+fn is_top_level_help(e: &clap::Error, args: &[OsString]) -> bool {
+    if e.kind() != clap::error::ErrorKind::DisplayHelp {
+        return false;
+    }
+    let mut top = cli_command();
+    if let Some(name) = args
+        .first()
+        .and_then(|a| Path::new(a).file_name())
+        .and_then(|n| n.to_str())
+    {
+        top = top.bin_name(name);
+    }
+    let shown = e.render().to_string();
+    shown == top.render_help().to_string() || shown == top.render_long_help().to_string()
 }
 
 /// The last `--color WHEN` or `--color=WHEN` before `--`, for arguments that did not parse.
@@ -825,12 +909,17 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
     let Some(command) = cli.command else {
         let path = config::config_path(cli.config)?;
         if config::exists(&path) {
-            let help = Cli::command().render_help();
-            if colors.stderr.is_on() {
-                eprint!("{}", help.ansi());
+            let help = cli_command().render_help();
+            let color = colors.stderr.is_on();
+            let text = if color {
+                help.ansi().to_string()
             } else {
-                eprint!("{help}");
-            }
+                help.to_string()
+            };
+            eprint!(
+                "{}",
+                help::with_logo(help::Stream::Stderr.logo(color), &text)
+            );
         } else {
             eprint!("{}", start_text());
         }
@@ -1059,7 +1148,7 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
             command: AccountCommand::Add(add),
         } => {
             let path = config::config_path(cli.config)?;
-            add_account(add, &path, input, &mut out)?;
+            add_account(*add, &path, input, &mut out)?;
             ExitCode::SUCCESS
         }
         Command::Account {
@@ -1472,7 +1561,8 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
         ("--username", add.username.is_some()),
         ("--password-command", add.password_command.is_some()),
     ];
-    let no_check = [("--no-check", add.no_check)];
+    let gmail_only = [("--project", add.project.is_some())];
+    let outlook_only = [("--account-type", add.account_type.is_some())];
     let imap_only = [
         ("--host", add.host.is_some()),
         ("--security", add.security.is_some()),
@@ -1485,11 +1575,18 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
         ("--cert-sha256", add.cert_sha256.is_some()),
     ];
     let refused: Vec<(&str, bool)> = match provider {
-        AddProvider::Gmail => [&password_only[..], &no_check, &imap_only, &port_pin].concat(),
-        AddProvider::Outlook => [&password_only[..], &imap_only, &port_pin].concat(),
-        AddProvider::GmailAppPassword => [&oauth_only[..], &imap_only, &port_pin].concat(),
-        AddProvider::Proton => [&oauth_only[..], &imap_only].concat(),
-        AddProvider::Imap => oauth_only.to_vec(),
+        AddProvider::Gmail => [&password_only[..], &outlook_only, &imap_only, &port_pin].concat(),
+        AddProvider::Outlook => [&password_only[..], &gmail_only, &imap_only, &port_pin].concat(),
+        AddProvider::GmailAppPassword => [
+            &oauth_only[..],
+            &gmail_only,
+            &outlook_only,
+            &imap_only,
+            &port_pin,
+        ]
+        .concat(),
+        AddProvider::Proton => [&oauth_only[..], &gmail_only, &outlook_only, &imap_only].concat(),
+        AddProvider::Imap => [&oauth_only[..], &gmail_only, &outlook_only].concat(),
     };
     if let Some((flag, _)) = refused.iter().find(|(_, given)| *given) {
         return Err(usage(format!(
@@ -1503,6 +1600,8 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
                 name: add.name,
                 email: add.email,
                 client_id: add.client_id,
+                project: add.project,
+                account_type: add.account_type.map(|t| t.as_str().to_owned()),
                 no_browser: add.no_browser,
                 device_code: add.device_code,
                 no_check: add.no_check,
@@ -1513,7 +1612,15 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
             };
             return account::add(oauth_provider, path, args, input, out);
         }
-        AddProvider::GmailAppPassword => &setup::GMAIL_APP_PASSWORD,
+        AddProvider::GmailAppPassword => {
+            let args = wizard::gmail::Args {
+                name: add.name,
+                username: add.username,
+                password_command: add.password_command,
+                no_check: add.no_check,
+            };
+            return wizard::gmail::add(path, args, input, out);
+        }
         AddProvider::Proton => &setup::PROTON,
         AddProvider::Imap => &setup::IMAP,
     };

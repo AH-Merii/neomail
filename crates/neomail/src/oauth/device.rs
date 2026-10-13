@@ -13,7 +13,8 @@ use serde::Deserialize;
 use tokio::time::Instant;
 
 use super::{
-    Client, EndpointError, Provider, Secret, SignedIn, check_sign_in, endpoint_error, printable,
+    Client, EndpointError, Provider, Secret, SignInError, SignedIn, check_sign_in, endpoint_error,
+    printable,
 };
 use crate::http::Http;
 
@@ -82,10 +83,11 @@ pub async fn sign_in<H: Http>(
     loop {
         tokio::time::sleep(interval).await;
         if Instant::now() >= deadline {
-            bail!(
+            return Err(SignInError::TimedOut(format!(
                 "the sign-in did not finish within {} minutes; run the command again",
                 lifetime.as_secs() / 60
-            );
+            ))
+            .into());
         }
         let error = match super::token_request(http, provider, &poll).await {
             Ok(tokens) => return check_sign_in(provider, tokens),
@@ -98,10 +100,20 @@ pub async fn sign_in<H: Http>(
             Some("authorization_pending") => {}
             Some("slow_down") => interval += SLOW_DOWN,
             Some("authorization_declined" | "access_denied") => {
-                bail!("the sign-in was declined; nothing was saved")
+                let description = error
+                    .downcast_ref::<EndpointError>()
+                    .and_then(|e| e.description.clone());
+                return Err(SignInError::Declined {
+                    message: "the sign-in was declined; nothing was saved",
+                    description,
+                }
+                .into());
             }
             Some("expired_token") => {
-                bail!("the code expired before the sign-in finished; run the command again")
+                return Err(SignInError::TimedOut(
+                    "the code expired before the sign-in finished; run the command again".into(),
+                )
+                .into());
             }
             Some("bad_verification_code") => bail!(
                 "{} did not recognise the device code; run the command again",

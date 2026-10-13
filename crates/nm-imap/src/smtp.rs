@@ -144,6 +144,17 @@ pub async fn submit(
     result
 }
 
+/// Logs in to the server at `config` and leaves: EHLO, AUTH, then QUIT right after it, so nothing
+/// is sent. Meant as a setup check before an account is written. Ok means the server took the
+/// login.
+pub async fn check_auth(config: &SmtpConfig, login: Login<'_>) -> Result<(), SmtpError> {
+    let tls = tls::client_config(config.cert_pin).map_err(SmtpError::TlsConfig)?;
+    let mut conn = open(config, tls).await?;
+    let result = authenticate(&mut conn, &config.username, login).await;
+    conn.quit().await;
+    result
+}
+
 /// Connects to `config`'s server, secures the connection with `tls` (TLS from the first byte or
 /// STARTTLS) and greets it with EHLO.
 async fn open(
