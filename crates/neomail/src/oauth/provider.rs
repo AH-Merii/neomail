@@ -47,6 +47,7 @@ pub struct Setup {
 pub struct RefreshScope {
     pub read: &'static str,
     pub read_write: &'static str,
+    pub read_write_send: &'static str,
 }
 
 impl RefreshScope {
@@ -54,6 +55,7 @@ impl RefreshScope {
         match grant {
             MailGrant::Read => self.read,
             MailGrant::ReadWrite => self.read_write,
+            MailGrant::ReadWriteSend => self.read_write_send,
         }
     }
 }
@@ -83,6 +85,9 @@ pub struct Provider {
     /// The grants among `mail_scopes` that also let neomail change mail (mark it read or
     /// unread), without [`Provider::scope_prefix`].
     pub write_scopes: &'static [&'static str],
+    /// The grants that also let neomail send mail as the account, without
+    /// [`Provider::scope_prefix`].
+    pub send_scopes: &'static [&'static str],
     /// Stripped from a granted scope before it is matched against `mail_scopes`.
     pub scope_prefix: &'static str,
     /// The `scope` sent with a refresh, when the provider needs one.
@@ -113,6 +118,9 @@ pub const GOOGLE: Provider = Provider {
     mail_scopes: &["https://mail.google.com/"],
     // Full access: IMAP's STORE works with it.
     write_scopes: &["https://mail.google.com/"],
+    // The full mail scope also covers SMTP
+    // (<https://developers.google.com/workspace/gmail/imap/xoauth2-protocol>).
+    send_scopes: &["https://mail.google.com/"],
     scope_prefix: "",
     refresh_scope: None,
     mail: MailApi::Imap {
@@ -173,6 +181,9 @@ app for your own use (under 100 users) needs no verification.
 ///   Mail.ReadWrite also reads: the previous release refreshes every sign-in with Mail.Read, which
 ///   the subset rule above then allows. A sign-in made when neomail asked for Mail.Read only
 ///   keeps Mail.Read: its refresh asks for no more than it granted.
+/// - Mail.Send, so neomail can send with sendMail
+///   (<https://learn.microsoft.com/en-us/graph/api/user-sendmail>). A sign-in from before it was
+///   asked keeps Mail.ReadWrite only, for the same reason, until `neomail account login`.
 pub const MICROSOFT: Provider = Provider {
     id: "microsoft",
     name: "Microsoft",
@@ -183,13 +194,16 @@ pub const MICROSOFT: Provider = Provider {
     client: ClientKind::Public,
     redirect_host: "localhost",
     scope: "offline_access openid profile email https://graph.microsoft.com/Mail.Read \
-            https://graph.microsoft.com/Mail.ReadWrite",
+            https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send",
     mail_scopes: &["Mail.Read", "Mail.ReadWrite"],
     write_scopes: &["Mail.ReadWrite"],
+    send_scopes: &["Mail.Send"],
     scope_prefix: "https://graph.microsoft.com/",
     refresh_scope: Some(RefreshScope {
         read: "offline_access https://graph.microsoft.com/Mail.Read",
         read_write: "offline_access https://graph.microsoft.com/Mail.ReadWrite",
+        read_write_send: "offline_access https://graph.microsoft.com/Mail.ReadWrite \
+                          https://graph.microsoft.com/Mail.Send",
     }),
     mail: MailApi::Graph,
     auth_params: &[],

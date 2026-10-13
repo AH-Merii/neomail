@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use nm_core::GroupRules;
+use nm_core::compose::Mailbox;
+use nm_imap::smtp::SmtpConfig;
 use nm_imap::{CertPin, ImapConfig, Security};
 use serde::Deserialize;
 
@@ -149,6 +151,67 @@ pub struct Account {
     pub name: String,
     pub server: Server,
     pub login: Login,
+    /// The address mail is sent from, when it is not the username.
+    pub address: Option<String>,
+    /// The name sent with the address.
+    pub display_name: Option<String>,
+    /// The SMTP server the config names; [`Account::outbound`] derives one for known servers.
+    pub smtp: Option<SmtpSettings>,
+}
+
+/// An SMTP server for sending, as `[accounts.smtp]` says or a preset derives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmtpSettings {
+    pub host: String,
+    pub port: u16,
+    pub security: Security,
+    pub cert_pin: Option<CertPin>,
+    /// Append a copy to the mailbox marked `\Sent` after sending: only for servers whose SMTP
+    /// keeps none. Gmail and Bridge keep one, and a second would be a duplicate.
+    pub save_sent: bool,
+}
+
+/// How an account sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outbound {
+    /// SMTP submission, logged in as the IMAP login is.
+    Smtp { config: SmtpConfig, save_sent: bool },
+    /// Microsoft Graph's sendMail, which keeps the copy in Sent Items itself.
+    Graph,
+}
+
+/// The SMTP server of a known IMAP server, so an account added before neomail could send needs
+/// no new config:
+///
+/// - Gmail: smtp.gmail.com, port 465, TLS
+///   (<https://developers.google.com/workspace/gmail/imap/imap-smtp>). "Sent messages are
+///   automatically copied to the Gmail/Sent folder if your email client uses SMTP"
+///   (<https://support.google.com/mail/answer/78892>), so no copy is appended.
+/// - Proton Mail Bridge on 127.0.0.1 port 1143 with a pinned certificate: its SMTP on port 1025
+///   (<https://proton.me/support/port-already-occupied-error>) with STARTTLS and the same pin.
+///   Proton tells Outlook users not to save copies of sent items
+///   (<https://proton.me/support/protonmail-bridge-clients-windows-outlook-2019>), as Bridge
+///   keeps them, so no copy is appended.
+pub fn preset_smtp(imap: &ImapConfig) -> Option<SmtpSettings> {
+    if imap.host.eq_ignore_ascii_case("imap.gmail.com") {
+        return Some(SmtpSettings {
+            host: "smtp.gmail.com".to_owned(),
+            port: 465,
+            security: Security::Tls,
+            cert_pin: None,
+            save_sent: false,
+        });
+    }
+    if imap.host == "127.0.0.1" && imap.port == 1143 && imap.cert_pin.is_some() {
+        return Some(SmtpSettings {
+            host: "127.0.0.1".to_owned(),
+            port: 1025,
+            security: Security::StartTls,
+            cert_pin: imap.cert_pin,
+            save_sent: false,
+        });
+    }
+    None
 }
 
 impl Account {
@@ -158,6 +221,44 @@ impl Account {
             Server::Imap(imap) => &imap.username,
             Server::Graph { username } => username,
         }
+    }
+
+    /// Who mail is sent as: `address` (else the username) and `display_name`.
+    pub fn identity(&self) -> Result<Mailbox> {
+        let address = self.address.as_deref().unwrap_or(self.username());
+        Mailbox::new(self.display_name.as_deref(), address).map_err(|e| {
+            anyhow::anyhow!(
+                "account {:?} cannot send: {e}; set address = \"you@example.com\" in its \
+                 [[accounts]] entry",
+                self.name
+            )
+        })
+    }
+
+    /// How the account sends: SMTP as `[accounts.smtp]` says or as [`preset_smtp`] derives, or
+    /// Graph.
+    pub fn outbound(&self) -> Result<Outbound> {
+        let imap = match &self.server {
+            Server::Graph { .. } => return Ok(Outbound::Graph),
+            Server::Imap(imap) => imap,
+        };
+        let Some(smtp) = self.smtp.clone().or_else(|| preset_smtp(imap)) else {
+            bail!(
+                "account {name} has no smtp; add an [accounts.smtp] table with its host to the \
+                 config file (`neomail config path` shows where)",
+                name = self.name
+            );
+        };
+        Ok(Outbound::Smtp {
+            config: SmtpConfig {
+                host: smtp.host,
+                port: smtp.port,
+                security: smtp.security,
+                username: imap.username.clone(),
+                cert_pin: smtp.cert_pin,
+            },
+            save_sent: smtp.save_sent,
+        })
     }
 
     /// The IMAP server, for an IMAP account. Only the tests need it; code matches on `server`.
@@ -305,6 +406,20 @@ struct RawAccount {
     password_command: Option<String>,
     oauth: Option<RawOAuth>,
     imap: Option<RawImap>,
+    address: Option<String>,
+    display_name: Option<String>,
+    smtp: Option<RawSmtp>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSmtp {
+    host: String,
+    port: Option<u16>,
+    #[serde(default)]
+    security: RawSecurity,
+    cert_sha256: Option<String>,
+    save_sent: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -361,19 +476,26 @@ impl Config {
             if a.username.trim().is_empty() {
                 bail!("account {name:?}: username is empty");
             }
+            let (address, display_name) = identity(&name, a.address, a.display_name)?;
             if let Some(raw) = a.oauth {
                 if a.password_command.is_some() {
                     bail!("account {name:?}: set either oauth or password_command, not both");
                 }
-                if a.imap.is_some() {
-                    bail!(
-                        "account {name:?}: an oauth account takes its mail server from the \
-                         provider; remove imap"
-                    );
+                for (set, key) in [(a.imap.is_some(), "imap"), (a.smtp.is_some(), "smtp")] {
+                    if set {
+                        bail!(
+                            "account {name:?}: an oauth account takes its mail server from the \
+                             provider; remove {key}"
+                        );
+                    }
                 }
-                accounts.push(oauth_account(name, a.username, raw)?);
+                let mut account = oauth_account(name, a.username, raw)?;
+                account.address = address;
+                account.display_name = display_name;
+                accounts.push(account);
                 continue;
             }
+            let smtp = a.smtp.map(|raw| smtp_settings(&name, raw)).transpose()?;
             let Some(imap) = a.imap else {
                 bail!("account {name:?}: imap is missing");
             };
@@ -411,6 +533,9 @@ impl Config {
                 }),
                 login: Login::Password(password),
                 name,
+                address,
+                display_name,
+                smtp,
             });
         }
         Ok(Self {
@@ -481,6 +606,60 @@ fn oauth_account(name: String, username: String, raw: RawOAuth) -> Result<Accoun
             client_id,
         }),
         name,
+        address: None,
+        display_name: None,
+        smtp: None,
+    })
+}
+
+/// An account's `address` and `display_name`, checked: an address neomail can send from, and a
+/// name without line breaks.
+fn identity(
+    name: &str,
+    address: Option<String>,
+    display_name: Option<String>,
+) -> Result<(Option<String>, Option<String>)> {
+    let address = address.map(|a| a.trim().to_owned());
+    let display_name = display_name
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty());
+    let checked = Mailbox::new(
+        display_name.as_deref(),
+        address.as_deref().unwrap_or("x@example.com"),
+    );
+    if let Err(e) = checked {
+        bail!("account {name:?}: {e}");
+    }
+    Ok((address, display_name))
+}
+
+/// `[accounts.smtp]`, checked. The port defaults to 465 for TLS and 587 for STARTTLS (RFC 8314
+/// section 7.3, RFC 6409 section 3.1); a server named here keeps no copy of sent mail unless
+/// `save_sent = false` says it does.
+fn smtp_settings(name: &str, raw: RawSmtp) -> Result<SmtpSettings> {
+    let host = raw.host.trim().to_owned();
+    if host.is_empty() {
+        bail!("account {name:?}: smtp.host is empty");
+    }
+    let security = match raw.security {
+        RawSecurity::Tls => Security::Tls,
+        RawSecurity::Starttls => Security::StartTls,
+    };
+    let cert_pin = raw
+        .cert_sha256
+        .as_deref()
+        .map(str::parse::<CertPin>)
+        .transpose()
+        .with_context(|| format!("account {name:?}: smtp.cert_sha256"))?;
+    Ok(SmtpSettings {
+        host,
+        port: raw.port.unwrap_or(match security {
+            Security::Tls => 465,
+            Security::StartTls => 587,
+        }),
+        security,
+        cert_pin,
+        save_sent: raw.save_sent.unwrap_or(true),
     })
 }
 
@@ -502,11 +681,13 @@ pub fn oauth_account_toml(
 }
 
 /// The TOML for a new password account, ready to append to the config file. Without
-/// `password_command` the password is in the OS keyring.
+/// `password_command` the password is in the OS keyring. `smtp`, when given, is written out in
+/// full, so the config shows how the account sends.
 pub fn password_account_toml(
     name: &str,
     imap: &ImapConfig,
     password_command: Option<&str>,
+    smtp: Option<&SmtpSettings>,
 ) -> String {
     let quote = |s: &str| toml::Value::String(s.to_owned()).to_string();
     let mut block = format!(
@@ -517,20 +698,35 @@ pub fn password_account_toml(
     if let Some(command) = password_command {
         block.push_str(&format!("password_command = {}\n", quote(command)));
     }
-    let security = match imap.security {
-        Security::Tls => "tls",
-        Security::StartTls => "starttls",
-    };
     block.push_str(&format!(
         "[accounts.imap]\nhost = {}\nport = {}\nsecurity = {}\n",
         quote(&imap.host),
         imap.port,
-        quote(security)
+        quote(security_name(imap.security))
     ));
     if let Some(pin) = imap.cert_pin {
         block.push_str(&format!("cert_sha256 = {}\n", quote(&pin.to_string())));
     }
+    if let Some(smtp) = smtp {
+        block.push_str(&format!(
+            "[accounts.smtp]\nhost = {}\nport = {}\nsecurity = {}\nsave_sent = {}\n",
+            quote(&smtp.host),
+            smtp.port,
+            quote(security_name(smtp.security)),
+            smtp.save_sent
+        ));
+        if let Some(pin) = smtp.cert_pin {
+            block.push_str(&format!("cert_sha256 = {}\n", quote(&pin.to_string())));
+        }
+    }
     block
+}
+
+fn security_name(security: Security) -> &'static str {
+    match security {
+        Security::Tls => "tls",
+        Security::StartTls => "starttls",
+    }
 }
 
 /// The config file's text, or `None` when there is no file yet.
@@ -1009,14 +1205,18 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             username: "you@example.com".into(),
             cert_pin: Some(pin),
         };
-        let block = password_account_toml("proton", &imap, Some("pass show \"bridge\""));
+        let smtp = preset_smtp(&imap);
+        let block =
+            password_account_toml("proton", &imap, Some("pass show \"bridge\""), smtp.as_ref());
         assert_eq!(
             block,
             format!(
                 "[[accounts]]\nname = \"proton\"\nusername = \"you@example.com\"\n\
                  password_command = 'pass show \"bridge\"'\n[accounts.imap]\nhost = \"127.0.0.1\"\n\
-                 port = 1143\nsecurity = \"starttls\"\ncert_sha256 = \"{}\"\n",
-                "ab".repeat(32)
+                 port = 1143\nsecurity = \"starttls\"\ncert_sha256 = \"{pin}\"\n\
+                 [accounts.smtp]\nhost = \"127.0.0.1\"\nport = 1025\nsecurity = \"starttls\"\n\
+                 save_sent = false\ncert_sha256 = \"{pin}\"\n",
+                pin = "ab".repeat(32)
             )
         );
         append_account(&path, "proton", &block).unwrap();
@@ -1027,7 +1227,8 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             username: "user@mail.example".into(),
             cert_pin: None,
         };
-        append_account(&path, "work", &password_account_toml("work", &plain, None)).unwrap();
+        let block = password_account_toml("work", &plain, None, None);
+        append_account(&path, "work", &block).unwrap();
         let c = Config::load(&path).unwrap();
         let proton = c.find("proton").unwrap();
         assert_eq!(
@@ -1052,6 +1253,139 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
             ("imap.mail.example", 993, None)
         );
         assert_eq!(work.login, Login::Password(PasswordSource::Keyring));
+        assert_eq!(proton.smtp, smtp);
+    }
+
+    /// One `[[accounts]]` entry: `extra` lines after the name, then `tables`.
+    fn account(extra: &str, tables: &str) -> Result<Account> {
+        let text = format!("[[accounts]]\nname = \"a\"\n{extra}\n{tables}");
+        Ok(Config::parse(&text)?.accounts.remove(0))
+    }
+
+    const IMAP_ACCOUNT: &str = "username = \"me@example.com\"\npassword_command = \"true\"";
+
+    #[test]
+    fn mail_is_sent_as_the_address_else_the_username() {
+        let imap = "[accounts.imap]\nhost = \"imap.example.com\"";
+        let me = account(IMAP_ACCOUNT, imap).unwrap().identity().unwrap();
+        assert_eq!(me.to_string(), "me@example.com");
+        let named = "display_name = \" Zoë Ødegård \"\naddress = \"zoe@example.com\"";
+        let me = account(&format!("{IMAP_ACCOUNT}\n{named}"), imap)
+            .unwrap()
+            .identity()
+            .unwrap();
+        assert_eq!(me.to_string(), "Zoë Ødegård <zoe@example.com>");
+        // A login name that is not an address needs `address`, and says so when sending.
+        let bare = "username = \"me\"\npassword_command = \"true\"";
+        let e = account(bare, imap).unwrap().identity().unwrap_err();
+        assert!(e.to_string().contains("set address = "), "{e}");
+        for bad in [
+            "address = \"not an address\"",
+            "address = \"me@example.com\\r\\nBcc: x@example.net\"",
+            "display_name = \"Me\\r\\nBcc: x@example.net\"",
+        ] {
+            let e = account(&format!("{IMAP_ACCOUNT}\n{bad}"), imap).unwrap_err();
+            assert!(format!("{e:#}").contains("account \"a\""), "{bad}: {e:#}");
+        }
+    }
+
+    #[test]
+    fn each_account_sends_through_its_server_or_its_providers_preset() {
+        let pin = "ab".repeat(32);
+        let smtp = |host: &str, port, security, cert_pin, save_sent| Outbound::Smtp {
+            config: SmtpConfig {
+                host: host.into(),
+                port,
+                security,
+                username: "me@example.com".into(),
+                cert_pin,
+            },
+            save_sent,
+        };
+        let gmail = smtp("smtp.gmail.com", 465, Security::Tls, None, false);
+        let bridge_imap = format!(
+            "[accounts.imap]\nhost = \"127.0.0.1\"\nport = 1143\nsecurity = \"starttls\"\n\
+             cert_sha256 = \"{pin}\""
+        );
+        let google =
+            "username = \"me@example.com\"\noauth = { provider = \"google\", client_id = \"i\" }";
+        let microsoft = "username = \"me@example.com\"\noauth = { provider = \"microsoft\", client_id = \"i\" }";
+        let cases = [
+            (google, String::new(), gmail.clone()),
+            (
+                IMAP_ACCOUNT,
+                "[accounts.imap]\nhost = \"imap.gmail.com\"".into(),
+                gmail,
+            ),
+            (
+                IMAP_ACCOUNT,
+                bridge_imap,
+                smtp(
+                    "127.0.0.1",
+                    1025,
+                    Security::StartTls,
+                    pin.parse().ok(),
+                    false,
+                ),
+            ),
+            (
+                IMAP_ACCOUNT,
+                "[accounts.imap]\nhost = \"imap.example.com\"\n\
+                 [accounts.smtp]\nhost = \"smtp.example.com\"\nsecurity = \"starttls\""
+                    .into(),
+                smtp("smtp.example.com", 587, Security::StartTls, None, true),
+            ),
+            (
+                IMAP_ACCOUNT,
+                format!(
+                    "[accounts.imap]\nhost = \"imap.gmail.com\"\n[accounts.smtp]\n\
+                     host = \"mail.example.com\"\nsave_sent = false\ncert_sha256 = \"{pin}\""
+                ),
+                smtp(
+                    "mail.example.com",
+                    465,
+                    Security::Tls,
+                    pin.parse().ok(),
+                    false,
+                ),
+            ),
+            (microsoft, String::new(), Outbound::Graph),
+        ];
+        for (extra, tables, want) in cases {
+            let a = account(extra, &tables).unwrap();
+            assert_eq!(a.outbound().unwrap(), want, "{extra} {tables}");
+        }
+    }
+
+    #[test]
+    fn an_account_with_no_known_smtp_says_how_to_add_one() {
+        let pin = "ab".repeat(32);
+        for tables in [
+            "[accounts.imap]\nhost = \"imap.example.com\"".to_owned(),
+            // Bridge's port without a pin is not Bridge.
+            "[accounts.imap]\nhost = \"127.0.0.1\"\nport = 1143\nsecurity = \"starttls\"".into(),
+            format!("[accounts.imap]\nhost = \"127.0.0.2\"\nport = 1143\ncert_sha256 = \"{pin}\""),
+        ] {
+            let e = account(IMAP_ACCOUNT, &tables)
+                .unwrap()
+                .outbound()
+                .unwrap_err();
+            assert!(
+                e.to_string()
+                    .starts_with("account a has no smtp; add an [accounts.smtp]"),
+                "{e}"
+            );
+        }
+        let google =
+            "username = \"me@example.com\"\noauth = { provider = \"google\", client_id = \"i\" }";
+        let e = account(google, "[accounts.smtp]\nhost = \"smtp.example.com\"").unwrap_err();
+        assert!(e.to_string().contains("remove smtp"), "{e}");
+        let e = account(
+            IMAP_ACCOUNT,
+            "[accounts.imap]\nhost = \"h\"\n[accounts.smtp]\nhost = \" \"",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("smtp.host is empty"), "{e}");
     }
 
     #[test]

@@ -3,7 +3,10 @@
 //! It writes a message's read state ([`GraphSource::set_read`]) and moves a message to the archive
 //! or the trash ([`GraphSource::move_to`]).
 //!
-//! [`Transport`] is the seam: one HTTPS GET, or one PATCH or POST with a JSON body. neomail
+//! It also sends mail ([`GraphSource::send`]).
+//!
+//! [`Transport`] is the seam: one HTTPS GET, or one PATCH or POST with a JSON body, or one POST
+//! with a text body. neomail
 //! implements it with its own HTTP client; the tests give a scripted fake, so nothing here opens a
 //! connection.
 //!
@@ -40,6 +43,9 @@
 //!   for good, or creates, renames or deletes a folder.
 //! - At most [`CONCURRENT_FETCHES`] message downloads or writes run at once: Outlook allows four concurrent
 //!   requests per app and mailbox (<https://learn.microsoft.com/en-us/graph/throttling-limits>).
+//! - A message is sent with `POST /me/sendMail` and its MIME source, base64-encoded, as
+//!   `Content-Type: text/plain`; Graph answers `202 Accepted` and saves the message in Sent Items
+//!   itself. That needs Mail.Send (<https://learn.microsoft.com/en-us/graph/api/user-sendmail>).
 //! - Errors never quote a response body or the token.
 
 use std::error::Error;
@@ -48,8 +54,11 @@ use std::future::Future;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
+use nm_core::compose::Outgoing;
 use nm_core::{
     Cursor, Destination, Flags, FolderName, IdChange, IdChanges, IdFetched, IdListed, IdSource,
     ListedFolder, Moved, RemoteId, Role, Written,
@@ -133,6 +142,15 @@ pub trait Transport {
         body: &[u8],
         max_body: usize,
     ) -> impl Future<Output = Result<Reply, TransportError>>;
+
+    /// A POST with `body`, sent as `Content-Type: text/plain`, as for [`Self::patch_json`].
+    fn post_text(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> impl Future<Output = Result<Reply, TransportError>>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -154,6 +172,25 @@ pub enum GraphError {
     /// Any other status, with Graph's `error.code` cleaned to letters, digits, `_`, `-` and `.`.
     #[error("Microsoft Graph answered HTTP {status}{}", code_suffix(.code))]
     Status { status: u16, code: Option<String> },
+    /// 403 on sendMail: the sign-in may lack Mail.Send, or the account may not send.
+    #[error(
+        "Microsoft Graph refused to send the message (HTTP 403): the sign-in may not include \
+         Mail.Send; nothing was sent"
+    )]
+    CannotSend,
+    /// sendMail failed in a way that does not say the message was refused: a transport error,
+    /// which may come after Graph got the request, or a 5xx. It may have been sent.
+    #[error(
+        "Microsoft Graph did not confirm the message, so it may have been sent; check Sent Items \
+         before sending it again"
+    )]
+    Unconfirmed(#[source] Box<GraphError>),
+    /// sendMail takes its recipients from the message's headers, and Bcc is in none.
+    #[error(
+        "Outlook accounts cannot send Bcc yet: Microsoft Graph takes the recipients from the \
+         message's headers, which never hold Bcc; nothing was sent"
+    )]
+    Bcc,
     #[error("Microsoft Graph's answer is not the expected JSON")]
     Malformed,
     #[error("Microsoft Graph's next page or delta link points outside {GRAPH_ORIGIN}; refused")]
@@ -378,21 +415,27 @@ impl<T: Transport> GraphSource<T> {
         } else {
             &[auth, PREFER]
         };
-        retrying(|| self.transport.get(url, headers, max_body)).await
+        retrying(THROTTLED, || self.transport.get(url, headers, max_body)).await
     }
 
     /// PATCHes `url` with the JSON `body`, under the same rules as [`Self::get`].
     async fn patch(&self, url: &str, body: &[u8], max_body: usize) -> Result<Reply, GraphError> {
         let auth = ("Authorization", self.authorization.as_str());
         let headers = [auth, PREFER, ACCEPT_JSON];
-        retrying(|| self.transport.patch_json(url, &headers, body, max_body)).await
+        retrying(THROTTLED, || {
+            self.transport.patch_json(url, &headers, body, max_body)
+        })
+        .await
     }
 
     /// POSTs the JSON `body` to `url`, under the same rules as [`Self::get`].
     async fn post(&self, url: &str, body: &[u8], max_body: usize) -> Result<Reply, GraphError> {
         let auth = ("Authorization", self.authorization.as_str());
         let headers = [auth, PREFER, ACCEPT_JSON];
-        retrying(|| self.transport.post_json(url, &headers, body, max_body)).await
+        retrying(THROTTLED, || {
+            self.transport.post_json(url, &headers, body, max_body)
+        })
+        .await
     }
 
     async fn get_json<D: serde::de::DeserializeOwned>(&self, url: &str) -> Result<D, GraphError> {
@@ -830,10 +873,14 @@ impl<T: Transport> GraphSource<T> {
     }
 }
 
-/// Sends with `send` until the answer is not throttled: 429 and 503 are sent again after
+/// The statuses a request is sent again after: Graph's throttling answers
+/// (<https://learn.microsoft.com/en-us/graph/throttling>).
+const THROTTLED: &[u16] = &[429, 503];
+
+/// Sends with `send` until the answer is not throttled: a status in `retry` is sent again after
 /// `Retry-After`, else after a doubling backoff, for at most [`MAX_TRIES`] tries. 401 and 403
 /// are errors; any other status is the caller's.
-async fn retrying<F, Fut>(mut send: F) -> Result<Reply, GraphError>
+async fn retrying<F, Fut>(retry: &[u16], mut send: F) -> Result<Reply, GraphError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Reply, TransportError>>,
@@ -843,16 +890,53 @@ where
     loop {
         let reply = send().await.map_err(GraphError::Transport)?;
         match reply.status {
-            429 | 503 if tries < MAX_TRIES => {
+            status if retry.contains(&status) && tries < MAX_TRIES => {
                 let wait = reply.retry_after.unwrap_or(backoff).min(MAX_RETRY_AFTER);
                 tokio::time::sleep(wait).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 tries += 1;
             }
-            status @ (429 | 503) => return Err(GraphError::Throttled { status }),
+            status if retry.contains(&status) => return Err(GraphError::Throttled { status }),
             401 => return Err(GraphError::Unauthorized),
             403 => return Err(GraphError::Forbidden),
             _ => return Ok(reply),
+        }
+    }
+}
+
+impl<T: Transport> GraphSource<T> {
+    /// Sends `message` with `POST /me/sendMail`: its MIME source, base64-encoded, as
+    /// `Content-Type: text/plain` (<https://learn.microsoft.com/en-us/graph/api/user-sendmail>).
+    /// Ok is Graph's `202 Accepted`, which means accepted, not delivered. Graph saves the copy in
+    /// Sent Items itself.
+    ///
+    /// Graph takes no envelope and reads the recipients from the headers, so a message with Bcc
+    /// recipients is refused before any request: [`GraphError::Bcc`]. 403 is
+    /// [`GraphError::CannotSend`]. Only 429 is sent again: it says the request was not
+    /// processed, and a 503 might come after Graph accepted the message, which a retry would send
+    /// twice. So a 5xx or a transport error is [`GraphError::Unconfirmed`]: it may have been sent.
+    pub async fn send(&self, message: &Outgoing) -> Result<(), GraphError> {
+        if !message.bcc.is_empty() {
+            return Err(GraphError::Bcc);
+        }
+        let body = BASE64.encode(&message.mime);
+        let url = format!("{API}/me/sendMail");
+        let auth = ("Authorization", self.authorization.as_str());
+        let headers = [auth, ACCEPT_JSON];
+        let reply = retrying(&[429], || {
+            self.transport
+                .post_text(&url, &headers, body.as_bytes(), MAX_JSON)
+        })
+        .await
+        .map_err(|e| match e {
+            GraphError::Forbidden => GraphError::CannotSend,
+            e @ GraphError::Transport(_) => GraphError::Unconfirmed(Box::new(e)),
+            e => e,
+        })?;
+        match reply.status {
+            202 => Ok(()),
+            500.. => Err(GraphError::Unconfirmed(Box::new(status_error(&reply)))),
+            _ => Err(status_error(&reply)),
         }
     }
 }

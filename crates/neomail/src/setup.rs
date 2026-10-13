@@ -90,6 +90,11 @@ pub struct Args {
     pub password_command: Option<String>,
     pub cert_sha256: Option<CertPin>,
     pub no_check: bool,
+    /// imap: the SMTP server; Gmail's and Bridge's are known.
+    pub smtp_host: Option<String>,
+    pub smtp_port: Option<u16>,
+    /// imap: how the SMTP connection is secured; by default STARTTLS on 587, else TLS.
+    pub smtp_security: Option<Security>,
 }
 
 /// What `add` will do, once everything is known but nothing is written.
@@ -102,6 +107,9 @@ pub struct Plan {
     /// else the user confirms it.
     pub read_pin: Option<Option<CertPin>>,
     pub check: bool,
+    /// The SMTP server `--smtp-host` names; without it, the one [`config::preset_smtp`] knows
+    /// for the IMAP server, if any.
+    pub smtp: Option<config::SmtpSettings>,
 }
 
 /// The steps that reach outside the process. Plain function values, not a trait: one real set
@@ -244,6 +252,7 @@ pub fn gather(
         }
     });
     let password_command = args.password_command.filter(|c| !c.trim().is_empty());
+    let smtp = smtp_settings(args.smtp_host, args.smtp_port, args.smtp_security)?;
     Ok(Plan {
         imap: ImapConfig {
             host,
@@ -256,7 +265,37 @@ pub fn gather(
         check: !args.no_check,
         name,
         password_command,
+        smtp,
     })
+}
+
+/// `--smtp-host`, `--smtp-port` and `--smtp-security`: without `--smtp-security`, port 587 is
+/// submission with STARTTLS (RFC 6409 section 3.1), any other port TLS from the first byte, 465 by
+/// default (RFC 8314 section 3.3). A server named here keeps no copy of sent mail, so neomail
+/// appends one to Sent.
+fn smtp_settings(
+    host: Option<String>,
+    port: Option<u16>,
+    security: Option<Security>,
+) -> Result<Option<config::SmtpSettings>> {
+    let Some(host) = host.map(|h| h.trim().to_owned()) else {
+        return Ok(None);
+    };
+    if host.is_empty() {
+        return Err(crate::usage("--smtp-host is empty"));
+    }
+    let port = port.unwrap_or(465);
+    Ok(Some(config::SmtpSettings {
+        host,
+        port,
+        security: security.unwrap_or(if port == 587 {
+            Security::StartTls
+        } else {
+            Security::Tls
+        }),
+        cert_pin: None,
+        save_sent: true,
+    }))
 }
 
 /// Checks that the account can be appended, pins the certificate, reads the password, checks the
@@ -270,7 +309,15 @@ pub fn execute(
 ) -> Result<()> {
     let name = plan.name.clone();
     let block = |plan: &Plan| {
-        config::password_account_toml(&name, &plan.imap, plan.password_command.as_deref())
+        config::password_account_toml(
+            &name,
+            &plan.imap,
+            plan.password_command.as_deref(),
+            plan.smtp
+                .clone()
+                .or_else(|| config::preset_smtp(&plan.imap))
+                .as_ref(),
+        )
     };
     config::check_append(config_path, &name, &block(&plan))?;
 
@@ -565,6 +612,56 @@ mod tests {
     }
 
     #[test]
+    fn imap_writes_the_smtp_server_it_is_given_and_appends_sent_copies() {
+        for (port, security, expected) in [
+            (None, None, (465, Security::Tls)),
+            (Some(587), None, (587, Security::StartTls)),
+            (Some(2465), None, (2465, Security::Tls)),
+            (
+                Some(2525),
+                Some(Security::StartTls),
+                (2525, Security::StartTls),
+            ),
+            (Some(587), Some(Security::Tls), (587, Security::Tls)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let args = Args {
+                name: Some("work".into()),
+                username: Some("user@mail.example".into()),
+                host: Some("imap.mail.example".into()),
+                smtp_host: Some("smtp.mail.example".into()),
+                smtp_port: port,
+                smtp_security: security,
+                ..Args::default()
+            };
+            let plan = gather(&IMAP, &path, args, OFF_TERMINAL).unwrap();
+            Fakes::new().run(plan, &path).unwrap();
+            let config = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let smtp = config.find("work").unwrap().smtp.clone().unwrap();
+            assert_eq!(smtp.host, "smtp.mail.example");
+            assert_eq!((smtp.port, smtp.security), expected, "{port:?}");
+            assert!(
+                smtp.save_sent,
+                "a server neomail does not know keeps no copy"
+            );
+        }
+        // Without one, a server neomail does not know gets no smtp at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let args = Args {
+            name: Some("work".into()),
+            username: Some("user@mail.example".into()),
+            host: Some("imap.mail.example".into()),
+            ..Args::default()
+        };
+        let plan = gather(&IMAP, &path, args, OFF_TERMINAL).unwrap();
+        Fakes::new().run(plan, &path).unwrap();
+        let config = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.find("work").unwrap().smtp, None);
+    }
+
+    #[test]
     fn a_pin_mismatch_is_refused_before_anything_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -605,6 +702,17 @@ mod tests {
         assert_eq!(
             c.find("proton").unwrap().imap().unwrap().cert_pin,
             Some(pin("ab"))
+        );
+        // Bridge's SMTP is written with the pin just confirmed, and keeps its own Sent copy.
+        assert_eq!(
+            c.find("proton").unwrap().smtp,
+            Some(config::SmtpSettings {
+                host: "127.0.0.1".into(),
+                port: 1025,
+                security: Security::StartTls,
+                cert_pin: Some(pin("ab")),
+                save_sent: false,
+            })
         );
     }
 

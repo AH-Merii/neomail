@@ -55,6 +55,8 @@ rusqlite.workspace = true
 tempfile.workspace = true
 # Paused time for the device code polling tests.
 tokio = { workspace = true, features = ["test-util"] }
+# A self-signed certificate for the fake SMTP server the send tests pin.
+rcgen.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The notification test serves the D-Bus call on a socket pair, without a bus.

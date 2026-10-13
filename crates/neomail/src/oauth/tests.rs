@@ -980,6 +980,11 @@ async fn microsoft_refreshes_each_sign_in_for_no_more_than_it_granted() {
             MailGrant::ReadWrite,
             "offline_access https://graph.microsoft.com/Mail.ReadWrite",
         ),
+        (
+            MailGrant::ReadWriteSend,
+            "offline_access https://graph.microsoft.com/Mail.ReadWrite \
+             https://graph.microsoft.com/Mail.Send",
+        ),
     ] {
         let http = FakeHttp::new(&[(200, &ms_token(None, MS_REFRESH))]);
         let refreshed = refresh(
@@ -1005,7 +1010,7 @@ async fn microsoft_refreshes_each_sign_in_for_no_more_than_it_granted() {
     }
 }
 
-/// A new sign-in asks for Mail.ReadWrite and Mail.Read, and what it records follows what
+/// A new sign-in asks for Mail.ReadWrite, Mail.Read and Mail.Send, and what it records follows what
 /// Microsoft granted. A refresh may ask only for what the sign-in asked for or a subset
 /// (<https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow>), so
 /// this version's refreshes and the previous release's (`offline_access` and Mail.Read) all stay
@@ -1016,6 +1021,7 @@ fn a_sign_in_records_whether_it_may_change_mail() {
     for scope in [
         "https://graph.microsoft.com/Mail.ReadWrite",
         "https://graph.microsoft.com/Mail.Read",
+        "https://graph.microsoft.com/Mail.Send",
     ] {
         assert!(asked.contains(&scope), "{asked:?}");
     }
@@ -1024,6 +1030,7 @@ fn a_sign_in_records_whether_it_may_change_mail() {
         "offline_access https://graph.microsoft.com/Mail.Read",
         refresh.for_grant(MailGrant::Read),
         refresh.for_grant(MailGrant::ReadWrite),
+        refresh.for_grant(MailGrant::ReadWriteSend),
     ] {
         assert!(
             refreshed
@@ -1046,8 +1053,43 @@ fn a_sign_in_records_whether_it_may_change_mail() {
         ms(Some("https://graph.microsoft.com/Mail.Read openid")),
         MailGrant::Read
     );
+    assert_eq!(
+        ms(Some(
+            "https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/mail.send"
+        )),
+        MailGrant::ReadWriteSend
+    );
+    // Send without write stays read-only, so its refresh asks for no more than was granted.
+    assert_eq!(
+        ms(Some(
+            "https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send"
+        )),
+        MailGrant::Read
+    );
     // No scope in the answer means the scopes asked for.
-    assert_eq!(ms(None), MailGrant::ReadWrite);
+    assert_eq!(ms(None), MailGrant::ReadWriteSend);
     let google = token_json(FULL_SCOPE, Some(REFRESH), "you@example.com");
-    assert_eq!(grant(&GOOGLE, google), MailGrant::ReadWrite);
+    assert_eq!(grant(&GOOGLE, google), MailGrant::ReadWriteSend);
+}
+
+/// What each grant lets neomail do. The match has no wildcard, so a new grant must be classified
+/// here before it compiles.
+#[test]
+fn each_grant_says_what_it_allows() {
+    let allows = |grant: MailGrant| match grant {
+        MailGrant::Read => (false, false),
+        MailGrant::ReadWrite => (true, false),
+        MailGrant::ReadWriteSend => (true, true),
+    };
+    for grant in [
+        MailGrant::Read,
+        MailGrant::ReadWrite,
+        MailGrant::ReadWriteSend,
+    ] {
+        assert_eq!(
+            (grant.can_write(), grant.can_send()),
+            allows(grant),
+            "{grant:?}"
+        );
+    }
 }

@@ -12,7 +12,9 @@ publish = false
 chrono.workspace = true
 html2text.workspace = true
 html5ever.workspace = true
+mail-builder.workspace = true
 mail-parser.workspace = true
+pulldown-cmark.workspace = true
 rusqlite.workspace = true
 # msg_key: the hash of a message without a Message-ID (crates/nm-core/src/parse.rs). Already in
 # the tree through neomail.

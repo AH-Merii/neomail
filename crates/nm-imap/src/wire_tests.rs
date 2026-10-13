@@ -14,8 +14,8 @@ use nm_core::{Cache, sync_inbox};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
 use super::{
-    ImapConfig, ImapError, ImapSource, Login, Security, WatchEvent, Watcher, check_on, greeting,
-    log_in, server_certificate, xoauth2_response,
+    ImapConfig, ImapError, ImapSource, Login, Security, WatchEvent, Watcher, append_sent_on,
+    check_on, greeting, log_in, server_certificate, xoauth2_response,
 };
 
 /// The FETCH response for one whole, unread message.
@@ -1209,4 +1209,95 @@ async fn a_name_two_mailboxes_share_once_decoded_is_refused() {
         * LIST () \"/\" \"Bad&-AO-name\"\r\n";
     let e = refused("Bad&AO-name", list).await;
     assert!(matches!(e, ImapError::SharedName(_)), "{e:?}");
+}
+
+/// A server for APPEND: answers LIST with `list`, takes APPEND's literal, and returns every
+/// command line and each appended message.
+async fn append_server(stream: DuplexStream, list: &'static str) -> (Vec<String>, Vec<Vec<u8>>) {
+    use tokio::io::AsyncReadExt;
+    let (read, mut write) = tokio::io::split(stream);
+    let mut read = BufReader::new(read);
+    let (mut seen, mut appended) = (Vec::new(), Vec::new());
+    write.write_all(b"* OK ready\r\n").await.unwrap();
+    loop {
+        let mut line = String::new();
+        if read.read_line(&mut line).await.unwrap() == 0 {
+            break;
+        }
+        let line = line.trim_end().to_owned();
+        let (tag, command) = line.split_once(' ').unwrap_or((&line, ""));
+        let upper = command.to_ascii_uppercase();
+        seen.push(command.to_owned());
+        let untagged = if upper.starts_with("LIST") {
+            list.to_owned()
+        } else if upper.starts_with("APPEND") {
+            let size: usize = command
+                .rsplit_once('{')
+                .unwrap()
+                .1
+                .trim_end_matches('}')
+                .parse()
+                .unwrap();
+            write.write_all(b"+ go ahead\r\n").await.unwrap();
+            let mut message = vec![0; size + 2];
+            read.read_exact(&mut message).await.unwrap();
+            message.truncate(size);
+            appended.push(message);
+            String::new()
+        } else if upper.starts_with("LOGOUT") {
+            "* BYE\r\n".to_owned()
+        } else {
+            String::new()
+        };
+        let reply = format!("{untagged}{tag} OK done\r\n");
+        write.write_all(reply.as_bytes()).await.unwrap();
+        if upper.starts_with("LOGOUT") {
+            break;
+        }
+    }
+    (seen, appended)
+}
+
+async fn append_with(
+    list: &'static str,
+    mime: &[u8],
+) -> (Result<(), ImapError>, Vec<String>, Vec<Vec<u8>>) {
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(append_server(server_end, list));
+    let mut client = Client::new(client_end);
+    greeting(&mut client).await.unwrap();
+    let session = log_in(client, "user", Login::Password("pw")).await.unwrap();
+    let result = append_sent_on(session, mime).await;
+    let (seen, appended) = server.await.unwrap();
+    (result, seen, appended)
+}
+
+#[tokio::test]
+async fn a_sent_copy_goes_to_the_mailbox_marked_sent_as_seen() {
+    let list = "* LIST () \"/\" \"INBOX\"\r\n\
+        * LIST () \"/\" \"Sent\"\r\n\
+        * LIST (\\Sent \\HasNoChildren) \"/\" \"Sent Items\"\r\n";
+    let mime = b"From: me@example.com\r\nSubject: s\r\n\r\nbody\r\n";
+    let (result, seen, appended) = append_with(list, mime).await;
+    result.unwrap();
+    assert_eq!(appended, [mime.to_vec()]);
+    let append = seen.iter().find(|c| c.starts_with("APPEND")).unwrap();
+    assert!(
+        append.starts_with("APPEND \"Sent Items\" (\\Seen) {"),
+        "{append}"
+    );
+    assert_eq!(seen.last().unwrap(), "LOGOUT");
+}
+
+#[tokio::test]
+async fn without_a_sent_mailbox_nothing_is_appended_or_created() {
+    let (result, seen, appended) = append_with(GMAIL_LIST, b"x\r\n").await;
+    assert!(matches!(result, Err(ImapError::NoSent)), "{result:?}");
+    assert!(appended.is_empty());
+    for c in seen.iter().map(|c| c.to_ascii_uppercase()) {
+        assert!(
+            !c.starts_with("APPEND") && !c.starts_with("CREATE") && !c.starts_with("SELECT"),
+            "{c}"
+        );
+    }
 }

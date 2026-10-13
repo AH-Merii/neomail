@@ -12,6 +12,8 @@ publish = false
 nm-core.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+# sendMail takes the MIME source base64-encoded.
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
