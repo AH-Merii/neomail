@@ -1,8 +1,9 @@
-//! `neomail account add` for the password providers: any IMAP server, Proton Mail Bridge and
-//! Gmail with an app password. A provider is data (a [`Preset`]); one flow gathers what the flags
-//! left out, reads and pins the certificate when the preset says so, checks the login and writes
-//! the account with the shared config writer. Nothing touching the network or the keyring is
-//! called directly: [`Deps`] holds those steps, so the tests give in-memory ones.
+//! `neomail account add` for the password providers without a wizard yet: any IMAP server and
+//! Proton Mail Bridge ([`crate::wizard::gmail`] has Gmail with an app password). A provider is
+//! data (a [`Preset`]); one flow gathers what the flags left out, reads and pins the certificate
+//! when the preset says so, checks the login and writes the account with the shared config
+//! writer. Nothing touching the network or the keyring is called directly: [`Deps`] holds those
+//! steps, so the tests give in-memory ones.
 
 use std::io::Write;
 use std::path::Path;
@@ -62,23 +63,6 @@ Bridge's self-signed certificate after showing you its SHA-256.
 ",
 };
 
-pub const GMAIL_APP_PASSWORD: Preset = Preset {
-    id: "gmail-app-password",
-    default_name: Some("gmail"),
-    host: Some("imap.gmail.com"),
-    port: 993,
-    security: Security::Tls,
-    username_prompt: "Gmail address: ",
-    password_prompt: "App password (not shown): ",
-    pin: false,
-    intro: "\
-Gmail with an app password, over IMAP (imap.gmail.com, port 993, TLS). Google: \"To create an
-app password, you need 2-Step Verification on your Google Account\"
-(https://support.google.com/accounts/answer/185833). Create one at
-https://myaccount.google.com/apppasswords and paste it below.
-",
-};
-
 /// The flags `account add` takes for a password provider.
 #[derive(Debug, Default)]
 pub struct Args {
@@ -123,7 +107,7 @@ pub struct Deps<'a> {
     pub check_login: &'a dyn Fn(&ImapConfig, &Password) -> Result<u32>,
 }
 
-/// `neomail account add imap|proton|gmail-app-password`.
+/// `neomail account add imap|proton`.
 pub fn add(
     preset: &'static Preset,
     config_path: &Path,
@@ -488,13 +472,6 @@ mod tests {
     fn each_preset_writes_its_server_and_the_password_goes_to_the_keyring() {
         for (preset, host, port, security, pinned) in [
             (&PROTON, "127.0.0.1", 1143, Security::StartTls, true),
-            (
-                &GMAIL_APP_PASSWORD,
-                "imap.gmail.com",
-                993,
-                Security::Tls,
-                false,
-            ),
             (&IMAP, "imap.mail.example", 993, Security::Tls, false),
         ] {
             let dir = tempfile::tempdir().unwrap();

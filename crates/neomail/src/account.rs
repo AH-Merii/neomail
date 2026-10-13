@@ -5,26 +5,19 @@
 //! the token refresh and the revocation run inside it.
 
 use std::io::Write;
-use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{self, Account, Login, OAuthSettings};
+mod add;
+
+pub use add::{AddArgs, add};
+
+use crate::config::{Account, Login, OAuthSettings};
 use crate::http::Https;
 use crate::keyring::{self, Keyring, OAuthEntry};
-use crate::oauth::{self, ClientKind, MailApi, Provider, Refreshed, Secret, SignedIn};
+use crate::oauth::{self, ClientKind, Provider, Refreshed, Secret, SignedIn};
 use crate::secret::{Input, SavedSignIn};
 use crate::{browser, secret};
-
-pub struct AddArgs {
-    pub name: Option<String>,
-    pub email: Option<String>,
-    pub client_id: Option<String>,
-    pub no_browser: bool,
-    pub device_code: bool,
-    /// Skip the read-only check of a Graph mailbox before the config is written.
-    pub no_check: bool,
-}
 
 /// How the user signs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,159 +56,6 @@ fn flow_here(provider: &Provider, asked: bool) -> Result<Flow> {
         asked,
         browser::ssh_without_display(|name| std::env::var(name).ok()),
     )
-}
-
-/// `neomail account add gmail` or `outlook`: shows the provider's setup steps, asks for what is
-/// missing, signs in, checks a Graph mailbox with one read-only request (unless `no_check`),
-/// stores the sign-in in the keyring, then appends the account to the config file. A failed
-/// sign-in or check stores and writes nothing.
-pub fn add(
-    provider: &'static Provider,
-    config_path: &Path,
-    args: AddArgs,
-    input: Input,
-    out: &mut impl Write,
-) -> Result<()> {
-    let flow = flow_here(provider, args.device_code)?;
-    let interactive = input.can_prompt();
-    let setup = &provider.setup;
-    let confidential = provider.client == ClientKind::Confidential;
-    if !interactive {
-        let missing: Vec<&str> = [
-            ("--email", args.email.is_none()),
-            ("--client-id", args.client_id.is_none()),
-        ]
-        .into_iter()
-        .filter_map(|(flag, missing)| missing.then_some(flag))
-        .collect();
-        if !missing.is_empty() {
-            let secret_note = if confidential {
-                " (the client secret is then read as one line of standard input)"
-            } else {
-                ""
-            };
-            return Err(secret::cannot_ask(
-                input,
-                &format!("{}{secret_note}", missing.join(" and ")),
-            ));
-        }
-    } else {
-        eprintln!("{}", setup.steps.replace("GUIDE", setup.guide));
-    }
-
-    let name = match args.name {
-        Some(name) => name.trim().to_owned(),
-        None if interactive => {
-            let typed = secret::prompt_line(&format!(
-                "Account name in neomail [{}]: ",
-                setup.default_name
-            ))?;
-            if typed.is_empty() {
-                setup.default_name.to_owned()
-            } else {
-                typed
-            }
-        }
-        None => setup.default_name.to_owned(),
-    };
-    if name.is_empty() {
-        bail!("the account name is empty");
-    }
-    config::check_can_add(config_path, &name)?;
-    let email = match args.email {
-        Some(email) => email.trim().to_owned(),
-        None => secret::prompt_line(setup.address_prompt)?,
-    };
-    if !email.contains('@') {
-        bail!("{email:?} is not an email address");
-    }
-    let client_id = match args.client_id {
-        Some(id) => id.trim().to_owned(),
-        None => secret::prompt_line(setup.client_id_prompt)?,
-    };
-    if client_id.is_empty() {
-        bail!("the client ID is empty");
-    }
-    let client_secret = if confidential {
-        Some(Secret::new(secret::read_secret(
-            setup.client_secret_prompt,
-            "client secret",
-            input,
-        )?))
-    } else {
-        None
-    };
-    // Before the browser: no point signing in when the sign-in cannot be kept. On Linux,
-    // opening the store connects to the Secret Service; reading the entry checks it answers.
-    // The append is tried with the address given, which the sign-in must match.
-    let keyring = Keyring::open_for_oauth()?;
-    let leftover = match keyring.get_oauth(&name) {
-        Err(e) if e.is::<keyring::Malformed>() => None,
-        other => other?,
-    };
-    config::check_append(
-        config_path,
-        &name,
-        &config::oauth_account_toml(&name, &email, provider, &client_id),
-    )?;
-    if let Some(leftover) = leftover {
-        revoke_leftover(provider, &keyring, &name, &leftover)?;
-    }
-    let client = oauth::Client {
-        id: client_id,
-        secret: client_secret,
-    };
-
-    let signed_in = sign_in(provider, &client, &email, args.no_browser, flow)?;
-    if provider.mail == MailApi::Graph && !args.no_check {
-        let token = signed_in.access_token.as_ref().with_context(|| {
-            format!(
-                "{} returned no access token; nothing was saved",
-                provider.name
-            )
-        })?;
-        let count = runtime()?.block_on(crate::graph::check(token))?;
-        eprintln!(
-            "neomail: checked {} through Microsoft Graph: its INBOX holds {count} message{}",
-            signed_in.email,
-            if count == 1 { "" } else { "s" }
-        );
-    }
-    keyring.set_oauth(&name, &entry(&client, &signed_in))?;
-    let block = config::oauth_account_toml(&name, &signed_in.email, provider, &client.id);
-    config::append_account(config_path, &name, &block).context(
-        "the sign-in is stored in the keyring, but the config file could not be updated",
-    )?;
-    writeln!(
-        out,
-        "Added {name:?} ({}) to {}. Its sign-in is in {} (service {:?}, username {name:?}).\n\
-         Next: neomail sync --account {name}",
-        signed_in.email,
-        config_path.display(),
-        keyring.name(),
-        keyring::OAUTH_SERVICE,
-    )?;
-    Ok(())
-}
-
-/// A sign-in left in the keyring under `name` with no account in the config (a config edited by
-/// hand, or an `add` whose append failed). It is revoked before the new sign-in, not after:
-/// Google's revocation invalidates every token the user granted the project, the new one too
-/// (<https://developers.google.com/identity/protocols/oauth2/native-app#tokenrevoke>).
-fn revoke_leftover(
-    provider: &Provider,
-    keyring: &Keyring,
-    name: &str,
-    leftover: &OAuthEntry,
-) -> Result<()> {
-    let revoke = provider.revoke_url.map(|_| {
-        |token: &Secret| {
-            Https::new().and_then(|http| runtime()?.block_on(oauth::revoke(&http, provider, token)))
-        }
-    });
-    let line = clear_leftover(keyring, name, leftover, provider.name, revoke)?;
-    eprintln!("{line}");
-    Ok(())
 }
 
 /// Revokes the leftover's refresh token with `revoke` (a failure is only a warning; `None` when
@@ -402,6 +242,26 @@ fn sign_in(
     no_browser: bool,
     flow: Flow,
 ) -> Result<SignedIn> {
+    let signed_in = sign_in_as(provider, client, email, no_browser, flow)?;
+    if !signed_in.email.eq_ignore_ascii_case(email) {
+        bail!(
+            "you signed in as {}, not {email}; nothing was saved. Sign in with {email}, or use \
+             --email {} for a new account",
+            signed_in.email,
+            signed_in.email
+        );
+    }
+    Ok(signed_in)
+}
+
+/// Signs in through the browser or with a device code, with `email` as the hint.
+fn sign_in_as(
+    provider: &Provider,
+    client: &oauth::Client,
+    email: &str,
+    no_browser: bool,
+    flow: Flow,
+) -> Result<SignedIn> {
     let http = Https::new()?;
     if flow == Flow::AutoDeviceCode {
         eprintln!("neomail: over SSH without a display: using device code sign-in");
@@ -418,14 +278,6 @@ fn sign_in(
             },
         ))?
     };
-    if !signed_in.email.eq_ignore_ascii_case(email) {
-        bail!(
-            "you signed in as {}, not {email}; nothing was saved. Sign in with {email}, or use \
-             --email {} for a new account",
-            signed_in.email,
-            signed_in.email
-        );
-    }
     Ok(signed_in)
 }
 
@@ -553,7 +405,7 @@ mod tests {
 
     #[test]
     fn a_google_entry_without_a_client_secret_says_to_log_in_again() {
-        let config = config::Config::parse(
+        let config = crate::config::Config::parse(
             "[[accounts]]\nname = \"gmail\"\nusername = \"you@example.com\"\n\
              oauth = { provider = \"google\", client_id = \"1234-abc.apps.googleusercontent.com\" }\n",
         )

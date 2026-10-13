@@ -6,81 +6,49 @@ create. It ships with no client of its own
 to, so with your own, no one else's app ever holds access to your mail, and no shared client can
 be blocked or abused for everyone at once.
 
-The setup takes about five minutes, once. `neomail account add gmail` prints the same steps in
-short.
-
-## 1. Create a Google Cloud project
-
-Open <https://console.cloud.google.com/projectcreate> and create a project, for example
-"neomail".
-
-*Why:* every OAuth client belongs to a project. A project of its own keeps neomail's client apart
-from anything else you run. No billing account is needed.
-
-## 2. Enable the Gmail API
-
-Open <https://console.cloud.google.com/apis/library/gmail.googleapis.com> with the project
-selected and click **Enable**.
-
-*Why:* it makes Gmail's scopes available to the project in step 4. neomail reads your mail over
-IMAP with one of them.
-
-## 3. Set up the Google Auth Platform: Branding and Audience
-
-In the console, go to **Google Auth platform > Branding**. In a new project it says the platform
-is not configured yet: click **Get started** and fill in its steps: **App information** (an app
-name only you will see, and your address as the support email), **Audience** (**External**),
-**Contact information** (your address) and **Finish** (agree to the user data policy), then
-click **Create** ([Google's guide](https://developers.google.com/workspace/guides/configure-oauth-consent)).
-
-Then open **Audience** and, under **Test users**, click **Add users** and add the Gmail address
-you will read.
-
-*Why:* *External* lets a personal `@gmail.com` account sign in (*Internal* is only for a Google
-Workspace organisation's own users). While the app is in *Testing*, only the test users listed
-here can sign in.
-
-## 4. Data Access: add the mail scope
-
-Go to **Data Access > Add or Remove Scopes**, add `https://mail.google.com/` and save.
-
-*Why:* this is the scope Gmail's IMAP requires for OAuth sign-in
-([IMAP with OAuth](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol)).
-neomail also asks for `openid email`, which needs no setup: it tells neomail which address you
-signed in with.
-
-## 5. Clients: create a Desktop app client
-
-Go to **Clients > Create Client**, choose **Application type > Desktop app**, give it a name and
-click **Create**
-([Google's guide](https://developers.google.com/workspace/guides/create-credentials)). Copy the
-**client ID** and the **client secret** now: Google shows the secret only once, when the client
-is created, and afterwards only its last four characters
-([Google: manage OAuth clients](https://support.google.com/cloud/answer/15549257)). If you lost
-it, open the client and click **Add secret** to get a new one.
-
-*Why:* a *Desktop app* client may redirect the browser back to `http://127.0.0.1` on any port
-([OAuth for desktop apps](https://developers.google.com/identity/protocols/oauth2/native-app)).
-That is where `neomail` listens for the sign-in to come back.
-
-## 6. Add the account
+## Add the account
 
 ```sh
 neomail account add gmail
-```
-
-It asks for a name for the account (default `gmail`), your address, the client ID and the client
-secret (not shown as you type), then opens Google's sign-in in your browser. Use `--no-browser` to
-only print the URL, for example over SSH. Google may first show a warning that it hasn't
-verified the app, in Testing mode too
-([Google: publishing status](https://support.google.com/cloud/answer/15549945)); it may also go
-straight to consent. If the warning shows, it is your own app, so click **Continue**. Then:
-
-```sh
 neomail sync --account gmail
 ```
 
-Off a terminal, pass everything as flags and the client secret as one line of standard input:
+On a terminal, `account add gmail` takes you through the setup one step at a time, from no
+Google Cloud project to a signed-in Desktop client. Each step says what to do, why it exists and
+which console page to open; `<` goes back a step. Give your project's ID when asked (or
+`--project ID`) and the links open that project. The steps are:
+
+1. Create a Google Cloud project, then give its ID (optional).
+2. Enable the Gmail API, so its scope is offered under Data Access.
+3. Set up the Google Auth Platform with Audience **External**, so a personal `@gmail.com`
+   account can sign in ([Google's guide](https://developers.google.com/workspace/guides/configure-oauth-consent)).
+4. Your address, then add it as a test user: while the app is in *Testing*, only test users can
+   sign in.
+5. Data Access: add `https://mail.google.com/`, the scope Gmail's IMAP and SMTP need for OAuth
+   ([IMAP with OAuth](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol)).
+6. Choose Testing or published ([below](#testing-mode-sign-ins-that-last-7-days)).
+7. Name the account. neomail checks that the name is free, that the config file can take it and
+   that the keyring opens, before it asks for anything secret.
+8. Create a **Desktop app** client and paste its ID and secret. Google shows the secret in full
+   only once, when the client is created
+   ([manage OAuth clients](https://support.google.com/cloud/answer/15549257)); if you lost it,
+   open the client and click **Add secret**. A Desktop app client may send the sign-in back to
+   `http://127.0.0.1` on any port, where neomail waits
+   ([OAuth for desktop apps](https://developers.google.com/identity/protocols/oauth2/native-app)).
+
+neomail then checks the client ID and secret with Google before you sign in: it sends a token
+request with a made-up code, which Google refuses differently for an unknown client, a wrong
+secret and a good pair. A wrong value sends you back to the step that asks for it. Then it opens
+Google's sign-in (`--no-browser` only prints the URL), and logs in to Gmail's IMAP (opening INBOX
+read-only) and SMTP (sending nothing) with the new sign-in. Nothing reaches the keyring or the
+config file until all of that has worked, with one exception: a sign-in left in the keyring under
+that name with no account in the config is revoked and deleted right before the new sign-in, since
+revoking it afterwards would end the new sign-in too. If the sign-in or the mail logins then fail,
+nothing replaces it. `--no-check` skips the client check and the mail logins, not the sign-in. A sign-in that times out names the steps whose mistakes Google shows
+only on its own page: the test user, the client type and the mail scope.
+
+Off a terminal, or with `--no-input`, the console steps are skipped: pass `--email` and
+`--client-id`, and the client secret as one line of standard input:
 
 ```sh
 secret-tool lookup service my-google-client | \
@@ -98,6 +66,10 @@ still show; its way through is then **Advanced**, then **Go to** your app's name
 ([Google's troubleshooting guide](https://developers.google.com/apps-script/api/troubleshoot-authentication-authorization)),
 and an app for your own use (fewer than 100 users) needs no verification
 ([Google: verification exceptions](https://support.google.com/cloud/answer/13464323)).
+
+Neither works with Advanced Protection: Google lets "only verified third-party apps" reach such an
+account's sensitive data ([Advanced Protection](https://support.google.com/accounts/answer/7539956)),
+and your own client is unverified.
 
 ## Archive and delete
 
@@ -181,7 +153,7 @@ neomail adds none. No setting is needed: an account on imap.gmail.com sends this
 - **"did not grant mail access":** when Google's consent screen shows a checkbox per
   permission, mail access may have been left unticked. Sign in again and tick it.
 - **"Access blocked" or "has not completed the Google verification process":** the address is
-  not a test user (step 3), or you signed in with another account.
+  not a test user, or you signed in with another account.
 - **"you signed in as …, not …":** the browser used another Google account. Sign in with the
   address you gave, or add the other one as its own account.
 - **"the server has no archive folder" or "the server has no trash folder":** All Mail or Trash
@@ -193,4 +165,4 @@ neomail adds none. No setting is needed: an account on imap.gmail.com sends this
   again with the right ones. For an account already added, run `neomail account logout NAME`, then
   `neomail account login NAME`, which asks for the secret again (a wrong client ID is fixed in the
   config file). Google shows a secret only when it is created; if you no longer have it, open the
-  client under **Clients** and click **Add secret** (step 5).
+  client under **Clients** and click **Add secret**.

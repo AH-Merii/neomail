@@ -504,3 +504,23 @@ async fn without_starttls_or_with_injected_data_nothing_is_said_in_plaintext() {
         assert!(seen.commands.is_empty(), "{seen:?}");
     }
 }
+
+#[tokio::test]
+async fn the_auth_check_logs_in_and_quits_without_sending_anything() {
+    for auth_fails in [false, true] {
+        let script = Script {
+            auth_fails,
+            ..Script::default()
+        };
+        let (addr, pin, server) = tls_server(Security::Tls, script).await;
+        let result = check_auth(&config(addr, Security::Tls, pin), Login::Password(PASSWORD)).await;
+        match &result {
+            Ok(()) => assert!(!auth_fails),
+            Err(SmtpError::Auth { reply, .. }) => assert!(auth_fails && reply.code == 535),
+            Err(e) => panic!("{e:?}"),
+        }
+        let seen = server.await.unwrap();
+        // A failed PLAIN with an initial response gets its final reply at once: no "*" follows.
+        assert_eq!(seen.verbs(), ["EHLO", "AUTH", "QUIT"], "{seen:?}");
+    }
+}

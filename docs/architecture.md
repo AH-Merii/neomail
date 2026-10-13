@@ -212,7 +212,7 @@ directory, then a rename). A new file gets mode 0600 in a directory created with
 existing one keeps its mode.
 
 **Setup** (`neomail/src/setup.rs`, DEC-2026-10-12-cli-ux): a password **provider is data**, a
-`Preset` (`IMAP`, `PROTON`, `GMAIL_APP_PASSWORD`: fixed host, port and security, prompts, an intro,
+`Preset` (`IMAP`, `PROTON`: fixed host, port and security, prompts, an intro,
 and whether to pin the certificate), and one flow serves them all. `gather` takes the flags and asks
 for the rest only when `Input::can_prompt` (standard input is a terminal and neither `--no-input`
 nor `NEOMAIL_NO_INPUT` is set); otherwise a missing value is a `UsageError` (exit 2) naming the
@@ -230,6 +230,22 @@ steps; the login check itself is tested on the wire against the scripted server
 the provider, from a numbered menu on a terminal. No new trait: the presets are values, `Deps` has
 one real and one fake set, and the seams below it (`CredentialStore`, `Transport`, the config
 writer) already exist.
+
+**Setup wizards** (`neomail/src/wizard.rs`, DEC-2026-10-13-wizard-steps): a provider's setup is
+a `Wizard`, a table of `Step`s, each a `Console` step (a provider's page, setting nothing), a
+`Gate` (cases that go on or stop with their own advice, setting nothing), an `Ask` (a `Question`
+with its flag, or a secret with none), a `Check` that names the earlier steps it reads, or the
+final `Commit`. A `Mistake` maps a check's failure kind to the step to change and its fix. A
+`Session` walks the table with no I/O: it takes `Event`s and returns `Prompt`s, answers steps
+from flags, skips `Console` and `Gate` steps when nothing can be asked, and on a failed check
+asks the named step again on a terminal or ends with it otherwise. A check gets `Answers` that
+expose only the steps it declares, so it cannot run on a value not yet asked. `wizard/cli.rs`
+shows a session on standard error through a `Term` (standard input, or a script in tests) and
+runs the caller's checks and write. `wizard/gmail.rs` is the first wizard, Gmail with an app
+password (issue #49): its checks are the config and keyring before the secret, then
+`nm_imap::check_login` and `nm_imap::smtp::check_auth` (EHLO, AUTH, QUIT) against `Servers`,
+Gmail's or fakes on 127.0.0.1 in the tests. The other providers keep `setup.rs` and `account.rs`
+until their wizards land.
 
 **Getting started** (`main.rs`): bare `neomail` without a config file prints the start lines and
 the README's "Try it" URL on standard error and exits 2, never prompting; with a config it prints

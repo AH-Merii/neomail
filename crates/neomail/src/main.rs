@@ -27,6 +27,7 @@ mod setup;
 mod style;
 mod sync;
 mod triage;
+mod wizard;
 
 use std::ffi::OsString;
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
@@ -551,7 +552,7 @@ enum ConfigCommand {
 enum AccountCommand {
     /// Add an account: a provider menu on a terminal, flags for everything else
     #[command(after_help = ADD_EXAMPLES)]
-    Add(AddCommand),
+    Add(Box<AddCommand>),
     /// List the configured accounts (reads only the config: no keyring, no network)
     List {
         #[command(flatten)]
@@ -599,7 +600,7 @@ struct AddCommand {
     /// gmail, outlook: the address to sign in with
     #[arg(long, value_name = "ADDR")]
     email: Option<String>,
-    /// gmail, outlook: your OAuth client's ID (gmail's secret is prompted for, or read from stdin; outlook has none)
+    /// gmail, outlook: your OAuth client's ID; checked with Google or Microsoft before the sign-in (gmail's secret is prompted for, or read from stdin; outlook has none)
     #[arg(long, value_name = "ID")]
     client_id: Option<String>,
     /// gmail, outlook: print the sign-in URL without opening a browser
@@ -608,6 +609,12 @@ struct AddCommand {
     /// outlook: sign in with a code on another device (automatic over SSH without a display)
     #[arg(long)]
     device_code: bool,
+    /// gmail: your Google Cloud project's ID, so the setup's console links open that project
+    #[arg(long, value_name = "ID")]
+    project: Option<String>,
+    /// outlook: personal (Outlook.com, Hotmail) or work (work or school); picks the setup steps shown [default: personal]
+    #[arg(long, value_name = "TYPE")]
+    account_type: Option<AccountTypeArg>,
     /// imap, proton, gmail-app-password: the login name (usually the address)
     #[arg(long, value_name = "USER")]
     username: Option<String>,
@@ -635,7 +642,7 @@ struct AddCommand {
     /// imap, proton: the server certificate's SHA-256 to pin (64 hex digits, colons allowed)
     #[arg(long, value_name = "HEX", value_parser = parse_pin)]
     cert_sha256: Option<CertPin>,
-    /// imap, proton, gmail-app-password, outlook: skip the read-only check before the config is written
+    /// Skip the read-only login check before the config is written; gmail and outlook also skip the client check before the sign-in
     #[arg(long)]
     no_check: bool,
 }
@@ -667,7 +674,7 @@ impl AddProvider {
         match self {
             Self::Gmail => "gmail",
             Self::Outlook => oauth::MICROSOFT.setup.default_name,
-            Self::GmailAppPassword => setup::GMAIL_APP_PASSWORD.id,
+            Self::GmailAppPassword => wizard::gmail::GMAIL_APP_PASSWORD.id,
             Self::Proton => setup::PROTON.id,
             Self::Imap => setup::IMAP.id,
         }
@@ -680,6 +687,23 @@ impl AddProvider {
             Self::GmailAppPassword => "Gmail with an app password (needs 2-Step Verification)",
             Self::Proton => "Proton Mail, through Proton Mail Bridge",
             Self::Imap => "any IMAP server, with a password",
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AccountTypeArg {
+    /// Outlook.com, Hotmail or Live
+    Personal,
+    /// An address your organisation gave you
+    Work,
+}
+
+impl AccountTypeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Personal => oauth::steps::PERSONAL,
+            Self::Work => oauth::steps::WORK,
         }
     }
 }
@@ -1059,7 +1083,7 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
             command: AccountCommand::Add(add),
         } => {
             let path = config::config_path(cli.config)?;
-            add_account(add, &path, input, &mut out)?;
+            add_account(*add, &path, input, &mut out)?;
             ExitCode::SUCCESS
         }
         Command::Account {
@@ -1472,7 +1496,8 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
         ("--username", add.username.is_some()),
         ("--password-command", add.password_command.is_some()),
     ];
-    let no_check = [("--no-check", add.no_check)];
+    let gmail_only = [("--project", add.project.is_some())];
+    let outlook_only = [("--account-type", add.account_type.is_some())];
     let imap_only = [
         ("--host", add.host.is_some()),
         ("--security", add.security.is_some()),
@@ -1485,11 +1510,18 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
         ("--cert-sha256", add.cert_sha256.is_some()),
     ];
     let refused: Vec<(&str, bool)> = match provider {
-        AddProvider::Gmail => [&password_only[..], &no_check, &imap_only, &port_pin].concat(),
-        AddProvider::Outlook => [&password_only[..], &imap_only, &port_pin].concat(),
-        AddProvider::GmailAppPassword => [&oauth_only[..], &imap_only, &port_pin].concat(),
-        AddProvider::Proton => [&oauth_only[..], &imap_only].concat(),
-        AddProvider::Imap => oauth_only.to_vec(),
+        AddProvider::Gmail => [&password_only[..], &outlook_only, &imap_only, &port_pin].concat(),
+        AddProvider::Outlook => [&password_only[..], &gmail_only, &imap_only, &port_pin].concat(),
+        AddProvider::GmailAppPassword => [
+            &oauth_only[..],
+            &gmail_only,
+            &outlook_only,
+            &imap_only,
+            &port_pin,
+        ]
+        .concat(),
+        AddProvider::Proton => [&oauth_only[..], &gmail_only, &outlook_only, &imap_only].concat(),
+        AddProvider::Imap => [&oauth_only[..], &gmail_only, &outlook_only].concat(),
     };
     if let Some((flag, _)) = refused.iter().find(|(_, given)| *given) {
         return Err(usage(format!(
@@ -1503,6 +1535,8 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
                 name: add.name,
                 email: add.email,
                 client_id: add.client_id,
+                project: add.project,
+                account_type: add.account_type.map(|t| t.as_str().to_owned()),
                 no_browser: add.no_browser,
                 device_code: add.device_code,
                 no_check: add.no_check,
@@ -1513,7 +1547,15 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
             };
             return account::add(oauth_provider, path, args, input, out);
         }
-        AddProvider::GmailAppPassword => &setup::GMAIL_APP_PASSWORD,
+        AddProvider::GmailAppPassword => {
+            let args = wizard::gmail::Args {
+                name: add.name,
+                username: add.username,
+                password_command: add.password_command,
+                no_check: add.no_check,
+            };
+            return wizard::gmail::add(path, args, input, out);
+        }
         AddProvider::Proton => &setup::PROTON,
         AddProvider::Imap => &setup::IMAP,
     };

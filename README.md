@@ -100,9 +100,13 @@ input, or come from `--password-command`. `--no-check` skips the login. `neomail
   still there. Moving it there again changes nothing; archive it, or move it to a folder under
   `Folders/`, to take it out of the INBOX. Both rest on Proton's pages: the test account has no
   folder or label of its own, so a live check has tried neither.
-- **Gmail with an app password:** `neomail account add gmail-app-password`. Google: "To create an
-  app password, you need 2-Step Verification on your Google Account"
-  ([Google's help](https://support.google.com/accounts/answer/185833)).
+- **Gmail with an app password:** `neomail account add gmail-app-password` takes you through it
+  one step at a time: whether your account can have an app password (Google may offer none with
+  2-Step Verification only for security keys, for work or school accounts, or with Advanced
+  Protection: [Google's help](https://support.google.com/accounts/answer/185833)), turning on 2-Step
+  Verification, creating the app password, then the name and address. Spaces in the pasted app
+  password are removed, and both the IMAP login and an SMTP login that sends nothing are checked
+  before anything is written. See [docs/gmail-app-password.md](docs/gmail-app-password.md).
 - **Gmail with your own OAuth app:** `neomail account add gmail`, below.
 - **Outlook or Hotmail with your own Entra app:** `neomail account add outlook`, below.
 - **Any IMAP server:** `neomail account add imap --name work --username you@example.com --host
@@ -203,11 +207,13 @@ password is never written to the config, the cache or a log, and never printed.
 ### Gmail
 
 Gmail signs in with OAuth through a Google OAuth client you create yourself; neomail ships none.
-[docs/gmail.md](docs/gmail.md) walks through the five console steps and why each exists, and the
-wizard prints them too:
+On a terminal, `account add gmail` takes you one step at a time from no Google Cloud project to a
+signed-in Desktop client; each step says why it exists and links the console page. It checks the
+client ID and secret with Google before you sign in, and logs in to Gmail's IMAP and SMTP after,
+before it saves the account. [docs/gmail.md](docs/gmail.md) lists the steps:
 
 ```sh
-neomail account add gmail          # asks for the address, client ID and secret, then opens the browser
+neomail account add gmail          # step by step to a signed-in client, then IMAP and SMTP checks
 neomail sync --account gmail
 neomail account login gmail        # sign in again (needed every 7 days while the app is in Testing)
 neomail account logout gmail       # revoke the sign-in and delete it from the keyring
@@ -220,11 +226,14 @@ Windows browser opens (`wslview` or `explorer.exe`), or the one in `$BROWSER`.
 ### Outlook
 
 Outlook, Outlook.com and Hotmail sign in with OAuth through a Microsoft Entra app registration you
-create yourself, and mail is read through Microsoft Graph. [docs/outlook.md](docs/outlook.md) walks
-through the five steps and why each exists; the wizard prints them too:
+create yourself, and mail is read through Microsoft Graph. On a terminal, `account add outlook`
+takes you one step at a time from no app to a signed-in one, showing only the steps your account
+type and sign-in need. It checks the client ID with Microsoft before you sign in, and reads the
+inbox through Graph after, before it saves the account. [docs/outlook.md](docs/outlook.md) lists
+the steps:
 
 ```sh
-neomail account add outlook        # asks for the address and the Application (client) ID, then signs in
+neomail account add outlook        # step by step: app, client ID, sign-in, then a Graph check
 neomail sync --account outlook
 neomail account login outlook --device-code   # sign in with a code on another device
 neomail account logout outlook     # delete the sign-in from the keyring

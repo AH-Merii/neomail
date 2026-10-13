@@ -138,10 +138,21 @@ fn redirect_parsing() {
         parse("/?error=access_denied&state=other"),
         Request::WrongState
     );
-    assert_eq!(parse("/?error=access_denied&state=st4te"), Request::Denied);
+    assert_eq!(
+        parse("/?error=access_denied&state=st4te"),
+        Request::Denied(None)
+    );
     assert_eq!(
         parse("/?error=server_error&state=st4te"),
-        Request::Error("server_error".into())
+        Request::Error("server_error".into(), None)
+    );
+    // Microsoft's description, with its AADSTS code, is kept, cleaned of control characters.
+    assert_eq!(
+        parse(
+            "/?error=access_denied&error_description=AADSTS65004%3A+User+declined%1B%5B2J\
+             &state=st4te"
+        ),
+        Request::Denied(Some("AADSTS65004: User declined[2J".into()))
     );
     assert_eq!(parse("/?state=st4te"), Request::NoCode);
     assert_eq!(parse("/?state=st4te&code="), Request::NoCode);
@@ -330,18 +341,30 @@ async fn listener_reports_a_declined_sign_in_and_times_out() {
         .unwrap();
     tokio::spawn(send(
         port,
-        b"GET /?error=access_denied&state=s HTTP/1.1\r\n\r\n",
+        b"GET /?error=access_denied&error_description=AADSTS65004%3A+User+declined&state=s \
+          HTTP/1.1\r\n\r\n",
     ));
     let e = listener
         .wait("s", Duration::from_secs(30))
         .await
         .unwrap_err();
     assert!(format!("{e:#}").contains("declined"), "{e:#}");
+    // The description comes along, so `account add` can tell which step it means.
+    let declined = e.downcast_ref::<SignInError>().unwrap();
+    assert!(
+        matches!(declined, SignInError::Declined { .. }),
+        "{declined:?}"
+    );
+    assert_eq!(declined.aadsts(), Some(65004));
     let e = listener
         .wait("s", Duration::from_millis(50))
         .await
         .unwrap_err();
     assert!(format!("{e:#}").contains("no sign-in came back"), "{e:#}");
+    assert!(matches!(
+        e.downcast_ref::<SignInError>(),
+        Some(SignInError::TimedOut(_))
+    ));
 }
 
 #[tokio::test]
@@ -715,10 +738,7 @@ async fn a_device_code_error_names_the_cause_and_never_the_code() {
         ),
         "{message}"
     );
-    assert!(
-        message.ends_with("; probably the app registration's public client flows are off: set Authentication > Advanced settings > Allow public client flows to Yes"),
-        "{message}"
-    );
+    assert!(message.ends_with(&format!("; {HINT_7000218}")), "{message}");
 }
 
 async fn exchange_with(provider: &Provider, client: &Client, answer: &str) -> Result<SignedIn> {
@@ -936,32 +956,6 @@ fn microsoft_is_offered_as_a_public_graph_client() {
     assert!(MICROSOFT.revoke_url.is_none());
     assert!(GOOGLE.device_code_url.is_none());
     assert!(MICROSOFT.auth_params.is_empty(), "no prompt=consent");
-}
-
-#[test]
-fn the_client_id_prompt_points_at_the_step_that_shows_the_id() {
-    for p in PROVIDERS {
-        let step = p
-            .setup
-            .client_id_prompt
-            .split("step ")
-            .nth(1)
-            .and_then(|rest| rest.split(')').next())
-            .unwrap();
-        let text = p
-            .setup
-            .steps
-            .split(&format!("\n {step}. "))
-            .nth(1)
-            .unwrap_or_else(|| panic!("{}: no step {step}", p.id));
-        let text = text.split("\n 6. ").next().unwrap();
-        assert!(
-            text.contains("client ID") || text.contains("(client) ID"),
-            "{}: {text}",
-            p.id
-        );
-        assert!(p.setup.steps.contains("GUIDE"), "{}", p.id);
-    }
 }
 
 /// Microsoft's refresh scope must be the original's or a subset
