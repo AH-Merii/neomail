@@ -478,7 +478,8 @@ fn deliver(account: &Account, mut draft: Draft, common: &Common, cx: Env<'_>) ->
         && !is_broken_pipe(&e)
     {
         eprintln!(
-            "neomail: {}: warning: the message <{}> was sent, but standard output could not be              written: {e:#}; do not send it again",
+            "neomail: {}: warning: the message <{}> was sent, but standard output could not be \
+             written: {e:#}; do not send it again",
             account.name, outgoing.message_id
         );
     }

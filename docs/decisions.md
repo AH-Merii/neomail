@@ -857,9 +857,10 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
     themselves; for other IMAP servers neomail appends it to the mailbox marked `\Sent`, and never
     creates one, so a server without one keeps no copy and a warning says so.
   - On a terminal neomail shows who it goes to and asks before sending; a no sends nothing and
-    exits 1. `--yes` sends from a script; without a terminal or with `--no-input`, and no
-    `--yes`, nothing is sent (exit 2), as for every question neomail asks
-    ([DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux)). `--dry-run` prints the message instead.
+    exits 1. `--yes` sends from a script; without a terminal or with `--no-input`
+    ([DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux)), and no `--yes`, nothing is sent: exit 2,
+    as for any question that can't be asked ([exit codes](json.md#exit-codes)). `--dry-run`
+    prints the message instead.
   - A refused recipient sends nothing to anyone, and so does a reply that would have to leave out
     an address it takes from the original because it can't be sent to yet (one that isn't
     ASCII). A message that was sent but whose Sent copy failed exits 0 with a warning, so a

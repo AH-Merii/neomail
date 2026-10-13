@@ -143,10 +143,10 @@ that neomail itself just printed.
   `username` attribute), with `mail_grant`, which says whether the sign-in lets neomail change mail
   and send it. Microsoft sends a new refresh token with each refresh; neomail saves it back with
   the same `mail_grant`.
-- Going back to a version from before `mail_grant` (the edge release, for one): it still reads
-  the entry, since it ignores `mail_grant`. A build from between that and sending knows `read` and
-  `read-write` but not `read-write-send`, the grant of a sign-in made by this version, so it
-  cannot read that entry: run `neomail account login NAME` in it. An earlier version refreshes
+- Going back to a version from before `mail_grant`: it still reads the entry, since it ignores
+  `mail_grant`. A later version from before sending knows `read` and `read-write` but not
+  `read-write-send`, the grant of a sign-in made by this version, so it cannot read that entry:
+  run `neomail account login NAME` in it. An earlier version refreshes
   with `offline_access` and `Mail.Read`, a subset of what a sign-in made by this version asked
   for, which Microsoft allows: a refresh's scopes "must be equivalent to or a subset of the scopes
   requested" at sign-in

@@ -549,6 +549,10 @@ fn a_sent_message_whose_output_cannot_be_written_still_exits_0() {
             "{format}: {id}: {err}"
         );
         assert!(err.contains("No space left on device"), "{format}: {err}");
+        assert!(
+            !err.contains("  "),
+            "{format}: one line, no run of spaces: {err}"
+        );
     }
     assert_eq!(smtp.seen().messages.len(), 3);
 }
