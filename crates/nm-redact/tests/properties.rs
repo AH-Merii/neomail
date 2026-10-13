@@ -108,6 +108,95 @@ fn no_local_part_survives() {
     assert!(checked > 100);
 }
 
+/// A link fails closed: whatever its host, none of its path, query or user info goes out, and a
+/// host holding a number or a known name gives a bare `<link>`.
+#[test]
+fn no_token_user_name_number_or_name_in_a_link_survives() {
+    let links = [
+        // A host that isn't plain ASCII, before a path or query.
+        "https://почта.рф/reset?token=AbCdEf123&user=jbloggs",
+        "https://例え.jp/reset?token=AbCdEf123&user=jbloggs",
+        "https://shop.例え.jp/u/jbloggs?token=AbCdEf123",
+        "https://bücher.example?token=AbCdEf123&user=jbloggs",
+        "www.почта.рф/u/jbloggs?token=AbCdEf123",
+        "https://%61cme.example?t=SECRET99&user=jbloggs",
+        "http://[fe80::1%25eth0]:8080/u/jbloggs?t=SECRET99",
+        "https://jörg:Secret@acme.example/u/jo?t=abcSECRET",
+        "https://jbloggs%40acme.example/u/jo?t=abcSECRET",
+        "https://[zz]/u/jo?t=abcSECRET",
+        "https://—/u/jo?t=abcSECRET",
+        // No host, or user info that isn't plain ASCII, with nothing after it.
+        "https://—jbloggs",
+        "https://jörg:Secret@acme.example",
+        // An underscore is part of a host.
+        "https://my_host.example/reset?token=abcSECRET",
+        "www.my_host.example/u/jo?t=abcSECRET",
+        // A host carrying a card, a phone number or a known name.
+        "https://acme.example-4111111111111111",
+        "https://acme.example.4111111111111111",
+        "https://acme.example-555-123-4567",
+        "https://acme.example.Smith",
+        "https://Smith.acme.example/u/jo",
+        "https://acme-Smith.example?t=abcSECRET",
+        // A host that goes on in letters that aren't ASCII, with no path after it.
+        "https://bücher.example&token=AbCdEf123",
+        "https://bücher.example=AbCdEf123",
+        "https://bücher.example;jsessionid=ABCD1234XYZ",
+        "https://bu\u{308}cher.example&token=AbCdEf123",
+        "https://www.Jörg-Schmidt.example",
+        "https://Müller.example",
+        // A backslash for a path.
+        r"https://acme.example\u\jbloggs\AbCdEf123",
+        r"https://acme.example\u\jbloggs?t=AbCdEf123",
+    ];
+    let frames = [
+        "{}",
+        "Visit {} now",
+        "({})",
+        "{}.",
+        "詳細は{}です",
+        "see {}, ok",
+    ];
+    let secrets = [
+        "AbCdEf123",
+        "SECRET99",
+        "abcSECRET",
+        "Secret",
+        "jbloggs",
+        "jo",
+        "jörg",
+        "örg",
+        "Smith",
+        "SMITH",
+        "Schmidt",
+        "Müller",
+        "üller",
+    ];
+    let known = Known::new(["Jane Smith", "Jörg Schmidt", "Zoë Müller"], [""; 0]);
+    let mut checked = 0;
+    for link in links {
+        for frame in frames {
+            let text = frame.replace("{}", link);
+            let out = redact(&text, &known);
+            let out = out.as_str();
+            let mut run = 0;
+            let digits4 = out.chars().any(|c| {
+                run = if c.is_numeric() { run + 1 } else { 0 };
+                run >= 4
+            });
+            let survivor = out
+                .split(|c: char| !c.is_alphanumeric())
+                .find(|w| secrets.contains(w));
+            assert!(
+                !digits4 && survivor.is_none(),
+                "{text:?} -> {out:?} ({survivor:?})"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 100);
+}
+
 #[test]
 fn no_known_name_survives_as_a_word() {
     let names = [
@@ -118,7 +207,8 @@ fn no_known_name_survives_as_a_word() {
         "Jean-Luc Picard",
         "Seán O’Neil",
     ];
-    // Apostrophes in either form, whichever the header used.
+    // Apostrophes in any form, whichever the header used.
+    const APOSTROPHES: [char; 6] = ['’', '‘', 'ʼ', '´', '`', '＇'];
     let words = [
         "Will",
         "Turner",
@@ -129,6 +219,10 @@ fn no_known_name_survives_as_a_word() {
         "Siobhán",
         "O'Brien",
         "O’Brien",
+        "O‘Brien",
+        "O´Brien",
+        "O`Brien",
+        "O＇Brien",
         "Jean",
         "Luc",
         "O'Neil",
@@ -154,11 +248,13 @@ fn no_known_name_survives_as_a_word() {
             for frame in frames {
                 let text = frame.replace("{}", &form);
                 let out = redact(&text, &known);
-                let fold = |w: &str| w.replace('’', "'");
+                let fold = |w: &str| w.replace(APOSTROPHES, "'");
                 let want = fold(&form);
                 let survivors: Vec<String> = out
                     .as_str()
-                    .split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '’'))
+                    .split(|c: char| {
+                        !(c.is_alphanumeric() || c == '\'' || APOSTROPHES.contains(&c))
+                    })
                     .map(fold)
                     .filter(|w| *w == want || w.strip_suffix("'s") == Some(want.as_str()))
                     .collect();

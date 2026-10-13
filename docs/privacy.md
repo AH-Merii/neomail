@@ -30,14 +30,14 @@ decide which other fields go with it, and this page will say so when it does.
 | ---- | ------- | ----- |
 | Email addresses | `<email>@acme.example` | The local part goes, quoted (`"jo doe"@…`) or not; the domain stays. |
 | Your own addresses | `<email>` | Each account's login in the config, when it is an email address, matched without case, masked whole. Without a config file at the default path there are none; a `--config` or `NEOMAIL_CONFIG` file that is missing or invalid is an error. |
-| Links | `<link host=acme.example>` | Scheme, user, port, path, query and fragment go; the host stays. A link without a scheme (`acme.example/reset/…`) counts too, in any case. The host is only letters, digits, dots and hyphens (or an `[…]` IPv6 address): when anything other than a path, query, fragment, `;`, `%`, `=`, `&`, `+` or `~` follows it with no space (`https://acme.example—call …`, a comma, CJK text), the link ends at the host and the rest goes through the other rules. A host longer than 253 characters is no host: the link becomes `<link>`. |
+| Links | `<link host=acme.example>` or `<link>` | Scheme, user, port, path, query and fragment go; the host stays. A link without a scheme (`acme.example/reset/…`) counts too, in any case. In a link with a scheme or `www.`, a backslash starts a path as `/` does, as browsers read it (`https://acme.example\u\…`). The host is only ASCII letters, digits, dots, hyphens and underscores (or an `[…]` IPv6 address of hex digits, `:` and `.`). When punctuation or a symbol follows it with no space (`https://acme.example—call …`, a comma, `。`) and no `/`, `\`, `?` or `#` comes later in the link, the link ends at the host and the rest goes through the other rules, except after `;`, `%`, `=`, `&`, `+` or `~`, which keep the rest in the link. The whole link becomes a bare `<link>` when the host goes on in letters that aren't ASCII (an internationalised host written in Unicode, such as `https://bücher.example`), when anything else that can't be part of a host comes before a `/`, `\`, `?` or `#` (a `%` in the host, an IPv6 zone), when the user part isn't plain ASCII, when there is no host, when the host is longer than 253 characters, or when it carries personal data: 7 or more digits (a phone or card number) or a known name as one of its words between dots, hyphens and underscores. |
 | IBANs | `<iban>` | Only when the ISO 13616 check digits are valid. |
 | Card numbers | `<card>` | 13 to 19 digits, optionally grouped by spaces or hyphens, passing the Luhn check. |
 | Amounts | `<amount>` | A number with a currency symbol (`$`, `€`, `£` …) or code (`EUR`, `USD` …) before or after it. |
-| One-time codes | `<code>` | A 4 to 16 character token holding a digit, or 4 to 16 digits in groups split by spaces, dots or hyphens (`482 917`, `4 8 2 9`), right after a word such as code, OTP, PIN, passcode, password, verification or 2FA. After password, passcode or PIN, any token of 4 to 64 characters, with or without a digit and symbols included (`Xk#92!pq7`); sentence punctuation after it stays, except a `!` or `?`, which is taken as part of it. A code right after its word wins over a date (`sort code 12-03-45`). |
+| One-time codes | `<code>` | A 4 to 16 character token holding a digit, or 4 to 16 digits in groups split by spaces, dots or hyphens (`482 917`, `4 8 2 9`), right after a word such as code, OTP, PIN, passcode, password, verification or 2FA. After password, passcode or PIN, a token of 4 to 64 characters, symbols included (`Xk#92!pq7`): any token when a separator comes first (`:`, `#`, `=`, `is`, `was`, a dash, an en or em dash, an arrow, or several of these, as in `password: hunterxyz`), and otherwise only one holding a digit or a symbol, so "Reset your password here" and "Pin this message" stay. A dash joining two words is no separator, so "password-protected" stays too. A token that is itself one of these words is never masked. Sentence punctuation after it stays, except a `!` or `?`, which is taken as part of it. A code right after its word wins over a date (`sort code 12-03-45`). |
 | Phone numbers | `<phone>` | International (`+` or `00`) and national forms. Dates and times are never phone numbers. |
 | Other numbers | `<number>` | Any other run of 4 or more digits: order numbers, account numbers, a year on its own. |
-| Known names | `<name>` | Each capitalised word of 2 or more characters of a display name in From, To, Cc or Reply-To, as a whole word, as written and in capitals; a word written in capitals with 3 or more letters (`SMITH`) also in title case (`Smith`). Apostrophes match in any form: `O'Brien` in a header masks `O’Brien` in the body. |
+| Known names | `<name>` | Each capitalised word of 2 or more characters of a display name in From, To, Cc or Reply-To, as a whole word, as written and in capitals; a word written in capitals with 3 or more letters (`SMITH`) also in title case (`Smith`). Apostrophes written `'`, `’`, `‘`, `ʼ`, `´`, a backtick or a full-width `＇` match one another: `O'Brien` in a header masks `O’Brien` or `O´Brien` in the body. |
 
 Names are matched with case: for someone called Will or May, "Will" and "WILL" are masked, but
 "will" and "may" are not. Lower-case particles such as "de" or "van" are not masked on their own.
@@ -70,7 +70,8 @@ valid IBAN or card number is never reported as a phone number.
 
 ## Gaps
 
-The rules are deliberately simple and fast. Said plainly, they miss:
+The rules are deliberately simple and fast. Said plainly, they miss some personal data, and mask
+some text that could have stayed:
 
 - **Names that appear in no header.** Other people and organisations named only in the body still go
   to jev. On the benchmark sample, the prototype these rules were ported from caught almost no names
@@ -97,13 +98,28 @@ The rules are deliberately simple and fast. Said plainly, they miss:
   its top-level domain is on a built-in list and a `/` follows the host. One with a newer ending
   (`acme.travel/reset/…`), with only a query (`acme.example?token=…`) or with an IP address for a
   host (`192.0.2.10/u/…`) keeps its path and query, apart from what the other rules mask in them.
-- **A link's host is kept as written**, digits included: `https://shop12345.example/x` becomes
-  `<link host=shop12345.example>`.
+- **A link's host is kept as written** when it holds fewer than 7 digits and no known name:
+  `https://shop12345.example/x` becomes `<link host=shop12345.example>`, and a name in no header
+  stays in a host too.
+- **An ordinary word after "is" or "was"** following password, passcode or PIN is masked as if it
+  were a secret: "Your password was changed yesterday" becomes "Your password was `<code>`
+  yesterday", which takes a word from the text a classifier reads.
+- **A link whose host isn't plain ASCII** becomes a bare `<link>`, so the classifier does not learn
+  which company an internationalised domain belongs to.
+- **Text written against a link with no space**, as Chinese and Japanese often are, is masked with
+  the link up to the next space when it starts with a letter or a path follows the host:
+  `詳細はhttps://acme.exampleです` becomes `詳細は<link>`.
+- **Names in scripts without capital letters**, such as Arabic, Hebrew, Chinese, Japanese, Korean or
+  Hindi, are never known names, since only capitalised words of a display name are: `سارة أحمد` in
+  a header leaves `سارة` in the body.
+- **Keywords and currencies in other languages.** The words before a code or password are English
+  only, so `كلمة المرور: hunterxyz` keeps its password, and an amount written with `ر.س` or `د.إ` is
+  not an amount: its digits are masked only when there are 4 or more.
 - **Unusual address forms** keep their local part: an invisible character or a full-width `＠`
   before the `@`, an escaped quote inside a quoted local part, a domain with no dot
   (`jo@localhost`) or an IP address for a domain, two dots in a row, and a percent-encoded `@` in a
   `mailto:` link.
-- **Digits hidden in other ways**: groups split by a soft hyphen or a zero-width character, or
+- **Digits hidden in other ways**: groups split by a soft hyphen, a zero-width character or a direction mark, or
   glued to a letter (`x555-1234`), can partly slip through, and superscript or circled digits
   (`⁴¹¹¹`, `①②③④`) are not read as digits.
 - **A name written in decomposed Unicode** in the body (an `e` followed by a combining diaeresis)

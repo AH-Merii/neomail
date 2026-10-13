@@ -76,6 +76,7 @@ struct Patterns {
     url: Regex,
     email: Regex,
     url_schemeless: Regex,
+    host_goes_on: Regex,
     domain: Regex,
     date_iso: Regex,
     date_numeric: Regex,
@@ -118,6 +119,10 @@ static P: LazyLock<Patterns> = LazyLock::new(|| {
             r#"(?:"[^"\r\n]{{1,64}}"|{atext}+(?:\.{atext}+)*)@(?:[\w-]+\.)+\p{{L}}{{2,}}"#
         )),
         url_schemeless: re(&format!(r#"(?-u:\b){link_host}(?::\d{{1,5}})?/[^\s<>"`]*"#)),
+        // A letter or digit straight after a link's ASCII host, past any marks and invisible
+        // format characters: the host goes on in Unicode (`bücher.example`), or text is written
+        // against it. Invisible characters alone, such as a zero-width space, don't count.
+        host_goes_on: re(r"^[\p{M}\p{Cf}]*[\p{L}\p{N}]"),
         domain: re(&format!(r"(?-u:\b){domain_host}(?-u:\b)")),
         date_iso: re(
             r"(?-u:\b)(?:19|20)\d{2}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?",
@@ -134,8 +139,10 @@ static P: LazyLock<Patterns> = LazyLock::new(|| {
         code: re(&format!(
             r"(?i)(?-u:\b)(?:{CODE_WORD})(?:\s+(?:{CODE_WORD}))*(?-u:\b)(?:\s+(?:is|was))?\s*[:#=\-]?\s*(\d{{2,4}}(?:[ .\-]\d{{2,4}}){{1,3}}|\d(?:[ .\-]\d){{3,15}}|[a-z0-9][a-z0-9\-]{{2,14}}[a-z0-9])(?-u:\b)"
         )),
+        // The keyword and any separators after it; the token is read after the match, so a
+        // keyword inside it (`password password: x`) is found again.
         secret: re(&format!(
-            r"(?i)(?-u:\b)(?:{SECRET_WORD})(?-u:\b)(?:\s+(?:is|was))?\s*[:#=\-]?\s*(\S+)"
+            r"(?i)(?-u:\b)(?:{SECRET_WORD})(?-u:\b)((?:\s*(?:[:#=>–—→-]|(?-u:\b)(?:is|was)(?-u:\b)))*)\s*"
         )),
         phone_intl: re(r"(?:\+|(?-u:\b)00)\d[\d \-.()/]{5,20}\d(?-u:\b)"),
         phone_national: re(
@@ -144,7 +151,7 @@ static P: LazyLock<Patterns> = LazyLock::new(|| {
         digits: re(r"\d{4,}"),
         digit: re(r"^\d$"),
         other_digit: re(r"[\d--0-9]"),
-        word: re(r"[\p{L}\p{M}\p{N}]+(?:['’][\p{L}\p{M}\p{N}]+)*"),
+        word: re(r"[\p{L}\p{M}\p{N}]+(?:['’‘´`＇][\p{L}\p{M}\p{N}]+)*"),
     }
 });
 
@@ -154,11 +161,16 @@ pub(crate) fn words(text: &str) -> impl Iterator<Item = &str> + '_ {
     P.word.find_iter(text).map(|m| m.as_str())
 }
 
-/// `word` with each typographic apostrophe (`’` U+2019, `ʼ` U+02BC) written as `'`, so a header's
-/// `O'Brien` and a body's `O’Brien` (as HTML mail is usually rendered) are one name.
+/// The characters written for an apostrophe besides `'`: `’` (U+2019, as HTML mail is usually
+/// rendered), `‘` (U+2018), `ʼ` (U+02BC), the acute accent `´` (U+00B4, from Spanish and Portuguese
+/// keyboards), a backtick and the full-width `＇` (U+FF07).
+const APOSTROPHES: [char; 6] = ['’', '‘', 'ʼ', '´', '`', '＇'];
+
+/// `word` with each other form of apostrophe ([`APOSTROPHES`]) written as `'`, so a header's
+/// `O'Brien` and a body's `O’Brien` or `O´Brien` are one name.
 pub(crate) fn fold_apostrophes(word: &str) -> Cow<'_, str> {
-    if word.contains(['’', 'ʼ']) {
-        Cow::Owned(word.replace(['’', 'ʼ'], "'"))
+    if word.contains(APOSTROPHES) {
+        Cow::Owned(word.replace(APOSTROPHES, "'"))
     } else {
         Cow::Borrowed(word)
     }
@@ -326,9 +338,9 @@ fn fold_digits(text: &str) -> Option<(String, Vec<usize>)> {
 /// Every span to mask in `text`, merged.
 fn find(text: &str, known: &Known) -> Vec<Span> {
     let mut f = Found::default();
-    links(text, &mut f);
+    links(text, known, &mut f);
     emails(text, known, &mut f);
-    links_schemeless(text, &mut f);
+    links_schemeless(text, known, &mut f);
     domains(text, &mut f);
     // A code follows its keyword, so it wins over a date's keep (`sort code 12-03-45`).
     codes(text, &mut f);
@@ -444,45 +456,69 @@ fn trim_url(u: &str) -> &str {
 
 /// Where a URL's parts are, as byte offsets into it.
 struct LinkParts {
-    /// The host: a run of letters, digits, dots and hyphens, or one `[…]` IPv6 literal.
-    host: (usize, usize),
-    /// Where the link ends: the end of the URL when [`URL_GOES_ON`] (or nothing) follows the host
-    /// and port, else straight after them, so the rest of the text (`https://a.example—call …`,
-    /// `https://a.example。電話…`) goes through the other rules instead of into the host.
+    /// The host: a run of ASCII letters, digits, dots, hyphens and underscores, or one `[…]` IPv6
+    /// literal. `None` when the host can't be read that way, and the whole URL is a bare `<link>`.
+    host: Option<(usize, usize)>,
+    /// Where the link ends: the end of the URL when a path, query or fragment, [`URL_GOES_ON`] or
+    /// nothing follows the host and port; else straight after them, so the rest of the text
+    /// (`https://a.example—call …`, `https://a.example。電話…`) goes through the other rules instead
+    /// of into the host.
     end: usize,
 }
 
 /// What, straight after a host (and port), keeps the rest in the link: a path, query or fragment,
-/// path parameters (`;jsessionid=…`) and percent-encoding. Anything else, such as a comma, a dash
-/// or CJK text, ends the link at the host.
+/// path parameters (`;jsessionid=…`) and percent-encoding.
 const URL_GOES_ON: [char; 9] = ['/', '?', '#', ';', '%', '=', '&', '+', '~'];
+
+/// What ends a URL's host and starts its path, query or fragment. A backslash counts as `/` does:
+/// the URL Standard reads it so in http, https, ws, wss and ftp URLs
+/// (<https://url.spec.whatwg.org/#authority-state>), and browsers follow it.
+const PATH: [char; 4] = ['/', '\\', '?', '#'];
 
 /// Characters RFC 3986 (section 3.2.1) allows in a URL's userinfo, besides letters and digits.
 const USERINFO: &str = "-._~%!$&'()*+,;=:";
 
-/// The host and end of the URL `u`, which starts with a scheme or `www.`; `None` without a host.
-fn link_parts(u: &str) -> Option<LinkParts> {
+/// The host and end of the URL `u`, which starts with a scheme or `www.`.
+///
+/// It fails closed: the whole URL is masked with no host, so none of its path or query goes out,
+/// when the host goes on in letters that aren't ASCII (`https://bücher.example`, `https://例え.jp`),
+/// when something else that can't be part of a plain host (`%61cme.example`, an IPv6 zone, user
+/// info with a non-ASCII letter) comes before a [`PATH`] character, or when there is no host at
+/// all. Only when punctuation or a symbol other than [`URL_GOES_ON`] follows the host, and nothing
+/// of a path, query or fragment comes later, does the link end at the host and the rest go
+/// through the other rules.
+fn link_parts(u: &str) -> LinkParts {
+    let whole = LinkParts {
+        host: None,
+        end: u.len(),
+    };
     let scheme_end = u.find("://").map_or(0, |i| i + 3);
     let rest = &u[scheme_end..];
-    let auth = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    let start = auth
-        .rfind('@')
-        .filter(|&at| {
-            auth[..at]
+    let auth = &rest[..rest.find(PATH).unwrap_or(rest.len())];
+    let start = match auth.rfind('@') {
+        None => 0,
+        Some(at)
+            if auth[..at]
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || USERINFO.contains(c))
-        })
-        .map_or(0, |at| at + 1);
+                .all(|c| c.is_ascii_alphanumeric() || USERINFO.contains(c)) =>
+        {
+            at + 1
+        }
+        // User info that isn't plain ASCII: where the host starts can't be told.
+        Some(_) => return whole,
+    };
     let host = &auth[start..];
     let mut len = if host.starts_with('[') {
-        let close = host.find(']')?;
+        let Some(close) = host.find(']') else {
+            return whole;
+        };
         let ipv6 = |c: char| c.is_ascii_hexdigit() || matches!(c, ':' | '.');
         if close == 1 || !host[1..close].chars().all(ipv6) {
-            return None;
+            return whole;
         }
         close + 1
     } else {
-        host.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-')))
+        host.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
             .unwrap_or(host.len())
     };
     let host_len = len;
@@ -493,51 +529,68 @@ fn link_parts(u: &str) -> Option<LinkParts> {
         }
     }
     let host_start = scheme_end + start;
-    let after = host_start + len;
-    let (host_len, end) = if after == u.len() || u[after..].starts_with(URL_GOES_ON) {
+    let after = &u[host_start + len..];
+    let (host_len, end) = if after.is_empty() || after.starts_with(PATH) {
+        (host_len, u.len())
+    } else if after.contains(PATH) || P.host_goes_on.is_match(after) {
+        // Something that can't be part of a plain host comes before a path, query or fragment,
+        // or the host goes on in letters that aren't ASCII.
+        return whole;
+    } else if after.starts_with(URL_GOES_ON) {
         (host_len, u.len())
     } else if len == host_len {
         // Only the host is a link here: a full stop straight after it ends the sentence.
         let trimmed = host[..host_len].trim_end_matches('.').len();
         (trimmed, host_start + trimmed)
     } else {
-        (host_len, after)
+        (host_len, host_start + len)
     };
-    let host_end = host_start + host_len;
-    (host_start < host_end).then_some(LinkParts {
-        host: (host_start, host_end),
+    if host_len == 0 {
+        return whole;
+    }
+    LinkParts {
+        host: Some((host_start, host_start + host_len)),
         end,
-    })
+    }
 }
 
 /// A host longer than DNS allows (RFC 1035 section 2.3.4: 255 bytes on the wire, so 253 written) is
 /// no host: the link is masked as a bare `<link>`.
 const HOST_MAX: usize = 253;
 
-fn push_link(f: &mut Found, start: usize, u: &str) {
-    let Some(parts) = link_parts(u) else {
-        return;
-    };
+/// Whether a host carries personal data, so the link is masked as a bare `<link>`: 7 or more
+/// digits in all (a phone number, or a 13 to 19 digit card), or a known name as one of its words
+/// (between dots, hyphens and underscores).
+fn personal_host(host: &str, known: &Known) -> bool {
+    host.len() > HOST_MAX
+        || host.bytes().filter(u8::is_ascii_digit).count() >= 7
+        || host.split(['.', '-', '_']).any(|w| known.is_name(w))
+}
+
+fn push_link(f: &mut Found, start: usize, u: &str, known: &Known) {
+    let parts = link_parts(u);
     let end = start + parts.end;
-    let (hs, he) = parts.host;
     if !f.is_kept(start, end) {
         f.spans.push(Span {
             start,
             end,
             kind: Kind::Link,
-            host: (he - hs <= HOST_MAX).then_some((start + hs, start + he)),
+            host: parts
+                .host
+                .filter(|&(hs, he)| !personal_host(&u[hs..he], known))
+                .map(|(hs, he)| (start + hs, start + he)),
         });
         f.keep(start, end);
     }
 }
 
 /// URLs with a scheme, or starting with `www.`: the whole URL becomes `<link host=…>`.
-fn links(text: &str, f: &mut Found) {
+fn links(text: &str, known: &Known, f: &mut Found) {
     for m in P.url.find_iter(text) {
         if in_address(text, m.start(), m.as_str()) {
             continue;
         }
-        push_link(f, m.start(), trim_url(m.as_str()));
+        push_link(f, m.start(), trim_url(m.as_str()), known);
     }
 }
 
@@ -558,14 +611,14 @@ fn in_address(text: &str, start: usize, u: &str) -> bool {
 }
 
 /// `acme.example/path` without a scheme.
-fn links_schemeless(text: &str, f: &mut Found) {
+fn links_schemeless(text: &str, known: &Known, f: &mut Found) {
     for m in P.url_schemeless.find_iter(text) {
         if char_before(text, m.start()) == Some('@') {
             continue;
         }
         let u = trim_url(m.as_str());
-        if link_parts(u).is_some_and(|p| real_tld(&u[p.host.0..p.host.1])) {
-            push_link(f, m.start(), u);
+        if link_parts(u).host.is_some_and(|(s, e)| real_tld(&u[s..e])) {
+            push_link(f, m.start(), u, known);
         }
     }
 }
@@ -651,7 +704,8 @@ fn dates(text: &str, f: &mut Found) {
     }
 }
 
-/// IBAN length per country, from the SWIFT IBAN registry (ISO 13616), release 99, December 2024.
+/// IBAN length per country (ISO 13616): release 99 (December 2024) of the SWIFT IBAN registry, as
+/// listed on <https://en.wikipedia.org/wiki/International_Bank_Account_Number>.
 const IBAN_LENGTHS: &[(&str, usize)] = &[
     ("AD", 24),
     ("AE", 23),
@@ -836,8 +890,11 @@ fn cards(text: &str, f: &mut Found) {
 
 /// One-time codes: a 4 to 16 character token holding a digit, right after a keyword, or digit
 /// groups joined by single spaces, dots or hyphens (`482 917`, `123.456`, `4 8 2 9`) holding 4 to
-/// 16 digits. After a password, passcode or PIN keyword, any token of 4 to 64 characters, symbols
-/// and all (`Xk#92!pq7`).
+/// 16 digits. After a password, passcode or PIN keyword, a token of 4 to 64 characters, symbols
+/// and all (`Xk#92!pq7`): any token after a separator (`:`, `#`, `=`, `is`, `was`, a dash or an
+/// arrow, one or several), else only one holding a digit or a symbol, so "Reset your password
+/// here" and "Pin this message" stay. A dash joining two words (`password-protected`) is no
+/// separator. A token that is itself a keyword is never masked.
 fn codes(text: &str, f: &mut Found) {
     let ok = |g: &str| {
         let digits = g.bytes().filter(u8::is_ascii_digit).count();
@@ -854,11 +911,19 @@ fn codes(text: &str, f: &mut Found) {
         }
     }
     for c in P.secret.captures_iter(text) {
-        if let Some(g) = c.get(1) {
-            let token = secret_token(g.as_str());
-            if (4..=64).contains(&token.chars().count()) {
-                found.push((g.start(), g.start() + token.len()));
-            }
+        let start = c.get(0).map_or(0, |m| m.end());
+        let separated = c.get(1).is_some_and(|g| {
+            let sep = g.as_str();
+            let joins_words = matches!(sep, "-" | "–" | "—") && g.end() == start;
+            !sep.trim().is_empty() && !joins_words
+        });
+        let rest = &text[start..];
+        let token = secret_token(&rest[..rest.find(char::is_whitespace).unwrap_or(rest.len())]);
+        let core = token.trim_matches(|c: char| !c.is_alphanumeric());
+        let keyword = CODE_WORD.split('|').any(|k| k.eq_ignore_ascii_case(core));
+        let secretive = core.chars().any(|c| !c.is_alphabetic());
+        if (4..=64).contains(&token.chars().count()) && !keyword && (separated || secretive) {
+            found.push((start, start + token.len()));
         }
     }
     for (s, e) in found {
@@ -919,9 +984,8 @@ fn names(text: &str, known: &Known, f: &mut Found) {
     for m in P.word.find_iter(text) {
         let w = m.as_str();
         let stem = w
-            .strip_suffix("'s")
-            .or_else(|| w.strip_suffix("’s"))
-            .or_else(|| w.strip_suffix("ʼs"))
+            .strip_suffix('s')
+            .and_then(|r| r.strip_suffix('\'').or_else(|| r.strip_suffix(APOSTROPHES)))
             .unwrap_or(w);
         if known.is_name(&fold_apostrophes(stem)) {
             f.push(m.start(), m.start() + stem.len(), Kind::Name);
@@ -970,13 +1034,29 @@ mod tests {
             trim_url("https://a.example/x_(y))."),
             "https://a.example/x_(y)"
         );
-        let parts = |u: &str| link_parts(u).map(|p| (p.host, p.end));
-        assert_eq!(parts("https://u:p@a.example:8443/x"), Some(((12, 21), 28)));
-        assert_eq!(parts("http://[::1]:8080/"), Some(((7, 12), 18)));
+        let parts = |u: &str| {
+            let p = link_parts(u);
+            (p.host, p.end)
+        };
+        assert_eq!(parts("https://u:p@a.example:8443/x"), (Some((12, 21)), 28));
+        assert_eq!(parts("http://[::1]:8080/"), (Some((7, 12)), 18));
+        assert_eq!(parts("https://my_host.example/x"), (Some((8, 23)), 25));
         // With no path after it, the host ends the link.
-        assert_eq!(parts("https://a.example—call"), Some(((8, 17), 17)));
-        assert_eq!(parts("https://a.example:8443,x"), Some(((8, 17), 22)));
-        assert_eq!(parts("https://a.example.—x"), Some(((8, 17), 17)));
-        assert_eq!(parts("https://[zz]/"), None);
+        assert_eq!(parts("https://a.example—call"), (Some((8, 17)), 17));
+        assert_eq!(parts("https://a.example:8443,x"), (Some((8, 17)), 22));
+        assert_eq!(parts("https://a.example.—x"), (Some((8, 17)), 17));
+        // A backslash starts a path as `/` does.
+        assert_eq!(parts(r"https://a.example\x"), (Some((8, 17)), 19));
+        assert_eq!(parts(r"https://u\p@a.example/x"), (Some((8, 9)), 23));
+        // No host, or one that isn't plain ASCII before a path: the whole URL, with no host.
+        assert_eq!(parts("https://[zz]/"), (None, 13));
+        assert_eq!(parts("https://—x"), (None, 12));
+        assert_eq!(parts("https://bücher.example/x"), (None, 25));
+        // A host that goes on in letters that aren't ASCII, whatever follows.
+        assert_eq!(parts("https://bücher.example"), (None, 23));
+        assert_eq!(parts("https://bu\u{308}cher.example&t=x"), (None, 28));
+        assert_eq!(parts("https://a.example:8443ü"), (None, 24));
+        // An invisible character alone after the host ends the link there.
+        assert_eq!(parts("https://a.example\u{200b}"), (Some((8, 17)), 17));
     }
 }

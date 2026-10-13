@@ -135,7 +135,8 @@ impl Known {
     /// capitals with three or more letters (`SMITH John`) is masked in title case too (`Smith`).
     /// Matching is case-sensitive, so a person called Will or May never masks "will" or "may";
     /// the cost of the title case is that a sender written `MAY` masks a sentence's first "May".
-    /// Apostrophes match in any form: a header's `O'Brien` masks a body's `O’Brien`, and back.
+    /// Apostrophes written `'`, `’`, `‘`, `ʼ`, `´`, a backtick or `＇` match one another: a header's
+    /// `O'Brien` masks a body's `O’Brien` or `O´Brien`, and back.
     ///
     /// `owner_addresses`: every account's address; matched case-insensitively and masked whole.
     pub fn new<N, A>(

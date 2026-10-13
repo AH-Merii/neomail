@@ -95,6 +95,59 @@ fn a_url_keeps_only_its_host() {
         plain("see https://acme.example%2Fu%2Fjbloggs%3Ft%3DSECRET"),
         "see <link host=acme.example>"
     );
+    // A host that isn't plain ASCII, before a path or query: the whole URL, with no host.
+    assert_eq!(
+        plain("Visit https://почта.рф/reset?token=AbCdEf123&user=jbloggs now"),
+        "Visit <link> now"
+    );
+    assert_eq!(
+        plain("https://shop.例え.jp/u/jbloggs?token=AbCdEf123"),
+        "<link>"
+    );
+    assert_eq!(
+        plain("http://[fe80::1%25eth0]:8080/u/jbloggs?t=SECRET99"),
+        "<link>"
+    );
+    assert_eq!(
+        plain("https://jörg:Secret@acme.example/u/jo?t=abcSECRET"),
+        "<link>"
+    );
+    assert_eq!(plain("https://jörg:Secret@acme.example ok"), "<link> ok");
+    // A host that goes on in letters that aren't ASCII, whatever follows, and text written
+    // against a host with no space, as Japanese is.
+    assert_eq!(
+        plain("see https://bücher.example&token=AbCdEf123 ok"),
+        "see <link> ok"
+    );
+    assert_eq!(plain("see https://Müller.example ok"), "see <link> ok");
+    assert_eq!(plain("詳細はhttps://acme.exampleです"), "詳細は<link>");
+    // An invisible character alone after a host is no part of it.
+    assert_eq!(
+        plain("Visit https://acme.example\u{200b} now"),
+        "Visit <link host=acme.example>\u{200b} now"
+    );
+    // A backslash starts a path as `/` does.
+    assert_eq!(
+        plain(r"see https://acme.example\u\jbloggs\AbCdEf123 ok"),
+        "see <link host=acme.example> ok"
+    );
+    assert_eq!(plain("http://[fe80::1%25eth0]/"), "<link>");
+    assert_eq!(
+        plain("https://my_host.example/reset?token=abcSECRET"),
+        "<link host=my_host.example>"
+    );
+    // A host carrying a card, a phone number or a known name.
+    for host in [
+        "acme.example-4111111111111111",
+        "acme.example.4111111111111111",
+        "acme.example-555-123-4567",
+        "acme.example.Smith",
+    ] {
+        assert_eq!(
+            with(&["Jane Smith"], &[], &format!("https://{host} ok")),
+            "<link> ok"
+        );
+    }
     // A host longer than DNS allows is no host.
     let long = "www.".repeat(100) + "acme.example";
     assert_eq!(plain(&format!("go {long} now")), "go <link> now");
@@ -349,6 +402,45 @@ fn a_one_time_code_after_a_keyword_is_masked() {
     ] {
         assert_eq!(plain(text), want, "{text}");
     }
+    // After password, passcode or PIN with no separator, only a token with a digit or a symbol;
+    // after one or several separators, any token; a keyword itself never.
+    for (text, want) in [
+        ("Reset your password here", "Reset your password here"),
+        (
+            "Please change your password before Friday",
+            "Please change your password before Friday",
+        ),
+        ("Pin this message to the top", "Pin this message to the top"),
+        ("PIN code: 4821", "PIN code: <code>"),
+        ("password hunter2 ok", "password <code> ok"),
+        ("password: hunterxyz", "password: <code>"),
+        ("password — Xk#92!pq7", "password — <code>"),
+        ("password – Xk#92!pq7", "password – <code>"),
+        ("password → Xk#92!pq7", "password → <code>"),
+        ("password -> Xk#92!pq7", "password -> <code>"),
+        ("password: : Xk#92!pq7", "password: : <code>"),
+        ("password - - Xk#92!pq7", "password - - <code>"),
+        ("password is: hunterxyz", "password is: <code>"),
+        (
+            "password: passcode: Xk#92!pq7",
+            "password: passcode: <code>",
+        ),
+        ("password password: Xk#92!pq7", "password password: <code>"),
+        // A dash joining two words is no separator.
+        (
+            "This file is password-protected.",
+            "This file is password-protected.",
+        ),
+        ("Set a PIN-protected lock", "Set a PIN-protected lock"),
+        (
+            "Your new password—remember it well",
+            "Your new password—remember it well",
+        ),
+        ("password-hunter2 ok", "password-<code> ok"),
+        ("password—Xk#92!pq7", "password—<code>"),
+    ] {
+        assert_eq!(plain(text), want, "{text}");
+    }
     let long = format!("password: {}", "x".repeat(65));
     assert_eq!(plain(&long), long);
     // No digit, or too short: not a code.
@@ -391,6 +483,12 @@ fn known_names_are_masked_as_whole_words_with_case() {
         ),
         "Dear Mr <name>, <name> here. <name>, <name>, <name>. It works, <name> said."
     );
+    // Any form of apostrophe matches any other, in the header or in the body.
+    let body = "Hi O’Brien and O‘Brien and O`Brien and O´Brien and OʼBrien and O＇Brien, O´Brien's";
+    let want = "Hi <name> and <name> and <name> and <name> and <name> and <name>, <name>'s";
+    assert_eq!(with(&["Jane O'Brien"], &[], body), want);
+    assert_eq!(with(&["Jane O´Brien"], &[], body), want);
+    assert_eq!(with(&["Jane O´Brien"], &[], "O'Brien"), "<name>");
 }
 
 #[test]
