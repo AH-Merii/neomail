@@ -1,0 +1,15 @@
+[package]
+name = "nm-redact"
+description = "neomail's PII redaction rules: the only maker of the text that may leave the machine for classification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+regex.workspace = true
+
+[lints]
+workspace = true

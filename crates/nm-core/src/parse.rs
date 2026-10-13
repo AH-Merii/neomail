@@ -80,6 +80,9 @@ pub struct ParsedMessage {
     pub from: Vec<EmailAddress>,
     pub to: Vec<EmailAddress>,
     pub cc: Vec<EmailAddress>,
+    /// Reply-To: not shown by `neomail show`, but its display names are known names for
+    /// redaction.
+    pub reply_to: Vec<EmailAddress>,
     pub subject: Option<String>,
     pub body_kind: BodyKind,
     pub body: String,
@@ -150,6 +153,7 @@ pub fn parse(raw: &[u8]) -> Result<ParsedMessage, ParseError> {
         from: addresses(msg.from()),
         to: addresses(msg.to()),
         cc: addresses(msg.cc()),
+        reply_to: addresses(msg.reply_to()),
         subject: msg.subject().map(str::to_owned),
         body_kind,
         body,
@@ -317,6 +321,21 @@ Content-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--b1--\r\n";
             Some("2026-10-10T08:30:00+00:00".into())
         );
         assert!(m.attachments.is_empty());
+        assert!(m.reply_to.is_empty());
+    }
+
+    #[test]
+    fn reply_to_is_parsed_with_its_names() {
+        let raw = b"From: a@mail.example\r\nReply-To: Desk <desk@mail.example>, b@mail.example\r\n\
+Subject: Hi\r\n\r\nBody.\r\n";
+        let m = parse(raw).unwrap();
+        assert_eq!(
+            m.reply_to
+                .iter()
+                .map(EmailAddress::display)
+                .collect::<Vec<_>>(),
+            ["Desk <desk@mail.example>", "b@mail.example"]
+        );
     }
 
     #[test]

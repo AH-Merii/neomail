@@ -8,6 +8,7 @@ use nm_core::cache::{ListEntry, StoredMessage};
 use nm_core::parse::{Attachment, BodyKind, EmailAddress, ParsedMessage};
 use nm_core::{Flags, MessageId, Uid};
 use nm_imap::Security;
+use nm_redact::{EXCERPT_CHARS, Excerpt, MaskCounts, Piece, Redacted};
 use serde::Serialize;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -85,6 +86,81 @@ impl<'a> ShowItem<'a> {
             attachments: &parsed.attachments,
         }
     }
+}
+
+/// One message of `neomail redact`: the text classification would send for it.
+#[derive(Serialize)]
+pub struct RedactItem<'a> {
+    pub id: MessageId,
+    pub account: &'a str,
+    pub subject: &'a str,
+    pub body: &'a str,
+    /// Whether the body was cut to its first [`EXCERPT_CHARS`] characters.
+    pub truncated: bool,
+    /// Every kind with its count, zeros included, so the shape never changes.
+    #[serde(serialize_with = "serialize_counts")]
+    pub masks: MaskCounts,
+    #[serde(skip)]
+    excerpt: &'a Excerpt,
+}
+
+impl<'a> RedactItem<'a> {
+    pub fn new(stored: &'a StoredMessage, excerpt: &'a Excerpt) -> Self {
+        Self {
+            id: stored.id,
+            account: &stored.account,
+            subject: excerpt.subject().as_str(),
+            body: excerpt.body().as_str(),
+            truncated: excerpt.truncated(),
+            masks: excerpt.masks(),
+            excerpt,
+        }
+    }
+}
+
+fn serialize_counts<S: serde::Serializer>(c: &MaskCounts, s: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = s.serialize_map(Some(nm_redact::Kind::ALL.len()))?;
+    for (kind, n) in c.iter() {
+        map.serialize_entry(kind.name(), &n)?;
+    }
+    map.end()
+}
+
+/// `neomail redact` for people and pipes: the subject and the body as they would be sent, with
+/// the placeholders styled when `paint` is on. Characters that could change the terminal are
+/// replaced, as `neomail show` does; JSON keeps the exact text.
+pub fn write_redacted(out: &mut dyn Write, item: &RedactItem<'_>, paint: Paint) -> io::Result<()> {
+    let styled = |r: &Redacted, safe: fn(&str) -> String| {
+        r.pieces()
+            .map(|p| match p {
+                Piece::Text(t) => safe(t),
+                Piece::Mask(_, m) => paint.mask(&one_line(m)),
+            })
+            .collect::<String>()
+    };
+    writeln!(
+        out,
+        "{} {}",
+        paint.strong("Subject:"),
+        styled(item.excerpt.subject(), one_line)
+    )?;
+    writeln!(out)?;
+    if item.body.is_empty() {
+        writeln!(out, "(no text body)")?;
+    } else {
+        writeln!(out, "{}", styled(item.excerpt.body(), text).trim_end())?;
+    }
+    if item.truncated {
+        writeln!(
+            out,
+            "{}",
+            paint.strong(&format!(
+                "[neomail: the body is cut here, at the {EXCERPT_CHARS}-character limit]"
+            ))
+        )?;
+    }
+    Ok(())
 }
 
 /// How a command prints its results, chosen once in main.rs.

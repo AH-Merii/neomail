@@ -126,6 +126,15 @@ impl Paint {
         self.fg(AnsiColor::Cyan, text)
     }
 
+    /// A redaction placeholder such as `<email>`: bold blue. The placeholder's words carry the
+    /// meaning; the colour only makes it stand out.
+    pub fn mask(self, text: &str) -> String {
+        self.paint(
+            Style::new().bold().fg_color(Some(AnsiColor::Blue.into())),
+            text,
+        )
+    }
+
     /// Unread mail and labels: bold.
     pub fn strong(self, text: &str) -> String {
         self.paint(Style::new().bold(), text)

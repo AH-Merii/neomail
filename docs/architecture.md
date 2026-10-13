@@ -19,6 +19,7 @@ actions, then `neomail archive` and `neomail delete` for IMAP and Outlook accoun
 | `crates/nm-core` | Domain types, the `MailSource`, `IdSource` and `MailWriter` traits, the SQLite cache, the sync engines, the actions, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
 | `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap); its two writes, `store_seen` and `move_to`, and `list_folders`, with modified UTF-7 names decoded. | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
 | `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port; its two writes, `set_read` and `move_to`, and `folders`, the read behind `folder list`. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
+| `crates/nm-redact` | The PII redaction rules, how each placeholder is spelled, and `Excerpt`, the text classification will send. Pure: no I/O, no network, no config; `regex` is its only dependency. | One owner for what may leave the machine: the classifier (slice 10) takes an `Excerpt`, and the rules change without touching it. What MCP clients receive is decided when MCP lands, through the same rules. |
 
 A new crate needs a reason of the same kind: a second implementation of a seam, or a heavy
 dependency to isolate.
@@ -397,6 +398,25 @@ reads are: 201 is moved, 404 is gone, and anything else fails the account. Both 
 the writer's one Graph login helper (`triage::Writer::graph`), as the IMAP ones share `imap`.
 
 The action tests (`nm-core/tests/action.rs`) drive `apply` with a fake writer.
+
+**`Excerpt`** (`nm-redact/src/lib.rs`) is the only text that may leave the machine for
+classification. `Excerpt::new(subject, body, &Known)` redacts the subject whole and the body whole,
+then cuts the body to its first 1,500 characters without splitting a placeholder. Its fields are
+private and nothing else makes one, so a request that takes an `Excerpt` can only carry redacted
+text. `Known` is what the caller already knows and wants masked, the display names from the headers
+and the owner's addresses; the caller gathers it (from the parsed message and the config) and
+nm-redact decides how it is matched. A `Redacted` text keeps where each placeholder sits, so the
+output styles masks without parsing placeholders back out, and `MaskCounts` has a count for every
+`Kind`, zeros included. The rules, their placeholders and what they keep are in
+`nm-redact/src/lib.rs`; the tests (`nm-redact/tests/`) check each rule and, over tables of inputs,
+that no digit run of 4 or more (outside a link host or a date), no address's local part and no known name survives.
+
+The caller's side is one function, `redact::excerpt` (`neomail/src/redact.rs`): it takes a
+`ParsedMessage` and the owner's addresses (every account's login that is an address, from the
+config), gathers the display names of From, To, Cc and Reply-To into a `Known`, and makes the
+`Excerpt` from the subject and the body as `neomail show` renders it. `neomail redact` prints that
+`Excerpt` (`output::RedactItem`, `output::write_redacted`), and slice 10's request will be built
+from the same call, so what the user previews is what is sent.
 
 ## How sync works
 
