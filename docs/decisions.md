@@ -241,6 +241,9 @@ the new entry.
 - **Moving to a folder** is `neomail move FOLDER ID...`, with a name exactly as
   `neomail folder list` prints it: never a folder created, online only
   ([DEC-2026-10-13-move](#dec-2026-10-13-move), proposed).
+- **Sending from the CLI** is `neomail send`, `neomail reply ID` and `neomail forward ID`, with a
+  Markdown body from a file or standard input, asked before sending on a terminal
+  ([DEC-2026-10-13-send](#dec-2026-10-13-send), proposed).
 - **Easy to extend** with new functionality and UI later.
 - **Agentically customizable, like Pi** (Mario Zechner's agent harness): agents can extend and
   customize neomail themselves (extensions, docs written for agents, hot reload).
@@ -841,6 +844,40 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
     `folder list` is a read, not an action.
 - **Builds on:** [DEC-2026-10-13-archive-delete](#dec-2026-10-13-archive-delete),
   [DEC-2026-10-13-mark](#dec-2026-10-13-mark) and [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).
+
+### <a id="dec-2026-10-13-send"></a>DEC-2026-10-13-send: sending, replying and forwarding from the CLI
+
+- **Status:** proposed by Claude on 2026-10-13, for roadmap slice 12.
+- **Proposal:**
+  - `neomail send`, `neomail reply ID [--all]` and `neomail forward ID` take a Markdown body from a
+    file or standard input and send it as the Markdown drafts bullets under [UX](#ux) say: the
+    rendered HTML plus the Markdown source, or `--text-only`. `--from` picks the account; one
+    identity per account (its address and display name) for now.
+  - Proton (through Bridge), Gmail (OAuth or an app password) and other IMAP accounts send over
+    SMTP, with a small client of neomail's own in nm-imap that shares its TLS and certificate
+    pinning. It greets the server as `[127.0.0.1]`, so the machine's name never leaves it.
+    Outlook sends through Microsoft Graph's `sendMail`, so new Outlook sign-ins also ask for
+    `Mail.Send`; an older sign-in is told to run `neomail account login` once, as for marking
+    ([DEC-2026-10-13-mark](#dec-2026-10-13-mark)). Graph takes a MIME message's recipients from
+    its headers, where Bcc never is, so an Outlook account refuses a Bcc before sending anything.
+  - Each message sent gets one copy in Sent where it can. Gmail, Bridge and Graph store it
+    themselves; for other IMAP servers neomail appends it to the mailbox marked `\Sent`, and never
+    creates one, so a server without one keeps no copy and a warning says so.
+  - On a terminal neomail shows who it goes to and asks before sending; a no sends nothing and
+    exits 1. `--yes` sends from a script; without a terminal or with `--no-input`
+    ([DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux)), and no `--yes`, nothing is sent: exit 2,
+    as for any question that can't be asked ([exit codes](json.md#exit-codes)). `--dry-run`
+    prints the message instead.
+  - A refused recipient sends nothing to anyone, and so does a reply that would have to leave out
+    an address it takes from the original because it can't be sent to yet (one that isn't
+    ASCII). A message that was sent but whose Sent copy failed exits 0 with a warning, so a
+    script never sends it twice.
+  - A forward is inline, with the original's headers above its text; attachments are not carried
+    until slice 15.
+  - Threading follows RFC 5322 3.6.4: In-Reply-To and References from the original.
+- **Builds on:** [DEC-2026-10-11-test-accounts](#dec-2026-10-11-test-accounts) for the live check;
+  agents sending with approval stay with slice 17
+  ([DEC-2026-10-11-agent-send](#dec-2026-10-11-agent-send)).
 
 ### <a id="dec-2026-10-13-redact"></a>DEC-2026-10-13-redact: the redaction preview and what it masks
 

@@ -167,8 +167,23 @@ pub fn auth_url(
 pub enum MailGrant {
     /// Read only: Microsoft's Mail.Read.
     Read,
-    /// Read and change: Microsoft's Mail.ReadWrite, Google's full mail scope.
+    /// Read and change: Microsoft's Mail.ReadWrite.
     ReadWrite,
+    /// Read, change and send: Microsoft's Mail.ReadWrite with Mail.Send, Google's full mail
+    /// scope.
+    ReadWriteSend,
+}
+
+impl MailGrant {
+    /// Whether neomail may change mail: mark it read or unread, move it.
+    pub fn can_write(self) -> bool {
+        matches!(self, Self::ReadWrite | Self::ReadWriteSend)
+    }
+
+    /// Whether neomail may send mail as the account.
+    pub fn can_send(self) -> bool {
+        self == Self::ReadWriteSend
+    }
 }
 
 /// What a sign-in leaves: the account's address, a refresh token, what it grants, and the access
@@ -279,10 +294,16 @@ fn check_sign_in(provider: &Provider, tokens: TokenResponse) -> Result<SignedIn>
     let id_token = tokens
         .id_token
         .with_context(|| format!("{} returned no ID token", provider.name))?;
-    let grant = if grants_any(provider, tokens.scope.as_deref(), provider.write_scopes) {
-        MailGrant::ReadWrite
-    } else {
-        MailGrant::Read
+    let granted = |wanted| grants_any(provider, tokens.scope.as_deref(), wanted);
+    // A sign-in that may send but not change mail is kept as read-only: the grants are a ladder,
+    // so a refresh never asks for more than the sign-in granted.
+    let grant = match (
+        granted(provider.write_scopes),
+        granted(provider.send_scopes),
+    ) {
+        (true, true) => MailGrant::ReadWriteSend,
+        (true, false) => MailGrant::ReadWrite,
+        (false, _) => MailGrant::Read,
     };
     Ok(SignedIn {
         email: id_token_email(&id_token)?,

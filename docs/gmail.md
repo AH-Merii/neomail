@@ -149,6 +149,15 @@ message were still in the INBOX afterwards, it would report it as not confirmed 
 cache. `neomail move "[Gmail]/Spam" ID...` moves a message to Spam the same way: a live check on a
 test account moved one, and it was then in `[Gmail]/Spam` and no longer in the INBOX.
 
+## Sending
+
+neomail sends through smtp.gmail.com on port 465 with TLS, signed in with the same OAuth scope
+(SASL XOAUTH2) or the app password
+([IMAP, POP and SMTP](https://developers.google.com/workspace/gmail/imap/imap-smtp)). Gmail keeps
+the copy in Sent itself ("Sent messages are automatically copied to the Gmail/Sent folder if your
+email client uses SMTP", [IMAP client settings](https://support.google.com/mail/answer/78892)), so
+neomail adds none. No setting is needed: an account on imap.gmail.com sends this way.
+
 ## Where things are kept
 
 - The config file holds the account's name, address and client ID, which are not secret:

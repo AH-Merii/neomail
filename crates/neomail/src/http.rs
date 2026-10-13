@@ -137,6 +137,24 @@ impl Https {
         .await
     }
 
+    /// POSTs the text `body` (`text/plain`) to `url` with `headers`, as [`Self::post_json`].
+    pub async fn post_text(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> Result<Response> {
+        self.send(Request {
+            method: "POST",
+            url,
+            headers,
+            body: Some(("text/plain", body)),
+            max_body,
+        })
+        .await
+    }
+
     async fn send(&self, request: Request<'_>) -> Result<Response> {
         let target = split_url(request.url)?;
         let host = target.host;

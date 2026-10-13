@@ -135,6 +135,35 @@ impl Headers {
     }
 }
 
+/// The headers a reply threads on (RFC 5322 section 3.6.4), each id without its angle brackets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Threading {
+    pub message_id: Option<String>,
+    /// In-Reply-To's ids, in order.
+    pub in_reply_to: Vec<String>,
+    /// References' ids, in order.
+    pub references: Vec<String>,
+}
+
+impl Threading {
+    fn of(msg: &Message<'_>) -> Self {
+        let ids = |value: &mail_parser::HeaderValue<'_>| {
+            value
+                .as_text_list()
+                .unwrap_or_default()
+                .iter()
+                .map(|id| id.trim().to_owned())
+                .filter(|id| !id.is_empty())
+                .collect()
+        };
+        Threading {
+            message_id: msg.message_id().map(str::to_owned),
+            in_reply_to: ids(msg.in_reply_to()),
+            references: ids(msg.references()),
+        }
+    }
+}
+
 /// Which part the body text came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BodyKind {
@@ -172,6 +201,7 @@ pub struct ParsedMessage {
     pub body: String,
     pub attachments: Vec<Attachment>,
     pub headers: Headers,
+    pub threading: Threading,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -245,6 +275,7 @@ pub fn parse(raw: &[u8]) -> Result<ParsedMessage, ParseError> {
         body,
         attachments,
         headers: Headers::of(&msg),
+        threading: Threading::of(&msg),
     })
 }
 

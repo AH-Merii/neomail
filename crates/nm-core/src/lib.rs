@@ -5,6 +5,7 @@
 
 pub mod action;
 pub mod cache;
+pub mod compose;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod folder;

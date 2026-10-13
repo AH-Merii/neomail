@@ -34,6 +34,12 @@ zbus-secret-service-keyring-store = { version = "1.0.1", default-features = fals
 # in, on tokio as there, so no crate or feature enters the tree.
 zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 mail-parser = "0.11"
+# Builds outgoing mail (crates/nm-core/src/compose.rs): RFC 2047 words, folding and the part
+# encodings. From mail-parser's authors; without gethostname, as compose sets the Message-ID.
+mail-builder = { version = "1.0", default-features = false }
+# Renders a draft's Markdown to the HTML part (crates/nm-core/src/compose.rs). Only the HTML
+# renderer: no getopts.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 rpassword = "7.5"
 # The redaction rules (crates/nm-redact): every pattern is compiled once, and its linear-time
 # matching keeps a 1,500-character excerpt cheap.
@@ -60,6 +66,8 @@ unicode-width = "0.2"
 anyhow = "1"
 base64 = "0.23"
 ring = { version = "0.17", default-features = false }
+# Tests only: a self-signed certificate for the fake SMTP server on 127.0.0.1 (crates/nm-imap).
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

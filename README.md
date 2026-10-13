@@ -124,7 +124,12 @@ unset). `account add` appends to it and keeps your text and comments:
 [[accounts]]
 name = "work"
 username = "user@mail.example"
+# Optional: who mail is sent as. `address` defaults to `username`.
+display_name = "Your Name"
 imap = { host = "imap.mail.example", port = 993, security = "tls" }
+# Where mail is sent: implicit TLS on 465 by default, or security = "starttls" (port 587).
+# save_sent appends a copy to the mailbox marked \Sent; it defaults to true here.
+smtp = { host = "smtp.mail.example" }
 
 [[accounts]]
 name = "proton"
@@ -143,6 +148,17 @@ cert_sha256 = "AB:CD:…"   # 64 hex digits
   option and no way to skip certificate checks.
 - Without `cert_sha256` the certificate is verified against the system's trust store. With it,
   only that exact certificate is accepted.
+- `smtp` takes the same `security` and `cert_sha256`, and `save_sent`. Gmail and Proton Mail
+  Bridge need none: neomail sends through smtp.gmail.com (port 465, TLS) and through Bridge's
+  127.0.0.1 port 1025 ([Proton's port list](https://proton.me/support/port-already-occupied-error)),
+  and both keep the copy in Sent themselves, so neomail adds none. Proton does not say how
+  Bridge's SMTP is secured; neomail uses STARTTLS with the IMAP pin. The live check sent through
+  Bridge's SMTP that way, from a hand-written `smtp` table, as its Bridge listened on other ports
+  and the preset only matches IMAP on port 1143. `account add proton` and `gmail-app-password`
+  write this out. An `smtp` table naming smtp.gmail.com also defaults to `save_sent = false`.
+  Any other server needs its `smtp` before it can send: `account add imap --smtp-host HOST`
+  writes it (`--smtp-port 587` uses STARTTLS, any other port TLS; `--smtp-security starttls|tls`
+  says otherwise, on port 587 or 465 unless `--smtp-port` names one).
 
 An optional `[classify]` table sets up classification with jev; every key has a default:
 
@@ -229,6 +245,9 @@ neomail archive 42           # move to the archive on the server, then drop from
 neomail delete 43            # move to the trash; nothing is deleted for good
 neomail folder list          # each account's folders: name, account, role
 neomail move Receipts 44     # move to the folder Receipts on the server, then drop from the cache
+neomail send --to ada@example.com --subject Hi --body note.md   # send Markdown, after asking
+neomail reply 42 --body answer.md                                # reply, threaded, original quoted
+neomail forward 42 --to ada@example.com                          # forward its text inline
 ```
 
 - `neomail sync --account work --limit 100`: the first sync takes the 500 messages that arrived
@@ -298,6 +317,31 @@ neomail move Receipts 44     # move to the folder Receipts on the server, then d
   creates, renames or deletes a folder. On Outlook a folder's name is its path of display names
   (`Inbox/Receipts`): [docs/outlook.md](docs/outlook.md#folders-and-move). What a move does on
   Gmail: [docs/gmail.md](docs/gmail.md#move-to-a-folder-or-label).
+- `neomail send --to ADDR --subject TEXT --body PATH|-` sends a message written in Markdown: the
+  HTML rendered from it, with the Markdown itself as the plain text part (`--text-only` sends that
+  alone). HTML typed into the Markdown is sent as text, never as HTML. `--to`, `--cc` and `--bcc`
+  repeat or take commas (a comma inside a quoted name, as in `"Doe, Jane" <jane@example.com>`,
+  does not split); Bcc recipients get the message but no header names them. `--from` picks the
+  account by its name or address; with one account it is that one. When standard input is a
+  terminal neomail shows who it goes to and asks; when it is not (for example a body piped to
+  `--body -`), pass `--yes`, or nothing is sent (exit 2). `--dry-run` prints the message, and on
+  standard error who it goes to, Bcc included; it connects to nothing. If the server refuses any
+  recipient, nobody gets it (exit 1). If the connection is lost after the whole message went
+  out, it also exits 1, but the error says the message may have been sent: check Sent before
+  sending it again. Gmail, Proton Mail Bridge and Outlook keep the copy in Sent themselves; for
+  any other server neomail appends one to the mailbox marked `\Sent`, and a copy that fails is a
+  warning, not a failure, so a retry never sends it twice. `--plain` prints the Message-ID alone
+  even on a terminal. Attachments come later.
+- `neomail reply ID [--all] --body PATH|-` answers a cached message from the account it is in:
+  to its Reply-To, else its From (its To when the original is yours), and with `--all` its To
+  and Cc too, never you. If any of those addresses cannot be sent to yet (it is not ASCII),
+  nothing is sent (exit 1); no one is left out quietly. The subject gets `Re: `, your text
+  goes above the original quoted with `> `, and In-Reply-To and References thread it (RFC 5322
+  section 3.6.4). `neomail forward ID --to ADDR [--body PATH|-]` sends the original's headers and
+  text below your note, with `Fwd: `; it warns that the original's attachments are not forwarded
+  yet. An Outlook account added before neomail could send needs `neomail account login NAME`
+  once ([docs/outlook.md](docs/outlook.md#accounts-added-before-neomail-could-send)). No Outlook
+  account can send Bcc yet.
 - `--json` and `--jsonl` print JSON for scripts; see [docs/json.md](docs/json.md) for the shapes,
   the plain columns and the exit codes.
 

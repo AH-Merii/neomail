@@ -76,8 +76,10 @@ pub const NO_JEV_KEY: &str = "no jev key: run `neomail key set` or set JEV_API_K
 /// unchanged.
 ///
 /// `mail_grant` came with marking mail. An entry without it is from an earlier sign-in, which
-/// asked Microsoft only for Mail.Read, so it reads as [`MailGrant::Read`]. An earlier neomail
-/// ignores the field (serde skips unknown fields), so it still reads a newer entry.
+/// asked Microsoft only for Mail.Read, so it reads as [`MailGrant::Read`]. A neomail from before
+/// the field ignores it (serde skips unknown fields), so it still reads a newer entry; one from
+/// before sending knows only `read` and `read-write`, cannot read an entry whose grant includes
+/// sending, and needs `neomail account login NAME` again.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1,12 +1,14 @@
 //! The IMAP [`MailSource`]: TLS or STARTTLS over rustls, then read-only IMAP on INBOX; and the
 //! two writes: [`store_seen`], which sets or clears `\Seen`, and [`move_to`], which moves
 //! messages from INBOX to the archive, the trash or a folder the user names. Neither ever
-//! expunges. [`list_folders`] lists the mailboxes a message can be in.
+//! expunges. [`list_folders`] lists the mailboxes a message can be in. [`append_sent`] keeps a
+//! copy of a sent message, and [`smtp`] submits mail, over the same TLS and pinning.
 //!
 //! A mailbox name is decoded from modified UTF-7 (RFC 3501 section 5.1.3) for the user, and the
 //! server's own encoded name is the one sent back: a user's name never reaches the wire, and an
 //! encoded name never leaves this crate.
 
+pub mod smtp;
 mod tls;
 mod utf7;
 mod watch;
@@ -187,6 +189,11 @@ pub enum ImapError {
          another mail app to move to it"
     )]
     SharedName(FolderName),
+    #[error(
+        "the server has no Sent folder: no mailbox has the \\Sent attribute (RFC 6154), and \
+         neomail never creates one"
+    )]
+    NoSent,
     #[error("timed out during {0}")]
     Timeout(&'static str),
     #[error("the server closed the connection")]
@@ -462,6 +469,28 @@ async fn list_folders_on<T: Transport>(
     Ok(result?.iter().filter_map(Mailbox::listed).collect())
 }
 
+/// Appends `mime` to the mailbox LIST marks `\Sent` (RFC 6154 section 2), flagged `\Seen`: the
+/// copy in Sent for a server whose SMTP does not keep one. Never creates a mailbox: a server
+/// with no `\Sent` mailbox gets [`ImapError::NoSent`] and nothing is stored. Selects nothing.
+pub async fn append_sent(
+    config: &ImapConfig,
+    login: Login<'_>,
+    mime: &[u8],
+) -> Result<(), ImapError> {
+    let tls = tls::client_config(config.cert_pin).map_err(ImapError::TlsConfig)?;
+    let client = open(config, tls).await?;
+    let session = log_in(client, &config.username, login).await?;
+    append_sent_on(session, mime).await
+}
+
+/// [`append_sent`] on a logged-in session, which it logs out. Shared with the wire tests.
+async fn append_sent_on<T: Transport>(session: Session<T>, mime: &[u8]) -> Result<(), ImapError> {
+    let mut source = ImapSource { session, exists: 0 };
+    let result = source.append_sent(mime).await;
+    source.logout().await;
+    result
+}
+
 /// The SHA-256 of the certificate the server at `config` presents, for the user to compare and
 /// pin (Proton Mail Bridge uses a self-signed one). The certificate is not trusted for anything:
 /// the connection is closed after the handshake (and the greeting), without logging in.
@@ -583,6 +612,24 @@ impl<T: Transport> ImapSource<T> {
             .map_err(|source| ImapError::Command { op, source })?;
         let names: Vec<Name> = collect(op, stream).await?;
         Ok(names.iter().map(Mailbox::new).collect())
+    }
+
+    /// See [`append_sent`].
+    async fn append_sent(&mut self, mime: &[u8]) -> Result<(), ImapError> {
+        let mailboxes = self.mailboxes().await?;
+        let sent = mailboxes
+            .iter()
+            .filter(|m| m.selectable && !m.inbox)
+            .find(|m| m.roles.contains(&Role::Sent))
+            .ok_or(ImapError::NoSent)?;
+        let op = "APPEND";
+        step(
+            op,
+            self.session
+                .append(&sent.wire, Some("(\\Seen)"), None, mime),
+        )
+        .await?
+        .map_err(|source| ImapError::Command { op, source })
     }
 
     /// Checks MOVE, finds the destination, SELECTs INBOX read-write, checks its UIDVALIDITY,

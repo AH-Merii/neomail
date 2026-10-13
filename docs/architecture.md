@@ -16,9 +16,9 @@ actions, then `neomail archive` and `neomail delete` for IMAP and Outlook accoun
 | Crate | What it holds | Why it is a crate |
 | ----- | ------------- | ----------------- |
 | `crates/neomail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, the daemon and its locks, output, wiring. | The composition root. Nothing depends on it. |
-| `crates/nm-core` | Domain types, the `MailSource`, `IdSource` and `MailWriter` traits, the SQLite cache, the sync engines, the actions, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
-| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap); its two writes, `store_seen` and `move_to`, and `list_folders`, with modified UTF-7 names decoded. | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
-| `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port; its two writes, `set_read` and `move_to`, and `folders`, the read behind `folder list`. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
+| `crates/nm-core` | Domain types, the `MailSource`, `IdSource` and `MailWriter` traits, the SQLite cache, the sync engines, the actions, mail parsing, and building outgoing mail (`compose`). | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
+| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap); its two writes, `store_seen` and `move_to`, and `list_folders`, with modified UTF-7 names decoded; `append_sent`, and SMTP submission (`smtp`) over the same TLS and pinning. | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
+| `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port; its two writes, `set_read` and `move_to`, and `folders`, the read behind `folder list`; `send`, through sendMail. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
 | `crates/nm-redact` | The PII redaction rules, how each placeholder is spelled, `Excerpt`, the text classification sends, and `Outgoing`, that text with the signals that go with it. Pure: no I/O, no network, no config; `regex` is its only dependency. | One owner for what may leave the machine: the classifier's request (slice 10) takes an `Outgoing` and nothing else, and the rules change without touching it. What MCP clients receive is decided when MCP lands, through the same rules. |
 
 A new crate needs a reason of the same kind: a second implementation of a seam, or a heavy
@@ -67,7 +67,7 @@ source that implements it also implements `IdSource`. `Cursor`'s `Debug` is reda
 never printed.
 
 **`Transport`** (`nm-graph/src/lib.rs`) is the port `GraphSource` reads and writes Graph through:
-one HTTPS GET, or a PATCH or POST with a JSON body, with request headers and a body cap, answered
+one HTTPS GET, a PATCH or POST with a JSON body, or a POST with a text body, with request headers and a body cap, answered
 with the status, `Retry-After` and the body.
 `neomail/src/graph.rs` implements it with neomail's HTTP client, and `nm-graph/tests/graph.rs` with
 a fake Graph: a mailbox model that pages with next page links, plus scripted replies. That fake
@@ -298,6 +298,43 @@ network step has a 60-second timeout: connecting, the handshake, each command's 
 response of a FETCH. A FETCH as a whole is not bounded, so a slow transfer of large mail is not cut
 off.
 
+**Sending** is built in three places, so each rule has one owner:
+
+- `nm_core::compose` turns a `Draft` (from, to, cc, bcc, subject, Markdown) into an `Outgoing`:
+  the RFC 5322 bytes (mail-builder), the envelope, the Bcc list and the Message-ID. The body is
+  multipart/alternative, the Markdown as text/plain and pulldown-cmark's HTML, with raw HTML
+  escaped. Bcc is in the envelope only. `reply` and `forward` build a draft from a cached
+  original (`ParsedMessage`, with its `Threading` headers): recipients, `Re:`/`Fwd:`, In-Reply-To
+  and References as RFC 5322 section 3.6.4 says, and the quoted text. It is pure, and the TUI and
+  agents will reuse it.
+- `nm_imap::smtp::submit` sends an `Outgoing` over implicit TLS or STARTTLS (refused when the
+  server does not offer it, and data sent ahead of the handshake ends the session), with AUTH
+  PLAIN or XOAUTH2. One refused recipient ends the transaction with RSET before DATA, so nobody
+  gets the message. `nm_imap::append_sent` stores a copy in the mailbox marked `\Sent`, `\Seen`,
+  and never creates one. `nm_graph::GraphSource::send` posts the MIME to sendMail; Graph reads
+  recipients from the headers, so it refuses a message with Bcc rather than drop them.
+- `config::Account` holds the identity (`address`, `display_name`) and `outbound()`: SMTP from
+  `[accounts.smtp]` or a preset (Gmail, Bridge), or Graph. Gmail, Bridge and Graph keep the Sent
+  copy themselves; only other servers get `append_sent` (`save_sent`). Microsoft sign-ins ask
+  for Mail.Send, and `MailGrant::ReadWriteSend` records it; an older sign-in is told to run
+  `account login` before the question, from the grant in its keyring entry, and `graph::send`
+  checks it again before any request.
+- `neomail/src/send.rs` is the commands `send`, `reply` and `forward`: it picks the account
+  (`--from`, else the original's, else the only one), reads the Markdown, builds the draft and
+  checks from the config that the account can send it (an SMTP server, no Bcc through Graph).
+  Then it either prints it (`--dry-run`, with the summary on standard error, before any keyring
+  or connection) or checks an Outlook grant, asks (or takes `--yes`; without either, a usage
+  error), takes the login
+  through `sync::Logins` as `mark` does, and sends. The copy in Sent comes after the send and
+  only warns when it fails. It owns the output: one line, the Message-ID, or the JSON object.
+
+The tests run a scripted SMTP server over a pipe and a TLS one with an rcgen certificate on
+127.0.0.1 (`nm-imap/src/smtp/tests.rs`), an APPEND server (`wire_tests.rs`) and the fake Graph.
+`neomail/tests/send.rs` drives the binary against a TLS SMTP server on 127.0.0.1 that records
+each command and message, and a listener that stands for an IMAP server whose append fails. The
+binary cannot reach a fake Graph (its URL is fixed), so Outlook's sending is tested in nm-graph
+and `graph.rs`, and the binary's tests stop an Outlook message before any request.
+
 **The action registry** (`nm-core/src/action.rs`) is how mail is changed. It is the typed set of
 actions that the TUI's keys, the CLI, scripts and agents share (the first bullet of
 [CLI, scripting, agents, extensibility](decisions.md#cli-scripting-agents-extensibility)). It
@@ -398,9 +435,10 @@ nm-imap.
 
 For Outlook, the writer calls `graph::set_read`, which calls `GraphSource::set_read`. Changing mail
 needs Mail.ReadWrite, which new sign-ins ask for along with Mail.Read. A sign-in records what it was
-granted as `oauth::MailGrant` (`Read` or `ReadWrite`) in its keyring entry (`mail_grant`). An entry
-without it comes from an earlier version, which asked only for Mail.Read, and counts as `Read`. The
-grant travels with the access token (`sync::AccessToken`), so two things follow from it:
+granted as `oauth::MailGrant` (`Read`, `ReadWrite` or `ReadWriteSend`) in its keyring entry
+(`mail_grant`). An entry without it comes from an earlier version, which asked only for Mail.Read,
+and counts as `Read`. The grant travels with the access token (`sync::AccessToken`), so two things
+follow from it:
 
 - The refresh asks for no more than the sign-in granted: `Provider::refresh_scope` holds one
   scope per grant, since Microsoft's refresh scope must be the original's or a subset.

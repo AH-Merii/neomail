@@ -58,6 +58,8 @@ struct FakeGraph {
     folder_page: usize,
     /// Where every listing page's next link points instead of the next page; `None` for Graph.
     next_link: Option<&'static str>,
+    /// Loses the connection after a POST to sendMail reached it, before any answer.
+    lose_sends: Cell<bool>,
 }
 
 struct FakeFolder {
@@ -87,6 +89,7 @@ impl FakeGraph {
             folders: Vec::new(),
             folder_page: 100,
             next_link: None,
+            lose_sends: Cell::new(false),
         }
     }
 
@@ -299,6 +302,33 @@ impl Transport for FakeGraph {
             max_body,
         };
         Ok(self.answer(seen, || self.serve_move(url)).await)
+    }
+
+    /// Records the text body as a JSON string; answers sendMail with 202.
+    async fn post_text(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> Result<Reply, TransportError> {
+        let seen = Seen {
+            method: "POST text/plain",
+            url: url.to_owned(),
+            body: Some(Value::String(String::from_utf8(body.to_vec()).unwrap())),
+            headers: owned(headers),
+            max_body,
+        };
+        let status = if url == format!("{API}/me/sendMail") {
+            202
+        } else {
+            404
+        };
+        let answer = self.answer(seen, || reply(status, Vec::new())).await;
+        if self.lose_sends.get() {
+            return Err("connection reset by peer".into());
+        }
+        Ok(answer)
     }
 }
 
@@ -1459,4 +1489,116 @@ async fn a_missing_shared_search_or_inbox_path_moves_nothing() {
             .is_empty()
     );
     assert!(transport(&s).seen.borrow().is_empty());
+}
+
+fn outgoing(bcc: &[&str]) -> nm_core::compose::Outgoing {
+    nm_core::compose::Outgoing {
+        mime: b"From: me@example.com\r\nTo: ann@example.org\r\nSubject: s\r\n\r\nhi\r\n".to_vec(),
+        envelope_from: "me@example.com".to_owned(),
+        envelope_to: ["ann@example.org"]
+            .iter()
+            .chain(bcc)
+            .map(|a| (*a).to_owned())
+            .collect(),
+        bcc: bcc.iter().map(|a| (*a).to_owned()).collect(),
+        message_id: "id@example.com".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn send_posts_the_mime_base64_encoded_as_text_to_sendmail() {
+    use base64::Engine;
+    let s = source(FakeGraph::new([]));
+    let message = outgoing(&[]);
+    s.send(&message).await.unwrap();
+    let seen = transport(&s).seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        (seen[0].method, seen[0].url.as_str()),
+        (
+            "POST text/plain",
+            "https://graph.microsoft.com/v1.0/me/sendMail"
+        )
+    );
+    let body = seen[0].body.as_ref().unwrap().as_str().unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .unwrap();
+    assert_eq!(decoded, message.mime);
+    assert!(
+        seen[0]
+            .headers
+            .contains(&("Authorization".to_owned(), format!("Bearer {TOKEN}")))
+    );
+}
+
+#[tokio::test]
+async fn send_refuses_bcc_before_any_request() {
+    let s = source(FakeGraph::new([]));
+    let result = s.send(&outgoing(&["hidden@example.net"])).await;
+    assert!(matches!(result, Err(GraphError::Bcc)), "{result:?}");
+    assert!(transport(&s).seen.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn a_send_graph_refuses_says_so_and_names_mail_send() {
+    for (status, check) in [
+        (
+            403,
+            (|e: &GraphError| matches!(e, GraphError::CannotSend)) as fn(&GraphError) -> bool,
+        ),
+        (400, |e| matches!(e, GraphError::Status { status: 400, .. })),
+        (200, |e| matches!(e, GraphError::Status { status: 200, .. })),
+    ] {
+        let s = source(FakeGraph::new([]).script([reply(status, Vec::new())]));
+        let err = s.send(&outgoing(&[])).await.unwrap_err();
+        assert!(check(&err), "{status}: {err:?}");
+        if status == 403 {
+            assert!(err.to_string().contains("Mail.Send"), "{err}");
+        }
+    }
+}
+
+/// 429 says the request was not processed, so it is sent again; a 503 may come after Graph took
+/// the message, so it is not, and the send is not repeated.
+#[tokio::test(start_paused = true)]
+async fn a_throttled_send_is_retried_but_a_503_is_not() {
+    let s = source(FakeGraph::new([]).script([throttled(429, Some(3))]));
+    s.send(&outgoing(&[])).await.unwrap();
+    assert_eq!(transport(&s).seen.borrow().len(), 2);
+
+    let s = source(FakeGraph::new([]).script([throttled(503, Some(3))]));
+    let err = s.send(&outgoing(&[])).await.unwrap_err();
+    assert!(
+        matches!(&err, GraphError::Unconfirmed(cause) if matches!(**cause, GraphError::Status { status: 503, .. })),
+        "{err:?}"
+    );
+    assert_eq!(transport(&s).seen.borrow().len(), 1);
+}
+
+/// A 5xx or a connection lost after the POST may come after Graph took the message, so the error
+/// says it may have been sent; a 4xx says it was refused.
+#[tokio::test]
+async fn a_send_graph_never_answered_may_have_been_sent() {
+    for (status, lost, unconfirmed) in [
+        (500, false, true),
+        (502, false, true),
+        (202, true, true),
+        (400, false, false),
+        (404, false, false),
+    ] {
+        let fake = FakeGraph::new([]).script([reply(status, Vec::new())]);
+        fake.lose_sends.set(lost);
+        let err = source(fake).send(&outgoing(&[])).await.unwrap_err();
+        assert_eq!(
+            matches!(err, GraphError::Unconfirmed(_)),
+            unconfirmed,
+            "{status} lost={lost}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string().contains("may have been sent"),
+            unconfirmed,
+            "{err}"
+        );
+    }
 }

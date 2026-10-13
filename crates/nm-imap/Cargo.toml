@@ -1,6 +1,6 @@
 [package]
 name = "nm-imap"
-description = "neomail's IMAP MailSource: TLS, STARTTLS, certificate pinning and IMAP"
+description = "neomail's IMAP MailSource and SMTP submission: TLS, STARTTLS, certificate pinning, IMAP and SMTP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,17 +11,19 @@ publish = false
 [dependencies]
 nm-core.workspace = true
 async-imap.workspace = true
+# SMTP AUTH (crates/nm-imap/src/smtp.rs).
+base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 rustls.workspace = true
 rustls-platform-verifier.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
 tokio-rustls.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
+rcgen.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }
 
 [lints]

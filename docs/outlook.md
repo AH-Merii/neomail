@@ -78,10 +78,13 @@ neomail reads the INBOX's message count through Graph, once, to check the sign-i
 `--no-check` skips that. A failed sign-in or check saves nothing.
 
 The browser opens on Microsoft's sign-in page; `--no-browser` only prints the URL. neomail asks
-for `Mail.ReadWrite` (to read your mail and change it), `Mail.Read` (so an earlier version can
+for `Mail.ReadWrite` (to read your mail and change it), `Mail.Send` (to send mail as you, with
+[sendMail](https://learn.microsoft.com/en-us/graph/api/user-sendmail), which also keeps the copy
+in Sent Items), `Mail.Read` (so an earlier version can
 still refresh this sign-in; see [Where things are kept](#where-things-are-kept)),
 `offline_access` (a refresh token), and `openid profile email` (your address). The consent screen
-therefore asks to read and change your mail ("Read and write access to your mail"). neomail needs
+therefore asks to read and change your mail ("Read and write access to your mail") and to send
+mail as you. neomail needs
 the change part to mark messages read or unread (`neomail mark`) and to move them
 (`neomail archive`, `neomail delete`): Graph allows both only with `Mail.ReadWrite`
 ([update message](https://learn.microsoft.com/en-us/graph/api/message-update),
@@ -99,9 +102,18 @@ may ask only for the scopes the sign-in asked for or fewer
 Do that once, accept the new permission, and the account can change mail.
 
 neomail tells the two apart by the `mail_grant` it keeps with the refresh token in the keyring
-(below): `read-write` for a sign-in that granted `Mail.ReadWrite`, `read` for one that granted only
+(below): `read-write-send` for a sign-in that granted `Mail.ReadWrite` and `Mail.Send`,
+`read-write` for one that granted `Mail.ReadWrite` only, `read` for one that granted only
 `Mail.Read`, and no `mail_grant` at all for a sign-in saved by an earlier version, which counts as
 `read`.
+
+### Accounts added before neomail could send
+
+A sign-in made before neomail asked for `Mail.Send` keeps reading and changing mail, and is
+refreshed for no more than it granted. Sending from it fails before the question and before any
+request, sends nothing, and says to run `neomail account login NAME` once. Graph takes the
+recipients from the message's headers and has no envelope, so an Outlook account cannot send Bcc
+yet: neomail refuses such a message rather than drop its Bcc recipients. Graph's `202 Accepted` means accepted, not delivered.
 
 ### Device code sign-in
 
@@ -128,13 +140,16 @@ that neomail itself just printed.
   ```
 
 - The refresh token is in the OS keyring only (service `neomail-oauth`, the account name as its
-  `username` attribute), with `mail_grant`, which says whether the sign-in lets neomail change mail.
-  Microsoft sends a new refresh token with each refresh; neomail saves it back with the same
-  `mail_grant`.
-- Going back to an earlier version: it still reads the entry, since it ignores `mail_grant`. It
-  refreshes with `offline_access` and `Mail.Read`, a subset of what a sign-in made by this
-  version asked for, which Microsoft allows: a refresh's scopes "must be equivalent to or a
-  subset of the scopes requested" at sign-in
+  `username` attribute), with `mail_grant`, which says whether the sign-in lets neomail change mail
+  and send it. Microsoft sends a new refresh token with each refresh; neomail saves it back with
+  the same `mail_grant`.
+- Going back to a version from before `mail_grant`: it still reads the entry, since it ignores
+  `mail_grant`. A later version from before sending knows `read` and `read-write` but not
+  `read-write-send`, the grant of a sign-in made by this version, so it cannot read that entry:
+  run `neomail account login NAME` in it. An earlier version refreshes
+  with `offline_access` and `Mail.Read`, a subset of what a sign-in made by this version asked
+  for, which Microsoft allows: a refresh's scopes "must be equivalent to or a subset of the scopes
+  requested" at sign-in
   ([authorization code flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow);
   not checked live). When the earlier version saves a new refresh token, the entry loses
   `mail_grant`, and this version then treats it as `read`: `neomail mark` says to run

@@ -22,6 +22,7 @@ mod pager;
 mod push;
 mod redact;
 mod secret;
+mod send;
 mod setup;
 mod style;
 mod sync;
@@ -66,6 +67,9 @@ Examples:
   neomail archive 42                Move message 42 to its account's archive
   neomail folder list               List each account's folders
   neomail move Receipts 42          Move message 42 to the folder Receipts
+  neomail send --to ada@example.com --subject Hi --body note.md
+                                    Send note.md, written in Markdown, after asking
+  neomail reply 42 --body answer.md Reply to message 42
   neomail config check              Check the config file
 
 Guide: https://github.com/AH-Merii/neomail#try-it";
@@ -453,6 +457,15 @@ Guide: https://github.com/AH-Merii/neomail/blob/main/docs/daemon.md"
         #[command(flatten)]
         format: ListingFormat,
     },
+    /// Send a message written in Markdown from one of your accounts, after asking
+    #[command(after_help = send::SEND_EXAMPLES, mut_arg("from", send::from_for_send))]
+    Send(send::SendArgs),
+    /// Reply to a cached message, by its id from `neomail list`, after asking
+    #[command(after_help = send::REPLY_EXAMPLES)]
+    Reply(send::ReplyArgs),
+    /// Forward a cached message, by its id from `neomail list`, after asking
+    #[command(after_help = send::FORWARD_EXAMPLES)]
+    Forward(send::ForwardArgs),
     /// List each account's folders, the names `neomail move` takes
     Folder {
         #[command(subcommand)]
@@ -607,6 +620,15 @@ struct AddCommand {
     /// imap, proton, gmail-app-password: run this through `sh -c` for the password instead of storing it in the OS keyring
     #[arg(long, value_name = "CMD")]
     password_command: Option<String>,
+    /// imap: the SMTP server to send through, with TLS [default: none, so the account cannot send until the config names one]
+    #[arg(long, value_name = "HOST")]
+    smtp_host: Option<String>,
+    /// imap: the SMTP port [default: 587 with starttls, else 465]
+    #[arg(long, value_name = "PORT", requires = "smtp_host")]
+    smtp_port: Option<u16>,
+    /// imap: how the SMTP connection is secured [default: starttls on port 587, else tls]
+    #[arg(long, value_name = "MODE", requires = "smtp_host")]
+    smtp_security: Option<SecurityArg>,
     /// imap, proton: the server certificate's SHA-256 to pin (64 hex digits, colons allowed)
     #[arg(long, value_name = "HEX", value_parser = parse_pin)]
     cert_sha256: Option<CertPin>,
@@ -665,6 +687,15 @@ enum SecurityArg {
     Tls,
     /// A plain connection upgraded with STARTTLS before login
     Starttls,
+}
+
+impl SecurityArg {
+    fn security(self) -> Security {
+        match self {
+            Self::Tls => Security::Tls,
+            Self::Starttls => Security::StartTls,
+        }
+    }
 }
 
 fn parse_pin(s: &str) -> Result<CertPin, String> {
@@ -777,10 +808,13 @@ fn no_cache_hint(explicit: Option<PathBuf>) -> String {
     }
 }
 
+/// Whether `e` is the reader of standard output going away. A broken pipe met while sending is a
+/// socket's, and a failure like any other.
 fn is_broken_pipe(e: &anyhow::Error) -> bool {
-    e.chain()
-        .filter_map(|c| c.downcast_ref::<io::Error>())
-        .any(|io| io.kind() == io::ErrorKind::BrokenPipe)
+    e.downcast_ref::<send::Sending>().is_none()
+        && e.chain()
+            .filter_map(|c| c.downcast_ref::<io::Error>())
+            .any(|io| io.kind() == io::ErrorKind::BrokenPipe)
 }
 
 fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
@@ -958,6 +992,17 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
             colors,
             &mut out,
         )?,
+        // These flush standard output themselves: once a message is sent, a failure to print is
+        // only a warning, so the flush below must not turn it into an error.
+        Command::Send(args) => {
+            return send::send(args, send_env(cli.config, input, terminal, &mut out));
+        }
+        Command::Reply(args) => {
+            return send::reply(args, send_env(cli.config, input, terminal, &mut out));
+        }
+        Command::Forward(args) => {
+            return send::forward(args, send_env(cli.config, input, terminal, &mut out));
+        }
         Command::Folder {
             command: FolderCommand::List { account, format },
         } => {
@@ -1084,6 +1129,21 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
     };
     out.flush()?;
     Ok(code)
+}
+
+/// What `send`, `reply` and `forward` read and write.
+fn send_env(
+    config: Option<PathBuf>,
+    input: Input,
+    terminal: bool,
+    out: &mut dyn Write,
+) -> send::Env<'_> {
+    send::Env {
+        config,
+        input,
+        terminal,
+        out,
+    }
 }
 
 /// The terminal's width for the human list, 80 when unknown.
@@ -1413,6 +1473,9 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
     let imap_only = [
         ("--host", add.host.is_some()),
         ("--security", add.security.is_some()),
+        ("--smtp-host", add.smtp_host.is_some()),
+        ("--smtp-port", add.smtp_port.is_some()),
+        ("--smtp-security", add.smtp_security.is_some()),
     ];
     let port_pin = [
         ("--port", add.port.is_some()),
@@ -1456,13 +1519,13 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
         username: add.username,
         host: add.host,
         port: add.port,
-        security: add.security.map(|s| match s {
-            SecurityArg::Tls => Security::Tls,
-            SecurityArg::Starttls => Security::StartTls,
-        }),
+        security: add.security.map(SecurityArg::security),
         password_command: add.password_command,
         cert_sha256: add.cert_sha256,
         no_check: add.no_check,
+        smtp_host: add.smtp_host,
+        smtp_port: add.smtp_port,
+        smtp_security: add.smtp_security.map(SecurityArg::security),
     };
     setup::add(preset, path, args, input, out)
 }
@@ -1591,6 +1654,22 @@ fn set_password(keyring: &Keyring, account: &Account, password: &Password) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only standard output's reader leaving is quiet: a socket's broken pipe met while sending
+    /// is a failure, or a script would take an unsent message for a sent one.
+    #[test]
+    fn a_broken_pipe_is_quiet_only_off_standard_output() {
+        let pipe = || io::Error::from(io::ErrorKind::BrokenPipe);
+        assert!(is_broken_pipe(
+            &anyhow::Error::new(pipe()).context("writing the list")
+        ));
+        let smtp = nm_imap::smtp::SmtpError::Io {
+            step: "the message",
+            source: pipe(),
+        };
+        let sending: Result<()> = Err(smtp).context(send::Sending("sending from work".into()));
+        assert!(!is_broken_pipe(&sending.unwrap_err().context("outer")));
+    }
 
     #[test]
     fn menu_answers_are_a_number_or_a_name() {
