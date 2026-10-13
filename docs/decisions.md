@@ -108,6 +108,13 @@ the new entry.
 - **Classifying from the CLI** is `neomail classify`, the first of slice 10's four parts; results are
   stored per message and survive a mailbox rebuild
   ([DEC-2026-10-13-classify](#dec-2026-10-13-classify), proposed).
+- **Group labels** ([DEC-2026-10-13-labels](#dec-2026-10-13-labels)): a label neomail creates for a
+  group is the group's name after a prefix, `nm-` by default and configurable
+  (`nm-receipts-invoices`). neomail never shows the prefix. Slice 10d's live check may create
+  these labels on the test accounts and keeps them.
+- **The daemon classifies new mail** as it syncs, once the user has consented for the backend
+  and a key exists; mail from a first sync is left to slice 11
+  ([DEC-2026-10-13-daemon-classify](#dec-2026-10-13-daemon-classify), proposed).
 
 ## Data and storage
 
@@ -915,3 +922,44 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Builds on:** [DEC-2026-10-13-classify-send](#dec-2026-10-13-classify-send),
   [DEC-2026-10-11-first-run](#dec-2026-10-11-first-run) and
   [DEC-2026-10-11-jev-offline](#dec-2026-10-11-jev-offline).
+
+### <a id="dec-2026-10-13-labels"></a>DEC-2026-10-13-labels: group labels carry a prefix neomail doesn't show
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-13, answering two questions
+  (f679d889:12486).
+- **Owner's words:**
+  - Asked what slice 10d's live check may do with labels on the test Gmail and Proton accounts:
+    "Create labels, keep them (Recommended)".
+  - Asked what the labels neomail creates should be called: "configurable, but the default is nm-
+    as a prefix, one more thing, in neomail we do not see the nm prefix".
+- **Ruling:** the "Group labels" bullet under [Classification](#classification-jev).
+- **Builds on:** "Where groups are stored" under [Classification](#classification-jev).
+
+### <a id="dec-2026-10-13-daemon-classify"></a>DEC-2026-10-13-daemon-classify: the daemon classifies new mail
+
+- **Status:** proposed by Claude on 2026-10-13, as the second of slice 10's four parts
+  ([DEC-2026-10-13-classify](#dec-2026-10-13-classify)).
+- **Proposal:**
+  - `neomail daemon` classifies each round's new mail after that round's sync and notifications,
+    with the same request `neomail classify` sends. Mail from a first sync or a rebuilt mailbox is
+    left to slice 11's first run and to `neomail classify`
+    ([DEC-2026-10-11-first-run](#dec-2026-10-11-first-run)).
+  - It never asks. It sends only to a host the user already consented to through `neomail
+    classify`, and only with a key; otherwise it says once why classifying is off. From this
+    slice on, the consent text says the daemon then sends new mail as it arrives
+    ([DEC-2026-10-13-classify-send](#dec-2026-10-13-classify-send)). A yes given before, to a
+    question that didn't mention the daemon, still covers `neomail classify` but not the daemon,
+    which waits for a yes to the new question on a terminal; `--yes` never turns the earlier yes
+    into the daemon's.
+  - `classify.daemon = false` turns it off; it is on by default.
+  - Each time the daemon syncs (a round, a push sync or an Outlook check) it sends at most 100
+    requests; the rest wait in memory for the next time. Mail older than 365 days is skipped, as
+    `neomail classify` skips it.
+  - A refused key pauses classifying until the key changes. A 402 (no credit left) pauses it for
+    an hour, or until the key changes. An answer that would come back every time (one that isn't
+    jev's, or a status such as 400 or 404) pauses it until `classify.url` or `classify.model`
+    changes. A restart ends any pause. A stopped run puts its messages back for the next time.
+  - Notifications don't change: they never wait for a group
+    ([DEC-2026-10-12-daemon-notifications](#dec-2026-10-12-daemon-notifications)).
+- **Builds on:** [DEC-2026-10-13-classify](#dec-2026-10-13-classify) and
+  [DEC-2026-10-13-classify-send](#dec-2026-10-13-classify-send).

@@ -1,7 +1,10 @@
 //! `neomail classify` and `neomail key`: choose the cached messages to classify, ask once per
 //! backend host before anything is sent, run the requests four at a time, store each result as
 //! it arrives, and estimate what is left. The wire format is jev.rs's; what is sent is built by
-//! redact.rs from nm-redact's [`Outgoing`](nm_redact::Outgoing) alone.
+//! redact.rs from nm-redact's [`Outgoing`](nm_redact::Outgoing) alone. `neomail daemon` sends
+//! the same requests through [`send`], under the consent `neomail classify` stored ([`daemon`]).
+
+pub(crate) mod daemon;
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
@@ -9,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -67,7 +71,10 @@ pub struct Args {
     /// Print what a run would send and cost, and send nothing
     #[arg(long)]
     pub estimate: bool,
-    /// Consent to sending to the backend without being asked (remembered, as a typed yes is)
+    /// Consent to sending to the backend without being asked. With no earlier yes for the host
+    /// it is remembered, as a typed yes is, and `neomail daemon` then also classifies new mail
+    /// unless classify.daemon = false; an earlier yes from before the daemon classified covers
+    /// the daemon only after a yes to its question on a terminal
     #[arg(long)]
     pub yes: bool,
     #[command(flatten)]
@@ -201,17 +208,39 @@ fn settings(config: Option<PathBuf>) -> Result<ClassifySettings> {
         .unwrap_or_default())
 }
 
-/// Whether the user agreed to send to `host`.
-fn consented(data_dir: &Path, host: &str) -> Result<bool> {
-    let path = data_dir.join(CONSENT_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(text.lines().any(|line| line.trim() == host)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
-    }
+/// What the user agreed to for a host, as the consent file records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Consent {
+    None,
+    /// A yes from before the daemon classified (slice 10a), a line with the host alone: its
+    /// question never mentioned the daemon, so it covers `neomail classify` only.
+    Classify,
+    /// A yes to the question that says the daemon also sends new mail: `HOST daemon`.
+    Daemon,
 }
 
-/// Remembers that the user agreed to send to `host`.
+/// What the user agreed to for `host`.
+pub(crate) fn consent(data_dir: &Path, host: &str) -> Result<Consent> {
+    let path = data_dir.join(CONSENT_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Consent::None),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let mut given = Consent::None;
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let this = match words[..] {
+            [h] if h == host => Consent::Classify,
+            [h, "daemon"] if h == host => Consent::Daemon,
+            _ => Consent::None,
+        };
+        given = given.max(this);
+    }
+    Ok(given)
+}
+
+/// Remembers that the user agreed to send to `host`, to the question that names the daemon.
 fn remember_consent(data_dir: &Path, host: &str) -> Result<()> {
     crate::create_private_dir(data_dir)?;
     let path = data_dir.join(CONSENT_FILE);
@@ -222,7 +251,7 @@ fn remember_consent(data_dir: &Path, host: &str) -> Result<()> {
     let mut file = options
         .open(&path)
         .with_context(|| format!("cannot create {}", path.display()))?;
-    writeln!(file, "{host}").with_context(|| format!("cannot write {}", path.display()))
+    writeln!(file, "{host} daemon").with_context(|| format!("cannot write {}", path.display()))
 }
 
 /// What is said before the first request to `host`.
@@ -249,49 +278,124 @@ fn consent_text(host: &str, messages: usize) -> String {
          Of the sender's address only the domain is sent. No other header and no attachment is\n\
          sent.\n\
          {keeps}\n\
-         `neomail redact ID` shows exactly what is sent for a message.\n"
+         `neomail redact ID` shows exactly what is sent for a message.\n\
+         Once you agree, `neomail daemon` also sends each new message as it arrives, unless\n\
+         classify.daemon = false.\n"
+    )
+}
+
+/// What is said to a user whose yes is from before the daemon classified ([`Consent::Classify`]).
+fn daemon_text(host: &str) -> String {
+    format!(
+        "You agreed to send to {host} from `neomail classify`. `neomail daemon` can now also send\n\
+         each new message as it arrives, the same request as `neomail classify` sends\n\
+         (classify.daemon = false turns that off). Your answer does not change this run; a no\n\
+         keeps your earlier consent for `neomail classify` only, and this question comes back on\n\
+         the next run on a terminal.\n"
     )
 }
 
 /// Asks once per host, unless `yes`; a yes is remembered. Without a terminal or with
 /// `--no-input`, and no earlier yes, it is a usage error and nothing is sent.
+///
+/// A yes from before the daemon classified ([`Consent::Classify`]) still lets this run send,
+/// and is never turned into the daemon's consent without its question: with `yes` or without a
+/// terminal nothing is asked or written, and with `classify.daemon = false` (`daemon`) nothing
+/// is asked either. Otherwise `ask` puts the question that names the daemon ([`offer_daemon`]).
+///
+/// `ask` shows a text and a prompt and returns the answer.
 fn ensure_consent(
     data_dir: &Path,
     host: &str,
     yes: bool,
+    daemon: bool,
     input: Input,
     messages: usize,
+    ask: &mut dyn FnMut(&str, &str) -> Result<String>,
 ) -> Result<bool> {
-    if consented(data_dir, host)? {
-        return Ok(true);
-    }
-    if yes {
-        remember_consent(data_dir, host)?;
-        return Ok(true);
-    }
-    if !input.can_prompt() {
-        return Err(usage(format!(
+    match consent(data_dir, host)? {
+        Consent::Daemon => Ok(true),
+        Consent::Classify => {
+            offer_daemon(data_dir, host, yes, daemon, input, ask)?;
+            Ok(true)
+        }
+        Consent::None if yes => {
+            remember_consent(data_dir, host)?;
+            Ok(true)
+        }
+        Consent::None if !input.can_prompt() => Err(usage(format!(
             "nothing was sent: {host} needs your consent once; run `neomail classify` on a \
              terminal, or pass --yes ({})",
             input.why_not()
-        )));
-    }
-    eprint!("{}", consent_text(host, messages));
-    let answer = secret::prompt_line(&format!("Send to {host}? [y/N] "))?;
-    if matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") {
-        remember_consent(data_dir, host)?;
-        Ok(true)
-    } else {
-        Ok(false)
+        ))),
+        Consent::None => {
+            let prompt = format!("Send to {host}? [y/N] ");
+            if agreed(&ask(&consent_text(host, messages), &prompt)?) {
+                remember_consent(data_dir, host)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
     }
 }
 
+fn agreed(answer: &str) -> bool {
+    matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// To a user whose yes is from before the daemon classified, on a terminal, without `yes` and
+/// with `classify.daemon` on: `ask` the question that names the daemon, and remember a yes.
+/// Whatever the answer, the run goes on as its earlier yes allows: a no, or an answer that never
+/// comes (end of input), is not remembered, so the question comes back on the next run on a
+/// terminal.
+fn offer_daemon(
+    data_dir: &Path,
+    host: &str,
+    yes: bool,
+    daemon: bool,
+    input: Input,
+    ask: &mut dyn FnMut(&str, &str) -> Result<String>,
+) -> Result<()> {
+    if yes || !daemon || !input.can_prompt() {
+        return Ok(());
+    }
+    let prompt = format!("Let `neomail daemon` send new mail to {host} too? [y/N] ");
+    if ask(&daemon_text(host), &prompt).is_ok_and(|answer| agreed(&answer)) {
+        remember_consent(data_dir, host)?;
+    }
+    Ok(())
+}
+
+/// A run with nothing to send still offers the daemon's question to a yes from before the daemon
+/// classified ([`offer_daemon`]): otherwise a user whose mail is all classified is never asked.
+/// It asks nothing for any other consent, and sends nothing.
+fn offer_daemon_alone(
+    data_dir: &Path,
+    host: &str,
+    yes: bool,
+    daemon: bool,
+    input: Input,
+    ask: &mut dyn FnMut(&str, &str) -> Result<String>,
+) -> Result<()> {
+    if consent(data_dir, host)? == Consent::Classify {
+        offer_daemon(data_dir, host, yes, daemon, input, ask)?;
+    }
+    Ok(())
+}
+
+/// Shows `text` on standard error and asks `prompt` on the terminal.
+fn ask_terminal(text: &str, prompt: &str) -> Result<String> {
+    eprint!("{text}");
+    secret::prompt_line(prompt)
+}
+
 /// One message to ask about: where its result goes, and the request, built before any is sent.
-struct Job {
-    id: MessageId,
-    account: String,
+pub(crate) struct Job {
+    pub(crate) id: MessageId,
+    pub(crate) account: String,
     msg_key: String,
-    received: Option<DateTime<Utc>>,
+    pub(crate) received: Option<DateTime<Utc>>,
     /// The original subject, for the terminal's line; never sent.
     subject: String,
     request: Vec<u8>,
@@ -317,10 +421,10 @@ struct Plan {
     left: Vec<MessageId>,
 }
 
-/// What [`plan`] needs to read a message.
-struct Reader<'a> {
-    owners: &'a [&'a str],
-    model: &'a str,
+/// What [`plan`] and [`job_for`] need to read a message.
+pub(crate) struct Reader<'a> {
+    pub(crate) owners: &'a [&'a str],
+    pub(crate) model: &'a str,
 }
 
 impl Reader<'_> {
@@ -417,6 +521,28 @@ fn plan(
         }
     }
     Ok(plan)
+}
+
+/// The job for one message of a sync's new mail, or `None` when it costs nothing to leave: it
+/// is gone or unreadable, it arrived before `cutoff` (or nobody knows when), it already has a
+/// result, or `seen` already holds its copy in another mailbox. `plan`'s rules for one message.
+pub(crate) fn job_for(
+    cache: &mut Cache,
+    id: MessageId,
+    reader: &Reader<'_>,
+    cutoff: DateTime<Utc>,
+    seen: &mut std::collections::HashSet<(String, String)>,
+) -> Result<Option<Job>> {
+    let Ok(job) = reader.read(cache, id)? else {
+        return Ok(None);
+    };
+    if job.received.is_none_or(|r| r < cutoff)
+        || cache.classification(&job.account, &job.msg_key)?.is_some()
+        || !seen.insert((job.account.clone(), job.msg_key.clone()))
+    {
+        return Ok(None);
+    }
+    Ok(Some(job))
 }
 
 /// Input tokens per request, and how that was worked out.
@@ -621,12 +747,38 @@ pub fn run(
             bail!("{}", keyring::NO_JEV_KEY);
         };
         let data_dir = config::data_dir()?;
-        if !ensure_consent(&data_dir, &host, args.yes, input, plan.jobs.len())? {
+        let asked = ensure_consent(
+            &data_dir,
+            &host,
+            args.yes,
+            settings.daemon,
+            input,
+            plan.jobs.len(),
+            &mut ask_terminal,
+        )?;
+        if !asked {
             printer.finish()?;
             eprintln!("neomail: nothing was sent");
             return Ok(ExitCode::from(EXIT_FAILURE));
         }
-        outcome = match send(&settings, &key, plan.jobs, &mut cache, &mut printer, now) {
+        let runtime = crate::account::runtime()?;
+        let halt = Arc::new(AtomicBool::new(false));
+        let sent = send(
+            &settings,
+            &key,
+            plan.jobs,
+            &mut cache,
+            &mut printer,
+            now,
+            &runtime,
+            &halt,
+            None,
+        );
+        let sent = sent.and_then(|mut sent| match sent.error.take() {
+            Some(e) => Err(e),
+            None => Ok(sent),
+        });
+        outcome = match sent {
             Ok(outcome) => outcome,
             Err(e) => {
                 // --json still prints the results that were stored. After a failed print this
@@ -635,8 +787,15 @@ pub fn run(
                 return Err(e);
             }
         };
-    } else if plan.known.is_empty() && plan.failures.is_empty() {
-        eprintln!("neomail: nothing to classify");
+    } else {
+        if plan.known.is_empty() && plan.failures.is_empty() {
+            eprintln!("neomail: nothing to classify");
+        }
+        if input.can_prompt() {
+            let data_dir = config::data_dir()?;
+            let (yes, daemon) = (args.yes, settings.daemon);
+            offer_daemon_alone(&data_dir, &host, yes, daemon, input, &mut ask_terminal)?;
+        }
     }
     printer.finish()?;
     if outcome.classified > 0 || outcome.failed > 0 {
@@ -948,13 +1107,79 @@ impl<'a> Printer<'a> {
     }
 }
 
+/// Where [`send`] reports each message as it settles: the terminal's [`Printer`], or the
+/// daemon's tally. An error stops the run, as a failure to store a result does.
+pub(crate) trait Sink {
+    fn result(
+        &mut self,
+        job: &Job,
+        result: &Classification,
+        rules: &GroupRules,
+        now: DateTime<Utc>,
+    ) -> Result<()>;
+    fn failed(&mut self, job: &Job, why: &str) -> Result<()>;
+    /// `done` of `total` messages settled.
+    fn progress(&mut self, _done: usize, _total: usize) {}
+}
+
+impl Sink for Printer<'_> {
+    fn result(
+        &mut self,
+        job: &Job,
+        result: &Classification,
+        rules: &GroupRules,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        Printer::result(
+            self,
+            job.id,
+            &job.account,
+            &job.subject,
+            job.received,
+            result,
+            rules,
+            now,
+        )
+    }
+
+    fn failed(&mut self, job: &Job, why: &str) -> Result<()> {
+        Printer::failed(self, job.id, &job.account, why)
+    }
+
+    fn progress(&mut self, done: usize, total: usize) {
+        Printer::progress(self, done, total);
+    }
+}
+
 /// How a run went.
 #[derive(Debug, Default)]
-struct Outcome {
-    classified: usize,
-    failed: usize,
+pub(crate) struct Outcome {
+    pub(crate) classified: usize,
+    pub(crate) failed: usize,
     /// Why the run stopped early, if it did.
-    stopped: Option<String>,
+    pub(crate) stopped: Option<String>,
+    /// Whether its stop would happen again on every run until something changes.
+    pub(crate) repeats: Option<Repeats>,
+    /// The messages that neither got a stored result nor failed on their own (a 422): the run
+    /// stopped before or while asking about them. Asking again later may well succeed.
+    pub(crate) retry: Vec<MessageId>,
+    /// The first error storing or printing a result, which stopped the run. The rest of the
+    /// outcome still holds, so a caller knows what was settled.
+    pub(crate) error: Option<anyhow::Error>,
+}
+
+/// What must change before a stop stops happening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Repeats {
+    /// jev refused the key (401 or 403).
+    Key,
+    /// The backend answered 2xx with something that is not jev's, or a status that is no rate
+    /// limit, no server error and no invalid request (a 400 or a 404, say): it would answer
+    /// every request to `classify.url` for `classify.model` the same.
+    Settings,
+    /// jev answered 402: the account is out of credit, which is put right without changing a
+    /// setting, so only time or another key changes it.
+    Credit,
 }
 
 /// What the workers share. The requests are built; the workers only send them.
@@ -964,29 +1189,69 @@ struct Shared {
     authorization: String,
     requests: Vec<Vec<u8>>,
     queue: Mutex<VecDeque<usize>>,
+    /// The run's own stop: a message failed the way every other would.
     stop: AtomicBool,
+    /// The caller's stop (the daemon's SIGINT or SIGTERM): no request starts after it, a retry's
+    /// wait ends, and the requests in flight are abandoned.
+    halt: Arc<AtomicBool>,
+    /// The caller's time limit (the daemon's, per wake): no request starts after it and no
+    /// retry waits past it, but a request in flight is answered and stored, as it cost a request.
+    deadline: Option<Instant>,
+}
+
+impl Shared {
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+            || self.halt.load(Ordering::SeqCst)
+            || self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+}
+
+/// How often a request in flight or a retry's wait looks at the caller's stop.
+const HALT_CHECK: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Ends once `halt` is set.
+async fn halted(halt: &AtomicBool) {
+    while !halt.load(Ordering::SeqCst) {
+        tokio::time::sleep(HALT_CHECK).await;
+    }
 }
 
 enum Event {
     Answered(usize, Answer),
     Failed(usize, String),
-    Stop(String),
-    /// A message failed in a way every other message would too, so the run stops: it ran out
-    /// of tries on a retry status (a rate limit or an outage that outlasts one message's tries
-    /// would cost every other message as many requests), or a 2xx answer is not jev's.
+    /// Every other request would fail the same way, and so would the next run's, unless
+    /// `Repeats` says what changes that.
+    Stop(String, Option<Repeats>),
+    /// A message ran out of tries on a retry status, so the run stops: a rate limit or an
+    /// outage that outlasts one message's tries would cost every other message as many
+    /// requests. The message is asked again later.
     GaveUp(usize, String),
+    /// A 2xx answer is not jev's: the message failed, and the run stops, as every other
+    /// request to this backend would be answered the same.
+    NotJev(usize, String),
     /// The run had already stopped, so this message was left unasked.
     Stopped,
+    /// jev asked for a wait that ends past the caller's deadline: the message and every one
+    /// after it are left for later, as each would be asked to wait as well.
+    OutOfTime,
 }
 
-/// Sends the requests, [`CONCURRENCY`] at a time, storing each result as soon as it arrives.
-fn send(
+/// Sends the requests, [`CONCURRENCY`] at a time, storing each result as soon as it arrives and
+/// reporting it to `sink`. Runs `runtime` itself, so it is called outside `block_on`. Once
+/// `halt` is set or `deadline` has passed no request starts (see [`Shared`]); the messages left
+/// unasked come back in [`Outcome::retry`].
+#[allow(clippy::too_many_arguments, reason = "a run's inputs")]
+pub(crate) fn send(
     settings: &ClassifySettings,
     key: &Secret,
     mut jobs: Vec<Job>,
     cache: &mut Cache,
-    printer: &mut Printer<'_>,
+    sink: &mut dyn Sink,
     now: DateTime<Utc>,
+    runtime: &tokio::runtime::Runtime,
+    halt: &Arc<AtomicBool>,
+    deadline: Option<Instant>,
 ) -> Result<Outcome> {
     let total = jobs.len();
     let shared = Arc::new(Shared {
@@ -999,8 +1264,11 @@ fn send(
             .collect(),
         queue: Mutex::new((0..total).collect()),
         stop: AtomicBool::new(false),
+        halt: Arc::clone(halt),
+        deadline,
     });
-    let runtime = crate::account::runtime()?;
+    // Whether each message got a stored result or failed on its own: the rest are `retry`.
+    let mut settled = vec![false; total];
     runtime.block_on(async {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         for _ in 0..CONCURRENCY.min(total) {
@@ -1014,7 +1282,7 @@ fn send(
         let mut error: Option<anyhow::Error> = None;
         let mut print_failed = false;
         let stop = &shared.stop;
-        printer.progress(0, total);
+        sink.progress(0, total);
         while let Some(event) = rx.recv().await {
             // Once printing failed (a closed pipe), nothing more is printed.
             let print = !print_failed;
@@ -1036,50 +1304,64 @@ fn send(
                         continue;
                     }
                     outcome.classified += 1;
+                    settled[i] = true;
                     if print {
-                        let printed = printer.result(
-                            job.id,
-                            &job.account,
-                            &job.subject,
-                            job.received,
-                            &result,
-                            &settings.rules,
-                            now,
-                        );
+                        let printed = sink.result(job, &result, &settings.rules, now);
                         print_failed |= printed.is_err();
                         keep(&mut error, stop, printed);
                     }
                 }
                 Event::Failed(i, why) => {
                     outcome.failed += 1;
+                    settled[i] = true;
                     if print {
-                        let printed = printer.failed(jobs[i].id, &jobs[i].account, &why);
+                        let printed = sink.failed(&jobs[i], &why);
                         print_failed |= printed.is_err();
                         keep(&mut error, stop, printed);
                     }
                 }
-                Event::Stop(why) => {
+                Event::Stop(why, repeats) => {
+                    if outcome.stopped.is_none() {
+                        outcome.repeats = repeats;
+                    }
+                    outcome.stopped.get_or_insert(why);
+                }
+                Event::NotJev(i, why) => {
+                    outcome.failed += 1;
+                    settled[i] = true;
+                    if print {
+                        let printed = sink.failed(&jobs[i], &why);
+                        print_failed |= printed.is_err();
+                        keep(&mut error, stop, printed);
+                    }
+                    if outcome.stopped.is_none() {
+                        outcome.repeats = Some(Repeats::Settings);
+                    }
                     outcome.stopped.get_or_insert(why);
                 }
                 Event::GaveUp(i, why) => {
                     outcome.failed += 1;
                     if print {
-                        let printed = printer.failed(jobs[i].id, &jobs[i].account, &why);
+                        let printed = sink.failed(&jobs[i], &why);
                         print_failed |= printed.is_err();
                         keep(&mut error, stop, printed);
                     }
                     outcome.stopped.get_or_insert(why);
                 }
-                Event::Stopped => {}
+                Event::Stopped | Event::OutOfTime => {}
             }
             if error.is_none() {
-                printer.progress(outcome.classified + outcome.failed, total);
+                sink.progress(outcome.classified + outcome.failed, total);
             }
         }
-        match error {
-            Some(e) => Err(e),
-            None => Ok(outcome),
-        }
+        outcome.retry = jobs
+            .iter()
+            .zip(&settled)
+            .filter(|(_, settled)| !**settled)
+            .map(|(job, _)| job.id)
+            .collect();
+        outcome.error = error;
+        Ok(outcome)
     })
 }
 
@@ -1093,11 +1375,14 @@ fn keep(error: &mut Option<anyhow::Error>, stop: &AtomicBool, done: Result<()>) 
 
 /// Takes requests off the queue until it is empty or the run stops.
 async fn worker(shared: Arc<Shared>, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
-    while !shared.stop.load(Ordering::Relaxed) {
+    while !shared.stopped() {
         let next = shared.queue.lock().ok().and_then(|mut q| q.pop_front());
         let Some(i) = next else { break };
         let event = ask(&shared, i).await;
-        if matches!(event, Event::Stop(_) | Event::GaveUp(..)) {
+        if matches!(
+            event,
+            Event::Stop(..) | Event::GaveUp(..) | Event::NotJev(..) | Event::OutOfTime
+        ) {
             shared.stop.store(true, Ordering::Relaxed);
         }
         if tx.send(event).is_err() {
@@ -1114,19 +1399,20 @@ async fn ask(shared: &Shared, i: usize) -> Event {
     ];
     let mut attempt = 1;
     loop {
-        let sent = shared
-            .http
-            .post_json(
-                &shared.endpoint,
-                &headers,
-                &shared.requests[i],
-                jev::MAX_ANSWER,
-            )
-            .await;
+        let post = shared.http.post_json(
+            &shared.endpoint,
+            &headers,
+            &shared.requests[i],
+            jev::MAX_ANSWER,
+        );
+        let sent = tokio::select! {
+            sent = post => sent,
+            () = halted(&shared.halt) => return Event::Stopped,
+        };
         let response = match sent {
             Ok(response) => response,
             // The backend cannot be reached: every other request would fail the same way.
-            Err(e) => return Event::Stop(format!("{e:#}")),
+            Err(e) => return Event::Stop(format!("{e:#}"), None),
         };
         let status = response.status;
         match jev::verdict(
@@ -1141,13 +1427,20 @@ async fn ask(shared: &Shared, i: usize) -> Event {
                     Ok(answer) => Event::Answered(i, answer),
                     // Most likely classify.url names some other service: every other message
                     // would be sent to it for nothing.
-                    Err(e) => Event::GaveUp(i, format!("the backend's answer is not jev's: {e}")),
+                    Err(e) => Event::NotJev(i, format!("the backend's answer is not jev's: {e}")),
                 };
             }
             Verdict::Retry(wait) if attempt < jev::MAX_TRIES => {
-                tokio::time::sleep(wait).await;
+                // A wait past the deadline would end in no request: the message waits instead.
+                if shared.deadline.is_some_and(|d| Instant::now() + wait >= d) {
+                    return Event::OutOfTime;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    () = halted(&shared.halt) => return Event::Stopped,
+                }
                 // Another worker may have stopped the run while this one waited.
-                if shared.stop.load(Ordering::Relaxed) {
+                if shared.stopped() {
                     return Event::Stopped;
                 }
                 attempt += 1;
@@ -1162,13 +1455,22 @@ async fn ask(shared: &Shared, i: usize) -> Event {
                 return Event::Failed(i, "jev refused the request as invalid (422)".to_owned());
             }
             Verdict::StopKey => {
-                return Event::Stop(format!(
-                    "jev refused the key ({status}): {}",
-                    keyring::NO_JEV_KEY.trim_start_matches("no jev key: ")
-                ));
+                return Event::Stop(
+                    format!(
+                        "jev refused the key ({status}): {}",
+                        keyring::NO_JEV_KEY.trim_start_matches("no jev key: ")
+                    ),
+                    Some(Repeats::Key),
+                );
             }
             Verdict::Stop { status, body } => {
-                return Event::Stop(format!("jev answered {status}: {body}"));
+                let repeats = if status == 402 {
+                    Repeats::Credit
+                } else {
+                    Repeats::Settings
+                };
+                let repeats = Some(repeats);
+                return Event::Stop(format!("jev answered {status}: {body}"), repeats);
             }
         }
     }
@@ -1230,19 +1532,181 @@ mod tests {
         assert_eq!(per_request(None, &[]), None);
     }
 
-    #[test]
-    fn consent_is_remembered_per_host() {
+    const OFF: Input = Input {
+        terminal: false,
+        no_input: false,
+    };
+    const ON: Input = Input {
+        terminal: true,
+        no_input: false,
+    };
+
+    /// A data directory whose consent file holds `lines`.
+    fn consent_file(lines: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
-        let input = Input {
-            terminal: false,
-            no_input: false,
-        };
-        let refused = ensure_consent(&data, "api.typesafe.ai", false, input, 3);
+        std::fs::create_dir_all(&data).unwrap();
+        if !lines.is_empty() {
+            std::fs::write(data.join(CONSENT_FILE), lines).unwrap();
+        }
+        (dir, data)
+    }
+
+    /// Answers `answer` to each question and records the texts and prompts it was shown.
+    fn answering(
+        answer: &str,
+        asked: &mut Vec<String>,
+    ) -> impl FnMut(&str, &str) -> Result<String> {
+        move |text: &str, prompt: &str| {
+            asked.push(format!("{text}{prompt}"));
+            Ok(answer.to_owned())
+        }
+    }
+
+    fn never(_: &str, _: &str) -> Result<String> {
+        panic!("nothing may be asked here")
+    }
+
+    #[test]
+    fn consent_is_remembered_per_host() {
+        let (_dir, data) = consent_file("");
+        let host = "api.typesafe.ai";
+        let refused = ensure_consent(&data, host, false, true, OFF, 3, &mut never);
         assert!(refused.unwrap_err().is::<crate::UsageError>());
-        assert!(ensure_consent(&data, "api.typesafe.ai", true, input, 3).unwrap());
-        assert!(ensure_consent(&data, "api.typesafe.ai", false, input, 3).unwrap());
-        assert!(ensure_consent(&data, "127.0.0.1", false, input, 3).is_err());
+        assert!(ensure_consent(&data, host, true, true, OFF, 3, &mut never).unwrap());
+        assert!(ensure_consent(&data, host, false, true, OFF, 3, &mut never).unwrap());
+        assert!(ensure_consent(&data, "127.0.0.1", false, true, OFF, 3, &mut never).is_err());
+        assert_eq!(consent(&data, host).unwrap(), Consent::Daemon);
+
+        // On a terminal, a no sends nothing and is not remembered; a yes is.
+        let (_dir, data) = consent_file("");
+        let mut asked = Vec::new();
+        let mut no = answering("n", &mut asked);
+        assert!(!ensure_consent(&data, host, false, true, ON, 3, &mut no).unwrap());
+        assert_eq!(consent(&data, host).unwrap(), Consent::None);
+        let mut asked = Vec::new();
+        let mut yes = answering("y", &mut asked);
+        assert!(ensure_consent(&data, host, false, true, ON, 3, &mut yes).unwrap());
+        assert_eq!(consent(&data, host).unwrap(), Consent::Daemon);
+        drop(yes);
+        assert!(
+            asked[0].ends_with("Send to api.typesafe.ai? [y/N] "),
+            "{asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_yes_from_before_the_daemon_covers_neomail_classify_but_not_the_daemon() {
+        let (_dir, data) = consent_file("api.typesafe.ai\n");
+        assert_eq!(
+            consent(&data, "api.typesafe.ai").unwrap(),
+            Consent::Classify
+        );
+        assert!(ensure_consent(&data, "api.typesafe.ai", false, true, OFF, 3, &mut never).unwrap());
+        assert_eq!(
+            consent(&data, "api.typesafe.ai").unwrap(),
+            Consent::Classify,
+            "no question was asked, so none was answered"
+        );
+        let mut system = daemon::System { data_dir: data };
+        assert!(!daemon::Access::consented(&mut system, "api.typesafe.ai").unwrap());
+    }
+
+    #[test]
+    fn yes_sends_on_a_consent_from_before_the_daemon_and_never_turns_it_into_the_daemons() {
+        for input in [OFF, ON] {
+            let (_dir, data) = consent_file("api.typesafe.ai\n");
+            let sent = ensure_consent(&data, "api.typesafe.ai", true, true, input, 3, &mut never);
+            assert!(sent.unwrap(), "{input:?}");
+            let file = std::fs::read_to_string(data.join(CONSENT_FILE)).unwrap();
+            assert_eq!(file, "api.typesafe.ai\n", "{input:?}");
+            let mut system = daemon::System { data_dir: data };
+            assert!(!daemon::Access::consented(&mut system, "api.typesafe.ai").unwrap());
+        }
+    }
+
+    #[test]
+    fn on_a_terminal_a_consent_from_before_the_daemon_is_asked_about_the_daemon() {
+        let host = "api.typesafe.ai";
+        let (_dir, data) = consent_file("api.typesafe.ai\n");
+        let mut asked = Vec::new();
+        let mut no = answering("n", &mut asked);
+        // A no still sends this run on the earlier yes, keeps it, and is asked again next run.
+        assert!(ensure_consent(&data, host, false, true, ON, 3, &mut no).unwrap());
+        assert!(ensure_consent(&data, host, false, true, ON, 3, &mut no).unwrap());
+        assert_eq!(consent(&data, host).unwrap(), Consent::Classify);
+        drop(no);
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        let flat = asked[0].split_whitespace().collect::<Vec<_>>().join(" ");
+        for part in [
+            "`neomail daemon` can now also send each new message as it arrives",
+            "classify.daemon = false turns that off",
+            "Your answer does not change this run",
+            "this question comes back on the next run on a terminal",
+            "Let `neomail daemon` send new mail to api.typesafe.ai too? [y/N]",
+        ] {
+            assert!(flat.contains(part), "{part}: {flat}");
+        }
+
+        let mut asked = Vec::new();
+        let mut yes = answering("yes", &mut asked);
+        assert!(ensure_consent(&data, host, false, true, ON, 3, &mut yes).unwrap());
+        assert_eq!(consent(&data, host).unwrap(), Consent::Daemon);
+
+        // With classify.daemon = false there is nothing to ask about.
+        let (_dir, data) = consent_file("api.typesafe.ai\n");
+        assert!(ensure_consent(&data, host, false, false, ON, 3, &mut never).unwrap());
+        assert_eq!(consent(&data, host).unwrap(), Consent::Classify);
+    }
+
+    #[test]
+    fn closing_input_at_the_daemon_question_is_a_no_and_the_run_still_sends() {
+        let host = "api.typesafe.ai";
+        let (_dir, data) = consent_file("api.typesafe.ai\n");
+        let mut asked = 0;
+        let mut closed = |_: &str, _: &str| -> Result<String> {
+            asked += 1;
+            anyhow::bail!("standard input closed")
+        };
+        assert!(ensure_consent(&data, host, false, true, ON, 3, &mut closed).unwrap());
+        assert_eq!(asked, 1);
+        let file = std::fs::read_to_string(data.join(CONSENT_FILE)).unwrap();
+        assert_eq!(file, "api.typesafe.ai\n");
+    }
+
+    #[test]
+    fn with_nothing_to_send_a_consent_from_before_the_daemon_is_still_asked_about_it() {
+        let host = "api.typesafe.ai";
+        let (_dir, data) = consent_file("api.typesafe.ai\n");
+        let mut asked = Vec::new();
+        let mut yes = answering("y", &mut asked);
+        offer_daemon_alone(&data, host, false, true, ON, &mut yes).unwrap();
+        drop(yes);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].ends_with("[y/N] "), "{asked:?}");
+        assert_eq!(consent(&data, host).unwrap(), Consent::Daemon);
+
+        // A no keeps the old consent.
+        let (_dir, data) = consent_file("api.typesafe.ai\n");
+        let mut asked = Vec::new();
+        let mut no = answering("n", &mut asked);
+        offer_daemon_alone(&data, host, false, true, ON, &mut no).unwrap();
+        assert_eq!(consent(&data, host).unwrap(), Consent::Classify);
+
+        // Asked nothing: no consent at all, the daemon's already, --yes, classify.daemon =
+        // false, or no terminal.
+        for (lines, yes, daemon, input) in [
+            ("", false, true, ON),
+            ("api.typesafe.ai daemon\n", false, true, ON),
+            ("api.typesafe.ai\n", true, true, ON),
+            ("api.typesafe.ai\n", false, false, ON),
+            ("api.typesafe.ai\n", false, true, OFF),
+        ] {
+            let (_dir, data) = consent_file(lines);
+            offer_daemon_alone(&data, host, yes, daemon, input, &mut never).unwrap();
+            let file = std::fs::read_to_string(data.join(CONSENT_FILE)).unwrap_or_default();
+            assert_eq!(file, lines);
+        }
     }
 
     #[test]
@@ -1268,6 +1732,8 @@ mod tests {
             TYPESAFE_PRIVACY,
             TYPESAFE_TERMS,
             "`neomail redact ID`",
+            "`neomail daemon` also sends each new message as it arrives, unless classify.daemon \
+             = false",
         ] {
             assert!(flat.contains(&part.to_lowercase()), "{part}: {text}");
         }

@@ -1,7 +1,9 @@
 # Background sync
 
 `neomail daemon` keeps every account's cache current: it syncs them all at once, then again every
-interval, so new mail shows up in `neomail list` without running `neomail sync`.
+interval, so new mail shows up in `neomail list` without running `neomail sync`. Once you have
+agreed to classification through `neomail classify`, it also sorts new mail into groups as it
+arrives (see [Classifying](#classifying)).
 
 ## In a terminal
 
@@ -13,8 +15,11 @@ neomail daemon --interval 1m    # digits followed by s, m or h, from 30s to 24h
 It prints one line when it starts, then stays in the foreground:
 
 ```text
-neomail daemon: syncing 2 accounts every 5 minutes, notifications on; Ctrl-C stops
+neomail daemon: syncing 2 accounts every 5 minutes, notifications on, classifying new mail with api.typesafe.ai; Ctrl-C stops
 ```
+
+The notifications part is explained under [Notifications](#notifications), the classifying part
+under [Classifying](#classifying).
 
 Ctrl-C (SIGINT) or SIGTERM lets the account being synced finish, then exits 0. A second Ctrl-C
 stops it at once. One daemon runs per data directory; a second one exits 1 with
@@ -295,6 +300,106 @@ exit 0
 Then `SVDIR=~/.config/service sv up neomail` (or `SVDIR=~/service`) starts it again, and
 `sv status` shows it.
 
+## Classifying
+
+After each sync's notifications (a round, a push sync or an Outlook check), the daemon sends that
+sync's new mail to the classifier, one request per message, and stores each answer, so `neomail list --group` and `neomail list --json`
+show the group without running `neomail classify`. The request is the one `neomail classify`
+sends, built by the same code: `neomail redact ID` shows exactly what leaves for a message, and
+[privacy.md](privacy.md) says what is sent and what never is.
+
+The daemon never asks for anything. It sends only when all of these hold, and its start line says
+which applies:
+
+- `classifying new mail with HOST`: the `[classify]` backend's host has your consent, given once
+  to `neomail classify`, and there is a key (`neomail key set`, or `JEV_API_KEY`). A yes given
+  before the daemon classified answered a question that did not mention it, so it does not count
+  here, and `neomail classify --yes` does not turn it into one. `neomail classify` on a terminal
+  asks whether the daemon may send too, also when it has nothing to send; your answer does not
+  change that run, which sends on your earlier yes. A no, or closing the input, keeps that yes
+  for `neomail classify` only and is asked again on its next run on a terminal. With
+  `classify.daemon = false` or `--yes` it does not ask;
+- ``classifying off: no jev key (run `neomail key set` or set JEV_API_KEY)``;
+- ``classifying off: cannot read the jev key from the keyring: WHY``: the keyring failed to
+  answer (the Secret Service restarting, say) and `JEV_API_KEY` is not set. Unlike the other
+  states, this keeps what waits for the next time it syncs, as it may pass;
+- ``classifying off: HOST needs your consent once; run `neomail classify` on a terminal``.
+  `neomail classify` asks before its first request to HOST, then classifies up to 1000 messages
+  from the last 365 days, one request each; `neomail classify --limit 1` gives the consent for
+  one request. When every message already has a group, `neomail classify` sends nothing and does
+  not ask: `neomail classify --again --limit 1` asks, and classifies the newest message again;
+- `classifying off (classify.daemon = false)`: you turned it off in the config:
+
+  ```toml
+  [classify]
+  daemon = false
+  ```
+
+While classifying is off, the daemon looks again each time it syncs new mail. When the key or the
+consent appears it prints `neomail daemon: classifying on (HOST)` and classifies from that sync
+on. Mail that arrived while it was off is not sent then; `neomail classify` still finds it. When
+classifying turns off or pauses while messages wait for the next time it syncs, they are dropped
+too (unless a 402 paused it, see below), and the line says how many:
+``…; N waiting messages are left to `neomail classify` ``. The key and the consent are read again
+each time it syncs with mail to classify, and the config at every round. `classify.daemon = false`
+stops it from the next round, without a restart. `neomail key delete` and `neomail key set` take
+effect the next time it syncs with mail to classify, unless `JEV_API_KEY` is set in the daemon's
+environment: the daemon then falls back to it. The keyring was unlocked when the daemon started,
+so this rarely asks you to unlock it again.
+
+Which mail is sent:
+
+- Only mail that is new in a round. An account's first sync and a rebuilt cache are not new mail
+  and are not classified; `neomail classify` does that. A message already classified, in any
+  mailbox, is never sent again.
+- Only mail received in the last 365 days, as `neomail classify` takes; `neomail classify --all`
+  covers older mail moved into a synced mailbox.
+- At most 100 messages each time it syncs (a round, a push sync or an Outlook check), each
+  tried up to three times, four at a time, and none started after a minute (or after the
+  interval, when it is shorter), so a slow or rate-limited jev cannot hold up the next sync. A
+  request already sent still gets its answer. The rest wait in memory for the next time it syncs,
+  which sends them even if it brings no new mail. A watcher's other news (push on, no IDLE, a
+  watcher that failed or ended) syncs nothing, so it sends nothing either. What waits is
+  forgotten when the daemon stops, and `neomail classify` picks it up.
+
+Each account that got answers prints one line, with the groups as `neomail list --group` shows
+them. It never names a subject, a sender or the key:
+
+```text
+14:05:00 work: classified 3 (newsletters 2, main 1), 1 failed, 20 wait for the next sync
+```
+
+When classifying fails, the sync and the notifications go on as before:
+
+- An outage, a status that keeps asking for a retry (after three tries), or a sync's minute
+  running out (`out of time for this sync`, also when jev asks for a wait that would end past it)
+  stops that sync's classifying. Its messages wait for the next time it syncs, which sends them
+  again, and standard error says once
+  `neomail daemon: classifying stopped: WHY; N messages wait for the next sync`.
+- An answer that is not jev's (a 2xx it cannot read), or a status every request would get (a
+  400 or a 404, say: any but 401, 402, 403, 408, 422, 429 and 5xx), would come back the same at
+  every sync, so it pauses classifying until `classify.url` or `classify.model` changes, or the
+  daemon restarts. Nothing waits, the message with the unreadable answer counts as failed, and
+  standard error says once `neomail daemon: classifying paused: WHY; change classify.url or
+  classify.model, or restart the daemon`.
+- A 402 (the jev account is out of credit) pauses classifying for an hour, or until the key
+  changes, whichever comes first. Nothing is sent meanwhile; what waits stays queued, with the
+  mail that arrives during the pause, and is sent once the pause lifts. Standard error says once
+  per pause `neomail daemon: classifying paused: jev answered 402: BODY; the jev account is out
+  of credit; trying again at HH:MM, or sooner if the key changes`. If jev still answers 402
+  then, it pauses for another hour.
+- A message jev refuses as invalid (422) counts as failed and is not sent again by the daemon.
+- A refused key (401 or 403) pauses classifying until the key changes:
+  ``neomail daemon: classifying paused: jev refused the key (401): run `neomail key set` or set
+  JEV_API_KEY``. While paused, on a refused key or a 402, the daemon keeps only a digest of the
+  key, not the key itself, and reads the key again each time it syncs new mail.
+
+Ctrl-C or SIGTERM starts no new request: the requests on their way are abandoned, a retry's wait
+ends, and the answers already stored stay. An abandoned request, or one that ended in an outage
+or a timeout, has no stored answer, so its message is asked about again later and may be paid
+for twice. If `neomail classify` runs at the same time as the daemon, both may ask about the same
+message, and it is paid for twice.
+
 ## What the output means
 
 Each account's first successful sync after the daemon starts prints a line, even with nothing
@@ -310,7 +415,8 @@ starts with the local time, then the line `neomail sync` prints:
 14:35:00 home: 0 new, 0 updated, 0 removed
 ```
 
-Changes go to standard output; failures, warnings and the push lines go to standard error. One
+Changes and the classifying results go to standard output; failures, warnings, the push lines and
+the classifying state lines go to standard error. One
 account failing never stops the others. A failure or warning that repeats the account's last one is
 not printed again; the account's next success is printed even with nothing new, so you can see it
 recovered (the last line above). Messages whose body could not be fetched (`N without a body`) are
