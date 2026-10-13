@@ -668,6 +668,8 @@ fn an_arabic_organisation_name_masks_none_of_its_words() {
             "أبرز أخبار الرياض اليوم: أمطار على الرياض وجدة. اشترك في صحيفة الرياض",
         ),
         ("نادي الهلال", "نادي الهلال يفوز على النصر"),
+        ("نادى الزمالك", "نادى الزمالك يفوز اليوم"),
+        ("أسواق العثيم", "عروض أسواق العثيم الأسبوعية"),
     ] {
         assert_eq!(with(&[name], &[], text), text, "{name}: {text}");
     }
@@ -806,8 +808,7 @@ fn an_amount_in_an_arabic_currency_or_with_arabic_separators_is_masked() {
             "{amount:?} -> {out:?}"
         );
     }
-    // The accusative ending after 11 to 99, `جم` (`ج.م` without its dot), Arab currency codes and
-    // `SR`: masked to the end.
+    // The accusative ending after 11 to 99, Arab currency codes and `SR`: masked to the end.
     for (text, want) in [
         ("المبلغ ٥٠ ريالاً فقط", "المبلغ <amount> فقط"),
         ("السعر 50 ريالًا فقط", "السعر <amount> فقط"),
@@ -815,8 +816,6 @@ fn an_amount_in_an_arabic_currency_or_with_arabic_separators_is_masked() {
         ("بقيمة ٢٠ ديناراً", "بقيمة <amount>"),
         ("بقيمة ٢٠٠ جنيهاً مصرياً", "بقيمة <amount> مصرياً"),
         ("بقيمة ١٥ ليرةً", "بقيمة <amount>"),
-        ("السعر 120 جم فقط", "السعر <amount> فقط"),
-        ("الإجمالي 1,250 جم", "الإجمالي <amount>"),
         ("Total: EGP 1,200", "Total: <amount>"),
         ("Total 120 LYD", "Total <amount>"),
         ("Total: KWD 1,200.500", "Total: <amount>"),
@@ -827,11 +826,9 @@ fn an_amount_in_an_arabic_currency_or_with_arabic_separators_is_masked() {
         assert_eq!(plain(text), want, "{text}");
     }
     // A word that starts like a currency is not one; a grouped number alone is kept, as `1,500` is.
-    // A score before a club whose name starts with `ريال` ("Real") is no amount, and `جم` must
-    // end its word: "write 3 short sentences".
+    // A score before a club whose name starts with `ريال` ("Real") is no amount.
     for text in [
         "لديك ١٠ رسائل",
-        "اكتب 3 جمل قصيرة",
         "منذ ٣ ليالٍ",
         "عدد الزوار ١٬٥٠٠",
         "برشلونة ٢-١ ريال مدريد",

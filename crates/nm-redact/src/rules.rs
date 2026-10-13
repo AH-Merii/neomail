@@ -28,12 +28,11 @@ const SECRET_WORD: &str = "pin|passcode|password";
 /// Currencies written in Arabic, after the number as CLDR's Arabic formats put them: the dotted
 /// symbols (`ر.س`, `د.إ`, `ج.م` …, from CLDR's `ar` currency data), the words (`ريال`, `درهم`,
 /// `دينار`, `جنيه`, `ليرة`, `دولار`, `يورو`, with their plurals and the accusative ending `اً`, `ًا`
-/// or `ً` that follows the numbers 11 to 99: `٥٠ ريالاً`), `جم` (`ج.م` without its dot) when it
-/// ends its word ([`jm_in_word`]) and the rial signs U+FDFC and U+20C1. Longer forms first, as the
-/// regex takes the first alternative that matches.
+/// or `ً` that follows the numbers 11 to 99: `٥٠ ريالاً`) and the rial signs U+FDFC and U+20C1.
+/// Longer forms first, as the regex takes the first alternative that matches.
 const CUR_AR: &str = "(?:ر\\.\\s?[سقعي]|د\\.\\s?[إكبأمجتعل]|ج\\.\\s?[مس]|ل\\.\\s?[سل])\\.?\
                       |(?:ريالات|ريال|دراهم|درهم|دنانير|دينار|جنيهات|جنيه|ليرات|ليرة|دولارات|دولار\
-                      |يورو)(?:ا\u{64b}?|\u{64b}ا?)?|جم|\u{fdfc}|\u{20c1}";
+                      |يورو)(?:ا\u{64b}?|\u{64b}ا?)?|\u{fdfc}|\u{20c1}";
 /// Month names written in Arabic, from CLDR 48: the Gregorian names of `ar`, the Levantine and
 /// Iraqi names of `ar_SY`, `ar_LB`, `ar_IQ` and `ar_JO`, the Maghreb names of `ar_DZ`, `ar_TN` and
 /// `ar_MA`, and the Hijri names of `ar`. A hamza or madda on an alef may be left off. `ذي` is the
@@ -474,8 +473,7 @@ fn find(text: &str, known: &Known) -> Vec<Span> {
     ibans(text, &mut f);
     cards(text, &mut f);
     for m in P.amount.find_iter(text) {
-        let after = &text[m.end()..];
-        if !real_club(m.as_str(), after) && !jm_in_word(m.as_str(), after) {
+        if !real_club(m.as_str(), &text[m.end()..]) {
             f.push(m.start(), m.end(), Kind::Amount);
         }
     }
@@ -503,13 +501,6 @@ fn real_club(amount: &str, after: &str) -> bool {
         let next = after.trim_start();
         next.len() < after.len() && REAL_CLUBS.iter().any(|c| next.starts_with(c))
     }
-}
-
-/// Whether an amount match ending in `جم` stops inside a longer word, where `جم` is no currency:
-/// `٣ جمل` ("3 sentences"), `٤ جمادى الأولى` (a Hijri date). A Unicode `\b` after `جم` in the regex
-/// would say so too, but made an excerpt over twice as slow (see [`P`]).
-fn jm_in_word(amount: &str, after: &str) -> bool {
-    amount.ends_with("جم") && after.starts_with(char::is_alphanumeric)
 }
 
 /// How each kind is spelled; [`Kind::Link`] adds its host.
@@ -1207,7 +1198,7 @@ pub(crate) const NAME_PARTICLES: &[&str] = &[
 /// "centre", "platform", "administration", "university", "hospital", "municipality", "post",
 /// "app", "portal", "office", "airlines", "aviation", "telecom", "fund", "academy", "pharmacy",
 /// "school", "newspaper" (two words), "channel", "magazine", "bookshop" or "library", "club",
-/// "association" or "charity", "website", "council", "clinic", "market", "newsletter". As folded
+/// "association" or "charity", "website", "council", "clinic", "market(s)", "newsletter". As folded
 /// by [`fold_name`], without the article. No given or family name is one of them, and mail from
 /// `البنك الأهلي` or `خدمة العملاء` uses these words throughout its body.
 pub(crate) const ORG_WORDS: &[&str] = &[
@@ -1252,15 +1243,19 @@ pub(crate) const ORG_WORDS: &[&str] = &[
     "مجلس",
     "عيادة",
     "سوق",
+    "اسواق",
     "نشرة",
 ];
 
 /// Whether a display name's folded words name an organisation: one of them, with or without the
-/// article, is in [`ORG_WORDS`].
+/// article, is in [`ORG_WORDS`]. A final `ى` counts as `ي` here, as Egyptian spelling writes `نادى`
+/// for `نادي` ("club"); names keep the two apart ([`fold_name`]).
 pub(crate) fn is_org_name(words: &[String]) -> bool {
-    words
-        .iter()
-        .any(|w| ORG_WORDS.contains(&w.strip_prefix("ال").unwrap_or(w)))
+    words.iter().any(|w| {
+        let w = w.strip_prefix("ال").unwrap_or(w);
+        let yeh = w.strip_suffix('ى').map(|stem| format!("{stem}ي"));
+        ORG_WORDS.contains(&w) || yeh.is_some_and(|w| ORG_WORDS.contains(&w.as_str()))
+    })
 }
 
 /// What may be joined to the front of an Arabic name: the letters "and", "with" and "to". The
