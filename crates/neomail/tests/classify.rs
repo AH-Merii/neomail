@@ -1091,21 +1091,21 @@ fn a_closed_output_ends_quietly_and_every_answer_that_arrived_is_stored() {
 }
 
 #[test]
-fn the_help_says_yes_covers_the_daemon_only_without_an_earlier_yes() {
+fn the_help_says_the_daemon_classifies_only_once_the_config_switches_it_on() {
     let dir = tempfile::tempdir().unwrap();
     let o = neomail(dir.path(), &["classify", "--help"]);
     assert!(o.status.success());
     let flat = stdout(&o).split_whitespace().collect::<Vec<_>>().join(" ");
-    for part in [
-        "With no earlier yes for the host it is remembered, as a typed yes is, and `neomail \
-         daemon` then also classifies new mail",
-        "covers the daemon only after a yes to its question on a terminal",
-        "--yes gives it only when there is no earlier yes for the host: a yes from before the \
-         daemon classified needs the daemon's question, asked on a terminal even when there is \
-         nothing to send",
-    ] {
-        assert!(flat.contains(part), "{part}: {flat}");
-    }
+    assert!(
+        flat.contains(
+            "`neomail daemon` classifies new mail in the background only once `daemon = true` \
+             under [classify] in the config switches it on"
+        ),
+        "{flat}"
+    );
+    // Neither a yes nor --yes switches the daemon on.
+    assert!(!flat.contains("also classifies new mail"), "{flat}");
+    assert!(!flat.contains("also lets `neomail daemon`"), "{flat}");
 }
 
 /// `work` and an Outlook account `outlook` whose cache holds one message, with `extra` in the

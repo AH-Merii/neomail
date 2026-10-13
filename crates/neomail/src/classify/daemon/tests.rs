@@ -95,6 +95,7 @@ impl World {
         let jev = FakeJev::start();
         let settings = ClassifySettings {
             url: jev.url(),
+            daemon: true,
             ..ClassifySettings::default()
         };
         World {
@@ -712,12 +713,45 @@ fn mail_received_more_than_a_year_ago_is_left_alone() {
 }
 
 #[test]
+fn by_default_the_daemon_reads_no_key_and_sends_nothing_even_with_consent() {
+    let mut w = World::new();
+    w.settings = ClassifySettings {
+        url: w.jev.url(),
+        ..ClassifySettings::default()
+    };
+    let mut access = granted();
+    let mut c = Classifier::new(&w.settings, &mut access);
+    assert!(c.status().starts_with("classifying off"), "{}", c.status());
+    let new = w.arrive("INBOX", &[mail(1, 1, "main Hi")]);
+    w.wake(&mut c, &new, &mut access);
+    assert_eq!(w.jev.count(), 0);
+    assert_eq!(access.reads, 0, "no key is read while classifying is off");
+    assert!(!w.stored(new[0].ids[0]));
+
+    // Switched on in the config, the running daemon classifies from its next wake with mail.
+    w.settings.daemon = true;
+    let new = w.arrive("INBOX", &[mail(2, 1, "main Later")]);
+    assert_eq!(
+        w.wake(&mut c, &new, &mut access),
+        [
+            "err neomail daemon: classifying on (127.0.0.1)",
+            "out work: classified 1 (main 1)"
+        ]
+    );
+    assert_eq!(w.jev.count(), 1);
+    assert!(w.stored(new[0].ids[0]));
+}
+
+#[test]
 fn classify_daemon_false_sends_nothing_and_drops_what_waits() {
     let mut w = World::new();
     let mut access = granted();
     w.settings.daemon = false;
     let c = Classifier::new(&w.settings, &mut access);
-    assert_eq!(c.status(), "classifying off (classify.daemon = false)");
+    assert_eq!(
+        c.status(),
+        "classifying off (`daemon = true` under [classify] in the config turns it on)"
+    );
     assert_eq!(access.reads, 0, "no key is read for nothing");
 
     w.settings.daemon = true;
@@ -725,16 +759,21 @@ fn classify_daemon_false_sends_nothing_and_drops_what_waits() {
     let new = w.arrive("INBOX", &many(150));
     w.wake(&mut c, &new, &mut access);
     assert!(c.waiting());
+    assert!(c.key.is_some(), "a key is held while classifying is on");
     w.settings.daemon = false;
     let new = w.arrive("INBOX", &[mail(151, 1, "main Hi")]);
     assert_eq!(
         w.wake(&mut c, &new, &mut access),
         [
-            "err neomail daemon: classifying off (classify.daemon = false); 50 waiting messages \
-             are left to `neomail classify`"
+            "err neomail daemon: classifying off (`daemon = true` under [classify] in the config \
+             turns it on); 50 waiting messages are left to `neomail classify`"
         ]
     );
     assert!(!c.waiting());
+    assert!(
+        c.key.is_none(),
+        "no key is held once classifying is switched off"
+    );
     w.settings.daemon = true;
     assert_eq!(w.wake(&mut c, &[], &mut access), Vec::<String>::new());
     assert_eq!(w.jev.count(), PER_WAKE);

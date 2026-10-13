@@ -123,14 +123,13 @@ Each message costs one request to classify.url (https://api.typesafe.ai by defau
 up to twice on a rate limit or a server error, with its redacted subject and body excerpt, the
 sender's domain and four signals: exactly what `neomail redact ID` shows. Before the first
 request to a host, neomail says what will be sent and asks once; --yes consents for a script.
-That consent also lets `neomail daemon` classify new mail (classify.daemon = false turns it off),
-but --yes gives it only when there is no earlier yes for the host: a yes from before the daemon
-classified needs the daemon's question, asked on a terminal even when there is nothing to send. A
-result is stored as soon as it arrives and is never asked for again unless --again: a stopped
-run resumes where it left off. Then each classified Outlook message gets its group as a category
-(classify.label_prefix, nm- by default; classify.labels = false turns it off), up to 1,000 per
-account, keeping your own categories. Exit 1 when a message failed, a category write or an
-account's sign-in for it failed, or the run stopped. What is sent and kept:
+`neomail daemon` classifies new mail in the background only once `daemon = true` under [classify]
+in the config switches it on; that consent then covers it too. A result is stored as soon as it
+arrives and is never asked for again unless --again: a stopped run resumes where it left off.
+Then each classified Outlook message gets its group as a category (classify.label_prefix, nm- by
+default; classify.labels = false turns it off), up to 1,000 per account, keeping your own
+categories. Exit 1 when a message failed, a category write or an account's sign-in for it
+failed, or the run stopped. What is sent and kept:
 https://github.com/AH-Merii/neomail/blob/main/docs/privacy.md";
 
 const MARK_EXAMPLES: &str = "\
@@ -357,12 +356,14 @@ enum Command {
     /// Keep every account's cache current: sync them all now and then every interval, until Ctrl-C or SIGTERM
     #[cfg(unix)]
     #[command(
-        after_help = "It also classifies new mail as it arrives, with the request `neomail classify` sends, once \
-`neomail classify` has your consent for the backend and there is a key (`neomail key set` or JEV_API_KEY); \
-it never asks. A consent given before neomail daemon classified covers `neomail classify` only: run \
-`neomail classify` on a terminal to give it again. It sends at most 100 messages each time it syncs (a \
-round, a push sync or an Outlook check); the rest wait for the next time it syncs. \
-`classify.daemon = false` in the config turns that off.\n\n\
+        after_help = "Classifying in the background is off until `daemon = true` under [classify] in the config \
+switches it on; the config is read again at each round (every --interval), so switching it takes effect \
+from the next round. While it is off, the daemon sends nothing \
+to the classifier and writes no groups. Once on, it classifies new mail as it arrives, with the request \
+`neomail classify` sends, once `neomail classify` has your consent for the backend and there is a key \
+(`neomail key set` or JEV_API_KEY); it never asks. It sends at most 100 messages each time it syncs (a \
+round, a push sync or an Outlook check); the rest wait for the next time it syncs. After classifying, it \
+writes each Outlook message's group as a category; `classify.labels = false` turns that off.\n\n\
 Guide: https://github.com/AH-Merii/neomail/blob/main/docs/daemon.md"
     )]
     Daemon {
