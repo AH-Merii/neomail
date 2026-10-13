@@ -1589,10 +1589,11 @@ fn archive_and_delete_usage_errors_exit_2_and_change_nothing() {
     assert_eq!(stdout(&neomail(data, &["list", "--json"])), before);
 }
 
-/// An Outlook account moves through Microsoft Graph with its sign-in; without one the account
-/// fails with one line, Graph is never reached, and its message stays.
+/// An Outlook account moves through Microsoft Graph with its sign-in, to a role or to a named
+/// folder; without one the account fails with one line, Graph is never reached, and its message
+/// stays.
 #[test]
-fn archive_and_delete_on_outlook_without_its_sign_in_fail_and_change_nothing() {
+fn archive_delete_and_move_on_outlook_without_its_sign_in_fail_and_change_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path();
     std::fs::write(data.join("config.toml"), OUTLOOK_CONFIG).unwrap();
@@ -1609,11 +1610,16 @@ fn archive_and_delete_on_outlook_without_its_sign_in_fail_and_change_nothing() {
             .store_id_messages(mailbox.id, &[(&listed, raw)], None)
             .unwrap()[0]
     };
-    for (command, may_not) in [
-        ("archive", "be archived"),
-        ("delete", "be moved to the trash"),
+    let id_arg = id.to_string();
+    for (args, may_not) in [
+        (&["archive", &id_arg][..], "be archived"),
+        (&["delete", &id_arg], "be moved to the trash"),
+        (
+            &["move", "Inbox/Receipts", &id_arg],
+            "be moved to Inbox/Receipts",
+        ),
     ] {
-        let o = neomail(data, &[command, &id.to_string()]);
+        let o = neomail(data, args);
         assert_eq!(o.status.code(), Some(1));
         // The tests have no keyring, so the sign-in cannot be read.
         let err = stderr(&o);
@@ -1626,4 +1632,125 @@ fn archive_and_delete_on_outlook_without_its_sign_in_fail_and_change_nothing() {
         assert_eq!(err.lines().count(), 1, "{err}");
     }
     assert_eq!(json(&neomail(data, &["list", "--json"]))[0]["id"], id.get());
+}
+
+/// `move` fails as `archive` does: one `neomail:` line per id, the others go on, nothing leaves
+/// the cache, and the exit status is 1.
+#[test]
+fn move_reports_each_failure_and_changes_nothing() {
+    let dir = seeded();
+    let data = dir.path();
+    closed_port_work(data);
+    let [bob, _, _, home] = <[String; 4]>::try_from(ids(data)).unwrap();
+    let before = stdout(&neomail(data, &["list", "--json"]));
+    let o = neomail(data, &["move", "--json", "Receipts", &bob, "999", &home]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&o.stdout).unwrap(),
+        Value::Array(vec![])
+    );
+    let err = stderr(&o);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 3, "{err}");
+    assert_eq!(
+        lines[0],
+        "neomail: no cached message with id 999; see `neomail list`"
+    );
+    assert!(
+        lines[1].starts_with(&format!(
+            "neomail: work: message {bob} may not be moved to Receipts: could not connect to 127.0.0.1:"
+        )),
+        "{err}"
+    );
+    assert!(
+        lines[2].starts_with(&format!(
+            "neomail: home: message {home} may not be moved to Receipts: no account named \"home\""
+        )),
+        "{err}"
+    );
+    assert_eq!(stdout(&neomail(data, &["list", "--json"])), before);
+}
+
+#[test]
+fn move_usage_errors_exit_2_and_change_nothing() {
+    let dir = seeded();
+    let data = dir.path();
+    closed_port_work(data);
+    let before = stdout(&neomail(data, &["list", "--json"]));
+    let o = neomail_stdin(data, &["move", "Receipts", "1", "-"], "2\n");
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(
+        stderr(&o),
+        "neomail: `-` reads the ids from standard input; give no other ids\n"
+    );
+    for args in [
+        &["move"][..],
+        &["move", "Receipts"],
+        &["move", "", "1"],
+        &["move", "Receipts", "x"],
+        &["move", "Receipts", "1", "--json", "--plain"],
+    ] {
+        let o = neomail(data, args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert!(o.stdout.is_empty());
+    }
+    let o = neomail_stdin(data, &["move", "Receipts", "-"], "998\tx\n\n999\n");
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(stdout(&o), "");
+    assert_eq!(
+        stderr(&o),
+        "neomail: no cached message with id 998; see `neomail list`\n\
+         neomail: no cached message with id 999; see `neomail list`\n"
+    );
+    assert_eq!(stdout(&neomail(data, &["list", "--json"])), before);
+}
+
+/// Every account is tried in config order; each failure is one `neomail:` line after the
+/// others' folders, and the exit status is 1. An unknown --account fails at once.
+#[test]
+fn folder_list_reports_each_failed_account_and_exits_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    closed_port_work(data);
+    let work = std::fs::read_to_string(data.join("config.toml")).unwrap();
+    std::fs::write(data.join("config.toml"), format!("{work}{OUTLOOK_CONFIG}")).unwrap();
+    for (format, empty) in [("--json", "[]\n"), ("--jsonl", ""), ("--plain", "")] {
+        let o = neomail(data, &["folder", "list", format]);
+        assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+        assert_eq!(stdout(&o), empty, "{format}");
+        let err = stderr(&o);
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines.len(), 2, "{err}");
+        assert!(
+            lines[0].starts_with("neomail: work: could not connect to 127.0.0.1:"),
+            "{err}"
+        );
+        // The tests have no keyring, so the Outlook sign-in cannot be read.
+        assert!(
+            lines[1].starts_with("neomail: outlook: ") && lines[1].contains("keyring"),
+            "{err}"
+        );
+    }
+    // `--account` lists the named account alone, whichever it is.
+    for (account, start, says) in [
+        ("outlook", "neomail: outlook: ", "keyring"),
+        ("work", "neomail: work: could not connect to 127.0.0.1:", ""),
+    ] {
+        let o = neomail(data, &["folder", "list", "--account", account]);
+        assert_eq!(o.status.code(), Some(1), "{account}");
+        assert_eq!(stdout(&o), "", "{account}");
+        let err = stderr(&o);
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(err.starts_with(start) && err.contains(says), "{err}");
+    }
+    let o = neomail(data, &["folder", "list", "--account", "nope"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).contains("no account named \"nope\""),
+        "{}",
+        stderr(&o)
+    );
+    for args in [&["folder"][..], &["folder", "list", "--json", "--plain"]] {
+        assert_eq!(neomail(data, args).status.code(), Some(2), "{args:?}");
+    }
 }

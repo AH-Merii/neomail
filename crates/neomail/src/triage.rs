@@ -1,7 +1,7 @@
-//! `neomail mark read|unread`, `neomail archive` and `neomail delete`: the CLI face of the
-//! actions. [`Writer`] is the [`MailWriter`] that reaches the servers with the logins `neomail
-//! sync` uses, under the same account locks; [`finish`] prints the report. Online only: nothing
-//! is queued.
+//! `neomail mark read|unread`, `neomail archive`, `neomail delete` and `neomail move`: the CLI face
+//! of the actions. [`Writer`] is the [`MailWriter`] that reaches the servers with the logins
+//! `neomail sync` uses, under the same account locks; [`finish`] prints the report. Online only:
+//! nothing is queued.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -9,8 +9,8 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use nm_core::action::{Failure, Report, State};
 use nm_core::{
-    Action, Change, Flags, Folder, MailWriter, MessageId, Moved, RemoteId, Uid, UidValidity,
-    Written,
+    Action, Change, Destination, Flags, Folder, MailWriter, MessageId, Moved, RemoteId, Uid,
+    UidValidity, Written,
 };
 use serde::Serialize;
 use tokio::runtime::Runtime;
@@ -128,14 +128,21 @@ impl MailWriter for Writer<'_> {
         name: &str,
         uid_validity: UidValidity,
         uids: &[Uid],
-        to: Folder,
+        to: &Destination,
     ) -> Result<Moved<Uid>> {
         self.imap(name, |runtime, imap, login| {
-            Ok(runtime.block_on(nm_imap::move_to(imap, login, uid_validity, uids, to))?)
+            runtime
+                .block_on(nm_imap::move_to(imap, login, uid_validity, uids, to))
+                .map_err(|e| explain_imap_move(e, name))
         })
     }
 
-    fn move_by_id(&mut self, name: &str, ids: &[RemoteId], to: Folder) -> Result<Moved<RemoteId>> {
+    fn move_by_id(
+        &mut self,
+        name: &str,
+        ids: &[RemoteId],
+        to: &Destination,
+    ) -> Result<Moved<RemoteId>> {
         self.graph(name, |runtime, token| {
             runtime.block_on(graph::move_to(name, token, ids, to))
         })
@@ -153,8 +160,18 @@ impl MailWriter for Writer<'_> {
     }
 }
 
+/// An IMAP error from a move, with what to do next.
+fn explain_imap_move(e: nm_imap::ImapError, account: &str) -> anyhow::Error {
+    match e {
+        e @ (nm_imap::ImapError::NoSuchFolder(_) | nm_imap::ImapError::NotSelectable(_)) => {
+            crate::folders::point_at_folder_list(e, account)
+        }
+        e => e.into(),
+    }
+}
+
 /// One done message in `--json` and `--jsonl`. A marked one's fields mean what they mean in
-/// `list --json`; a moved one names the folder it is now in, as the server names it.
+/// `list --json`; a moved one names the folder it is now in, as `folder list` shows it.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Item<'a> {
@@ -188,32 +205,57 @@ struct Words {
 impl Words {
     fn done(&self, n: usize) -> String {
         let s = if n == 1 { "" } else { "s" };
-        match self.change {
-            Change::Seen(seen) => format!("Marked {n} message{s} {}.", state(seen)),
-            Change::Move(Folder::Archive) => format!("Archived {n} message{s}."),
-            Change::Move(Folder::Trash) => format!("Moved {n} message{s} to the trash."),
+        match &self.change {
+            Change::Seen(seen) => format!("Marked {n} message{s} {}.", state(*seen)),
+            Change::Move(Destination::Role(Folder::Archive)) => format!("Archived {n} message{s}."),
+            Change::Move(Destination::Role(Folder::Trash)) => {
+                format!("Moved {n} message{s} to the trash.")
+            }
+            Change::Move(Destination::Name(name)) => {
+                format!(
+                    "Moved {n} message{s} to {}.",
+                    output::one_line(name.as_str())
+                )
+            }
+        }
+    }
+
+    /// Where a move puts a message, in a sentence: "the archive", "the trash" or the name.
+    fn to(destination: &Destination) -> String {
+        match destination {
+            Destination::Role(role) => format!("the {role}"),
+            Destination::Name(name) => output::one_line(name.as_str()),
         }
     }
 
     fn not_confirmed(&self, id: MessageId) -> String {
-        match self.change {
+        match &self.change {
             Change::Seen(seen) => format!(
                 "the server did not confirm message {id} as {}; run `neomail sync` to see its \
                  state, then try again",
-                state(seen)
+                state(*seen)
             ),
-            Change::Move(to) => format!(
-                "the server did not confirm message {id} moved to the {to}; run `neomail sync` \
-                 to see where it is, then try again"
+            Change::Move(to @ Destination::Role(_)) => format!(
+                "the server did not confirm message {id} moved to {}; run `neomail sync` to see \
+                 where it is, then try again",
+                Self::to(to)
+            ),
+            // Moving into a label (Proton Bridge's Labels/...) may only add the label, so the
+            // message stays in the INBOX every time: trying again would not help.
+            Change::Move(to @ Destination::Name(_)) => format!(
+                "the server did not take message {id} out of the INBOX after moving it to {} \
+                 (moving to a label, such as Proton Bridge's Labels/..., may only add the \
+                 label); run `neomail sync` to see where it is",
+                Self::to(to)
             ),
         }
     }
 
     fn may_not(&self) -> String {
-        match self.change {
-            Change::Seen(seen) => format!("be marked {}", state(seen)),
-            Change::Move(Folder::Archive) => "be archived".to_owned(),
-            Change::Move(Folder::Trash) => "be moved to the trash".to_owned(),
+        match &self.change {
+            Change::Seen(seen) => format!("be marked {}", state(*seen)),
+            Change::Move(Destination::Role(Folder::Archive)) => "be archived".to_owned(),
+            Change::Move(to) => format!("be moved to {}", Self::to(to)),
         }
     }
 }
@@ -225,7 +267,7 @@ fn state(seen: bool) -> &'static str {
 /// Prints `report`: the results on `out` in `mode`, then one `neomail:` line per failure on
 /// `err`. Returns the exit status: 0 when every id is in the asked state, else 1.
 pub fn finish(
-    action: Action,
+    action: &Action,
     report: &Report<anyhow::Error>,
     mode: Mode,
     out: &mut dyn Write,
@@ -317,7 +359,7 @@ mod tests {
 
     fn render(action: Action, report: &Report<anyhow::Error>, mode: Mode) -> (String, String, u8) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = finish(action, report, mode, &mut out, &mut err, Paint::OFF).unwrap();
+        let code = finish(&action, report, mode, &mut out, &mut err, Paint::OFF).unwrap();
         (
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
@@ -458,6 +500,49 @@ mod tests {
         );
     }
 
+    fn receipts() -> Action {
+        Action::Move(nm_core::FolderName::new("Folders/Receipts").unwrap())
+    }
+
+    #[test]
+    fn a_named_move_prints_the_folder_in_each_mode() {
+        let done = |id, account: &str| Done {
+            id: MessageId::new(id),
+            account: account.to_owned(),
+            state: State::MovedTo("Folders/Receipts".to_owned()),
+        };
+        let r = Report {
+            done: vec![done(4, "proton"), done(2, "proton")],
+            failures: Vec::new(),
+        };
+        assert_eq!(
+            render(receipts(), &r, Mode::Human),
+            (
+                "Moved 2 messages to Folders/Receipts.\n".to_owned(),
+                String::new(),
+                0
+            )
+        );
+        assert_eq!(render(receipts(), &r, Mode::Plain).0, "4\n2\n");
+        let json: serde_json::Value =
+            serde_json::from_str(&render(receipts(), &r, Mode::Json).0).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"id": 4, "account": "proton", "folder": "Folders/Receipts"},
+                {"id": 2, "account": "proton", "folder": "Folders/Receipts"},
+            ])
+        );
+        let one = Report {
+            done: vec![done(4, "proton")],
+            failures: Vec::new(),
+        };
+        assert_eq!(
+            render(receipts(), &one, Mode::Human).0,
+            "Moved 1 message to Folders/Receipts.\n"
+        );
+    }
+
     #[test]
     fn every_move_failure_is_one_line_that_says_what_to_do_and_exits_1() {
         let failures = || {
@@ -477,9 +562,28 @@ mod tests {
                 },
             ]
         };
-        for (action, folder, may_not) in [
-            (Action::Archive, "archive", "be archived"),
-            (Action::Delete, "trash", "be moved to the trash"),
+        // A named move may be into a label, which stays in the INBOX every time, so its line
+        // does not say to try again.
+        for (action, not_confirmed, may_not) in [
+            (
+                Action::Archive,
+                "the server did not confirm message 6 moved to the archive; run `neomail sync` \
+                 to see where it is, then try again",
+                "be archived",
+            ),
+            (
+                Action::Delete,
+                "the server did not confirm message 6 moved to the trash; run `neomail sync` to \
+                 see where it is, then try again",
+                "be moved to the trash",
+            ),
+            (
+                receipts(),
+                "the server did not take message 6 out of the INBOX after moving it to \
+                 Folders/Receipts (moving to a label, such as Proton Bridge's Labels/..., may \
+                 only add the label); run `neomail sync` to see where it is",
+                "be moved to Folders/Receipts",
+            ),
         ] {
             let r = Report {
                 done: Vec::new(),
@@ -492,13 +596,53 @@ mod tests {
                 [
                     "neomail: work: message 5 is gone from the server; the next sync removes it"
                         .to_owned(),
-                    format!(
-                        "neomail: work: the server did not confirm message 6 moved to the \
-                         {folder}; run `neomail sync` to see where it is, then try again"
-                    ),
+                    format!("neomail: work: {not_confirmed}"),
                     format!("neomail: home: message 8 may not {may_not}: refused"),
                 ]
             );
         }
+    }
+
+    /// On every provider, a folder that is missing or cannot hold messages is one line that
+    /// names the account and points at `folder list`; any other move error passes through as it
+    /// is.
+    #[test]
+    fn a_folder_that_cannot_be_moved_to_says_to_list_the_accounts_folders_on_every_provider() {
+        let name = |n: &str| nm_core::FolderName::new(n).unwrap();
+        let refused: [(&str, anyhow::Error); 4] = [
+            (
+                "the server has no folder named \"Receipts\"; nothing was moved; run `neomail \
+                 folder list --account work` to see its folders",
+                explain_imap_move(nm_imap::ImapError::NoSuchFolder(name("Receipts")), "work"),
+            ),
+            (
+                "\"Folders\" cannot hold messages (the server marks it \\Noselect or \\NonExistent); \
+                 nothing was moved; run `neomail folder list --account work` to see its folders",
+                explain_imap_move(nm_imap::ImapError::NotSelectable(name("Folders")), "work"),
+            ),
+            (
+                "the mailbox has no folder named \"Receipts\"; nothing was moved; run `neomail \
+                 folder list --account outlook` to see its folders",
+                graph::explain_write(
+                    nm_graph::GraphError::NoSuchFolder(name("Receipts")),
+                    "outlook",
+                ),
+            ),
+            (
+                "\"Unread\" is a search folder, which cannot hold messages; nothing was moved; run \
+                 `neomail folder list --account outlook` to see its folders",
+                graph::explain_write(
+                    nm_graph::GraphError::SearchFolder(name("Unread")),
+                    "outlook",
+                ),
+            ),
+        ];
+        for (want, e) in refused {
+            assert_eq!(e.to_string(), want);
+        }
+        assert_eq!(
+            explain_imap_move(nm_imap::ImapError::IntoInbox, "work").to_string(),
+            "the messages are in the INBOX already; nothing was moved"
+        );
     }
 }

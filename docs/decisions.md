@@ -212,6 +212,9 @@ the new entry.
 - **Archiving and deleting** is `neomail archive` and `neomail delete`: a move to the account's
   archive or trash, never a deletion for good, online only
   ([DEC-2026-10-13-archive-delete](#dec-2026-10-13-archive-delete), proposed).
+- **Moving to a folder** is `neomail move FOLDER ID...`, with a name exactly as
+  `neomail folder list` prints it: never a folder created, online only
+  ([DEC-2026-10-13-move](#dec-2026-10-13-move), proposed).
 - **Easy to extend** with new functionality and UI later.
 - **Agentically customizable, like Pi** (Mario Zechner's agent harness): agents can extend and
   customize neomail themselves (extensions, docs written for agents, hot reload).
@@ -782,4 +785,33 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   agents ask the owner before deleting. There are no agent profiles yet, so `neomail delete` asks
   no one. Once they exist, does a move to the trash count as deleting?
 - **Builds on:** "archiving and deleting mail" in [Identity](#identity),
+  [DEC-2026-10-13-mark](#dec-2026-10-13-mark) and [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).
+
+### <a id="dec-2026-10-13-move"></a>DEC-2026-10-13-move: moving mail to a named folder, and listing folders
+
+- **Status:** proposed by Claude on 2026-10-13, after the owner asked to "go autopilot and
+  continue" (f679d889:9128). Part 3 of roadmap slice 8 follows it.
+- **Proposal:**
+  - `neomail folder list [--account NAME]` lists each account's folders from its server: the
+    name, the account and the role (inbox, archive, trash, junk, sent, drafts, all, flagged, or
+    none). It is a read: it takes no lock and leaves the cache alone. A folder that cannot hold
+    messages is left out. An account that fails is one error line, the others are still listed,
+    and the exit code is 1.
+  - `neomail move FOLDER ID...` takes the folder first, as `neomail mark read ID...` takes the
+    state, and the ids as `neomail archive` does, `-` included. Each message moves from the INBOX
+    to the folder of that name in its own account, under archive's rules: online only, under the
+    account's lock, counted once the server confirms it, and then removed from the cache.
+  - A name matches exactly as `folder list` prints it. Over IMAP that is the mailbox name decoded
+    from modified UTF-7
+    ([RFC 3501 section 5.1.3](https://www.rfc-editor.org/rfc/rfc3501#section-5.1.3)), with the
+    server's own delimiter, and the server's encoded name is the one sent back. On Outlook it is
+    the path of display names from the top of the mailbox, such as `Inbox/Receipts`, and the move
+    sends the folder's id.
+  - Refused before anything moves, for that account only: the INBOX (in any case over IMAP; on
+    Outlook by its id, since its display name follows the mailbox's language), a folder that
+    cannot hold messages, a name no folder has, and a name two folders share. neomail never
+    creates, renames or deletes a folder.
+  - The action joins the typed set as `move`, carrying the folder name as a typed value.
+    `folder list` is a read, not an action.
+- **Builds on:** [DEC-2026-10-13-archive-delete](#dec-2026-10-13-archive-delete),
   [DEC-2026-10-13-mark](#dec-2026-10-13-mark) and [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).

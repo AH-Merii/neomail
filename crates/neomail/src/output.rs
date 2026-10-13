@@ -377,6 +377,66 @@ pub fn write_accounts(
     Ok(())
 }
 
+/// One folder in `folder list --json` and `--jsonl`.
+#[derive(Serialize)]
+pub struct FolderItem<'a> {
+    /// The name `neomail move` takes: decoded from modified UTF-7 on IMAP.
+    pub name: &'a str,
+    pub account: &'a str,
+    /// One of [`nm_core::Role`]'s names, or null.
+    pub role: Option<&'static str>,
+}
+
+/// `folder list` as TSV: name, account, role or empty.
+pub fn write_folders_plain(
+    out: &mut dyn Write,
+    folders: &[FolderItem<'_>],
+    paint: Paint,
+) -> io::Result<()> {
+    for f in folders {
+        write_record(
+            out,
+            &[
+                (f.name, plain_text),
+                (f.account, Paint::account),
+                (f.role.unwrap_or(""), plain_text),
+            ],
+            paint,
+        )?;
+    }
+    Ok(())
+}
+
+/// One line per folder: name, account and role, in aligned columns.
+pub fn write_folders(
+    out: &mut dyn Write,
+    folders: &[FolderItem<'_>],
+    paint: Paint,
+) -> io::Result<()> {
+    let rows: Vec<[String; 3]> = folders
+        .iter()
+        .map(|f| {
+            [
+                one_line(f.name),
+                one_line(f.account),
+                f.role.unwrap_or("").to_owned(),
+            ]
+        })
+        .collect();
+    let mut widths = [0; 3];
+    for row in &rows {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.width());
+        }
+    }
+    for [name, account, role] in &rows {
+        let account = paint.account(&fit(account, widths[1], true));
+        let line = format!("{}  {account}  {role}", fit(name, widths[0], true));
+        writeln!(out, "{}", line.trim_end())?;
+    }
+    Ok(())
+}
+
 /// The per-account counter `neomail sync` shows on standard error ("work: fetching 50/120"),
 /// updated in place and cleared at the end. Disabled (off a terminal) it writes nothing.
 pub struct ProgressLine {

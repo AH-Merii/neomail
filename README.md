@@ -11,8 +11,8 @@ A fast, modal terminal email client for Outlook, Gmail and Proton Mail.
 > (`neomail sync`, `neomail list`, `neomail show`): over IMAP with passwords (an app password,
 > Proton Mail Bridge) or, for Gmail, OAuth sign-in through your own Google client; and Outlook or
 > Hotmail through Microsoft Graph, signed in through your own Microsoft Entra app. `neomail mark`
-> marks mail read or unread, and `neomail archive` and `neomail delete` move mail out of the INBOX;
-> otherwise nothing changes on the server. There is no TUI yet.
+> marks mail read or unread, and `neomail archive`, `neomail delete` and `neomail move` move mail
+> out of the INBOX; otherwise nothing changes on the server. There is no TUI yet.
 
 ## Try it
 
@@ -87,6 +87,19 @@ input, or come from `--password-command`. `--no-check` skips the login. `neomail
   it, run `neomail account add proton` on a terminal once, or, with Bridge running, read it with
   `openssl s_client -connect 127.0.0.1:1143 -starttls imap </dev/null | openssl x509 -noout
   -fingerprint -sha256 | cut -d= -f2`.
+
+  Bridge's IMAP LIST shows your folders under `Folders/` and your labels under `Labels/`. Proton has
+  you create folders under the Folders group and labels under the Labels group
+  (["This computer only" folders in Outlook](https://proton.me/support/this-computer-only-folder-outlook)),
+  and says "your existing labels will appear as folders within the Labels folder"
+  ([Labels and folders in Bridge](https://proton.me/support/labels-in-bridge)). So
+  `neomail move Folders/Receipts 42` moves a message to the folder Receipts. Moving into a label
+  applies the label, and "the message will appear in both the Labels and the Folder it resides in"
+  (the same page): `neomail move Labels/Work 42` labels the message, but it stays in the INBOX, so
+  neomail reports it as not confirmed (exit 1), keeps it in the cache, and the next sync shows it
+  still there. Moving it there again changes nothing; archive it, or move it to a folder under
+  `Folders/`, to take it out of the INBOX. Both rest on Proton's pages: the test account has no
+  folder or label of its own, so a live check has tried neither.
 - **Gmail with an app password:** `neomail account add gmail-app-password`. Google: "To create an
   app password, you need 2-Step Verification on your Google Account"
   ([Google's help](https://support.google.com/accounts/answer/185833)).
@@ -194,6 +207,8 @@ neomail show 42              # headers, body, attachments
 neomail mark read 42 43      # mark read on the server, then in the cache
 neomail archive 42           # move to the archive on the server, then drop from the cache
 neomail delete 43            # move to the trash; nothing is deleted for good
+neomail folder list          # each account's folders: name, account, role
+neomail move Receipts 44     # move to the folder Receipts on the server, then drop from the cache
 ```
 
 - `neomail sync --account work --limit 100`: the first sync takes the 500 messages that arrived
@@ -219,17 +234,34 @@ neomail delete 43            # move to the trash; nothing is deleted for good
   and deletes to Deleted Items. Where each puts a message:
   [docs/gmail.md](docs/gmail.md#archive-and-delete) and
   [docs/outlook.md](docs/outlook.md#where-archive-and-delete-put-a-message).
+- `neomail folder list [--account NAME]` lists each account's folders from its server, online:
+  the name `move` takes, the account, and the role (inbox, archive, trash, junk, sent, drafts,
+  all, flagged, or none) from the server's special-use attributes on IMAP, and from Graph's
+  well-known folder names on Outlook ([docs/outlook.md](docs/outlook.md#folders-and-move)). A
+  folder that cannot hold
+  messages is left out. An account that fails is one `neomail:` line after the others, and the
+  exit status is 1.
+- `neomail move FOLDER ID...` moves messages from the INBOX to the folder named FOLDER in each
+  message's own account, exactly as `folder list` prints it (on IMAP the server's own hierarchy
+  delimiter: `Folders/Receipts` on Proton Mail Bridge, `[Gmail]/Spam` or a label on Gmail). It works
+  as `archive` does: server first, then the cache, across accounts, nothing queued. INBOX is
+  refused, and so is a folder that cannot hold messages; an account without a folder of that name
+  moves none of its messages and says to run `neomail folder list --account NAME`. neomail never
+  creates, renames or deletes a folder. On Outlook a folder's name is its path of display names
+  (`Inbox/Receipts`): [docs/outlook.md](docs/outlook.md#folders-and-move). What a move does on
+  Gmail: [docs/gmail.md](docs/gmail.md#move-to-a-folder-or-label).
 - `--json` and `--jsonl` print JSON for scripts; see [docs/json.md](docs/json.md) for the shapes,
   the plain columns and the exit codes.
 
 On a terminal, listings are aligned columns. In a pipe, or with `--plain`, they are tab-separated:
-one message per line, the id first, nothing cut off. `show -`, `mark read|unread -`, `archive -`
-and `delete -` read ids from standard input:
+one message per line, the id first, nothing cut off. `show -`, `mark read|unread -`, `archive -`,
+`delete -` and `move FOLDER -` read ids from standard input:
 
 ```sh
 neomail list | fzf -m | neomail show -                          # pick messages, read them
 neomail list | fzf -m | neomail mark read -                     # pick messages, mark them read
 neomail list | fzf -m | neomail archive -                       # pick messages, archive them
+neomail list | fzf -m | neomail move Receipts -                 # pick messages, move them to Receipts
 neomail list --color always | fzf --ansi -m | neomail show -    # the same, in colour
 neomail list | cut -f1,6                                        # id and subject
 neomail list --jsonl | jq -ac 'select(.unread) | .subject'      # unread subjects, ASCII-escaped

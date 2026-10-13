@@ -7,6 +7,7 @@ mod browser;
 mod config;
 #[cfg(unix)]
 mod daemon;
+mod folders;
 mod graph;
 mod http;
 mod keyring;
@@ -56,6 +57,8 @@ Examples:
                                     Pick messages with fzf, then read them
   neomail mark read 42 43           Mark messages 42 and 43 read, on the server too
   neomail archive 42                Move message 42 to its account's archive
+  neomail folder list               List each account's folders
+  neomail move Receipts 42          Move message 42 to the folder Receipts
   neomail config check              Check the config file
 
 Guide: https://github.com/AH-Merii/neomail#try-it";
@@ -102,6 +105,36 @@ server moves it first, then it leaves the cache, so `neomail list` no longer sho
 the server: nothing is queued. Exit 1 when any id was unknown, gone or not confirmed, or its
 account has no trash. An Outlook account added before neomail could change mail needs
 `neomail account login NAME` once.";
+
+const MOVE_EXAMPLES: &str = "\
+Examples:
+  neomail folder list --account proton
+                                    Find the folder's name
+  neomail move Folders/Receipts 42  Move message 42 to Folders/Receipts
+  neomail list | fzf -m | neomail move Receipts -
+                                    Pick messages with fzf, then move them to Receipts
+  neomail move Inbox/Receipts 42    On Outlook: move message 42 to Receipts inside the Inbox
+  neomail move --json Receipts 42   Print the moved messages and their folder as JSON
+
+FOLDER is a name exactly as `neomail folder list` prints it, in each message's own account
+(INBOX in any case is refused: the messages are in it). neomail never creates a folder: an
+account without one of that name moves none of its messages. Each message moves from the INBOX;
+the server moves it first, then it leaves the cache, so `neomail list` no longer shows it. It
+needs the server: nothing is queued. Exit 1 when any id was unknown, gone or not confirmed, or
+its account has no such folder. On Outlook a folder's name is its path of display names.";
+
+const FOLDER_LIST_EXAMPLES: &str = "\
+Examples:
+  neomail folder list               List every account's folders
+  neomail folder list --account gmail
+                                    List one account's folders
+  neomail folder list --plain | cut -f1
+                                    Print only the names `neomail move` takes
+
+Each folder's name, account and role (inbox, archive, trash, junk, sent, drafts, all, flagged,
+or none), read from the server: it needs the server. A folder that cannot hold messages is left
+out. Exit 1 when any account failed; the others are still printed. On Outlook a folder's name is
+its path of display names from the top of the mailbox, such as Inbox/Receipts.";
 
 const ADD_EXAMPLES: &str = "\
 Examples:
@@ -299,6 +332,23 @@ enum Command {
         #[command(flatten)]
         format: ListingFormat,
     },
+    /// Move messages from the INBOX to a folder of their account, by its name and the ids from `neomail list`
+    #[command(after_help = MOVE_EXAMPLES)]
+    Move {
+        /// The folder's name, as `neomail folder list` prints it
+        #[arg(value_name = "FOLDER", value_parser = parse_folder_name)]
+        folder: nm_core::FolderName,
+        /// Message ids, the first column of `neomail list`, or - to read them from standard input, one per line
+        #[arg(value_name = "ID", required = true, value_parser = parse_id_arg)]
+        ids: Vec<IdArg>,
+        #[command(flatten)]
+        format: ListingFormat,
+    },
+    /// List each account's folders, the names `neomail move` takes
+    Folder {
+        #[command(subcommand)]
+        command: FolderCommand,
+    },
     /// Print a shell completion script to standard output
     Completions {
         /// The shell
@@ -332,6 +382,25 @@ impl MarkState {
             Self::Unread => nm_core::Action::MarkUnread,
         }
     }
+}
+
+#[derive(Subcommand)]
+enum FolderCommand {
+    /// List each account's folders from its server: name, account and role
+    #[command(after_help = FOLDER_LIST_EXAMPLES)]
+    List {
+        /// List only this account's folders
+        #[arg(long, value_name = "NAME")]
+        account: Option<String>,
+        #[command(flatten)]
+        format: ListingFormat,
+    },
+}
+
+fn parse_folder_name(s: &str) -> Result<nm_core::FolderName, String> {
+    nm_core::FolderName::new(s).ok_or_else(|| {
+        "expected a folder name (the first column of `neomail folder list`)".to_owned()
+    })
 }
 
 #[derive(Subcommand)]
@@ -734,6 +803,39 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
             colors,
             &mut out,
         )?,
+        Command::Move {
+            folder,
+            ids,
+            format,
+        } => run_action(
+            nm_core::Action::Move(folder),
+            &ids,
+            &format,
+            cli.config,
+            terminal,
+            colors,
+            &mut out,
+        )?,
+        Command::Folder {
+            command: FolderCommand::List { account, format },
+        } => {
+            let config = Config::load(&config::config_path(cli.config)?)?;
+            let accounts = config.select(account.as_deref())?;
+            let runtime = account::runtime()?;
+            let mut logins = sync::Logins::default();
+            let listed: Vec<_> = accounts
+                .iter()
+                .map(|a| (a.name.as_str(), folders::list(&runtime, a, &mut logins)))
+                .collect();
+            let code = folders::finish(
+                &listed,
+                format.mode(terminal),
+                &mut out,
+                &mut io::stderr().lock(),
+                colors,
+            )?;
+            ExitCode::from(code)
+        }
         Command::Completions { shell } => {
             // Into memory first: clap_complete panics when a write fails.
             let mut script = Vec::new();
@@ -847,8 +949,8 @@ fn terminal_width() -> usize {
     terminal_size::terminal_size_of(io::stdout()).map_or(output::WIDTH, |(w, _)| usize::from(w.0))
 }
 
-/// `mark`, `archive` and `delete`: applies `action` to the ids on their servers, then in the
-/// cache, and prints the report.
+/// `mark`, `archive`, `delete` and `move`: applies `action` to the ids on their servers, then in
+/// the cache, and prints the report.
 fn run_action(
     action: nm_core::Action,
     ids: &[IdArg],
@@ -872,9 +974,9 @@ fn run_action(
         logins: sync::Logins::default(),
     };
     let ids: Vec<MessageId> = ids.into_iter().map(MessageId::new).collect();
-    let report = nm_core::action::apply(action, &ids, &mut cache, &mut writer)?;
+    let report = nm_core::action::apply(action.clone(), &ids, &mut cache, &mut writer)?;
     let code = triage::finish(
-        action,
+        &action,
         &report,
         format.mode(terminal),
         out,
@@ -1397,7 +1499,11 @@ mod tests {
                 command: Some(Command::Delete { ids, .. }),
                 ..
             }) => Ok((nm_core::Action::Delete, ids)),
-            Ok(_) => panic!("not archive or delete"),
+            Ok(Cli {
+                command: Some(Command::Move { folder, ids, .. }),
+                ..
+            }) => Ok((nm_core::Action::Move(folder), ids)),
+            Ok(_) => panic!("not archive, delete or move"),
             Err(e) => Err(e.exit_code()),
         }
     }
@@ -1420,6 +1526,62 @@ mod tests {
             &["delete", "4", "--force"],
         ] {
             assert_eq!(parse_move(bad), Err(2), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn move_takes_a_folder_then_ids_or_a_dash() {
+        let receipts = || nm_core::Action::Move(nm_core::FolderName::new("Receipts").unwrap());
+        assert_eq!(
+            parse_move(&["move", "Receipts", "4", "2"]),
+            Ok((receipts(), vec![IdArg::Id(4), IdArg::Id(2)]))
+        );
+        assert_eq!(
+            parse_move(&["move", "Receipts", "-", "--json"]),
+            Ok((receipts(), vec![IdArg::Stdin]))
+        );
+        assert_eq!(
+            parse_move(&["move", "[Gmail]/All Mail", "4"]),
+            Ok((
+                nm_core::Action::Move(nm_core::FolderName::new("[Gmail]/All Mail").unwrap()),
+                vec![IdArg::Id(4)]
+            ))
+        );
+        for bad in [
+            &["move"][..],
+            &["move", "Receipts"],
+            &["move", "", "4"],
+            &["move", "Receipts", "abc"],
+            &["move", "Receipts", "4", "--json", "--plain"],
+        ] {
+            assert_eq!(parse_move(bad), Err(2), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn folder_list_takes_an_account_and_a_format() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(["neomail"].iter().chain(args)) {
+            Ok(Cli {
+                command:
+                    Some(Command::Folder {
+                        command: FolderCommand::List { account, format },
+                    }),
+                ..
+            }) => Ok((account, format.mode(false))),
+            Ok(_) => panic!("not folder list"),
+            Err(e) => Err(e.exit_code()),
+        };
+        assert_eq!(parse(&["folder", "list"]), Ok((None, Mode::Plain)));
+        assert_eq!(
+            parse(&["folder", "list", "--account", "gmail", "--jsonl"]),
+            Ok((Some("gmail".to_owned()), Mode::Jsonl))
+        );
+        for bad in [
+            &["folder"][..],
+            &["folder", "list", "extra"],
+            &["folder", "list", "--json", "--plain"],
+        ] {
+            assert_eq!(parse(bad), Err(2), "{bad:?}");
         }
     }
 

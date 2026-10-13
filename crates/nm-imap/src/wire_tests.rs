@@ -3,7 +3,7 @@
 //! BODY.PEEK[], and never send a command that can change the server. The push [`Watcher`] keeps
 //! the same guarantee. The writes select INBOX: `store_seen` stores `\Seen` and never sends a
 //! command that can remove a message; `move_to` moves with UID MOVE and never sends one that can
-//! destroy a message or change the folder tree.
+//! destroy a message or change the folder tree. `list_folders` only lists.
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
 
 use std::num::NonZeroU32;
@@ -803,7 +803,7 @@ async fn move_server(stream: DuplexStream, mut script: MoveScript) -> Vec<String
 async fn move_uids(
     validity: u32,
     uids: &[u32],
-    to: nm_core::Folder,
+    to: impl Into<nm_core::Destination>,
     script: MoveScript,
 ) -> (Result<nm_core::Moved<nm_core::Uid>, ImapError>, Vec<String>) {
     let (client_end, server_end) = tokio::io::duplex(64 * 1024);
@@ -818,7 +818,7 @@ async fn move_uids(
         .map(|&u| nm_core::Uid::new(u).unwrap())
         .collect();
     let validity = nm_core::UidValidity::new(validity).unwrap();
-    let result = super::move_on(session, validity, &uids, to).await;
+    let result = super::move_on(session, validity, &uids, &to.into()).await;
     (result, server.await.unwrap())
 }
 
@@ -909,6 +909,23 @@ async fn delete_moves_to_the_trash_mailbox() {
         assert!(commands.contains(&format!("UID MOVE 1 \"{trash}\"")));
         assert_never_destroys(&commands);
     }
+}
+
+/// A role's mailbox whose name is in modified UTF-7 (a French Gmail's "Supprim\u{E9}s"): the
+/// output shows the decoded name and the wire carries the server's own encoded one.
+#[tokio::test]
+async fn a_role_move_to_an_encoded_mailbox_shows_it_decoded_and_sends_it_encoded() {
+    let list = "* LIST () \"/\" \"INBOX\"\r\n\
+        * LIST (\\HasNoChildren \\Trash) \"/\" \"[Gmail]/Supprim&AOk-s\"\r\n";
+    let (moved, commands) = move_uids(7, &[2], nm_core::Folder::Trash, MoveScript::new(list)).await;
+    let moved = moved.unwrap();
+    assert_eq!(moved.folder, "[Gmail]/Supprim\u{E9}s");
+    assert_eq!(uids(&moved.moved), [2]);
+    assert!(
+        commands.contains(&"UID MOVE 2 \"[Gmail]/Supprim&AOk-s\"".to_owned()),
+        "{commands:?}"
+    );
+    assert_never_destroys(&commands);
 }
 
 /// A `\Noselect` mailbox and INBOX never qualify, whatever their attributes.
@@ -1015,4 +1032,181 @@ async fn a_move_the_server_refuses_fails_and_still_logs_out() {
     );
     assert!(sent_move(&commands), "{commands:?}");
     assert_never_destroys(&commands);
+}
+
+/// Proton Mail Bridge's LIST with user folders and labels, a name in modified UTF-7
+/// ("Folders/Re\u{E7}us"), a `\NonExistent` mailbox, and a name that does not decode.
+const NAMED_LIST: &str = "* LIST (\\Noselect) \"/\" \"Folders\"\r\n\
+    * LIST (\\Noselect) \"/\" \"Labels\"\r\n\
+    * LIST () \"/\" \"INBOX\"\r\n\
+    * LIST (\\Trash) \"/\" \"Trash\"\r\n\
+    * LIST (\\Flagged) \"/\" \"Starred\"\r\n\
+    * LIST (\\Archive) \"/\" \"Archive\"\r\n\
+    * LIST (\\Sent) \"/\" \"Sent\"\r\n\
+    * LIST (\\Drafts) \"/\" \"Drafts\"\r\n\
+    * LIST () \"/\" \"Folders/Receipts\"\r\n\
+    * LIST () \"/\" \"Folders/Re&AOc-us\"\r\n\
+    * LIST () \"/\" \"Labels/Work\"\r\n\
+    * LIST (\\NonExistent) \"/\" \"Folders/Gone\"\r\n\
+    * LIST () \"/\" \"Bad&AO-name\"\r\n";
+
+fn named(name: &str) -> nm_core::Destination {
+    nm_core::Destination::Name(nm_core::FolderName::new(name).unwrap())
+}
+
+/// Runs `list_folders_on` against [`move_server`] answering LIST with `list`, and returns the
+/// folders as (name, role) and the commands sent.
+async fn folders(list: &'static str) -> (Vec<(String, Option<&'static str>)>, Vec<String>) {
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(move_server(server_end, MoveScript::new(list)));
+    let mut client = Client::new(client_end);
+    greeting(&mut client).await.unwrap();
+    let session = log_in(client, "user", Login::Password("password"))
+        .await
+        .unwrap();
+    let listed = super::list_folders_on(session).await.unwrap();
+    let listed = listed
+        .into_iter()
+        .map(|f| (f.name.to_string(), f.role.map(nm_core::Role::name)))
+        .collect();
+    (listed, server.await.unwrap())
+}
+
+#[tokio::test]
+async fn folder_list_decodes_names_leaves_out_what_cannot_hold_mail_and_gives_roles() {
+    let (listed, commands) = folders(NAMED_LIST).await;
+    let expected: Vec<(String, Option<&str>)> = [
+        ("INBOX", Some("inbox")),
+        ("Trash", Some("trash")),
+        ("Starred", Some("flagged")),
+        ("Archive", Some("archive")),
+        ("Sent", Some("sent")),
+        ("Drafts", Some("drafts")),
+        ("Folders/Receipts", None),
+        ("Folders/Re\u{E7}us", None),
+        ("Labels/Work", None),
+        ("Bad&AO-name", None),
+    ]
+    .into_iter()
+    .map(|(n, r)| (n.to_owned(), r))
+    .collect();
+    assert_eq!(listed, expected);
+    assert_eq!(
+        commands,
+        ["LOGIN \"user\" \"password\"", "LIST \"\" *", "LOGOUT"]
+    );
+    assert_never_destroys(&commands);
+
+    let (listed, commands) = folders(GMAIL_LIST).await;
+    assert_eq!(
+        listed,
+        [
+            ("INBOX".to_owned(), Some("inbox")),
+            ("[Gmail]/All Mail".to_owned(), Some("all")),
+            ("[Gmail]/Trash".to_owned(), Some("trash")),
+            ("[Gmail]/Spam".to_owned(), Some("junk")),
+        ]
+    );
+    assert_never_destroys(&commands);
+}
+
+/// The user's decoded name finds the mailbox; the server's own encoded name goes on the wire,
+/// and the move is confirmed by UID as for the archive.
+#[tokio::test]
+async fn a_name_moves_to_its_mailbox_as_the_server_names_it_and_confirms_by_uid() {
+    let mut script = MoveScript::new(NAMED_LIST);
+    script.stuck = vec![2];
+    let (moved, commands) = move_uids(7, &[1, 2], named("Folders/Re\u{E7}us"), script).await;
+    let moved = moved.unwrap();
+    assert_eq!(moved.folder, "Folders/Re\u{E7}us");
+    assert_eq!(uids(&moved.moved), [1], "UID 2 is still in INBOX");
+    assert!(moved.gone.is_empty());
+    assert_eq!(
+        commands,
+        [
+            "LOGIN \"user\" \"password\"",
+            "CAPABILITY",
+            "LIST \"\" *",
+            "SELECT \"INBOX\"",
+            "UID FETCH 1,2 (UID FLAGS)",
+            "UID MOVE 1,2 \"Folders/Re&AOc-us\"",
+            "UID FETCH 1,2 (UID FLAGS)",
+            "LOGOUT",
+        ]
+    );
+    assert_never_destroys(&commands);
+
+    // A name that does not decode is matched as the server sent it.
+    let (moved, commands) =
+        move_uids(7, &[3], named("Bad&AO-name"), MoveScript::new(NAMED_LIST)).await;
+    assert_eq!(moved.unwrap().folder, "Bad&AO-name");
+    assert!(commands.contains(&"UID MOVE 3 \"Bad&AO-name\"".to_owned()));
+    assert_never_destroys(&commands);
+}
+
+/// Every refused name fails before INBOX is selected: nothing moves.
+async fn refused(name: &str, list: &'static str) -> ImapError {
+    let (moved, commands) = move_uids(7, &[1], named(name), MoveScript::new(list)).await;
+    assert_eq!(
+        commands,
+        [
+            "LOGIN \"user\" \"password\"",
+            "CAPABILITY",
+            "LIST \"\" *",
+            "LOGOUT"
+        ],
+        "{name}"
+    );
+    assert_never_destroys(&commands);
+    let e = moved.unwrap_err();
+    assert!(e.to_string().contains("nothing was moved"), "{e}");
+    e
+}
+
+#[tokio::test]
+async fn a_name_must_match_exactly_and_a_missing_one_is_an_error() {
+    // Case, the last level alone, and the encoded form typed by the user do not match.
+    for name in [
+        "folders/receipts",
+        "Receipts",
+        "Folders/Re&AOc-us",
+        "Receipts/Old",
+    ] {
+        let e = refused(name, NAMED_LIST).await;
+        assert!(
+            matches!(&e, ImapError::NoSuchFolder(n) if n.as_str() == name),
+            "{e:?}"
+        );
+        assert!(
+            e.to_string()
+                .starts_with(&format!("the server has no folder named \"{name}\"")),
+            "{e}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inbox_is_refused_in_any_case() {
+    for name in ["INBOX", "inbox", "Inbox"] {
+        let e = refused(name, NAMED_LIST).await;
+        assert!(matches!(e, ImapError::IntoInbox), "{e:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_mailbox_that_cannot_hold_messages_is_refused() {
+    for name in ["Folders", "Labels", "Folders/Gone"] {
+        let e = refused(name, NAMED_LIST).await;
+        assert!(matches!(e, ImapError::NotSelectable(_)), "{e:?}");
+    }
+}
+
+/// "Bad&AO-name" does not decode, so it is shown raw; "Bad&-AO-name" decodes to the same text.
+#[tokio::test]
+async fn a_name_two_mailboxes_share_once_decoded_is_refused() {
+    let list = "* LIST () \"/\" \"INBOX\"\r\n\
+        * LIST () \"/\" \"Bad&AO-name\"\r\n\
+        * LIST () \"/\" \"Bad&-AO-name\"\r\n";
+    let e = refused("Bad&AO-name", list).await;
+    assert!(matches!(e, ImapError::SharedName(_)), "{e:?}");
 }

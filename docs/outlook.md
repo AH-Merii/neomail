@@ -181,6 +181,49 @@ Graph moves a message by its id, wherever it is now. A message you moved out of 
 elsewhere since the last sync is therefore moved again, from that folder. Run `neomail sync`
 first if you have been sorting mail in another app.
 
+## Folders and move
+
+`neomail folder list` names each folder by its path of display names from the top of the
+mailbox, joined with `/`: `Inbox`, `Inbox/Receipts`, `Receipts`. That path is what
+`neomail move FOLDER` takes, matched exactly. The listing is read-only and works with either
+grant (Mail.Read or Mail.ReadWrite): `GET /me/mailFolders`, then
+`GET /me/mailFolders/{id}/childFolders` for each folder whose `childFolderCount` is above 0, each
+followed through every `@odata.nextLink`, 100 folders to a page
+([list mailFolders](https://learn.microsoft.com/en-us/graph/api/user-list-mailfolders),
+[list childFolders](https://learn.microsoft.com/en-us/graph/api/mailfolder-list-childfolders)).
+Graph's listing leaves hidden folders out by default, and neomail leaves out search folders
+(`@odata.type` `#microsoft.graph.mailSearchFolder`): their contents are a query's results, not
+messages moved there. Whether Graph refuses a move into a search folder is unverified; neomail
+refuses it before anything moves.
+
+Roles come from Graph's well-known folder names, which work whatever the mailbox's language
+([mailFolder](https://learn.microsoft.com/en-us/graph/api/resources/mailfolder)): neomail asks
+`GET /me/mailFolders/{name}?$select=id` for `inbox`, `archive`, `deleteditems`, `junkemail`,
+`sentitems` and `drafts`, and the folder with that id gets the role `inbox`, `archive`, `trash`,
+`junk`, `sent` or `drafts`. A listing therefore takes six requests for the roles, one per page of
+the top level, and one per page of each folder that has children.
+
+`neomail move FOLDER ID...` finds the folder before anything moves, without walking the whole
+folder tree: it lists the top of the mailbox, then the children of only those folders whose name
+starts what is left of the path. `Inbox/Receipts` takes two listings (the top, then the Inbox's
+children); `Receipts` takes one. Then it asks for the inbox's id, and refuses the move when the
+path names the inbox: its display name follows the mailbox's language, its id does not. Each
+message then gets `POST /me/messages/{id}/move` with the folder's id as `destinationId`
+([move message](https://learn.microsoft.com/en-us/graph/api/message-move)), with the concurrency,
+throttling waits and failures of `archive` above. So moving N messages to `Inbox/Receipts` takes
+3 + N requests when each listing fits on one page.
+
+Refused, with nothing moved and the account's one `neomail:` line:
+
+- a path no folder has: "the mailbox has no folder named "Receipts"; nothing was moved; run
+  `neomail folder list --account NAME` to see its folders";
+- a path that several folders share, which happens when a display name holds a `/` ("a/b" at
+  the top, and "b" inside "a"): use Outlook on the web for that folder;
+- the Inbox, and a search folder.
+
+The `folder` that `--json` prints for `move` is the path as typed; for `archive` and `delete` it
+stays the well-known name. neomail never creates, renames or deletes a folder.
+
 ## How mail is read
 
 `neomail sync` reads the INBOX through Graph, read-only: it lists messages

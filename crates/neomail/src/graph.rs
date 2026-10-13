@@ -1,13 +1,15 @@
 //! Microsoft Graph wiring: `nm_graph`'s [`Transport`] over neomail's [`Https`], the read-only
 //! check `account add outlook` runs before anything is saved, the sync of a Graph account, and
-//! the writes: marking its messages read or unread, and moving them to the archive or trash.
+//! the writes: marking its messages read or unread, and moving them to the archive, the trash or
+//! a folder the user names; and the listing of its folders.
 
 use std::io;
 use std::num::NonZeroU32;
 
 use anyhow::{Result, anyhow};
 use nm_core::{
-    Cache, Folder, Moved, RemoteId, SyncError, SyncReport, Written, sync_inbox_by_id_with_progress,
+    Cache, Destination, ListedFolder, Moved, RemoteId, SyncError, SyncReport, Written,
+    sync_inbox_by_id_with_progress,
 };
 use nm_graph::{GraphError, GraphSource, Reply, Transport, TransportError};
 
@@ -127,19 +129,31 @@ pub async fn set_read(
         .map_err(|e| explain_write(e, account))
 }
 
-/// Moves the messages `ids` of a Graph account to the folder with role `to`. Like
-/// [`set_read`], a Mail.Read sign-in fails before any request.
+/// Moves the messages `ids` of a Graph account to the folder `to`: a role, or a path of display
+/// names as [`folders`] prints it. Like [`set_read`], a Mail.Read sign-in fails before any
+/// request.
 pub async fn move_to(
     account: &str,
     token: &AccessToken,
     ids: &[RemoteId],
-    to: Folder,
+    to: &Destination,
 ) -> Result<Moved<RemoteId>> {
     may_write(account, token)?;
     GraphSource::new(Https::new()?, token.expose())
         .move_to(ids, to)
         .await
         .map_err(|e| explain_write(e, account))
+}
+
+/// The folders of a Graph account, read-only: any mail grant can list them.
+pub async fn folders(account: &str, token: &AccessToken) -> Result<Vec<ListedFolder>> {
+    GraphSource::new(Https::new()?, token.expose())
+        .folders()
+        .await
+        .map_err(|e| match e {
+            GraphError::Unauthorized => anyhow!("access token refused; run the command again"),
+            e => explain(e, account),
+        })
 }
 
 /// Fails when `token`'s sign-in grants only Mail.Read: changing or moving mail needs
@@ -155,7 +169,7 @@ fn may_write(account: &str, token: &AccessToken) -> Result<()> {
 }
 
 /// A Graph error from a write, with what to do next.
-fn explain_write(e: GraphError, account: &str) -> anyhow::Error {
+pub(crate) fn explain_write(e: GraphError, account: &str) -> anyhow::Error {
     match e {
         GraphError::Unauthorized => anyhow!("access token refused; run the command again"),
         GraphError::Forbidden => anyhow!(
@@ -165,6 +179,9 @@ fn explain_write(e: GraphError, account: &str) -> anyhow::Error {
         ),
         GraphError::NoFolder(_) => {
             anyhow!("{e}, so nothing was moved; use Outlook on the web for these messages")
+        }
+        e @ (GraphError::NoSuchFolder(_) | GraphError::SearchFolder(_)) => {
+            crate::folders::point_at_folder_list(e, account)
         }
         other => anyhow::Error::new(other),
     }
@@ -231,10 +248,15 @@ mod tests {
             "this account's sign-in lets neomail read mail but not change it; run `neomail \
              account login outlook` to let neomail change mail"
         );
-        // Nor move it, to either folder.
-        for to in [Folder::Archive, Folder::Trash] {
+        // Nor move it, to either role or to a named folder.
+        let receipts = Destination::Name(nm_core::FolderName::new("Inbox/Receipts").unwrap());
+        for to in [
+            nm_core::Folder::Archive.into(),
+            nm_core::Folder::Trash.into(),
+            receipts,
+        ] {
             let id = RemoteId::new("AAMk1".to_owned()).unwrap();
-            let e = move_to("outlook", &token, &[id], to).await.unwrap_err();
+            let e = move_to("outlook", &token, &[id], &to).await.unwrap_err();
             assert_eq!(
                 e.to_string(),
                 "this account's sign-in lets neomail read mail but not change it; run `neomail \

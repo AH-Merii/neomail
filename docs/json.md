@@ -1,10 +1,10 @@
 # Output for scripts
 
-`neomail list`, `neomail account list`, `neomail show`, `neomail mark`, `neomail archive` and
-`neomail delete` print JSON for scripts and agents with `--json`, and JSON Lines (one compact
-object per line, the same objects as `--json`'s array) with `--jsonl`. The shapes below are stable:
-later versions may add fields but will not rename, remove or retype these ones, and a field that
-can be `null` says so. Ignore fields you do not know.
+`neomail list`, `neomail account list`, `neomail folder list`, `neomail show`, `neomail mark`,
+`neomail archive`, `neomail delete` and `neomail move` print JSON for scripts and agents with
+`--json`, and JSON Lines (one compact object per line, the same objects as `--json`'s array) with
+`--jsonl`. The shapes below are stable: later versions may add fields but will not rename, remove or
+retype these ones, and a field that can be `null` says so. Ignore fields you do not know.
 Listings also have a plain format, below.
 
 Common rules:
@@ -12,7 +12,8 @@ Common rules:
 - Times are RFC 3339 in UTC (`"2026-10-10T08:30:00Z"`), or `null` when unknown.
 - `id` is neomail's id for the message, the one `neomail show` takes. It stays the same across syncs,
   unless the server's UIDVALIDITY changes and the cache is rebuilt. An id is never reused: once
-  its message is gone (deleted on the server, or moved out of the INBOX by `archive` or `delete`),
+  its message is gone (deleted on the server, or moved out of the INBOX by `archive`, `delete` or
+  `move`),
   `neomail show` reports it as not found rather than showing another message.
 - `uid` is the IMAP UID in the account's INBOX, or `null` for a message read through Microsoft
   Graph (Outlook), which has no UIDs.
@@ -84,6 +85,7 @@ makes sure they carry none.
 | ------- | ------ |
 | `list` | id, unread (`*` or empty), date (RFC 3339 UTC as in `--json`, empty when unknown), account, from (`Name <address>`, the address, or empty), subject |
 | `account list` | name, login, username, host, port, security, `pinned` or empty |
+| `folder list` | name (exactly what `move` takes), account, role or empty |
 
 ## `neomail show ID --json`
 
@@ -185,9 +187,11 @@ asked:
 ]
 ```
 
-`id` and `account` mean what they mean in `list --json`. `folder` is the destination as the server
-names it: an IMAP mailbox name, as LIST reports it, or for Outlook Graph's well-known folder name,
-`archive` or `deleteditems`
+`id` and `account` mean what they mean in `list --json`. `folder` is the destination: an IMAP
+mailbox name as LIST reports it, decoded from modified UTF-7
+([RFC 3501 section 5.1.3](https://www.rfc-editor.org/rfc/rfc3501#section-5.1.3)) as
+`folder list` shows it; for Outlook, the path `folder list` shows for `move`, and Graph's
+well-known folder name, `archive` or `deleteditems`, for `archive` and `delete`
 ([mailFolder](https://learn.microsoft.com/en-us/graph/api/resources/mailfolder)). On IMAP the
 archive is the mailbox with the `\Archive` attribute or, when there is none, the one with `\All`
 (Gmail's All Mail); the trash is the one with `\Trash`
@@ -205,6 +209,69 @@ its sign-in lets neomail read mail but not change it (run `neomail account login
 refuses the move ([docs/outlook.md](outlook.md#where-archive-and-delete-put-a-message)). A
 failed message stays in the cache.
 
+## `neomail folder list`
+
+Lists each account's folders, read from its server: every account in config order, or only the
+one `--account` names. Only folders a message can be in: a mailbox the server marks `\Noselect`
+or `\NonExistent` ([RFC 5258 section 3](https://www.rfc-editor.org/rfc/rfc5258#section-3)) is
+left out, and INBOX is listed with the role `inbox`. An account's folders come in the order its
+server lists them, which can change from one run to the next (a live check saw Proton Mail
+Bridge's change), so sort them when a script needs a stable order.
+
+- on a terminal: aligned columns, the name, the account and the role;
+- plain: name, account and role or empty, tab-separated (see Plain output);
+- `--json`: an array of objects; `--jsonl`: one object per line.
+
+```json
+[
+  { "name": "INBOX", "account": "proton", "role": "inbox" },
+  { "name": "Folders/Receipts", "account": "proton", "role": null },
+  { "name": "[Gmail]/All Mail", "account": "gmail", "role": "all" }
+]
+```
+
+`name` is the name `neomail move` takes: on IMAP the mailbox name LIST reports, decoded from
+modified UTF-7, with the server's hierarchy delimiter as it is (`Folders/Receipts` on Proton Mail
+Bridge, `[Gmail]/Spam` on Gmail). A name that is not valid modified UTF-7 is shown as the server
+sent it. `role` is `null` or one of `inbox`, `archive`, `trash`, `junk`, `sent`, `drafts`, `all` and
+`flagged`, from the mailbox's special-use attribute (`\Archive`, `\Trash`, `\Junk`, `\Sent`,
+`\Drafts`, `\All`, `\Flagged`,
+[RFC 6154 section 2](https://www.rfc-editor.org/rfc/rfc6154#section-2)). More roles may be added
+later.
+
+On Outlook, `name` is the folder's path of display names from the top of the mailbox, joined with
+`/` (`Inbox`, `Inbox/Receipts`, `Receipts`), and `role` comes from Graph's well-known folder names:
+`inbox`, `archive`, `deleteditems` (trash), `junkemail` (junk), `sentitems` (sent) and `drafts`
+([mailFolder](https://learn.microsoft.com/en-us/graph/api/resources/mailfolder)). Graph has no
+folder for all mail or flagged mail, so `all` and `flagged` never appear there. Search folders and
+hidden folders are left out ([docs/outlook.md](outlook.md#folders-and-move)).
+
+An account that fails is one `neomail:` line on standard error, after the other accounts'
+folders are printed.
+
+## `neomail move FOLDER ID...`
+
+Moves messages from the INBOX to the folder named FOLDER in each message's own account, as
+`archive` does: the same ids, `-` for ids on standard input
+(`neomail list | fzf -m | neomail move Receipts -`), the server first, then the cache. Its output
+is `archive`'s: on a terminal `Moved 2 messages to Receipts.`; plain, the ids; JSON, the same
+objects, with `folder` the folder's name as `folder list` shows it.
+
+FOLDER matches a name of `folder list` exactly. On IMAP only INBOX matches in any case
+([RFC 3501 section 5.1](https://www.rfc-editor.org/rfc/rfc3501#section-5.1)), and it is refused:
+the messages are in it already. On Outlook the Inbox is refused by its id, under the path
+`folder list` shows for it, whatever its display name. A folder that cannot hold messages (an
+IMAP mailbox marked `\Noselect` or `\NonExistent`, an Outlook search folder) is refused too. An
+account without a folder of that name fails, none of its messages moves, and its line says to run
+`neomail folder list --account NAME`, as does the line for a folder that cannot hold messages. An
+account where two mailboxes decode to that same name, or an Outlook account where two folders have
+that path (a display name can hold a `/`), fails the same way; its line says to use another mail
+app (on Outlook, Outlook on the web) for that folder.
+neomail never creates, renames or deletes a folder. The other failures, and their lines ("may
+not be moved to Receipts"), are `archive`'s, except that a message the server did not take out of
+the INBOX says only to run `neomail sync`, not to try again: a move into a label, such as Proton
+Bridge's `Labels/...`, may only add the label, so it would stay in the INBOX again.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -212,8 +279,8 @@ failed message stays in the cache.
 | 0 | Success. `list` with nothing cached also succeeds, printing `[]` with `--json`. |
 | 0 | Also when the reader of standard output goes away early (`neomail list \| head -1`, quitting the pager): neomail stops quietly. |
 | 0 | `daemon` stopped by SIGINT or SIGTERM. A failing account does not stop it. |
-| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others. `mark` exits 1 if any id was unknown, gone from the server, not confirmed or of an account that failed, after marking the others. `archive` and `delete` exit 1 the same way, after moving the others; an account without an archive or trash folder is an account that failed. A second `daemon` for the same data directory exits 1. |
-| 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s, `mark -`'s, `archive -`'s or `delete -`'s input without an id; `-` mixed with ids (`show`, `mark`, `archive`, `delete`); a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help; `daemon` without a config file or accounts (the start lines) or with an invalid config. |
+| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others. `mark` exits 1 if any id was unknown, gone from the server, not confirmed or of an account that failed, after marking the others. `archive` and `delete` exit 1 the same way, after moving the others; an account without an archive or trash folder is an account that failed. `move` exits 1 the same way; an account without the folder named is an account that failed. `folder list` exits 1 if any account failed, after listing the others. A second `daemon` for the same data directory exits 1. |
+| 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s, `mark -`'s, `archive -`'s, `delete -`'s or `move -`'s input without an id; `-` mixed with ids (`show`, `mark`, `archive`, `delete`, `move`); `move` without a folder or without ids; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help; `daemon` without a config file or accounts (the start lines) or with an invalid config. |
 
 Errors go to standard error, in these forms:
 
@@ -221,14 +288,14 @@ Errors go to standard error, in these forms:
   output flags) starts with `error:` and may be followed by a usage hint on further lines.
 - neomail's own usage errors (exit 2) are one line starting with `neomail:`: a value that cannot be
   asked for (standard input is not a terminal, or `--no-input`), a line of `show -`'s, `mark -`'s,
-  `archive -`'s or `delete -`'s input without an id, `--raw` with several ids, `-` mixed with ids,
-  an option that does not apply to the provider. They look like failures; only the exit code tells
-  them apart.
+  `archive -`'s, `delete -`'s or `move -`'s input without an id, `--raw` with several ids, `-` mixed
+  with ids, an option that does not apply to the provider. They look like failures; only the exit
+  code tells them apart.
 - Bare `neomail` (exit 2) prints the start lines (`neomail: no accounts yet. Start with:` and the
   commands) without a config, or the help with one.
-- A failure (exit 1) prints a line starting with `neomail:`; `sync` prints one per failed account,
-  and `mark`, `archive` and `delete` one per unknown, gone or unconfirmed id and one per failed
-  account, naming its ids.
+- A failure (exit 1) prints a line starting with `neomail:`; `sync` and `folder list` print one per
+  failed account, and `mark`, `archive`, `delete` and `move` one per unknown, gone or unconfirmed id
+  and one per failed account, naming its ids.
   A failed `config check` prints `PATH:LINE:COL: message` for a syntax error or `PATH: message`
   for an invalid value, without the `neomail:` prefix; a missing config file is an ordinary
   `neomail:` failure.
