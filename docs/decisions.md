@@ -103,10 +103,10 @@ the new entry.
   where, and asks once. The answer is remembered per host; a script consents with `--yes`. Without
   consent, nothing is sent.
 - **The live check of classification** sends at most 20 jev requests, made-up messages only, each
-  run recorded in a spend ledger
+  request recorded in a spend ledger before it is sent
   ([DEC-2026-10-13-classify-send](#dec-2026-10-13-classify-send)).
 - **Classifying from the CLI** is `neomail classify`, the first of slice 10's four parts; results are
-  cached per message and survive a cache rebuild
+  stored per message and survive a mailbox rebuild
   ([DEC-2026-10-13-classify](#dec-2026-10-13-classify), proposed).
 
 ## Data and storage
@@ -905,9 +905,9 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   - One request per message: one choice question with the ten groups in a fixed order, `main`
     first, and the model pinned to `jev-1.13.0`, so stored probabilities stay comparable.
   - A result is keyed by account and Message-ID, or a hash of the message when it has none, so it
-    survives a cache rebuild and no message is paid for twice. The effective group (`other` below
-    a confidence threshold, `follow-up-old` by age, `spam`) is worked out when the cache is read,
-    so thresholds can change without asking jev again.
+    survives a mailbox rebuild (a new UIDVALIDITY) and no message is paid for twice. The effective
+    group (`other` below a confidence threshold, `follow-up-old` by age, `spam`) is worked out when
+    the cache is read, so thresholds can change without asking jev again.
   - The key lives in the keyring under service `neomail-jev`, one entry per backend host, so it
     can't share an entry with a mail account named "jev". `JEV_API_KEY` is the fallback.
   - No new crate: every backend speaks one wire format, and the base URL is the seam. Plain HTTP
