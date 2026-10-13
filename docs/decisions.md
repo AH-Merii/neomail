@@ -33,7 +33,8 @@ the new entry.
   takes the user through setup one step at a time for Gmail (their own OAuth client, or an app
   password), Outlook and Proton Mail. Other IMAP servers get no wizard and keep today's
   questions. A wizard may check a client ID or secret with Google or Microsoft before the
-  sign-in, once a live check has shown that their answers tell a wrong one apart.
+  sign-in, once a live check has shown that their answers tell a wrong one apart. How the steps
+  work is proposed in [DEC-2026-10-13-wizard-steps](#dec-2026-10-13-wizard-steps).
 - **Gmail sign-in modes:** (1) the user's own Google OAuth client, (2) app password over
   IMAP/SMTP (requires Google 2-Step Verification). Both read mail over IMAP, with IDLE push. A
   slice that needs what IMAP can't do adds the Gmail API for that part only, in an entry of its
@@ -794,6 +795,33 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   the duplicate Entra app, a restart of the isolated Bridge), got no answer, so they make none.
 - **Builds on:** [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux) and "No built-in OAuth client
   IDs" under [Accounts and providers](#accounts-and-providers).
+
+### <a id="dec-2026-10-13-wizard-steps"></a>DEC-2026-10-13-wizard-steps: how the setup wizards work
+
+- **Status:** proposed by Claude on 2026-10-13, after the owner asked to work on the setup-wizard
+  issues in parallel with the roadmap (f679d889:13268), following
+  [DEC-2026-10-13-wizards](#dec-2026-10-13-wizards).
+- **Proposal:**
+  - One wizard model, data and a state machine with no I/O, drives every wizard in `neomail
+    account add`. The CLI shows it on stderr, and the TUI's add-account screen (roadmap slice 19)
+    can show the same steps. Each step says where the user is, why the step exists, where to go
+    and what is left, and the user can go back until anything is written.
+  - Each check runs right after the answer it tests. A failure names its step and what to change.
+    On a terminal that step is asked again; off a terminal neomail prints the step and the fix and
+    exits with the failure code. Nothing reaches the keyring or the config until every check
+    passes.
+  - Every question that changes the result keeps its flag. Secrets still come only from a no-echo
+    prompt, standard input or a password command. `--no-input` runs from flags alone and skips
+    the steps that only show a provider's page or advice.
+  - Links are always printed. A browser opens only when the user asks and a display exists.
+  - Three slices: the core with Gmail and an app password (#49) first; then, as soon as the core
+    exists, Gmail with your own client and Outlook together (#47, #48), since they share the
+    sign-in code; and Proton through Bridge (#50). All follow roadmap slice 12, which adds the
+    sending settings to `account add`.
+  - Until a live check shows that Google's and Microsoft's answers tell a wrong client ID or
+    secret apart, a sign-in that times out names the steps whose mistakes it can mean.
+- **Builds on:** [DEC-2026-10-13-wizards](#dec-2026-10-13-wizards) and
+  [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).
 
 ### <a id="dec-2026-10-13-mark"></a>DEC-2026-10-13-mark: marking mail read or unread from the CLI
 
