@@ -238,16 +238,16 @@ fn consent_text(host: &str, messages: usize) -> String {
     format!(
         "neomail classify sends one request per message to {host}, {messages} now, tried again\n\
          up to twice on a rate limit or a server error. Each holds:\n\
-         \x20 - the subject and the body's first 1500 characters, with the part of each email\n\
-         \x20   address before the @, links (their host stays), phone, card and IBAN numbers,\n\
-         \x20   amounts, one-time codes, runs of 4 or more digits and the names in the headers\n\
-         \x20   masked; shorter numbers, postal addresses and names that are in no header are\n\
-         \x20   sent as written;\n\
+         \x20 - the subject and the body's first 1500 characters, redacted on this machine: the\n\
+         \x20   part of each email address before the @, links (their host stays), phone, card\n\
+         \x20   and IBAN numbers, amounts, one-time codes, runs of 4 or more digits, and names from\n\
+         \x20   the headers that neomail recognises are masked; shorter numbers, postal addresses\n\
+         \x20   and other names are sent as written;\n\
          \x20 - the sender's domain (a personal domain identifies its owner);\n\
          \x20 - whether the sender is a role address (orders@, noreply@ ...), and whether the mail\n\
          \x20   came through a mailing list, was automated, or is a reply.\n\
-         Never the display names from the headers or the part of the sender's address before\n\
-         the @; a name in the body that is in no header is sent as written.\n\
+         Of the sender's address only the domain is sent. No other header and no attachment is\n\
+         sent.\n\
          {keeps}\n\
          `neomail redact ID` shows exactly what is sent for a message.\n"
     )
@@ -1009,13 +1009,15 @@ fn send(
         drop(tx);
         let mut outcome = Outcome::default();
         // The first error storing or printing a result. It stops the run, but the answers
-        // already on their way are still stored: each cost a request.
+        // already on their way are still stored, and printed unless printing failed: each cost
+        // a request.
         let mut error: Option<anyhow::Error> = None;
+        let mut print_failed = false;
         let stop = &shared.stop;
         printer.progress(0, total);
         while let Some(event) = rx.recv().await {
             // Once printing failed (a closed pipe), nothing more is printed.
-            let print = error.is_none();
+            let print = !print_failed;
             match event {
                 Event::Answered(i, answer) => {
                     let job = &jobs[i];
@@ -1044,6 +1046,7 @@ fn send(
                             &settings.rules,
                             now,
                         );
+                        print_failed |= printed.is_err();
                         keep(&mut error, stop, printed);
                     }
                 }
@@ -1051,6 +1054,7 @@ fn send(
                     outcome.failed += 1;
                     if print {
                         let printed = printer.failed(jobs[i].id, &jobs[i].account, &why);
+                        print_failed |= printed.is_err();
                         keep(&mut error, stop, printed);
                     }
                 }
@@ -1061,6 +1065,7 @@ fn send(
                     outcome.failed += 1;
                     if print {
                         let printed = printer.failed(jobs[i].id, &jobs[i].account, &why);
+                        print_failed |= printed.is_err();
                         keep(&mut error, stop, printed);
                     }
                     outcome.stopped.get_or_insert(why);
@@ -1253,20 +1258,22 @@ mod tests {
             "to api.typesafe.ai, 12 now",
             "tried again up to twice on a rate limit or a server error",
             "the sender's domain",
-            "never the display names from the headers or the part of the sender's address before \
-             the @; a name in the body that is in no header is sent as written",
+            "of the sender's address only the domain is sent",
+            "no other header and no attachment is sent",
+            "names from the headers that neomail recognises are masked",
             "the part of each email address before the @",
             "links (their host stays)",
             "phone, card and IBAN numbers, amounts, one-time codes, runs of 4 or more digits",
-            "shorter numbers, postal addresses and names that are in no header are sent as written",
+            "shorter numbers, postal addresses and other names are sent as written",
             TYPESAFE_PRIVACY,
             TYPESAFE_TERMS,
             "`neomail redact ID`",
         ] {
             assert!(flat.contains(&part.to_lowercase()), "{part}: {text}");
         }
-        // A name in the body that no header holds is sent.
+        // Names the rules miss are sent, so the text promises none never leaves.
         assert!(!flat.contains("never the sender's name"), "{text}");
+        assert!(!flat.contains("never the display names"), "{text}");
         assert!(!consent_text("127.0.0.1", 1).contains(TYPESAFE_TERMS));
     }
 }

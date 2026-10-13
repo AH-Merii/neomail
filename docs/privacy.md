@@ -42,11 +42,11 @@ server error, with your key as a Bearer token, holding only this:
   (List-Unsubscribe or List-Id); whether it is automated (Auto-Submitted other than `no`, or
   Precedence bulk, list or junk); and whether it is a reply (In-Reply-To).
 
-The part of the sender's address before the `@`, the display names from the headers, the other
-headers, attachments and the rest of the body are never sent. A name in the subject or body that
-is in no header is sent as written (see What is masked). One type in nm-redact, `Outgoing`, holds
-exactly the list above, and the request is built from it alone
-([architecture](architecture.md)).
+The request never holds the part of the sender's address before the `@`, any other header (display
+names among them), attachments or the rest of the body. Names written in the subject and body are
+masked only as [What is masked](#what-is-masked) says, so a name its rules miss is sent as written.
+One type in nm-redact, `Outgoing`, holds exactly the list above, and the request is built from it
+alone ([architecture](architecture.md)).
 
 **What TypeSafe does with it.** jev is TypeSafe's model, and TypeSafe keeps and uses what it
 receives as its [privacy policy](https://www.typesafe.ai/legal/privacy-policy) and its
