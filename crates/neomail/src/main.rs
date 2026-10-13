@@ -1,4 +1,4 @@
-//! `neomail`: the neomail command line: the INBOX (sync, list, show, mark, archive, delete),
+//! `neomail`: the neomail command line: the INBOX (sync, list, show, redact, mark, archive, delete),
 //! passwords in the OS keyring, Gmail and Outlook through the user's own OAuth client (Outlook read
 //! through Microsoft Graph), and setup (`account add`, `account list`, `config path|check`).
 
@@ -18,6 +18,7 @@ mod oauth;
 mod output;
 mod pager;
 mod push;
+mod redact;
 mod secret;
 mod setup;
 mod style;
@@ -55,6 +56,7 @@ Examples:
   neomail show 42                   Read message 42
   neomail list | fzf -m | neomail show -
                                     Pick messages with fzf, then read them
+  neomail redact 42                 See message 42 as a classifier would, personal data masked
   neomail mark read 42 43           Mark messages 42 and 43 read, on the server too
   neomail archive 42                Move message 42 to its account's archive
   neomail folder list               List each account's folders
@@ -62,6 +64,24 @@ Examples:
   neomail config check              Check the config file
 
 Guide: https://github.com/AH-Merii/neomail#try-it";
+
+const REDACT_EXAMPLES: &str = "\
+Examples:
+  neomail redact 42                 Print message 42's subject and body excerpt, masked
+  neomail redact 42 57              Print two messages, separated by a `── message 57 ──` line
+  neomail list | fzf -m | neomail redact -
+                                    Pick messages with fzf, then print them masked
+  neomail redact --json 42          Print the text and the mask counts as JSON
+
+This is the text neomail will send for classification: the subject, and the body's first 1500
+characters after masking. Email addresses, links, phone, card and IBAN numbers, amounts,
+one-time codes, runs of 4 or more digits and the names in the headers become placeholders such
+as <email>@acme.example or <name>; postal addresses and names in no header are not masked. The
+owner's addresses (the config's logins) are masked whole: without the default config there are
+none, and a --config or NEOMAIL_CONFIG file that is missing is an error. It reads the cache
+only: nothing is sent or changed. Exit 1 when any id was unknown or unreadable. What is masked
+and what is not:
+https://github.com/AH-Merii/neomail/blob/main/docs/privacy.md";
 
 const MARK_EXAMPLES: &str = "\
 Examples:
@@ -208,6 +228,21 @@ struct ShowFormat {
     raw: bool,
 }
 
+/// How `redact` prints: the text on a terminal or off one, or JSON.
+#[derive(clap::Args)]
+#[group(multiple = false)]
+struct RedactFormat {
+    /// Print the text without styling (the default when stdout is not a terminal)
+    #[arg(long)]
+    plain: bool,
+    /// Print JSON: one object for one id, an array for several or - (https://github.com/AH-Merii/neomail/blob/main/docs/json.md)
+    #[arg(long)]
+    json: bool,
+    /// Print JSON Lines: one object per message
+    #[arg(long)]
+    jsonl: bool,
+}
+
 /// `--limit`: a positive number, or `all`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Limit {
@@ -301,6 +336,15 @@ enum Command {
         /// Print directly instead of through the pager ($NEOMAIL_PAGER, $PAGER or less)
         #[arg(long)]
         no_pager: bool,
+    },
+    /// Show the text neomail would send to a classifier for cached messages, with personal data masked
+    #[command(after_help = REDACT_EXAMPLES)]
+    Redact {
+        /// Message ids, the first column of `neomail list`, or - to read them from standard input, one per line
+        #[arg(value_name = "ID", required = true, value_parser = parse_id_arg)]
+        ids: Vec<IdArg>,
+        #[command(flatten)]
+        format: RedactFormat,
     },
     /// Mark messages read or unread, on the server and in the cache, by the ids from `neomail list`
     #[command(after_help = MARK_EXAMPLES)]
@@ -776,6 +820,10 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
         } => show(
             &ids, &format, no_pager, cli.config, terminal, colors, &mut out,
         )?,
+        Command::Redact { ids, format } => {
+            let mode = Mode::choose(format.plain, format.json, format.jsonl, terminal);
+            redact(&ids, mode, cli.config, colors, &mut out)?
+        }
         Command::Mark { state, ids, format } => run_action(
             state.action(),
             &ids,
@@ -1069,7 +1117,91 @@ fn show(
     })
 }
 
-/// The ids of `show`, `mark`, `archive` and `delete`: the ones given, or with `-` the ones on
+/// `neomail redact`: for each id, the text classification would send, from the cache only.
+/// Unknown or unreadable messages are reported on standard error after the others, and exit 1.
+fn redact(
+    ids: &[IdArg],
+    mode: Mode,
+    config: Option<PathBuf>,
+    colors: Colors,
+    out: &mut dyn Write,
+) -> Result<ExitCode> {
+    let one_literal = matches!(ids, [IdArg::Id(_)]);
+    let ids = read_ids(ids)?;
+    let Some(cache) = open_cache(false)? else {
+        bail!("{}", no_cache_hint(config));
+    };
+    // The owner's addresses come from the config. Without the default one there are none to mask
+    // whole, but a config the user named must load: a typo never quietly drops the owner rule.
+    let named = config::named_path(config.clone()).is_some();
+    let path = config::config_path(config)?;
+    let config = if named || config::exists(&path) {
+        Some(Config::load(&path)?)
+    } else {
+        None
+    };
+    let owners = config
+        .as_ref()
+        .map(redact::owner_addresses)
+        .unwrap_or_default();
+    let mut failures = Vec::new();
+    let mut messages = Vec::new();
+    for id in ids {
+        let Some(stored) = cache.get(MessageId::new(id))? else {
+            failures.push(format!(
+                "no cached message with id {id}; see `neomail list`"
+            ));
+            continue;
+        };
+        match nm_core::parse::parse(&stored.raw) {
+            Ok(parsed) => {
+                let excerpt = redact::excerpt(&parsed, &owners);
+                messages.push((stored, excerpt));
+            }
+            Err(_) => failures.push(format!(
+                "message {id} cannot be read; see `neomail show --raw {id}`"
+            )),
+        }
+    }
+    let items = messages
+        .iter()
+        .map(|(stored, excerpt)| output::RedactItem::new(stored, excerpt));
+    match mode {
+        Mode::Jsonl => output::write_jsonl(out, items)?,
+        Mode::Json => {
+            let items: Vec<_> = items.collect();
+            match items.as_slice() {
+                [item] if one_literal => output::write_json(out, item)?,
+                [] if one_literal => {}
+                items => output::write_json(out, items)?,
+            }
+        }
+        Mode::Human | Mode::Plain => {
+            let paint = if mode == Mode::Human {
+                colors.stdout
+            } else {
+                colors.plain
+            };
+            for (i, item) in items.enumerate() {
+                if i > 0 {
+                    output::write_separator(out, item.id, paint)?;
+                }
+                output::write_redacted(out, &item, paint)?;
+            }
+        }
+    }
+    out.flush()?;
+    for message in &failures {
+        eprintln!("{}: {message}", colors.stderr.error("neomail"));
+    }
+    Ok(if failures.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(EXIT_FAILURE)
+    })
+}
+
+/// The ids of `show`, `redact`, `mark`, `archive` and `delete`: the ones given, or with `-` the ones on
 /// standard input. `-` with other ids is a usage error.
 fn read_ids(ids: &[IdArg]) -> Result<Vec<i64>> {
     if !ids.contains(&IdArg::Stdin) {

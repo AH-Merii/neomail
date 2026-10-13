@@ -1,7 +1,7 @@
 # Output for scripts
 
-`neomail list`, `neomail account list`, `neomail folder list`, `neomail show`, `neomail mark`,
-`neomail archive`, `neomail delete` and `neomail move` print JSON for scripts and agents with
+`neomail list`, `neomail account list`, `neomail folder list`, `neomail show`, `neomail redact`,
+`neomail mark`, `neomail archive`, `neomail delete` and `neomail move` print JSON for scripts and agents with
 `--json`, and JSON Lines (one compact object per line, the same objects as `--json`'s array) with
 `--jsonl`. The shapes below are stable: later versions may add fields but will not rename, remove or
 retype these ones, and a field that can be `null` says so. Ignore fields you do not know.
@@ -128,6 +128,46 @@ every case. Missing messages are left out of the output and reported on standard
 works. A line's id is its first field: after leading whitespace and colour codes, the digits up to
 the first tab or space. Blank lines are skipped; a line without an id is a usage error (exit 2)
 naming its line number, and nothing is shown. `--raw` takes exactly one id.
+
+## `neomail redact ID...`
+
+The text neomail will send to jev for classification, with personal data masked
+([privacy.md](privacy.md) lists the rules and placeholders). It reads the cache only. Ids are
+taken as `neomail show` takes them, `-` included. `--json` prints one object for one id given on
+the command line, else an array in the order asked; `--jsonl` prints one object per line.
+Unknown or unreadable messages are left out and reported on standard error.
+
+```json
+{
+  "id": 42,
+  "account": "work",
+  "subject": "Order <number> for <name>",
+  "body": "Hi <name>, call <phone> or see <link host=shop.example>.\n",
+  "truncated": false,
+  "masks": {
+    "email": 0, "link": 1, "iban": 0, "card": 0, "amount": 0,
+    "code": 0, "phone": 1, "number": 1, "name": 2
+  }
+}
+```
+
+- `subject` is the whole subject, redacted; `""` when the message has none.
+- `body` is the body as `neomail show` renders it (the plain part, else the HTML part as text),
+  redacted, then cut to its first 1,500 characters (Unicode scalar values), never inside a
+  placeholder. It is `""` when the message has no text body.
+- `truncated` is `true` when the body was cut.
+- `masks` counts the placeholders in `subject` and `body` by kind. Every kind is present, zeros
+  included; the keys are `email`, `link`, `iban`, `card`, `amount`, `code`, `phone`, `number` and
+  `name`.
+
+Without `--json` or `--jsonl`, `redact` prints `Subject: ` and the subject, a blank line, then the
+body; `(no text body)` stands for an empty one, and a line
+`[neomail: the body is cut here, at the 1500-character limit]` follows a cut one; a mask that would
+cross the limit is left out whole, so the body can end a little before it. Several messages are
+separated by a `── message ID ──` line as in `neomail show`. On a terminal the placeholders are
+coloured; off one, or with `--plain`, the text is the same without colour (unless `--color always`
+or `CLICOLOR_FORCE` asks for it). Escape sequences and other control characters are neutralised as
+in `neomail show`; JSON keeps the text exactly.
 
 ## `neomail mark read|unread ID...`
 
@@ -279,15 +319,15 @@ Bridge's `Labels/...`, may only add the label, so it would stay in the INBOX aga
 | 0 | Success. `list` with nothing cached also succeeds, printing `[]` with `--json`. |
 | 0 | Also when the reader of standard output goes away early (`neomail list \| head -1`, quitting the pager): neomail stops quietly. |
 | 0 | `daemon` stopped by SIGINT or SIGTERM. A failing account does not stop it. |
-| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others. `mark` exits 1 if any id was unknown, gone from the server, not confirmed or of an account that failed, after marking the others. `archive` and `delete` exit 1 the same way, after moving the others; an account without an archive or trash folder is an account that failed. `move` exits 1 the same way; an account without the folder named is an account that failed. `folder list` exits 1 if any account failed, after listing the others. A second `daemon` for the same data directory exits 1. |
-| 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s, `mark -`'s, `archive -`'s, `delete -`'s or `move -`'s input without an id; `-` mixed with ids (`show`, `mark`, `archive`, `delete`, `move`); `move` without a folder or without ids; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help; `daemon` without a config file or accounts (the start lines) or with an invalid config. |
+| 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others; `redact` the same, after printing the others. `mark` exits 1 if any id was unknown, gone from the server, not confirmed or of an account that failed, after marking the others. `archive` and `delete` exit 1 the same way, after moving the others; an account without an archive or trash folder is an account that failed. `move` exits 1 the same way; an account without the folder named is an account that failed. `folder list` exits 1 if any account failed, after listing the others. A second `daemon` for the same data directory exits 1. |
+| 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s, `redact -`'s, `mark -`'s, `archive -`'s, `delete -`'s or `move -`'s input without an id; `-` mixed with ids (`show`, `redact`, `mark`, `archive`, `delete`, `move`); `move` without a folder or without ids; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help; `daemon` without a config file or accounts (the start lines) or with an invalid config. |
 
 Errors go to standard error, in these forms:
 
 - An error from the argument parser (exit 2: an unknown option, an invalid value, conflicting
   output flags) starts with `error:` and may be followed by a usage hint on further lines.
 - neomail's own usage errors (exit 2) are one line starting with `neomail:`: a value that cannot be
-  asked for (standard input is not a terminal, or `--no-input`), a line of `show -`'s, `mark -`'s,
+  asked for (standard input is not a terminal, or `--no-input`), a line of `show -`'s, `redact -`'s, `mark -`'s,
   `archive -`'s, `delete -`'s or `move -`'s input without an id, `--raw` with several ids, `-` mixed
   with ids, an option that does not apply to the provider. They look like failures; only the exit
   code tells them apart.

@@ -1754,3 +1754,338 @@ fn folder_list_reports_each_failed_account_and_exits_1() {
         assert_eq!(neomail(data, args).status.code(), Some(2), "{args:?}");
     }
 }
+
+/// A cached message with this exact source.
+fn raw_message(uid: u32, raw: String) -> FetchedMessage {
+    FetchedMessage {
+        uid: Uid::new(uid).unwrap(),
+        flags: Flags::new(Vec::<String>::new()),
+        received: DateTime::from_timestamp(1000 - i64::from(uid), 0),
+        raw: raw.into_bytes(),
+    }
+}
+
+/// The body of the long message: 2,000 characters (2,400 bytes), with a known name past the cut.
+fn long_body() -> String {
+    format!("{}Ada", "abcé ".repeat(400))
+}
+
+/// A data directory for `redact`, in list order: a plain message full of personal data, an
+/// HTML-only message, a body longer than the excerpt, a message with no text body, and one with
+/// control characters in its subject and body. The
+/// config's account `user@mail.example` is the owner's address.
+fn redact_seeded() -> (tempfile::TempDir, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), KEYRING_CONFIG).unwrap();
+    let mut cache = Cache::open(&dir.path().join("cache.sqlite3")).unwrap();
+    let work = cache
+        .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
+        .unwrap();
+    let headers = "From: Ada Lovelace <ada@mail.example>\r\nTo: Bob Stone <user@mail.example>\r\n\
+                   Reply-To: Help Desk <desk@mail.example>\r\n";
+    cache
+        .insert_messages(
+            work.id,
+            &[
+                raw_message(
+                    1,
+                    format!(
+                        "{headers}Subject: Order 48213 for Ada\r\n\r\n\
+                         Hi Bob, your code: 7Q4X9Z. Call +44 20 7946 0958 or see \
+                         https://shop.example/track?id=99 today.\r\n\
+                         Write to ada@mail.example or USER@Mail.Example.\r\n\
+                         Pay EUR 120.50 by 2026-01-16 at 10:30; 1,500 people asked the Desk.\r\n"
+                    ),
+                ),
+                raw_message(
+                    2,
+                    format!(
+                        "{headers}Subject: News\r\nContent-Type: text/html\r\n\r\n\
+                         <html><body><p>Hello <b>Ada</b>, call 0115 496 0123</p></body></html>\r\n"
+                    ),
+                ),
+                raw_message(
+                    3,
+                    format!("{headers}Subject: Long\r\n\r\n{}\r\n", long_body()),
+                ),
+                raw_message(
+                    4,
+                    format!(
+                        "{headers}Subject: Scan\r\nContent-Type: application/pdf\r\n\
+                         Content-Transfer-Encoding: base64\r\n\r\nJVBERi0=\r\n"
+                    ),
+                ),
+                raw_message(
+                    5,
+                    format!(
+                        "{headers}Subject: Red \x1b[31m alert\x07\r\n\r\n\
+                         Body \x1b[31m red\x07 and \x1b]0;title\x07 end.\r\n"
+                    ),
+                ),
+            ],
+        )
+        .unwrap();
+    let ids = ids(dir.path());
+    (dir, ids)
+}
+
+#[test]
+fn redact_prints_the_masked_text_off_a_terminal() {
+    let (dir, ids) = redact_seeded();
+    let o = neomail(dir.path(), &["redact", &ids[0]]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "Subject: Order <number> for <name>\n\n\
+         Hi <name>, your code: <code>. Call <phone> or see <link host=shop.example> today.\n\
+         Write to <email>@mail.example or <email>.\n\
+         Pay <amount> by 2026-01-16 at 10:30; 1,500 people asked the <name>.\n"
+    );
+    assert!(stderr(&o).is_empty(), "{}", stderr(&o));
+    // --plain is what a pipe gets.
+    assert_eq!(
+        neomail(dir.path(), &["redact", "--plain", &ids[0]]).stdout,
+        o.stdout
+    );
+}
+
+#[test]
+fn redact_html_long_and_bodyless_messages() {
+    let (dir, ids) = redact_seeded();
+    let o = neomail(dir.path(), &["redact", &ids[1], &ids[2], &ids[3]]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = stdout(&o);
+    // The HTML part as text, as `neomail show` renders it.
+    assert!(
+        out.starts_with("Subject: News\n\nHello **<name>**, call <phone>\n"),
+        "{out}"
+    );
+    assert!(!out.contains("<p>"), "{out}");
+    // Several messages are separated as `neomail show` separates them.
+    assert!(out.contains(&format!("── message {} ──", ids[2])), "{out}");
+    assert!(
+        out.contains("[neomail: the body is cut here, at the 1500-character limit]"),
+        "{out}"
+    );
+    assert!(out.ends_with("Subject: Scan\n\n(no text body)\n"), "{out}");
+
+    let v = json(&neomail(dir.path(), &["redact", "--json", &ids[2]]));
+    let body = v["body"].as_str().unwrap();
+    assert_eq!(v["truncated"], true);
+    assert_eq!(body, long_body().chars().take(1500).collect::<String>());
+    assert_eq!(
+        v["masks"]["name"], 0,
+        "the name past the cut is not counted"
+    );
+    let v = json(&neomail(dir.path(), &["redact", "--json", &ids[3]]));
+    assert_eq!(
+        (v["body"].as_str(), v["truncated"].as_bool()),
+        (Some(""), Some(false))
+    );
+}
+
+#[test]
+fn redact_json_shape_is_stable() {
+    let (dir, ids) = redact_seeded();
+    let v = json(&neomail(dir.path(), &["redact", "--json", &ids[0]]));
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["account", "body", "id", "masks", "subject", "truncated"]
+    );
+    assert_eq!(v["id"].to_string(), ids[0]);
+    assert_eq!(v["account"], "work");
+    assert_eq!(v["subject"], "Order <number> for <name>");
+    assert_eq!(v["truncated"], false);
+    assert_eq!(
+        v["masks"],
+        serde_json::json!({
+            "email": 2, "link": 1, "iban": 0, "card": 0, "amount": 1, "code": 1,
+            "phone": 1, "number": 1, "name": 3
+        })
+    );
+    // Several ids give an array; JSON Lines gives the same objects; colour never reaches JSON.
+    let all = json(&neomail(
+        dir.path(),
+        &["redact", "--json", &ids[0], &ids[3]],
+    ));
+    assert_eq!(all.as_array().map(Vec::len), Some(2));
+    assert_eq!(all[1]["masks"]["email"], 0);
+    assert_jsonl_matches_json(
+        dir.path(),
+        &["redact", &ids[0], &ids[1], "--color", "always"],
+    );
+    let o = neomail(
+        dir.path(),
+        &["redact", "--json", &ids[0], "--color", "always"],
+    );
+    assert!(!o.stdout.contains(&0x1b));
+}
+
+#[test]
+fn redact_styles_placeholders_only_when_colour_is_on() {
+    let (dir, ids) = redact_seeded();
+    let plain = stdout(&neomail(dir.path(), &["redact", &ids[0]]));
+    let o = neomail(dir.path(), &["redact", &ids[0], "--color", "always"]);
+    let styled = stdout(&o);
+    assert!(
+        styled.contains("\x1b[1m\x1b[34m<name>\x1b[0m"),
+        "{styled:?}"
+    );
+    // The words are the same with the styling taken out.
+    let unstyled = styled
+        .replace("\x1b[1m\x1b[34m", "")
+        .replace("\x1b[1m", "")
+        .replace("\x1b[0m", "");
+    assert_eq!(unstyled, plain);
+    let o = command(dir.path(), &["redact", &ids[0]])
+        .env("CLICOLOR_FORCE", "1")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&o), plain);
+}
+
+#[test]
+fn redact_reports_unknown_ids_after_the_rest_and_writes_nothing() {
+    let (dir, ids) = redact_seeded();
+    let cache = dir.path().join("cache.sqlite3");
+    let before = std::fs::read(&cache).unwrap();
+    let o = neomail(dir.path(), &["redact", "999999", &ids[3]]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).starts_with("Subject: Scan\n"), "{}", stdout(&o));
+    assert_eq!(
+        stderr(&o),
+        "neomail: no cached message with id 999999; see `neomail list`\n"
+    );
+    // One missing literal id prints nothing in JSON, as `show` does.
+    let o = neomail(dir.path(), &["redact", "--json", "999999"]);
+    assert_eq!((o.status.code(), o.stdout.is_empty()), (Some(1), true));
+    // With several ids, JSON is an array of the messages found.
+    let o = neomail(dir.path(), &["redact", "--json", "999999", &ids[3]]);
+    assert_eq!(o.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    let got: Vec<String> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].to_string())
+        .collect();
+    assert_eq!(got, [ids[3].clone()]);
+    assert_eq!(std::fs::read(&cache).unwrap(), before);
+}
+
+#[test]
+fn redact_neutralises_control_characters_except_in_json() {
+    let (dir, ids) = redact_seeded();
+    for args in [
+        &["redact", &ids[4]][..],
+        &["redact", "--plain", &ids[4]],
+        &["redact", &ids[4], "--color", "always"],
+    ] {
+        let o = neomail(dir.path(), args);
+        assert!(o.status.success(), "{}", stderr(&o));
+        let out = stdout(&o);
+        assert!(out.contains("Red") && out.contains("Body"), "{out:?}");
+        assert!(
+            !out.contains("\x1b[31m") && !out.contains("\x1b]0;"),
+            "{args:?}: {out:?}"
+        );
+        assert!(!out.contains(['\x07', '\r']), "{args:?}: {out:?}");
+        if !args.contains(&"always") {
+            assert!(!out.contains('\x1b'), "{args:?}: {out:?}");
+        }
+    }
+    // JSON keeps the exact text; its encoder escapes it.
+    let v = json(&neomail(dir.path(), &["redact", "--json", &ids[4]]));
+    assert_eq!(v["subject"], "Red \x1b[31m alert\x07");
+    assert_eq!(
+        v["body"],
+        "Body \x1b[31m red\x07 and \x1b]0;title\x07 end.\r\n"
+    );
+}
+
+#[test]
+fn redact_reads_ids_from_standard_input() {
+    let (dir, ids) = redact_seeded();
+    // TSV lines, as `neomail list | fzf -m` passes them.
+    let tsv = stdout(&neomail(dir.path(), &["list"]));
+    let picked: String = tsv.lines().skip(2).map(|l| format!("{l}\n\n")).collect();
+    let o = neomail_stdin(dir.path(), &["redact", "-", "--jsonl"], &picked);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let got: Vec<String> = stdout(&o)
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].to_string())
+        .collect();
+    assert_eq!(got, ids[2..]);
+    // Ids from standard input give an array, even for one.
+    let o = neomail_stdin(
+        dir.path(),
+        &["redact", "-", "--json"],
+        &format!("{}\n", ids[2]),
+    );
+    let v = json(&o);
+    let got: Vec<String> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].to_string())
+        .collect();
+    assert_eq!(got, [ids[2].clone()]);
+    let o = neomail_stdin(dir.path(), &["redact", "-"], "not an id\n");
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+}
+
+#[test]
+fn redact_usage_errors_and_no_config() {
+    let (dir, ids) = redact_seeded();
+    for args in [
+        &["redact"][..],
+        &["redact", "x"],
+        &["redact", "-", &ids[0]],
+        &["redact", "--json", "--plain", &ids[0]],
+        &["redact", "--raw", &ids[0]],
+    ] {
+        let o = neomail_stdin(dir.path(), args, "");
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", stderr(&o));
+        assert!(o.stdout.is_empty(), "{args:?}");
+    }
+    // A config that does not load is an error, never a preview without the owner rule: an
+    // invalid one, a missing `--config`, and a missing NEOMAIL_CONFIG (the tests set it).
+    let fails = |o: Output, why: &str| {
+        assert_eq!(o.status.code(), Some(1), "{why}: {}", stderr(&o));
+        assert!(o.stdout.is_empty(), "{why}");
+        assert!(stderr(&o).starts_with("neomail: "), "{why}: {}", stderr(&o));
+        assert_eq!(stderr(&o).lines().count(), 1, "{why}: {}", stderr(&o));
+    };
+    let config = dir.path().join("config.toml");
+    let good = std::fs::read(&config).unwrap();
+    std::fs::write(&config, "accounts = 3\n").unwrap();
+    fails(neomail(dir.path(), &["redact", &ids[0]]), "invalid");
+    std::fs::write(&config, &good).unwrap();
+    let typo = dir.path().join("typo.toml");
+    let typo = typo.to_str().unwrap();
+    fails(
+        neomail(dir.path(), &["redact", "--config", typo, &ids[0]]),
+        "--config",
+    );
+    std::fs::remove_file(&config).unwrap();
+    fails(neomail(dir.path(), &["redact", &ids[0]]), "NEOMAIL_CONFIG");
+    // Without the default config there is no owner address to mask whole: it keeps its domain.
+    let mut c = command(dir.path(), &["redact", "--json", &ids[0]]);
+    let v = json(&c.env_remove("NEOMAIL_CONFIG").output().unwrap());
+    assert!(
+        v["body"]
+            .as_str()
+            .unwrap()
+            .contains("<email>@Mail.Example."),
+        "{}",
+        v["body"]
+    );
+    // Without a cache, the next command is named.
+    let empty = tempfile::tempdir().unwrap();
+    let o = neomail(empty.path(), &["redact", "1"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(stderr(&o), format!("neomail: {ADD_HINT}\n"));
+}

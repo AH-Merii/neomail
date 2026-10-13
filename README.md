@@ -204,6 +204,7 @@ The cache lives in `~/.local/share/neomail/` (`$XDG_DATA_HOME/neomail/`, or `NEO
 neomail sync                 # fetch new mail for every account: "work: 12 new, 1 updated, 0 removed"
 neomail list                 # newest first; * marks unread
 neomail show 42              # headers, body, attachments
+neomail redact 42            # the text classification will send, personal data masked
 neomail mark read 42 43      # mark read on the server, then in the cache
 neomail archive 42           # move to the archive on the server, then drop from the cache
 neomail delete 43            # move to the trash; nothing is deleted for good
@@ -218,6 +219,11 @@ neomail move Receipts 44     # move to the folder Receipts on the server, then d
   or `all` on `list` and `sync`.
 - `neomail show 42 43` shows several messages; `neomail show 42 --raw` prints one message's source.
   On a terminal `show` goes through `$NEOMAIL_PAGER`, `$PAGER` or `less`; `--no-pager` turns it off.
+- `neomail redact ID...` prints what neomail will send to jev once classification lands: the
+  subject and the body's first 1,500 characters, with email addresses, links, phone, card and IBAN
+  numbers, amounts, one-time codes, runs of 4 or more digits and the names in the headers replaced
+  by placeholders such as `<email>@acme.example` or `<name>`. It reads the cache only and sends
+  nothing. What it masks and what it misses: [docs/privacy.md](docs/privacy.md).
 - `neomail mark read ID...` and `neomail mark unread ID...` change the read state on the server
   first, then in the cache, so `neomail list` shows it at once. Ids may be of several accounts.
   It needs the server: nothing is queued, and an account that cannot be reached keeps its

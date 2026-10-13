@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/neomail", "crates/nm-core", "crates/nm-graph", "crates/nm-imap"]
+members = ["crates/neomail", "crates/nm-core", "crates/nm-graph", "crates/nm-imap", "crates/nm-redact"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ repository = "https://github.com/AH-Merii/neomail"
 nm-core = { path = "crates/nm-core" }
 nm-graph = { path = "crates/nm-graph" }
 nm-imap = { path = "crates/nm-imap" }
+nm-redact = { path = "crates/nm-redact" }
 
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
@@ -34,6 +35,9 @@ zbus-secret-service-keyring-store = { version = "1.0.1", default-features = fals
 zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 mail-parser = "0.11"
 rpassword = "7.5"
+# The redaction rules (crates/nm-redact): every pattern is compiled once, and its linear-time
+# matching keeps a 1,500-character excerpt cheap.
+regex = { version = "1.11", default-features = false, features = ["std", "perf", "unicode"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-platform-verifier = "0.7"

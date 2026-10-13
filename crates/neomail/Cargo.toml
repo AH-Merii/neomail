@@ -16,6 +16,7 @@ path = "src/main.rs"
 nm-core.workspace = true
 nm-graph.workspace = true
 nm-imap.workspace = true
+nm-redact.workspace = true
 anstyle.workspace = true
 anyhow.workspace = true
 base64.workspace = true

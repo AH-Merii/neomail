@@ -14,14 +14,20 @@ use crate::oauth::{self, Provider};
 /// `$XDG_CONFIG_HOME/neomail/config.toml`, then `~/.config/neomail/config.toml`. An empty
 /// `NEOMAIL_CONFIG` counts as unset, like an empty `NEOMAIL_DATA_DIR`.
 pub fn config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    match explicit.or_else(|| {
-        env::var_os("NEOMAIL_CONFIG")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    }) {
+    match named_path(explicit) {
         Some(p) => Ok(p),
         None => Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?.join("neomail/config.toml")),
     }
+}
+
+/// The config path the user named: `--config`, then a non-empty `NEOMAIL_CONFIG`; `None` for the
+/// default path.
+pub fn named_path(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    explicit.or_else(|| {
+        env::var_os("NEOMAIL_CONFIG")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    })
 }
 
 /// Where the cache lives: `NEOMAIL_DATA_DIR`, then `$XDG_DATA_HOME/neomail`, then
