@@ -357,6 +357,32 @@ fn a_large_body_of_links_dates_numbers_and_names_redacts_quickly() {
 }
 
 #[test]
+fn a_megabyte_of_direction_marks_or_tatweel_redacts_quickly() {
+    let e = within(30, || {
+        let body = format!(
+            "محمد{}x ١{}٢ محـ{}مد",
+            "\u{200f}".repeat(1 << 19),
+            "\u{200e}".repeat(1 << 19),
+            "ـ".repeat(1 << 19)
+        );
+        Excerpt::new("", &body, &Known::new(["محمد"], [""; 0]))
+    });
+    assert!(e.body().as_str().starts_with("<name>"));
+}
+
+#[test]
+fn a_large_arabic_body_of_names_dates_amounts_and_codes_redacts_quickly() {
+    let e = within(30, || {
+        let body = "شكرا لمحمد، الموعد ١٦ يناير ٢٠٢٦، المبلغ ١٬٢٥٠٫٥٠ ر.س، رمز التحقق: ٤٨٢٩١٠، اتصل ٠٥٠\u{200e}-١٢٣\u{200e}-٤٥٦٧. "
+            .repeat(1 << 14);
+        Excerpt::new("", &body, &Known::new(["محمد العتيبي"], [""; 0]))
+    });
+    assert!(e.body().as_str().starts_with(
+        "شكرا <name>، الموعد ١٦ يناير ٢٠٢٦، المبلغ <amount>، رمز التحقق: <code>، اتصل <phone>. شكرا"
+    ));
+}
+
+#[test]
 fn a_short_body_and_the_whole_subject_are_kept() {
     let subject = format!("Order 12345 {}", "s".repeat(2 * EXCERPT_CHARS));
     let e = Excerpt::new(
@@ -378,4 +404,98 @@ fn a_short_body_and_the_whole_subject_are_kept() {
         .map(|(k, n)| (k.name(), n))
         .collect();
     assert_eq!(masks, [("phone", 1), ("number", 1), ("name", 1)]);
+}
+
+/// Arabic name words from made-up headers, each with a body spelling: as written, with short
+/// vowels, with a stretched letter, with a hamza left off.
+const ARABIC_NAMES: &[(&str, &[&str])] = &[
+    ("محمد", &["محمد", "مُحَمَّد", "محـمد", "محـــمد"]),
+    ("العتيبي", &["العتيبي", "العُتَيْبِي", "العتـيبي"]),
+    ("سارة", &["سارة", "سَارَة", "سـارة"]),
+    ("أحمد", &["أحمد", "احمد", "أَحْمَد", "أحـمد"]),
+    ("إيمان", &["إيمان", "ايمان", "إِيمَان"]),
+    ("نور", &["نور", "نُور"]),
+];
+
+#[test]
+fn no_known_arabic_name_survives_as_a_word() {
+    let known = Known::new(["محمد العتيبي", "سارة أحمد", "إيمان نور"], [""; 0]);
+    // No given name carries the article, so it is never a prefix; a family name keeps its own.
+    let prefixes = ["", "و", "ب", "ل"];
+    let frames = [
+        "{}",
+        "مرحبا {}،",
+        "شكرا {}.",
+        "({})",
+        "{}؟",
+        "x {} y",
+        "رد {}\n",
+    ];
+    let fold = |w: &str| -> String {
+        w.chars()
+            .filter(|c| !matches!(c, '\u{64b}'..='\u{65f}' | '\u{640}'))
+            .map(|c| if matches!(c, 'أ' | 'إ') { 'ا' } else { c })
+            .collect()
+    };
+    let mut checked = 0;
+    for (name, forms) in ARABIC_NAMES {
+        for form in *forms {
+            for prefix in prefixes {
+                // `ل` before the article drops its alef: `للعتيبي`.
+                let word = match form.strip_prefix('ا') {
+                    Some(rest) if prefix == "ل" && name.starts_with("ال") => format!("ل{rest}"),
+                    _ => format!("{prefix}{form}"),
+                };
+                for frame in frames {
+                    let text = frame.replace("{}", &word);
+                    let out = redact(&text, &known);
+                    let leaked = out
+                        .as_str()
+                        .split(|c: char| !c.is_alphabetic() && !matches!(c, '\u{64b}'..='\u{65f}'))
+                        .any(|w| fold(w).ends_with(&fold(name)));
+                    assert!(!leaked, "{text:?} -> {:?}", out.as_str());
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 300, "{checked}");
+}
+
+#[test]
+fn a_number_split_by_direction_marks_is_masked_whole() {
+    let marks = [
+        '\u{200e}', '\u{200f}', '\u{61c}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+    ];
+    let numbers = [
+        "٠٥٠-١٢٣-٤٥٦٧",
+        "١٢٣٤ ٥٦٧٨",
+        "1234-5678",
+        "٤١١١ ١١١١ ١١١١ ١١١١",
+        "١٢٣٤٥٦",
+    ];
+    // No frame holds a digit, so any digit left is part of a number not masked whole.
+    let frames = ["{}", "رقم {}.", "اتصل على {} الآن", "المرجع: {}", "({})"];
+    let mut checked = 0;
+    for mark in marks {
+        for n in numbers {
+            // A mark after every digit group, and one between every two digits.
+            let grouped: String = n
+                .chars()
+                .flat_map(|c| [(!c.is_numeric()).then_some(mark), Some(c)])
+                .flatten()
+                .collect();
+            let spread: String = n.chars().flat_map(|c| [c, mark]).collect();
+            for number in [grouped, spread] {
+                for frame in frames {
+                    let text = frame.replace("{}", &number);
+                    let out = redact(&text, &Known::default());
+                    let out = out.as_str();
+                    assert!(!out.contains(char::is_numeric), "{text:?} -> {out:?}");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 300, "{checked}");
 }

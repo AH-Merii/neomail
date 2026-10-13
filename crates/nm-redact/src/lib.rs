@@ -13,11 +13,11 @@
 //! | [`Kind::Link`] | a URL, all but its host | `<link host=acme.example>` |
 //! | [`Kind::Iban`] | an IBAN passing the ISO 13616 check digits | `<iban>` |
 //! | [`Kind::Card`] | 13 to 19 digits passing the Luhn check | `<card>` |
-//! | [`Kind::Amount`] | a number with a currency symbol or code | `<amount>` |
-//! | [`Kind::Code`] | a one-time code after "code", "OTP" …, or a password after "password", "PIN" … | `<code>` |
+//! | [`Kind::Amount`] | a number with a currency symbol, code or Arabic currency word | `<amount>` |
+//! | [`Kind::Code`] | a one-time code after "code", "OTP", `رمز التحقق` …, or a password after "password", "PIN", `كلمة المرور` … | `<code>` |
 //! | [`Kind::Phone`] | a phone number (dates and times excluded) | `<phone>` |
 //! | [`Kind::Number`] | any other run of 4 or more digits | `<number>` |
-//! | [`Kind::Name`] | a known name, as a whole word | `<name>` |
+//! | [`Kind::Name`] | a known name, as a whole word (in Arabic, also with a joined prefix, without short vowels or tatweel) | `<name>` |
 //!
 //! Kept on purpose: domains and link hosts, dates and times, numbers of 1 to 3 digits, and names
 //! that appear in no header. Overlapping matches merge into one mask, named by the kind listed
@@ -123,6 +123,11 @@ impl MaskCounts {
 pub struct Known {
     /// Capitalised words of the display names, plus their all-caps forms; matched case-sensitively.
     names: HashSet<String>,
+    /// Words of the display names in scripts without capital letters (Arabic, Hebrew, Hindi,
+    /// Korean …), folded by `rules::fold_name`; an Arabic `عبد` joined to the word after it.
+    caseless: HashSet<String>,
+    /// Whether a caseless name starts with `عبد`, so a body's `عبد الله` is read as one word.
+    has_compounds: bool,
     /// The owner's addresses, lower-cased; matched without case.
     owner_addresses: HashSet<String>,
 }
@@ -138,6 +143,15 @@ impl Known {
     /// Apostrophes written `'`, `’`, `‘`, `ʼ`, `´`, a backtick or `＇` match one another: a header's
     /// `O'Brien` masks a body's `O’Brien` or `O´Brien`, and back.
     ///
+    /// A word in a script without capital letters (Arabic, Hebrew, Hindi, Korean …) with two or
+    /// more letters is masked as a whole word too, compared without Arabic short vowels, the
+    /// stretching tatweel or a hamza on an alef, and with `و`, `ب` or `ل` joined to its front
+    /// (`لمحمد`, `والعتيبي`, `للعتيبي`), never the article. The particles `بن`, `ابن`, `بنت`,
+    /// `أبو`, `أم`, `آل` are not masked alone, nor `الله` or `الدين`; `عبد` is masked with the word
+    /// after it (`عبد الله`). A display name holding a word such as `بنك`, `شركة`, `خدمة` or
+    /// `وزارة` ("bank", "company", "service", "ministry") names an organisation, and none of its
+    /// Arabic words is masked.
+    ///
     /// `owner_addresses`: every account's address; matched case-insensitively and masked whole.
     pub fn new<N, A>(
         display_names: impl IntoIterator<Item = N>,
@@ -148,7 +162,29 @@ impl Known {
         A: AsRef<str>,
     {
         let mut names = HashSet::new();
+        let mut caseless = HashSet::new();
         for name in display_names {
+            let words: Vec<String> = rules::words(name.as_ref())
+                .filter(|w| !w.chars().any(|c| c.is_uppercase() || c.is_lowercase()))
+                .filter(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2)
+                .map(rules::fold_name)
+                .collect();
+            // An organisation's name is made of ordinary words (`البنك الأهلي`, "the national
+            // bank"), which have no capitals to tell the name from the word: none is masked.
+            let org = rules::is_org_name(&words);
+            let mut i = 0;
+            while !org && i < words.len() {
+                let word = &words[i];
+                if word == "عبد" {
+                    if let Some(next) = words.get(i + 1) {
+                        caseless.insert(format!("{word}{next}"));
+                        i += 1;
+                    }
+                } else if !rules::NAME_PARTICLES.contains(&word.as_str()) {
+                    caseless.insert(word.clone());
+                }
+                i += 1;
+            }
             for word in rules::words(name.as_ref()) {
                 let folded = rules::fold_apostrophes(word);
                 let word: &str = &folded;
@@ -172,8 +208,13 @@ impl Known {
             .map(|a| a.as_ref().trim().to_lowercase())
             .filter(|a| a.contains('@'))
             .collect();
+        let has_compounds = caseless
+            .iter()
+            .any(|w: &String| w.starts_with("عبد") && w.chars().count() > 3);
         Known {
             names,
+            caseless,
+            has_compounds,
             owner_addresses,
         }
     }

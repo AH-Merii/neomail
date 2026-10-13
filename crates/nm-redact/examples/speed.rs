@@ -36,4 +36,26 @@ fn main() {
     }
     let per = start.elapsed().as_secs_f64() * 1e3 / f64::from(runs);
     println!("prose: {per:.4} ms per excerpt");
+
+    let mut arabic = String::new();
+    while arabic.chars().count() < 1_600 {
+        arabic.push_str(
+            "مرحبا محمد، طلبك رقم ١٢٣٤٥ يصل في ١٦ يناير ٢٠٢٦. المبلغ ١٬٢٥٠٫٥٠ ر.س على \
+             https://pay.acme.example/i/9 أو اتصل على ٠٥٠\u{200e}-١٢٣\u{200e}-٤٥٦٧؛ رمز التحقق: ٤٨٢٩١٠. \
+             شكرا لسارة والعتيبي على المساعدة، ونراكم في رمضان ١٤٤٧هـ. ",
+        );
+    }
+    let known = Known::new(["محمد العتيبي", "سارة أحمد"], ["you@outlook.example"]);
+    let start = Instant::now();
+    let mut masks = 0;
+    for _ in 0..runs {
+        masks += Excerpt::new("طلبك رقم ١٢٣٤٥", &arabic, &known)
+            .masks()
+            .total();
+    }
+    let per = start.elapsed().as_secs_f64() * 1e3 / f64::from(runs);
+    println!(
+        "arabic: {per:.4} ms per excerpt ({} masks each)",
+        masks / runs as usize
+    );
 }
