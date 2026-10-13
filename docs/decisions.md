@@ -90,6 +90,10 @@ the new entry.
 - **Groups as Outlook categories** ([DEC-2026-10-13-categories](#dec-2026-10-13-categories),
   proposed): the label prefix and the group name, written by `neomail classify` and the daemon,
   never touching the user's own categories or asking for a new permission.
+- **Groups as Gmail and Proton labels, and spam to Junk**
+  ([DEC-2026-10-14-labels-junk](#dec-2026-10-14-labels-junk), proposed): Gmail labels over IMAP
+  and Proton labels over Bridge, never touching the user's own labels; confident spam moves to the
+  account's Junk folder once, and a message the user moves back stays.
 - **Each email is classified once** (results cached locally with model id, probabilities and
   timestamp so thresholds can be re-tuned without re-calling the model).
 - **Classify only when asked**
@@ -897,6 +901,41 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Builds on:** [DEC-2026-10-13-labels](#dec-2026-10-13-labels),
   [DEC-2026-10-13-classify](#dec-2026-10-13-classify) and
   [DEC-2026-10-13-mark](#dec-2026-10-13-mark).
+
+### <a id="dec-2026-10-14-labels-junk"></a>DEC-2026-10-14-labels-junk: groups as Gmail and Proton labels, and spam to Junk
+
+- **Status:** proposed by Claude on 2026-10-14, as the last of slice 10's four parts
+  ([DEC-2026-10-13-classify](#dec-2026-10-13-classify)).
+- **Proposal:**
+  - Each classified Gmail or Proton message gets one label, the group's name after the prefix
+    ([DEC-2026-10-13-labels](#dec-2026-10-13-labels)). `neomail classify` and the daemon write it
+    in the same pass and under the same caps as Outlook's categories
+    ([DEC-2026-10-13-categories](#dec-2026-10-13-categories)). The user's own labels are never
+    touched: neomail removes only the name it wrote before.
+  - Gmail is an account on `imap.gmail.com` whose server has the `X-GM-EXT-1` capability. It is
+    labelled over IMAP with `X-GM-LABELS`, adding and removing single names, never replacing a
+    message's set
+    ([Gmail's IMAP extensions](https://developers.google.com/workspace/gmail/imap/imap-extensions)).
+  - Proton is an account with Bridge's shape in the config (127.0.0.1 and a pinned certificate)
+    whose server lists Bridge's `Labels` and `Folders`. A label is a copy into `Labels/<name>`.
+    neomail's earlier label is removed by marking and expunging exactly that message's UIDs in
+    that label's mailbox, only on a server that advertises UIDPLUS
+    ([RFC 4315, section 2.1](https://www.rfc-editor.org/rfc/rfc4315#section-2.1)). Otherwise,
+    and for a message without a Message-ID, the old label stays and a warning says so.
+  - Other IMAP servers get no labels, so neomail signs in to them only when spam is due a move
+    to Junk.
+  - neomail creates its own labels when they are missing and keeps them. It never renames or
+    deletes a label.
+  - Spam at or above `classify.junk_at` (0.9 by default) is labelled, then moved to the account's
+    Junk folder: the mailbox IMAP marks `\Junk`, or Outlook's `junkemail`. `classify.junk = false`
+    moves nothing. Without a Junk folder or MOVE, nothing moves and a warning says so. Which
+    messages are due a move is worked out apart from labels, so a failed move is tried again.
+  - A message moves to Junk at most once: the move is recorded before it is made, and a message
+    the user moves back is never moved again. Spam classified before this slice moves too, under
+    the same caps.
+- **Builds on:** [DEC-2026-10-13-labels](#dec-2026-10-13-labels),
+  [DEC-2026-10-13-categories](#dec-2026-10-13-categories), and the "Spam" bullet under
+  [Classification](#classification-jev).
 
 ### <a id="dec-2026-10-13-archive-delete"></a>DEC-2026-10-13-archive-delete: archiving and deleting mail from the CLI
 
