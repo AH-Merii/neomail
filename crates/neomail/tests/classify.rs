@@ -3,204 +3,19 @@
 //! opened, and nothing sleeps: retries are told to wait 0 seconds.
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
 
-use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, Utc};
 use nm_core::{Cache, FetchedMessage, Flags, Uid, UidValidity};
 use serde_json::{Value, json};
 
+#[path = "support/fake_jev.rs"]
+mod fake_jev;
+use fake_jev::{FakeJev, GROUPS, Reply, default_answer};
+
 const KEY: &str = "fake-jev-key-0123";
-
-/// One scripted answer.
-#[derive(Clone)]
-struct Reply {
-    status: u16,
-    headers: Vec<(&'static str, &'static str)>,
-    body: String,
-}
-
-impl Reply {
-    fn status(status: u16, body: &str) -> Self {
-        Reply {
-            status,
-            headers: Vec::new(),
-            body: body.to_owned(),
-        }
-    }
-}
-
-/// A request the fake received.
-struct Captured {
-    /// The request line, such as `POST /v1/systemone HTTP/1.1`.
-    request_line: String,
-    content_type: Option<String>,
-    authorization: Option<String>,
-    body: String,
-}
-
-impl Captured {
-    fn json(&self) -> Value {
-        serde_json::from_str(&self.body).unwrap()
-    }
-}
-
-/// jev on 127.0.0.1: it records every request and plays the scripted replies in order, then
-/// answers each request by its subject (see [`default_answer`]). One connection at a time.
-struct FakeJev {
-    port: u16,
-    captured: Arc<Mutex<Vec<Captured>>>,
-    script: Arc<Mutex<VecDeque<Reply>>>,
-}
-
-impl FakeJev {
-    fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let script = Arc::new(Mutex::new(VecDeque::new()));
-        let (c, s) = (captured.clone(), script.clone());
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
-                serve(stream, &c, &s);
-            }
-        });
-        FakeJev {
-            port,
-            captured,
-            script,
-        }
-    }
-
-    fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
-
-    fn play(&self, replies: impl IntoIterator<Item = Reply>) {
-        self.script.lock().unwrap().extend(replies);
-    }
-
-    fn count(&self) -> usize {
-        self.captured.lock().unwrap().len()
-    }
-
-    fn bodies(&self) -> Vec<Value> {
-        self.captured
-            .lock()
-            .unwrap()
-            .iter()
-            .map(Captured::json)
-            .collect()
-    }
-}
-
-fn serve(stream: TcpStream, captured: &Mutex<Vec<Captured>>, script: &Mutex<VecDeque<Reply>>) {
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
-        return;
-    }
-    let request_line = request_line.trim_end().to_owned();
-    let (mut length, mut authorization, mut content_type) = (0, None, None);
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            return;
-        }
-        let line = line.trim_end();
-        if line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            match name.to_ascii_lowercase().as_str() {
-                "content-length" => length = value.trim().parse().unwrap(),
-                "authorization" => authorization = Some(value.trim().to_owned()),
-                "content-type" => content_type = Some(value.trim().to_owned()),
-                _ => {}
-            }
-        }
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).unwrap();
-    let body = String::from_utf8(body).unwrap();
-    let reply = script
-        .lock()
-        .unwrap()
-        .pop_front()
-        .unwrap_or_else(|| default_answer(&body));
-    captured.lock().unwrap().push(Captured {
-        request_line,
-        content_type,
-        authorization,
-        body,
-    });
-    let mut head = format!(
-        "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-         Connection: close\r\n",
-        reply.status,
-        reply.body.len()
-    );
-    for (name, value) in &reply.headers {
-        head.push_str(&format!("{name}: {value}\r\n"));
-    }
-    let mut stream = stream;
-    let _ = stream.write_all(format!("{head}\r\n{}", reply.body).as_bytes());
-}
-
-/// jev's answer for a subject whose first word is the choice, with confidence 0.2 when the
-/// second word is "unsure" and 0.9 otherwise: "spam unsure Win" answers spam with 0.2. A subject
-/// that starts with no option's name answers main.
-fn default_answer(request: &str) -> Reply {
-    let request: Value = serde_json::from_str(request).unwrap();
-    let subject = request["state"]["subject"].as_str().unwrap_or("");
-    let mut words = subject.split_whitespace();
-    let choice = words
-        .next()
-        .filter(|w| GROUPS.contains(w))
-        .unwrap_or("main");
-    let confidence = if words.next() == Some("unsure") {
-        0.2
-    } else {
-        0.9
-    };
-    Reply::status(200, &answer(choice, confidence))
-}
-
-/// The ten options, in the order the request lists them.
-const GROUPS: [&str; 10] = [
-    "main",
-    "follow-up",
-    "recruitment",
-    "receipts-invoices",
-    "orders-shipping",
-    "newsletters",
-    "promotions",
-    "notifications",
-    "spam",
-    "other",
-];
-
-/// A choice answer as https://docs.typesafe.ai/api.md gives one.
-fn answer(choice: &str, confidence: f64) -> String {
-    let probabilities: serde_json::Map<String, Value> = GROUPS
-        .iter()
-        .map(|g| (g.to_string(), json!(if *g == choice { 0.9 } else { 0.01 })))
-        .collect();
-    json!({
-        "model": "jev-1.13.0",
-        "answers": {"group": {
-            "type": "choice", "choice": choice,
-            "probabilities": probabilities, "confidence": confidence
-        }},
-        "usage": {"input_tokens": 400, "output_tokens": 20}
-    })
-    .to_string()
-}
 
 /// A message `days` old, from `from`, with a Message-ID made from `uid`.
 fn mail(uid: u32, days: i64, from: &str, subject: &str, body: &str) -> FetchedMessage {
@@ -255,7 +70,8 @@ fn copy_to(dir: &Path, mailbox: &str, messages: &[FetchedMessage]) {
     cache.insert_messages(copy.id, messages).unwrap();
 }
 
-/// The binary with its data and config in `dir`, the fake key in JEV_API_KEY, and no keyring.
+/// The binary with its data and config in `dir`, the fake key in JEV_API_KEY, and the debug
+/// build's file keyring in `dir` (empty unless a test stores a key), so never the system's.
 fn command(dir: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_neomail"));
     c.args(args)
@@ -264,7 +80,7 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         .env("HOME", dir)
         .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
         .env("JEV_API_KEY", KEY)
-        .env_remove("NEOMAIL_TEST_KEYRING")
+        .env("NEOMAIL_TEST_KEYRING", dir.join("test-keyring.json"))
         .env_remove("NEOMAIL_NO_INPUT")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
@@ -1272,4 +1088,22 @@ fn a_closed_output_ends_quietly_and_every_answer_that_arrived_is_stored() {
         12 - sent,
         "{sent} requests answered"
     );
+}
+
+#[test]
+fn the_help_says_yes_covers_the_daemon_only_without_an_earlier_yes() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = neomail(dir.path(), &["classify", "--help"]);
+    assert!(o.status.success());
+    let flat = stdout(&o).split_whitespace().collect::<Vec<_>>().join(" ");
+    for part in [
+        "With no earlier yes for the host it is remembered, as a typed yes is, and `neomail \
+         daemon` then also classifies new mail",
+        "covers the daemon only after a yes to its question on a terminal",
+        "--yes gives it only when there is no earlier yes for the host: a yes from before the \
+         daemon classified needs the daemon's question, asked on a terminal even when there is \
+         nothing to send",
+    ] {
+        assert!(flat.contains(part), "{part}: {flat}");
+    }
 }

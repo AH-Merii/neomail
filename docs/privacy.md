@@ -1,9 +1,12 @@
 # Privacy: what leaves your machine
 
 neomail keeps your mail on your machine. Syncing reads it from your provider into a local cache.
-Only `neomail classify`, which you run, sends anything else anywhere.
+Only classification sends anything else anywhere: `neomail classify`, which you run, and, once
+you have agreed to it there, `neomail daemon` for new mail as it arrives.
 
-`neomail classify` sends a short text per message to jev, the classifier. That text is redacted
+`neomail classify` sends a short text per message to jev, the classifier. `neomail daemon` sends
+the same request, built by the same code, for each new message it syncs
+([docs/daemon.md](daemon.md#classifying)). That text is redacted
 first, on your machine, by neomail's own rules: no model and no network call. `neomail redact
 ID...` shows exactly what is sent for cached messages, so you can see what would leave before
 anything does: `--json` gives it exactly, and the terminal and plain forms show it with
@@ -13,8 +16,29 @@ characters made safe. It reads the cache only and sends nothing.
 **Consent, once per backend.** Before the first request to a host, `neomail classify` says what
 will be sent, to which host and under whose terms, and asks yes or no. A yes is remembered for
 that host in `classify-consent` in the data directory (not in the cache, so deleting
-`cache.sqlite3` does not lose it, and not in your config file); `--yes` gives it from a script.
-Without a yes, nothing is sent. `neomail classify --estimate` never sends anything.
+`cache.sqlite3` does not lose it, and not in your config file); `--yes` gives it from a script,
+without showing the question. Without a yes, nothing is sent. `neomail classify --estimate` never
+sends anything. To withdraw a yes, delete the host's line (or the whole file) from
+`classify-consent`: `neomail classify` then asks again, and a running daemon stops the next time
+it syncs with mail to classify and says why.
+
+A yes, or `--yes` with no earlier yes for the host, also covers `neomail daemon`; the question
+and `neomail classify --help` say so. From then on the daemon also sends each new message to that
+host as it arrives, unless `classify.daemon = false` is in your config.
+A yes given before the daemon classified answered a question that did not mention it, so it
+covers `neomail classify` only, and `neomail classify --yes` sends on it without turning it into
+the daemon's. `neomail classify` on a terminal then asks whether the daemon may send too, also
+when it has nothing to send: the answer does not change that run, which sends on the earlier yes,
+and a no (or closing the input) keeps that yes for `neomail classify` only and is asked again on
+the next run on a terminal. With `classify.daemon = false` or `--yes` it does not ask. The daemon
+waits until that question gets a yes. The daemon never asks itself. Without a yes for the host, or
+without a key, it sends nothing and says once why classifying is off. `classify.daemon = false`
+stops it from the next round without a restart, as the config is read again each round.
+`neomail key delete` stops it the next time it syncs with mail to classify, unless `JEV_API_KEY`
+is set in the daemon's environment, which it then falls back to. It sends mail received in the
+last 365 days only, never an account's first sync, and at most 100 messages each time it syncs (a
+round, a push sync or an Outlook check), each tried up to three times; the rest wait for the next
+time it syncs. A 402 (no credit left) pauses it for an hour, or until the key changes.
 
 ## What will be sent
 
@@ -65,7 +89,11 @@ machine.
 the model, the tokens it used and when) is stored in the local cache, `cache.sqlite3` in the data
 directory, keyed by account and Message-ID (a hash of the message without one), as soon as it
 arrives. It outlives a mailbox rebuild (a UIDVALIDITY change, which gives the mailbox's messages
-new ids), so the same mail is never sent twice unless you ask with `--again`. Deleting
+new ids), so mail with a stored answer is never sent again unless you ask with `--again`. A
+message without one can be sent twice: a request abandoned by Ctrl-C or SIGTERM, or ended by an
+outage or a timeout, is sent again later, and `neomail classify` running while the daemon
+classifies may ask about a message the daemon is asking about
+([daemon.md](daemon.md#classifying)). Deleting
 `cache.sqlite3` deletes the stored answers too, and the next run sends that mail again. Nothing is
 written to your mail server.
 

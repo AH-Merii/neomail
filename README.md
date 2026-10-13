@@ -168,6 +168,7 @@ url = "https://api.typesafe.ai"   # the backend's base URL; requests go to {url}
 model = "jev-1.13.0"              # pinned, so stored confidences stay comparable
 other_below = 0.4                 # below this confidence a message lists as `other`
 follow_up_old_days = 90           # a `follow-up` older than this lists as `follow-up-old`
+daemon = true                     # `neomail daemon` classifies new mail once you have consented
 ```
 
 - `url` must be `https://`, except for a backend on this machine: `http://127.0.0.1`,
@@ -275,9 +276,11 @@ neomail forward 42 --to ada@example.com                          # forward its t
   what the `neomail classify --all` it suggests would send and cost: every message still without
   a group, or with `--again` every message again (TypeSafe charges $0.042 per million input
   tokens).
-  `--estimate` prints that and sends nothing. A message is never asked about twice, even after a
-  mailbox rebuild (a UIDVALIDITY change), unless `--again`; deleting `cache.sqlite3` deletes the
-  stored results too. `neomail classify 42 57` classifies those messages.
+  `--estimate` prints that and sends nothing. A stored result is never asked for again, even after
+  a mailbox rebuild (a UIDVALIDITY change), unless `--again`; deleting `cache.sqlite3` deletes the
+  stored results too. Stopping a run during a request, or running it while the daemon classifies,
+  can pay for one message twice ([docs/daemon.md](docs/daemon.md#classifying)).
+  `neomail classify 42 57` classifies those messages.
 - `neomail list --group G` lists one group: `main`, `follow-up`, `follow-up-old`, `recruitment`,
   `receipts-invoices`, `orders-shipping`, `newsletters`, `promotions`, `notifications`, `spam`,
   `other`, or `unclassified`. On a terminal `list` shows each message's group once any is
@@ -377,6 +380,12 @@ new mail arrives, naming the sender and subject (`--no-notify` turns them off). 
 arrives. Outlook accounts are checked every minute through Graph's delta query, since Graph has no
 push for a program on your computer. To run it as a systemd, OpenRC or runit user service, and for
 what its output means, see [docs/daemon.md](docs/daemon.md).
+
+Once you have agreed to classification through `neomail classify` and stored a key, the daemon also
+classifies new mail as it arrives, with the same request, at most 100 messages each time it syncs
+(a round, a push sync or an Outlook check), so `neomail list --group` stays current. It never asks
+for consent itself, and leaves an account's first sync to `neomail classify`;
+`classify.daemon = false` turns it off ([docs/daemon.md](docs/daemon.md#classifying)).
 
 How it fits together: [docs/architecture.md](docs/architecture.md).
 

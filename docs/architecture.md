@@ -262,7 +262,7 @@ with looser modes (`neomail/src/main.rs`, `restrict_cache_files`). Tables:
 - `classification (account, msg_key, choice, confidence, probabilities, model, request_version,
   input_tokens, classified_at)`: one classifier answer per message, as given. It is keyed by
   account and `msg_key`, not by `message.id`, because rebuilding a mailbox deletes its rows and
-  gives them new ids, and an answer must outlive that so no message is paid for twice.
+  gives them new ids, and an answer must outlive that so a rebuild pays for no message again.
 
 The group a message lists under is worked out when the cache is read, in one place:
 `GroupRules::effective` (`nm-core/src/group.rs`), which `Cache::list_grouped` applies to each row
@@ -511,7 +511,8 @@ read before the tokio runtime starts (keyring.rs says why). `send` runs 4 worker
 current-thread runtime, each taking the next request off a shared queue, one connection per
 request; the main loop stores each answer with `Cache::store_classification` as it arrives,
 then prints it, so a stopped run resumes where it left off. A worker's `Stop` (401, 403, an
-unexpected status, an unreachable backend) stops the others taking new requests.
+unexpected status, an unreachable backend) stops the others taking new requests. `neomail
+daemon` sends through the same `send` (see [The daemon](#the-daemon)).
 
 Debug builds open a JSON file named by `NEOMAIL_TEST_KEYRING` instead of the OS keyring
 (`keyring/test_store.rs`), so the CLI tests can store a key in one process and read it in the
@@ -633,6 +634,42 @@ notifications, so a service that does not answer costs one timeout per round, no
 (two in the round where `ready` finds it: the lookup and the first `Notify` each have their own); a
 stop request ends them too. No trait: there is one notifier per platform, the tests pass a closure,
 and the D-Bus call is tested against a zbus server on a socket pair.
+
+**Classifying in the daemon** (`neomail/src/classify/daemon.rs`) comes after the notifications,
+in the same wake: `daemon::after_sync` notifies first and then calls the classifier, which only
+returns lines, so a notification never waits for jev and no classifying failure reaches the sync.
+Only a wake that synced calls it (`Wake::syncs`: a round, a resume or an account wake); a
+watcher's other news does not, so the classifier's cap and budget hold per sync.
+It takes the same `NewMail` as the notifications, so a first sync or a rebuild is never sent.
+`Classifier` owns the daemon's rules: the gate (`classify.daemon`, then a key, then the consent
+`neomail classify` stored for the host, in 10a's order; only a `HOST daemon` line, written by the
+question that names the daemon, counts, not 10a's bare `HOST`), the in-memory queue that holds what is
+over 100 messages a wake or what a stopped run put back (dropped, with a count in the state line,
+when classifying turns off or pauses, but kept while the keyring fails to answer or a 402 pauses it), the pause after a
+stop that would come back at every wake (`Outcome::repeats`: the SHA-256 of a refused key, or
+`classify.url` and `classify.model` after an answer that is not jev's or a 400 or 404, or for a
+402 the key's SHA-256 and the wake's time plus `CREDIT_PAUSE`, an hour; no key is held while
+paused), and the state it last
+reported, so each reason is said once. It sends nothing of its own: `job_for` reads
+a message through `classify.rs`'s `Reader`, the one place that builds a request, with
+`classify`'s rules for one message (the 365-day window, a stored result, a copy in another
+mailbox), and `classify::send` sends the jobs as `neomail classify` does. `send` takes the
+caller's runtime, a stop flag and a `Sink`: the terminal's `Printer` is one, the daemon's per
+account tally another, which keeps no subject or sender. The flag is the daemon's signal flag:
+no worker takes a request after it, and a request in flight or a retry's wait ends within 50 ms.
+The daemon also passes a deadline, `classify::daemon::BUDGET` (60 s) or the interval if shorter,
+counted from the start of its classifying: no request starts after it and no retry waits past it
+(the run stops instead), but a request in flight is still answered and stored, so a wake ends
+within the budget plus one request's `http::TIMEOUT`. What is left comes back in `Outcome::retry`
+and waits for the next wake; a failure to store or print a result comes back in `Outcome::error`
+next to it, so the daemon puts back only `retry` and a 422 is never asked again. `neomail classify` passes no deadline.
+The key and the consent come through an `Access` trait, the keyring and the consent file in the
+daemon and fixed answers in the tests, so the tests open no keyring. `Access::key` tells a
+keyring that fails to answer (with no `JEV_API_KEY`) from one with no entry; the key is read outside
+`block_on`, at the start and again at each wake with work, as the consent is, so a deleted key
+stops the daemon's requests without a restart. The tests run the
+`Classifier` against the fake jev (`neomail/tests/support/fake_jev.rs`, shared with
+`tests/classify.rs` by `#[path]`, as the crate has no library target) and a cache in memory.
 
 `sync_inbox` (`nm-core/src/sync.rs`) runs once per account:
 
