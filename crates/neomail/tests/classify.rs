@@ -70,7 +70,8 @@ fn copy_to(dir: &Path, mailbox: &str, messages: &[FetchedMessage]) {
     cache.insert_messages(copy.id, messages).unwrap();
 }
 
-/// The binary with its data and config in `dir`, the fake key in JEV_API_KEY, and no keyring.
+/// The binary with its data and config in `dir`, the fake key in JEV_API_KEY, and the debug
+/// build's file keyring in `dir` (empty unless a test stores a key), so never the system's.
 fn command(dir: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_neomail"));
     c.args(args)
@@ -79,7 +80,7 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         .env("HOME", dir)
         .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
         .env("JEV_API_KEY", KEY)
-        .env_remove("NEOMAIL_TEST_KEYRING")
+        .env("NEOMAIL_TEST_KEYRING", dir.join("test-keyring.json"))
         .env_remove("NEOMAIL_NO_INPUT")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")

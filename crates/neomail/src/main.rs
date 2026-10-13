@@ -350,8 +350,11 @@ enum Command {
     #[cfg(unix)]
     #[command(
         after_help = "It also classifies new mail as it arrives, with the request `neomail classify` sends, once \
-`neomail classify` has your consent for the backend and a key is stored; it never asks. \
-`classify.daemon = false` in the config turns that off.\n\n\
+`neomail classify` has your consent for the backend and there is a key (`neomail key set` or JEV_API_KEY); \
+it never asks. A consent given before neomail daemon classified covers `neomail classify` only: run \
+`neomail classify` on a terminal to give it again. It sends at most 100 messages each time it syncs (a \
+round, a push sync or an Outlook check); the rest wait for the next. `classify.daemon = false` in the \
+config turns that off.\n\n\
 Guide: https://github.com/AH-Merii/neomail/blob/main/docs/daemon.md"
     )]
     Daemon {

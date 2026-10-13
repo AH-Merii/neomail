@@ -605,9 +605,11 @@ It takes the same `NewMail` as the notifications, so a first sync or a rebuild i
 `neomail classify` stored for the host, in 10a's order; only a `HOST daemon` line, written by the
 question that names the daemon, counts, not 10a's bare `HOST`), the in-memory queue that holds what is
 over 100 messages a wake or what a stopped run put back (dropped, with a count in the state line,
-when classifying turns off or pauses, but kept while the keyring fails to answer), the pause after a stop that would come
-back at every wake (`Outcome::repeats`: the SHA-256 of a refused key, or `classify.url` and
-`classify.model` after an answer that is not jev's or a 400 or 404), and the state it last
+when classifying turns off or pauses, but kept while the keyring fails to answer or a 402 pauses it), the pause after a
+stop that would come back at every wake (`Outcome::repeats`: the SHA-256 of a refused key, or
+`classify.url` and `classify.model` after an answer that is not jev's or a 400 or 404, or for a
+402 the key's SHA-256 and the wake's time plus `CREDIT_PAUSE`, an hour; no key is held while
+paused), and the state it last
 reported, so each reason is said once. It sends nothing of its own: `job_for` reads
 a message through `classify.rs`'s `Reader`, the one place that builds a request, with
 `classify`'s rules for one message (the 365-day window, a stored result, a copy in another

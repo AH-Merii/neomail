@@ -8,8 +8,9 @@
 //! wait in memory for the next wake, as do the messages of a run that stopped. A stop that
 //! would happen again on every wake pauses classifying instead: a refused key until the key
 //! read differs, an answer that is not jev's or a 4xx such as 404 until `classify.url` or
-//! `classify.model` does. What waits is lost when the daemon ends, and `neomail classify`
-//! still finds it.
+//! `classify.model` does, and a 402 (no credit left) for [`CREDIT_PAUSE`] or until the key
+//! differs, while what waits stays queued. What waits is lost when the daemon ends, and
+//! `neomail classify` still finds it.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -37,6 +38,9 @@ pub const PER_WAKE: usize = 100;
 /// rate-limited jev cannot hold up the next sync and its notifications. A request in flight
 /// still gets its answer, within `http::TIMEOUT`.
 pub const BUDGET: Duration = Duration::from_secs(60);
+
+/// How long a 402 (out of credit) pauses classifying, unless the key changes first.
+pub const CREDIT_PAUSE: TimeDelta = TimeDelta::hours(1);
 
 /// How long a wake classifies: [`BUDGET`], or `interval` when the rounds are closer together
 /// than that.
@@ -97,6 +101,9 @@ enum State {
     NoConsent(String),
     /// A stop that would repeat ([`Pause`]); the reason, with the status.
     Paused(String),
+    /// Out of credit (a 402) until a time ([`Pause::Credit`]); the reason, with that time. What
+    /// waits stays queued, as do new messages.
+    NoCredit(String),
     /// The settings, the keyring or the consent file cannot be read. What waits is kept, as
     /// this may pass by the next wake.
     Broken(String),
@@ -116,7 +123,7 @@ impl State {
                 "classifying off: {host} needs your consent once; run `neomail classify` on a \
                  terminal"
             ),
-            State::Paused(why) => format!("classifying paused: {why}"),
+            State::Paused(why) | State::NoCredit(why) => format!("classifying paused: {why}"),
             State::Broken(why) => format!("classifying off: {why}"),
         }
     }
@@ -142,7 +149,8 @@ impl State {
 pub struct Classifier {
     /// Messages for the next wake, oldest first, with their account.
     queue: VecDeque<(String, MessageId)>,
-    /// The key the last gate read; none once classifying is off.
+    /// The key the last gate read; none once classifying is off or paused, when only its digest
+    /// is kept ([`Pause`]).
     key: Option<Secret>,
     /// What the last stop that would repeat was given, and why it stopped.
     paused: Option<(Pause, String)>,
@@ -162,7 +170,7 @@ impl Classifier {
             state: State::Disabled,
             last_stop: None,
         };
-        classifier.state = classifier.gate(settings, access);
+        classifier.state = classifier.gate(settings, access, Utc::now());
         classifier
     }
 
@@ -179,8 +187,14 @@ impl Classifier {
 
     /// Whether to classify now. Reads the key anew each time, as the consent: a key deleted
     /// with `neomail key delete` or changed with `neomail key set` counts from the next wake
-    /// with work, not from the next start.
-    fn gate(&mut self, settings: &ClassifySettings, access: &mut dyn Access) -> State {
+    /// with work, not from the next start. `now` is the wake's time, against which a pause for
+    /// credit ends.
+    fn gate(
+        &mut self,
+        settings: &ClassifySettings,
+        access: &mut dyn Access,
+        now: DateTime<Utc>,
+    ) -> State {
         self.key = None;
         if !settings.daemon {
             return State::Disabled;
@@ -197,12 +211,19 @@ impl Classifier {
             return State::NoKey;
         };
         if let Some((pause, why)) = &self.paused {
-            let same = match pause {
-                Pause::Key(digest) => *digest == sha256(key),
-                Pause::Settings { url, model } => *url == settings.url && *model == settings.model,
+            let state = match pause {
+                Pause::Key(digest) => (*digest == sha256(key)).then(|| State::Paused(why.clone())),
+                Pause::Settings { url, model } => (*url == settings.url
+                    && *model == settings.model)
+                    .then(|| State::Paused(why.clone())),
+                Pause::Credit { key: digest, until } => {
+                    (*digest == sha256(key) && now < *until).then(|| State::NoCredit(why.clone()))
+                }
             };
-            if same {
-                return State::Paused(why.clone());
+            if let Some(state) = state {
+                // Nothing is sent while paused, so only the refused key's digest is kept.
+                self.key = None;
+                return state;
             }
             self.paused = None;
         }
@@ -216,7 +237,7 @@ impl Classifier {
     /// Reports `state` when it differs from the last one. Unless classifying is on or broken
     /// (which may pass), drops what waits, and the line says how many.
     fn report(&mut self, state: State, lines: &mut Vec<Line>) {
-        let dropped = if matches!(state, State::On(_) | State::Broken(_)) {
+        let dropped = if matches!(state, State::On(_) | State::Broken(_) | State::NoCredit(_)) {
             0
         } else {
             let n = self.queue.len();
@@ -254,6 +275,9 @@ enum Pause {
     /// `classify.url` and `classify.model` when the backend's answer was not jev's, or a 4xx
     /// that every request would get.
     Settings { url: String, model: String },
+    /// A 402: the SHA-256 of the key that has no credit, and the wake's time from which
+    /// classifying tries again.
+    Credit { key: Vec<u8>, until: DateTime<Utc> },
 }
 
 fn sha256(key: &Secret) -> Vec<u8> {
@@ -300,8 +324,16 @@ impl Classifier {
         if new_mail.is_empty() && self.queue.is_empty() {
             return lines;
         }
-        let state = self.gate(wake.settings, access);
+        let state = self.gate(wake.settings, access, wake.now);
         self.report(state, &mut lines);
+        if matches!(self.state, State::NoCredit(_)) {
+            // Waits for the credit, with what waited before.
+            for new in new_mail {
+                self.queue
+                    .extend(new.ids.iter().map(|id| (new.account.clone(), *id)));
+            }
+            return lines;
+        }
         if !matches!(self.state, State::On(_)) {
             // Mail that came while off is left to `neomail classify`; what waited was dropped
             // by `report` unless this may pass.
@@ -373,11 +405,31 @@ impl Classifier {
                         "{stopped}; change classify.url or classify.model, or restart the daemon"
                     ),
                 ),
+                Repeats::Credit => {
+                    let until = wake.now + CREDIT_PAUSE;
+                    let at = until.with_timezone(&chrono::Local).format("%H:%M");
+                    (
+                        Pause::Credit {
+                            key: sha256(&key),
+                            until,
+                        },
+                        format!(
+                            "{stopped}; the jev account is out of credit; trying again at {at}, \
+                             or sooner if the key changes"
+                        ),
+                    )
+                }
             };
-            self.paused = Some((pause, why.clone()));
-            // `report` drops them with the rest of what waits, and says how many.
+            let state = match pause {
+                Pause::Credit { .. } => State::NoCredit(why.clone()),
+                _ => State::Paused(why.clone()),
+            };
+            self.paused = Some((pause, why));
+            self.key = None;
+            // `report` drops them with the rest of what waits and says how many, unless they
+            // wait for the credit.
             self.requeue(asked.into_iter().filter(|(_, id)| retry.contains(id)));
-            self.report(State::Paused(why), &mut lines);
+            self.report(state, &mut lines);
             None
         } else {
             // A message that ran out of tries, or whose result could not be stored, waits for

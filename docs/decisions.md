@@ -949,13 +949,16 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
     slice on, the consent text says the daemon then sends new mail as it arrives
     ([DEC-2026-10-13-classify-send](#dec-2026-10-13-classify-send)). A yes given before, to a
     question that didn't mention the daemon, still covers `neomail classify` but not the daemon,
-    which waits for a yes to the new question.
+    which waits for a yes to the new question on a terminal; `--yes` never turns the earlier yes
+    into the daemon's.
   - `classify.daemon = false` turns it off; it is on by default.
-  - A round sends at most 100 requests; the rest wait in memory for the next round. Mail older
-    than 365 days is skipped, as `neomail classify` skips it.
-  - A refused key pauses classifying until the key changes. An answer that would come back every
-    round (one that isn't jev's, or a status such as 400 or 404) pauses it until `classify.url`
-    or `classify.model` changes. A stopped run puts its messages back for the next round.
+  - Each time the daemon syncs (a round, a push sync or an Outlook check) it sends at most 100
+    requests; the rest wait in memory for the next time. Mail older than 365 days is skipped, as
+    `neomail classify` skips it.
+  - A refused key pauses classifying until the key changes. A 402 (no credit left) pauses it for
+    an hour, or until the key changes. An answer that would come back every time (one that isn't
+    jev's, or a status such as 400 or 404) pauses it until `classify.url` or `classify.model`
+    changes. A stopped run puts its messages back for the next time.
   - Notifications don't change: they never wait for a group
     ([DEC-2026-10-12-daemon-notifications](#dec-2026-10-12-daemon-notifications)).
 - **Builds on:** [DEC-2026-10-13-classify](#dec-2026-10-13-classify) and

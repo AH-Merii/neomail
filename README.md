@@ -337,11 +337,11 @@ arrives. Outlook accounts are checked every minute through Graph's delta query, 
 push for a program on your computer. To run it as a systemd, OpenRC or runit user service, and for
 what its output means, see [docs/daemon.md](docs/daemon.md).
 
-Once you have agreed to classification through `neomail classify` and stored a key, the daemon
-also classifies new mail as it arrives, with the same request, at most 100 messages a round, so
-`neomail list --group` stays current. It never asks for consent itself, and leaves an account's
-first sync to `neomail classify`; `classify.daemon = false` turns it off
-([docs/daemon.md](docs/daemon.md#classifying)).
+Once you have agreed to classification through `neomail classify` and stored a key, the daemon also
+classifies new mail as it arrives, with the same request, at most 100 messages each time it syncs
+(a round, a push sync or an Outlook check), so `neomail list --group` stays current. It never asks
+for consent itself, and leaves an account's first sync to `neomail classify`;
+`classify.daemon = false` turns it off ([docs/daemon.md](docs/daemon.md#classifying)).
 
 How it fits together: [docs/architecture.md](docs/architecture.md).
 

@@ -17,8 +17,8 @@ const PATIENCE: Duration = Duration::from_secs(60);
 /// The start line's words on classifying when there is no jev key.
 const NO_KEY: &str = "classifying off: no jev key (run `neomail key set` or set JEV_API_KEY)";
 
-/// The binary with its data and config in `data`, no keyring, no jev key and no network but
-/// 127.0.0.1.
+/// The binary with its data and config in `data`, the debug build's file keyring there (empty,
+/// so never the system's), no jev key and no network but 127.0.0.1.
 fn command(data: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_neomail"));
     c.args(args)
@@ -28,7 +28,7 @@ fn command(data: &Path, args: &[&str]) -> Command {
         .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
         .env("BROWSER", "true")
         .env_remove("JEV_API_KEY")
-        .env_remove("NEOMAIL_TEST_KEYRING")
+        .env("NEOMAIL_TEST_KEYRING", data.join("test-keyring.json"))
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("NO_COLOR")
@@ -350,4 +350,21 @@ fn without_accounts_or_with_a_bad_interval_the_daemon_is_a_usage_error() {
         );
     }
     assert!(!data.join("daemon.lock").exists(), "nothing started");
+}
+
+#[test]
+fn the_help_names_both_key_sources_the_old_consent_and_the_cap_per_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = command(dir.path(), &["daemon", "--help"]).output().unwrap();
+    assert!(o.status.success());
+    let help = String::from_utf8(o.stdout).unwrap();
+    let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    for part in [
+        "there is a key (`neomail key set` or JEV_API_KEY)",
+        "A consent given before neomail daemon classified covers `neomail classify` only: run \
+         `neomail classify` on a terminal to give it again",
+        "at most 100 messages each time it syncs (a round, a push sync or an Outlook check)",
+    ] {
+        assert!(flat.contains(part), "{part}: {help}");
+    }
 }

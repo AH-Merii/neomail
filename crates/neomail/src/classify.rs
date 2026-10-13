@@ -282,43 +282,73 @@ fn consent_text(host: &str, messages: usize) -> String {
     )
 }
 
+/// What is said to a user whose yes is from before the daemon classified ([`Consent::Classify`]).
+fn daemon_text(host: &str) -> String {
+    format!(
+        "You agreed to send to {host} from `neomail classify`. `neomail daemon` can now also send\n\
+         each new message as it arrives, the same request as `neomail classify` sends\n\
+         (classify.daemon = false turns that off). This run sends either way; a no keeps your\n\
+         earlier consent for `neomail classify` only, and this question comes back on the next\n\
+         run on a terminal.\n"
+    )
+}
+
 /// Asks once per host, unless `yes`; a yes is remembered. Without a terminal or with
-/// `--no-input`, and no earlier yes, it is a usage error and nothing is sent. A yes from before
-/// the daemon classified ([`Consent::Classify`]) still lets this run send without a terminal,
-/// but on one the question, which now names the daemon, is asked again once.
+/// `--no-input`, and no earlier yes, it is a usage error and nothing is sent.
+///
+/// A yes from before the daemon classified ([`Consent::Classify`]) still lets this run send,
+/// and is never turned into the daemon's consent without its question: with `yes` or without a
+/// terminal nothing is asked or written, and with `classify.daemon = false` (`daemon`) nothing
+/// is asked either. Otherwise `ask` puts the question that names the daemon, and a no is not
+/// remembered, so it is asked again on the next run on a terminal.
+///
+/// `ask` shows a text and a prompt and returns the answer.
 fn ensure_consent(
     data_dir: &Path,
     host: &str,
     yes: bool,
+    daemon: bool,
     input: Input,
     messages: usize,
+    ask: &mut dyn FnMut(&str, &str) -> Result<String>,
 ) -> Result<bool> {
-    let given = consent(data_dir, host)?;
-    if given == Consent::Daemon {
-        return Ok(true);
-    }
-    if yes {
-        remember_consent(data_dir, host)?;
-        return Ok(true);
-    }
-    if !input.can_prompt() {
-        if given == Consent::Classify {
-            return Ok(true);
+    let agreed = |answer: String| matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes");
+    match consent(data_dir, host)? {
+        Consent::Daemon => Ok(true),
+        Consent::Classify => {
+            if !yes && daemon && input.can_prompt() {
+                let prompt = format!("Let `neomail daemon` send new mail to {host} too? [y/N] ");
+                if agreed(ask(&daemon_text(host), &prompt)?) {
+                    remember_consent(data_dir, host)?;
+                }
+            }
+            Ok(true)
         }
-        return Err(usage(format!(
+        Consent::None if yes => {
+            remember_consent(data_dir, host)?;
+            Ok(true)
+        }
+        Consent::None if !input.can_prompt() => Err(usage(format!(
             "nothing was sent: {host} needs your consent once; run `neomail classify` on a \
              terminal, or pass --yes ({})",
             input.why_not()
-        )));
+        ))),
+        Consent::None => {
+            let prompt = format!("Send to {host}? [y/N] ");
+            if agreed(ask(&consent_text(host, messages), &prompt)?) {
+                remember_consent(data_dir, host)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
     }
-    eprint!("{}", consent_text(host, messages));
-    let answer = secret::prompt_line(&format!("Send to {host}? [y/N] "))?;
-    if matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") {
-        remember_consent(data_dir, host)?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+}
+
+/// Shows `text` on standard error and asks `prompt` on the terminal.
+fn ask_terminal(text: &str, prompt: &str) -> Result<String> {
+    eprint!("{text}");
+    secret::prompt_line(prompt)
 }
 
 /// One message to ask about: where its result goes, and the request, built before any is sent.
@@ -678,7 +708,16 @@ pub fn run(
             bail!("{}", keyring::NO_JEV_KEY);
         };
         let data_dir = config::data_dir()?;
-        if !ensure_consent(&data_dir, &host, args.yes, input, plan.jobs.len())? {
+        let asked = ensure_consent(
+            &data_dir,
+            &host,
+            args.yes,
+            settings.daemon,
+            input,
+            plan.jobs.len(),
+            &mut ask_terminal,
+        )?;
+        if !asked {
             printer.finish()?;
             eprintln!("neomail: nothing was sent");
             return Ok(ExitCode::from(EXIT_FAILURE));
@@ -1090,9 +1129,11 @@ pub(crate) enum Repeats {
     Key,
     /// The backend answered 2xx with something that is not jev's, or a status that is no rate
     /// limit, no server error and no invalid request (a 400 or a 404, say): it would answer
-    /// every request to `classify.url` for `classify.model` the same. 402 is left out, as
-    /// running out of credit is put right without changing a setting.
+    /// every request to `classify.url` for `classify.model` the same.
     Settings,
+    /// jev answered 402: the account is out of credit, which is put right without changing a
+    /// setting, so only time or another key changes it.
+    Credit,
 }
 
 /// What the workers share. The requests are built; the workers only send them.
@@ -1377,7 +1418,12 @@ async fn ask(shared: &Shared, i: usize) -> Event {
                 );
             }
             Verdict::Stop { status, body } => {
-                let repeats = (status != 402).then_some(Repeats::Settings);
+                let repeats = if status == 402 {
+                    Repeats::Credit
+                } else {
+                    Repeats::Settings
+                };
+                let repeats = Some(repeats);
                 return Event::Stop(format!("jev answered {status}: {body}"), repeats);
             }
         }
@@ -1440,37 +1486,77 @@ mod tests {
         assert_eq!(per_request(None, &[]), None);
     }
 
-    #[test]
-    fn consent_is_remembered_per_host() {
+    const OFF: Input = Input {
+        terminal: false,
+        no_input: false,
+    };
+    const ON: Input = Input {
+        terminal: true,
+        no_input: false,
+    };
+
+    /// A data directory whose consent file holds `lines`.
+    fn consent_file(lines: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
-        let input = Input {
-            terminal: false,
-            no_input: false,
-        };
-        let refused = ensure_consent(&data, "api.typesafe.ai", false, input, 3);
+        std::fs::create_dir_all(&data).unwrap();
+        if !lines.is_empty() {
+            std::fs::write(data.join(CONSENT_FILE), lines).unwrap();
+        }
+        (dir, data)
+    }
+
+    /// Answers `answer` to each question and records the texts and prompts it was shown.
+    fn answering(
+        answer: &str,
+        asked: &mut Vec<String>,
+    ) -> impl FnMut(&str, &str) -> Result<String> {
+        move |text: &str, prompt: &str| {
+            asked.push(format!("{text}{prompt}"));
+            Ok(answer.to_owned())
+        }
+    }
+
+    fn never(_: &str, _: &str) -> Result<String> {
+        panic!("nothing may be asked here")
+    }
+
+    #[test]
+    fn consent_is_remembered_per_host() {
+        let (_dir, data) = consent_file("");
+        let host = "api.typesafe.ai";
+        let refused = ensure_consent(&data, host, false, true, OFF, 3, &mut never);
         assert!(refused.unwrap_err().is::<crate::UsageError>());
-        assert!(ensure_consent(&data, "api.typesafe.ai", true, input, 3).unwrap());
-        assert!(ensure_consent(&data, "api.typesafe.ai", false, input, 3).unwrap());
-        assert!(ensure_consent(&data, "127.0.0.1", false, input, 3).is_err());
-        assert_eq!(consent(&data, "api.typesafe.ai").unwrap(), Consent::Daemon);
+        assert!(ensure_consent(&data, host, true, true, OFF, 3, &mut never).unwrap());
+        assert!(ensure_consent(&data, host, false, true, OFF, 3, &mut never).unwrap());
+        assert!(ensure_consent(&data, "127.0.0.1", false, true, OFF, 3, &mut never).is_err());
+        assert_eq!(consent(&data, host).unwrap(), Consent::Daemon);
+
+        // On a terminal, a no sends nothing and is not remembered; a yes is.
+        let (_dir, data) = consent_file("");
+        let mut asked = Vec::new();
+        let mut no = answering("n", &mut asked);
+        assert!(!ensure_consent(&data, host, false, true, ON, 3, &mut no).unwrap());
+        assert_eq!(consent(&data, host).unwrap(), Consent::None);
+        let mut asked = Vec::new();
+        let mut yes = answering("y", &mut asked);
+        assert!(ensure_consent(&data, host, false, true, ON, 3, &mut yes).unwrap());
+        assert_eq!(consent(&data, host).unwrap(), Consent::Daemon);
+        drop(yes);
+        assert!(
+            asked[0].ends_with("Send to api.typesafe.ai? [y/N] "),
+            "{asked:?}"
+        );
     }
 
     #[test]
     fn a_yes_from_before_the_daemon_covers_neomail_classify_but_not_the_daemon() {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(data.join(CONSENT_FILE), "api.typesafe.ai\n").unwrap();
+        let (_dir, data) = consent_file("api.typesafe.ai\n");
         assert_eq!(
             consent(&data, "api.typesafe.ai").unwrap(),
             Consent::Classify
         );
-        let input = Input {
-            terminal: false,
-            no_input: false,
-        };
-        assert!(ensure_consent(&data, "api.typesafe.ai", false, input, 3).unwrap());
+        assert!(ensure_consent(&data, "api.typesafe.ai", false, true, OFF, 3, &mut never).unwrap());
         assert_eq!(
             consent(&data, "api.typesafe.ai").unwrap(),
             Consent::Classify,
@@ -1478,6 +1564,53 @@ mod tests {
         );
         let mut system = daemon::System { data_dir: data };
         assert!(!daemon::Access::consented(&mut system, "api.typesafe.ai").unwrap());
+    }
+
+    #[test]
+    fn yes_sends_on_a_consent_from_before_the_daemon_and_never_turns_it_into_the_daemons() {
+        for input in [OFF, ON] {
+            let (_dir, data) = consent_file("api.typesafe.ai\n");
+            let sent = ensure_consent(&data, "api.typesafe.ai", true, true, input, 3, &mut never);
+            assert!(sent.unwrap(), "{input:?}");
+            let file = std::fs::read_to_string(data.join(CONSENT_FILE)).unwrap();
+            assert_eq!(file, "api.typesafe.ai\n", "{input:?}");
+            let mut system = daemon::System { data_dir: data };
+            assert!(!daemon::Access::consented(&mut system, "api.typesafe.ai").unwrap());
+        }
+    }
+
+    #[test]
+    fn on_a_terminal_a_consent_from_before_the_daemon_is_asked_about_the_daemon() {
+        let host = "api.typesafe.ai";
+        let (_dir, data) = consent_file("api.typesafe.ai\n");
+        let mut asked = Vec::new();
+        let mut no = answering("n", &mut asked);
+        // A no still sends this run on the earlier yes, keeps it, and is asked again next run.
+        assert!(ensure_consent(&data, host, false, true, ON, 3, &mut no).unwrap());
+        assert!(ensure_consent(&data, host, false, true, ON, 3, &mut no).unwrap());
+        assert_eq!(consent(&data, host).unwrap(), Consent::Classify);
+        drop(no);
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        let flat = asked[0].split_whitespace().collect::<Vec<_>>().join(" ");
+        for part in [
+            "`neomail daemon` can now also send each new message as it arrives",
+            "classify.daemon = false turns that off",
+            "This run sends either way",
+            "this question comes back on the next run on a terminal",
+            "Let `neomail daemon` send new mail to api.typesafe.ai too? [y/N]",
+        ] {
+            assert!(flat.contains(part), "{part}: {flat}");
+        }
+
+        let mut asked = Vec::new();
+        let mut yes = answering("yes", &mut asked);
+        assert!(ensure_consent(&data, host, false, true, ON, 3, &mut yes).unwrap());
+        assert_eq!(consent(&data, host).unwrap(), Consent::Daemon);
+
+        // With classify.daemon = false there is nothing to ask about.
+        let (_dir, data) = consent_file("api.typesafe.ai\n");
+        assert!(ensure_consent(&data, host, false, false, ON, 3, &mut never).unwrap());
+        assert_eq!(consent(&data, host).unwrap(), Consent::Classify);
     }
 
     #[test]

@@ -314,7 +314,10 @@ which applies:
 - `classifying new mail with HOST`: the `[classify]` backend's host has your consent, given once
   to `neomail classify`, and there is a key (`neomail key set`, or `JEV_API_KEY`). A yes given
   before the daemon classified answered a question that did not mention it, so it does not count
-  here: `neomail classify` on a terminal asks once more, with the daemon named;
+  here, and `neomail classify --yes` does not turn it into one. `neomail classify` on a terminal
+  asks whether the daemon may send too; it sends that run on your earlier yes whatever you
+  answer, and a no keeps that yes for `neomail classify` only and is asked again on its next run
+  on a terminal. With `classify.daemon = false` it does not ask;
 - ``classifying off: no jev key (run `neomail key set` or set JEV_API_KEY)``;
 - ``classifying off: cannot read the jev key from the keyring: WHY``: the keyring failed to
   answer (the Secret Service restarting, say) and `JEV_API_KEY` is not set. Unlike the other
@@ -334,9 +337,9 @@ which applies:
 While classifying is off, the daemon looks again at each round with new mail. When the key or the
 consent appears it prints `neomail daemon: classifying on (HOST)` and classifies from that round
 on. Mail that arrived while it was off is not sent then; `neomail classify` still finds it. When
-classifying turns off or pauses while messages wait for the next round, they are dropped too, and
-the line says how many: ``…; N waiting messages are left to `neomail classify` ``. The
-key and the consent are read again at each round with mail to classify, and the config at every
+classifying turns off or pauses while messages wait for the next round, they are dropped too
+(unless a 402 paused it, see below), and the line says how many:
+``…; N waiting messages are left to `neomail classify` ``. The key and the consent are read again at each round with mail to classify, and the config at every
 round. `classify.daemon = false` stops it from the next round, without a restart. So do `neomail
 key delete` and `neomail key set`, unless `JEV_API_KEY` is set in the daemon's environment: the
 daemon then falls back to it. The keyring was unlocked
@@ -349,7 +352,8 @@ Which mail is sent:
   mailbox, is never sent again.
 - Only mail received in the last 365 days, as `neomail classify` takes; `neomail classify --all`
   covers older mail moved into a synced mailbox.
-- At most 100 messages a round (each tried up to three times), four at a time, and none started after a minute (or after the
+- At most 100 messages each time it syncs (a round, a push sync or an Outlook check), each
+  tried up to three times, four at a time, and none started after a minute (or after the
   interval, when it is shorter), so a slow or rate-limited jev cannot hold up the next sync. A
   request already sent still gets its answer. The rest wait in memory for the next round, which
   sends them even if it brings no new mail. What waits is forgotten when the daemon stops, and
@@ -364,7 +368,7 @@ them. It never names a subject, a sender or the key:
 
 When classifying fails, the sync and the notifications go on as before:
 
-- An outage, a status that keeps asking for a retry (after three tries), a 402, or a round's
+- An outage, a status that keeps asking for a retry (after three tries), or a round's
   minute running out (`out of time for this round`, also when jev asks for a wait that would end
   past it) stops that round's classifying. Its messages wait for the next round, which sends them
   again, and standard error says once
@@ -374,13 +378,18 @@ When classifying fails, the sync and the notifications go on as before:
   every round, so it pauses classifying until `classify.url` or `classify.model` changes, or the
   daemon restarts. Nothing waits, the message with the unreadable answer counts as failed, and
   standard error says once `neomail daemon: classifying paused: WHY; change classify.url or
-  classify.model, or restart the daemon`. 402 stops only the round, as running out of credit is
-  put right without changing a setting.
+  classify.model, or restart the daemon`.
+- A 402 (the jev account is out of credit) pauses classifying for an hour, or until the key
+  changes, whichever comes first. Nothing is sent meanwhile; what waits stays queued, with the
+  mail that arrives during the pause, and is sent once the pause lifts. Standard error says once
+  per pause `neomail daemon: classifying paused: jev answered 402: BODY; the jev account is out
+  of credit; trying again at HH:MM, or sooner if the key changes`. If jev still answers 402
+  then, it pauses for another hour.
 - A message jev refuses as invalid (422) counts as failed and is not sent again by the daemon.
 - A refused key (401 or 403) pauses classifying until the key changes:
   ``neomail daemon: classifying paused: jev refused the key (401): run `neomail key set` or set
-  JEV_API_KEY``. The daemon keeps only a digest of the refused key, and reads the key again at
-  each round with new mail.
+  JEV_API_KEY``. While paused, on a refused key or a 402, the daemon keeps only a digest of the
+  key, not the key itself, and reads the key again at each round with new mail.
 
 Ctrl-C or SIGTERM starts no new request: the requests on their way are abandoned, a retry's wait
 ends, and the answers already stored stay. An abandoned request, or one that ended in an outage

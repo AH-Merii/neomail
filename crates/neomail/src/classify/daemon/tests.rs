@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use nm_core::{Cache, FetchedMessage, Flags, MessageId, Uid, UidValidity};
 use tokio::runtime::Runtime;
 
-use super::{Access, Classifier, PER_WAKE, Wake};
+use super::{Access, CREDIT_PAUSE, Classifier, PER_WAKE, Wake};
 use crate::classify::Reader;
 use crate::config::ClassifySettings;
 use crate::daemon::Line;
@@ -85,6 +85,8 @@ struct World {
     stop: Arc<AtomicBool>,
     /// Each wake's time for classifying.
     budget: Duration,
+    /// Each wake's own time.
+    now: DateTime<Utc>,
     mailboxes: HashMap<String, i64>,
 }
 
@@ -102,6 +104,7 @@ impl World {
             runtime: crate::account::runtime().unwrap(),
             stop: Arc::new(AtomicBool::new(false)),
             budget: super::BUDGET,
+            now: Utc::now(),
             mailboxes: HashMap::new(),
         }
     }
@@ -141,7 +144,7 @@ impl World {
             runtime: &self.runtime,
             stop: &self.stop,
             budget: self.budget,
-            now: Utc::now(),
+            now: self.now,
         };
         let lines = c.wake(new, &wake, &mut self.cache, access);
         lines
@@ -353,6 +356,7 @@ fn a_refused_key_pauses_classifying_until_the_key_changes() {
     let new = w.arrive("INBOX", &[mail(2, 1, "main Hi")]);
     assert_eq!(w.wake(&mut c, &new, &mut access), Vec::<String>::new());
     assert_eq!(w.jev.count(), 1, "the same key is not sent again");
+    assert!(c.key.is_none(), "only the refused key's digest is kept");
 
     access.key = Some("key-two");
     let new = w.arrive("INBOX", &[mail(3, 1, "main Hi")]);
@@ -463,32 +467,135 @@ fn an_answer_that_is_not_jevs_pauses_classifying_until_the_settings_change() {
 }
 
 #[test]
-fn a_4xx_every_request_would_get_pauses_but_402_puts_the_messages_back() {
-    for (status, paused) in [(400, true), (404, true), (402, false)] {
+fn a_4xx_every_request_would_get_pauses_until_the_settings_change() {
+    for status in [400, 404] {
         let mut w = World::new();
         let mut access = granted();
         let mut c = Classifier::new(&w.settings, &mut access);
         w.jev.play([Reply::status(status, "{}")]);
         let new = w.arrive("INBOX", &[mail(1, 1, "main Hi")]);
         let lines = w.wake(&mut c, &new, &mut access);
-        let said = if paused { "paused" } else { "stopped" };
         assert!(
             lines.len() == 1
                 && lines[0].starts_with(&format!(
-                    "err neomail daemon: classifying {said}: jev answered {status}"
+                    "err neomail daemon: classifying paused: jev answered {status}"
                 )),
             "{status}: {lines:?}"
         );
-        assert_eq!(c.waiting(), !paused, "{status}");
-        let lines = w.wake(&mut c, &[], &mut access);
-        let expected: &[&str] = if paused {
-            &[]
-        } else {
-            &["out work: classified 1 (main 1)"]
-        };
-        assert_eq!(lines, expected, "{status}");
-        assert_eq!(w.jev.count(), if paused { 1 } else { 2 }, "{status}");
+        assert!(!c.waiting(), "{status}");
+        assert!(c.key.is_none(), "{status}: the paused key is not kept");
+        let new = w.arrive("INBOX", &[mail(2, 1, "main Hi")]);
+        assert_eq!(w.wake(&mut c, &new, &mut access), Vec::<String>::new());
+        assert_eq!(w.jev.count(), 1, "{status}");
     }
+}
+
+/// jev's 402 for each request of a wake: no credit left.
+fn no_credit(n: usize) -> impl Iterator<Item = Reply> {
+    std::iter::repeat_n(Reply::status(402, "{}"), n)
+}
+
+#[test]
+fn a_402_pauses_for_an_hour_says_so_once_and_keeps_what_waits() {
+    let mut w = World::new();
+    let mut access = granted();
+    let mut c = Classifier::new(&w.settings, &mut access);
+    w.jev.play(no_credit(PER_WAKE));
+    let first = w.arrive("INBOX", &many(8));
+    let lines = w.wake(&mut c, &first, &mut access);
+    let at = (w.now + CREDIT_PAUSE)
+        .with_timezone(&chrono::Local)
+        .format("%H:%M");
+    assert_eq!(
+        lines,
+        [format!(
+            "err neomail daemon: classifying paused: jev answered 402: {{}}; the jev account is \
+             out of credit; trying again at {at}, or sooner if the key changes"
+        )]
+    );
+    let sent = w.jev.count();
+    assert!((1..=8).contains(&sent), "{sent}");
+    assert!(c.waiting());
+    assert!(
+        c.key.is_none(),
+        "only the key's digest is kept while paused"
+    );
+
+    // Within the hour no request goes out and nothing more is said, with or without new mail;
+    // new mail waits with the rest.
+    let more = w.arrive("INBOX", &[mail(9, 1, "main Later")]);
+    w.now += TimeDelta::minutes(30);
+    assert_eq!(w.wake(&mut c, &more, &mut access), Vec::<String>::new());
+    w.now += TimeDelta::minutes(29);
+    assert_eq!(w.wake(&mut c, &[], &mut access), Vec::<String>::new());
+    assert_eq!(w.jev.count(), sent);
+    assert!(c.waiting());
+
+    // After the hour, with credit again, all nine are sent, each once.
+    w.jev.script.lock().unwrap().clear();
+    w.now += TimeDelta::minutes(1);
+    assert_eq!(
+        w.wake(&mut c, &[], &mut access),
+        [
+            "err neomail daemon: classifying on (127.0.0.1)",
+            "out work: classified 9 (main 9)"
+        ]
+    );
+    assert_eq!(w.jev.count(), sent + 9);
+    assert!(!c.waiting());
+    assert!(
+        first[0]
+            .ids
+            .iter()
+            .chain(&more[0].ids)
+            .all(|id| w.stored(*id))
+    );
+}
+
+#[test]
+fn a_402_pause_lifts_when_the_key_changes() {
+    let mut w = World::new();
+    let mut access = granted();
+    let mut c = Classifier::new(&w.settings, &mut access);
+    w.jev.play(no_credit(PER_WAKE));
+    let new = w.arrive("INBOX", &many(3));
+    assert_eq!(w.wake(&mut c, &new, &mut access).len(), 1);
+    let sent = w.jev.count();
+    w.now += TimeDelta::minutes(5);
+    assert_eq!(w.wake(&mut c, &[], &mut access), Vec::<String>::new());
+    assert_eq!(w.jev.count(), sent);
+
+    w.jev.script.lock().unwrap().clear();
+    access.key = Some("key-two");
+    w.now += TimeDelta::minutes(5);
+    assert_eq!(
+        w.wake(&mut c, &[], &mut access),
+        [
+            "err neomail daemon: classifying on (127.0.0.1)",
+            "out work: classified 3 (main 3)"
+        ]
+    );
+    assert_eq!(w.jev.count(), sent + 3);
+}
+
+#[test]
+fn a_402_after_the_pause_pauses_again_with_one_new_line() {
+    let mut w = World::new();
+    let mut access = granted();
+    let mut c = Classifier::new(&w.settings, &mut access);
+    w.jev.play(no_credit(2 * PER_WAKE));
+    let new = w.arrive("INBOX", &many(2));
+    assert_eq!(w.wake(&mut c, &new, &mut access).len(), 1);
+    w.now += CREDIT_PAUSE;
+    let lines = w.wake(&mut c, &[], &mut access);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0], "err neomail daemon: classifying on (127.0.0.1)");
+    assert!(lines[1].contains("out of credit"), "{lines:?}");
+    let sent = w.jev.count();
+    w.now += TimeDelta::minutes(10);
+    assert_eq!(w.wake(&mut c, &[], &mut access), Vec::<String>::new());
+    assert_eq!(w.jev.count(), sent);
+    assert!(c.waiting());
 }
 
 #[test]
