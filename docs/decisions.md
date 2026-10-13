@@ -209,6 +209,9 @@ the new entry.
     covers colour only, so one rule holds. Colour never carries meaning alone.
 - **Marking read and unread** is `neomail mark read|unread`: online only, with the output rules
   above ([DEC-2026-10-13-mark](#dec-2026-10-13-mark), proposed).
+- **Archiving and deleting** is `neomail archive` and `neomail delete`: a move to the account's
+  archive or trash, never a deletion for good, online only
+  ([DEC-2026-10-13-archive-delete](#dec-2026-10-13-archive-delete), proposed).
 - **Easy to extend** with new functionality and UI later.
 - **Agentically customizable, like Pi** (Mario Zechner's agent harness): agents can extend and
   customize neomail themselves (extensions, docs written for agents, hot reload).
@@ -750,3 +753,33 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux), and "Outlook asks for `Mail.Read` only, until
   triage (roadmap slice 8) needs to write" in
   [DEC-2026-10-12-outlook-defaults](#dec-2026-10-12-outlook-defaults).
+
+### <a id="dec-2026-10-13-archive-delete"></a>DEC-2026-10-13-archive-delete: archiving and deleting mail from the CLI
+
+- **Status:** proposed by Claude on 2026-10-13, while the owner was away ("no more questions for
+  now", f679d889:6909). Part 2 of roadmap slice 8 follows it.
+- **Proposal:**
+  - The commands are `neomail archive ID...` and `neomail delete ID...`. They take ids as
+    `neomail mark` does, run online only under the account's lock, and follow its output rules;
+    `--json` also names the folder each message went to, as the server names it.
+  - `delete` never deletes a message for good: it moves it to the account's trash, and neomail
+    never empties the trash.
+  - Over IMAP, the archive is the mailbox that LIST marks `\Archive`, else `\All` (Gmail's All
+    Mail), and the trash is the one marked `\Trash`
+    ([RFC 6154](https://www.rfc-editor.org/rfc/rfc6154.html#section-2)). On Outlook they are
+    Graph's well-known folders `archive` and `deleteditems`
+    ([mailFolder](https://learn.microsoft.com/en-us/graph/api/resources/mailfolder)).
+  - Over IMAP a message moves from INBOX with `UID MOVE`
+    ([RFC 6851](https://www.rfc-editor.org/rfc/rfc6851.html)), after the UIDVALIDITY check. A
+    server without MOVE or without the folder fails the account and nothing moves: neomail never
+    falls back to COPY, `\Deleted` and EXPUNGE, and never creates, renames or deletes a mailbox.
+  - A move counts once the server confirms it: over IMAP when INBOX no longer has the UID, on
+    Outlook when Graph answers `201 Created`. A confirmed message leaves the cache, as when a sync
+    finds it gone.
+  - The actions join the typed set as `archive` and `delete`. Moving to a folder the user names
+    comes next.
+- **Open question for the owner:** [DEC-2026-10-11-agent-send](#dec-2026-10-11-agent-send) has
+  agents ask the owner before deleting. There are no agent profiles yet, so `neomail delete` asks
+  no one. Once they exist, does a move to the trash count as deleting?
+- **Builds on:** "archiving and deleting mail" in [Identity](#identity),
+  [DEC-2026-10-13-mark](#dec-2026-10-13-mark) and [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).
