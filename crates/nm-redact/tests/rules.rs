@@ -663,6 +663,11 @@ fn an_arabic_organisation_name_masks_none_of_its_words() {
         ),
         ("وزارة الصحة", "نتمنى لكم الصحة والعافية."),
         ("مصرف الراجحي", "شكرا لاختيارك الراجحي."),
+        (
+            "صحيفة الرياض",
+            "أبرز أخبار الرياض اليوم: أمطار على الرياض وجدة. اشترك في صحيفة الرياض",
+        ),
+        ("نادي الهلال", "نادي الهلال يفوز على النصر"),
     ] {
         assert_eq!(with(&[name], &[], text), text, "{name}: {text}");
     }
@@ -744,7 +749,7 @@ fn a_code_or_password_after_an_arabic_keyword_is_masked() {
             "كلمة مروركم المؤقتة هي <code>",
         ),
         ("رقمك السري: 0042", "رقمك السري: <code>"),
-        ("كلمة مرور حسابك: hunterxyz", "كلمة مرور حسابك: <code>"),
+        ("كلمة مرور حسابك: P@ssw0rd", "كلمة مرور حسابك: <code>"),
         (
             "كلمة سر الواي فاي: sunshine2026",
             "كلمة سر الواي فاي: <code>",
@@ -762,6 +767,10 @@ fn a_code_or_password_after_an_arabic_keyword_is_masked() {
         "تم تغيير كلمة مرورك بنجاح. إذا لم تكن أنت، تواصل معنا",
         "كلمة مرورك ستنتهي قريبا - يرجى تغييرها",
         "كلمة مرورك الجديدة هي الأقوى",
+        // After other words, a colon alone does not make the next word a secret: "the password
+        // has expired: please renew it", "the password is wrong: try again".
+        "كلمة المرور منتهية الصلاحية: يرجى تحديثها",
+        "كلمة المرور غير صحيحة: حاول مرة أخرى",
     ] {
         assert_eq!(plain(text), text, "{text}");
     }
@@ -797,7 +806,8 @@ fn an_amount_in_an_arabic_currency_or_with_arabic_separators_is_masked() {
             "{amount:?} -> {out:?}"
         );
     }
-    // The accusative ending after 11 to 99, Arab currency codes and `SR`: masked to the end.
+    // The accusative ending after 11 to 99, `جم` (`ج.م` without its dot), Arab currency codes and
+    // `SR`: masked to the end.
     for (text, want) in [
         ("المبلغ ٥٠ ريالاً فقط", "المبلغ <amount> فقط"),
         ("السعر 50 ريالًا فقط", "السعر <amount> فقط"),
@@ -805,7 +815,10 @@ fn an_amount_in_an_arabic_currency_or_with_arabic_separators_is_masked() {
         ("بقيمة ٢٠ ديناراً", "بقيمة <amount>"),
         ("بقيمة ٢٠٠ جنيهاً مصرياً", "بقيمة <amount> مصرياً"),
         ("بقيمة ١٥ ليرةً", "بقيمة <amount>"),
+        ("السعر 120 جم فقط", "السعر <amount> فقط"),
+        ("الإجمالي 1,250 جم", "الإجمالي <amount>"),
         ("Total: EGP 1,200", "Total: <amount>"),
+        ("Total 120 LYD", "Total <amount>"),
         ("Total: KWD 1,200.500", "Total: <amount>"),
         ("Total: 45 QAR", "Total: <amount>"),
         ("الإجمالي: SR 120.00", "الإجمالي: <amount>"),
@@ -814,9 +827,11 @@ fn an_amount_in_an_arabic_currency_or_with_arabic_separators_is_masked() {
         assert_eq!(plain(text), want, "{text}");
     }
     // A word that starts like a currency is not one; a grouped number alone is kept, as `1,500` is.
-    // A score before a club whose name starts with `ريال` ("Real") is no amount.
+    // A score before a club whose name starts with `ريال` ("Real") is no amount, and `جم` must
+    // end its word: "write 3 short sentences".
     for text in [
         "لديك ١٠ رسائل",
+        "اكتب 3 جمل قصيرة",
         "منذ ٣ ليالٍ",
         "عدد الزوار ١٬٥٠٠",
         "برشلونة ٢-١ ريال مدريد",
@@ -840,6 +855,7 @@ fn a_date_with_an_arabic_month_name_stays_a_date() {
         "٢٠ ذي القعدة ١٤٤٧هـ",
         "٥ ذي الحجة ١٤٤٧ هـ",
         "١ ربيع الثاني ١٤٤٨هـ",
+        "4 جمادى الأولى 1447",
         "١٤٤٧/٠٥/١٢هـ",
         "يوليو وأغسطس ٢٠٢٦",
         "١٦ جانفي ٢٠٢٦",

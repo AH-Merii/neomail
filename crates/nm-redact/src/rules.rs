@@ -10,9 +10,10 @@ use regex::Regex;
 use crate::{Kind, Known, Mask, Redacted};
 
 /// ISO 4217 codes, with the Arab currencies' (`EGP`, `KWD` …) and `SR`, the Latin abbreviation
-/// Saudi shops print for the riyal.
+/// Saudi shops print for the riyal. Sudan's `SDG` is left out: "SDG 5", one of the UN's goals, is
+/// commoner in mail.
 const CUR_CODE: &str = "USD|EUR|GBP|CHF|JPY|CNY|INR|CAD|AUD|NZD|SEK|NOK|DKK|PLN|CZK|HUF|BRL|MXN|ZAR|SGD|HKD\
-     |AED|SAR|EGP|KWD|QAR|OMR|BHD|JOD|MAD|TND|DZD|IQD|LBP|SR";
+     |AED|SAR|EGP|KWD|QAR|OMR|BHD|JOD|MAD|TND|DZD|IQD|LBP|LYD|YER|SYP|SR";
 const CUR_SYM: &str = r"[$€£¥₹₩₽\u{fdfc}\u{20c1}]|(?:US|CA|AU|NZ|HK|SG|A|C|R)\$";
 // Thousands separators: comma, dot, apostrophe, no-break and narrow no-break space (not a plain
 // space, which would join neighbouring numbers).
@@ -27,11 +28,12 @@ const SECRET_WORD: &str = "pin|passcode|password";
 /// Currencies written in Arabic, after the number as CLDR's Arabic formats put them: the dotted
 /// symbols (`ر.س`, `د.إ`, `ج.م` …, from CLDR's `ar` currency data), the words (`ريال`, `درهم`,
 /// `دينار`, `جنيه`, `ليرة`, `دولار`, `يورو`, with their plurals and the accusative ending `اً`, `ًا`
-/// or `ً` that follows the numbers 11 to 99: `٥٠ ريالاً`) and the rial signs U+FDFC and U+20C1.
-/// Longer forms first, as the regex takes the first alternative that matches.
+/// or `ً` that follows the numbers 11 to 99: `٥٠ ريالاً`), `جم` (`ج.م` without its dot) when it
+/// ends its word ([`jm_in_word`]) and the rial signs U+FDFC and U+20C1. Longer forms first, as the
+/// regex takes the first alternative that matches.
 const CUR_AR: &str = "(?:ر\\.\\s?[سقعي]|د\\.\\s?[إكبأمجتعل]|ج\\.\\s?[مس]|ل\\.\\s?[سل])\\.?\
                       |(?:ريالات|ريال|دراهم|درهم|دنانير|دينار|جنيهات|جنيه|ليرات|ليرة|دولارات|دولار\
-                      |يورو)(?:ا\u{64b}?|\u{64b}ا?)?|\u{fdfc}|\u{20c1}";
+                      |يورو)(?:ا\u{64b}?|\u{64b}ا?)?|جم|\u{fdfc}|\u{20c1}";
 /// Month names written in Arabic, from CLDR 48: the Gregorian names of `ar`, the Levantine and
 /// Iraqi names of `ar_SY`, `ar_LB`, `ar_IQ` and `ar_JO`, the Maghreb names of `ar_DZ`, `ar_TN` and
 /// `ar_MA`, and the Hijri names of `ar`. A hamza or madda on an alef may be left off. `ذي` is the
@@ -44,8 +46,7 @@ const MONTH_AR: &str = "يناير|فبراير|مارس|[أا]بريل|مايو
                         |جمادى\\s+ال[أا]ولى|جمادى\\s+ال[آا]خرة|رجب|شعبان|رمضان|شوال\
                         |ربيع\\s+الثاني|ذ[وي]\\s+القعدة|ذ[وي]\\s+الحجة";
 /// Arabic words for a one-time code: `رمز` ("code") alone, as `رمزك` or `رمزكم` ("your code"), or
-/// with the kind of code, and `كود`. Microsoft's wording puts `الخاص بك` ("your") before `هو`
-/// ("is").
+/// with the kind of code, and `كود`. `الخاص بك` ("your") may stand before `هو` ("is").
 const CODE_AR: &str = "(?:ال)?رمز(?:كم|ك)?(?:\\s+(?:التحقق|التفعيل|الدخول|ال[أا]مان|المرور|[أا]حادي\\s+الاستخدام))?\
                        |كود(?:\\s+التحقق|\\s+التفعيل)?";
 /// Arabic words for a password or PIN, with or without `ك` or `كم` ("your": `كلمة مرورك`), then
@@ -58,7 +59,9 @@ const SECRET_AR: &str = "(?:كلمة\\s+(?:ال)?(?:مرور|سر)(?:كم|ك)?|(
 /// A separator between an Arabic password keyword and the secret: a symbol, or `هو` or `هي` ("is").
 const AR_SEP: &str = r"(?:\s*(?:[:#=>–—→-]|(?:هو|هي)(?:[\s:]|$)))";
 /// The separators allowed after other words between the keyword and the secret: only a colon or
-/// "is", so "your password expires soon - renew it" is no password.
+/// "is", so "your password expires soon - renew it" is no password. Even then only a token that
+/// looks like a secret is one: `كلمة المرور منتهية الصلاحية: يرجى تحديثها` ("the password has
+/// expired: please renew it") keeps its last words.
 const AR_SEP_AFTER_WORDS: &str = r"(?:\s*(?::|(?:هو|هي)(?:[\s:]|$)))";
 /// Direction marks (U+200E, U+200F, U+061C), embeddings and overrides (U+202A to U+202E) and
 /// isolates (U+2066 to U+2069): invisible, and set inside numbers and around currency symbols by
@@ -199,9 +202,11 @@ static P: LazyLock<Patterns> = LazyLock::new(|| {
             r"(?:{CODE_AR})(?:\s+الخاص\s+بك)?(?:\s+(?:هو|هي))?\s*[:#=\-]?\s*(\d{{2,4}}(?:[ .\-]\d{{2,4}}){{1,3}}|\d(?:[ .\-]\d){{3,15}}|[a-zA-Z0-9][a-zA-Z0-9\-]{{2,14}}[a-zA-Z0-9])(?-u:\b)"
         )),
         // One or two other words may stand between the keyword and a separator after them: "the
-        // password of your account:", `كلمة سر الواي فاي:` ("the Wi-Fi password:").
+        // password of your account:", `كلمة سر الواي فاي:` ("the Wi-Fi password:"). That separator
+        // is not captured, so [`codes`] masks only a token that looks like a secret after it.
+        // `هو` or `هي` ("is") before a colon is no other word: tried first, it is captured.
         secret_ar: re(&format!(
-            r"(?:{SECRET_AR})(?:(?:\s+[\p{{L}}\p{{M}}]+){{1,2}}({AR_SEP_AFTER_WORDS}+)|({AR_SEP}*))\s*"
+            r"(?:{SECRET_AR})(?:((?:\s*(?:هو|هي))?\s*:{AR_SEP}*)|(?:\s+[\p{{L}}\p{{M}}]+){{1,2}}{AR_SEP_AFTER_WORDS}+|({AR_SEP}*))\s*"
         )),
         phone_intl: re(r"(?:\+|(?-u:\b)00)\d[\d \-.()/]{5,20}\d(?-u:\b)"),
         phone_national: re(
@@ -469,7 +474,8 @@ fn find(text: &str, known: &Known) -> Vec<Span> {
     ibans(text, &mut f);
     cards(text, &mut f);
     for m in P.amount.find_iter(text) {
-        if !real_club(m.as_str(), &text[m.end()..]) {
+        let after = &text[m.end()..];
+        if !real_club(m.as_str(), after) && !jm_in_word(m.as_str(), after) {
             f.push(m.start(), m.end(), Kind::Amount);
         }
     }
@@ -497,6 +503,13 @@ fn real_club(amount: &str, after: &str) -> bool {
         let next = after.trim_start();
         next.len() < after.len() && REAL_CLUBS.iter().any(|c| next.starts_with(c))
     }
+}
+
+/// Whether an amount match ending in `جم` stops inside a longer word, where `جم` is no currency:
+/// `٣ جمل` ("3 sentences"), `٤ جمادى الأولى` (a Hijri date). A Unicode `\b` after `جم` in the regex
+/// would say so too, but made an excerpt over twice as slow (see [`P`]).
+fn jm_in_word(amount: &str, after: &str) -> bool {
+    amount.ends_with("جم") && after.starts_with(char::is_alphanumeric)
 }
 
 /// How each kind is spelled; [`Kind::Link`] adds its host.
@@ -1054,6 +1067,8 @@ fn cards(text: &str, f: &mut Found) {
 /// "Pin this message" and "Your password was changed" stay. A dash joining two words
 /// (`password-protected`) is no separator. A token that is itself a keyword is never masked. The
 /// Arabic keywords ([`CODE_AR`], [`SECRET_AR`], with `هو` or `هي` for "is") work the same way.
+/// After one or two other words and a colon or "is" ([`AR_SEP_AFTER_WORDS`]), an Arabic password
+/// keyword's token is masked only when it looks like a secret.
 fn codes(text: &str, f: &mut Found) {
     let ok = |g: &str| {
         let digits = g.bytes().filter(u8::is_ascii_digit).count();
@@ -1080,6 +1095,7 @@ fn codes(text: &str, f: &mut Found) {
     {
         let start = c.get(0).map_or(0, |m| m.end());
         // A separator other than a word: "is", "was", هو and هي alone only say a secret may follow.
+        // `secret_ar` leaves a separator after other words uncaptured, so it counts as none.
         let separated = c.get(1).or_else(|| c.get(2)).is_some_and(|g| {
             let sep = g.as_str();
             let joins_words = matches!(sep, "-" | "–" | "—") && g.end() == start;
@@ -1190,8 +1206,10 @@ pub(crate) const NAME_PARTICLES: &[&str] = &[
 /// "group", "service(s)", "customers", "store", "team", "support", "ministry", "authority",
 /// "centre", "platform", "administration", "university", "hospital", "municipality", "post",
 /// "app", "portal", "office", "airlines", "aviation", "telecom", "fund", "academy", "pharmacy",
-/// "school". As folded by [`fold_name`], without the article. No given or family name is one of
-/// them, and mail from `البنك الأهلي` or `خدمة العملاء` uses these words throughout its body.
+/// "school", "newspaper" (two words), "channel", "magazine", "bookshop" or "library", "club",
+/// "association" or "charity", "website", "council", "clinic", "market", "newsletter". As folded
+/// by [`fold_name`], without the article. No given or family name is one of them, and mail from
+/// `البنك الأهلي` or `خدمة العملاء` uses these words throughout its body.
 pub(crate) const ORG_WORDS: &[&str] = &[
     "بنك",
     "مصرف",
@@ -1223,6 +1241,18 @@ pub(crate) const ORG_WORDS: &[&str] = &[
     "اكاديمية",
     "صيدلية",
     "مدرسة",
+    "صحيفة",
+    "جريدة",
+    "قناة",
+    "مجلة",
+    "مكتبة",
+    "نادي",
+    "جمعية",
+    "موقع",
+    "مجلس",
+    "عيادة",
+    "سوق",
+    "نشرة",
 ];
 
 /// Whether a display name's folded words name an organisation: one of them, with or without the
