@@ -2,13 +2,13 @@
 
 This page follows the code: it describes what exists, not what is planned. Product decisions live
 in [decisions.md](decisions.md). The slices so far follow
-[DEC-2026-10-11-build-first](decisions.md#dec-2026-10-11-build-first): a read-only INBOX in the
-CLI (slice 1), IMAP passwords in the OS keyring (slice 2), Gmail through the user's own OAuth
-client (slice 3), getting started and setup (slice 4), output for people and pipes (slice 5),
-Outlook through Microsoft Graph with the user's own Entra app (slice 6) and background sync
-(slice 7): `neomail daemon`, with desktop notifications, IMAP IDLE push and a one-minute Outlook
-check through Graph's delta query. Triage in the CLI (slice 8) has begun with its first part:
-`neomail mark read|unread`, the first actions.
+[DEC-2026-10-11-build-first](decisions.md#dec-2026-10-11-build-first): a read-only INBOX in the CLI
+(slice 1), IMAP passwords in the OS keyring (slice 2), Gmail through the user's own OAuth client
+(slice 3), getting started and setup (slice 4), output for people and pipes (slice 5), Outlook
+through Microsoft Graph with the user's own Entra app (slice 6) and background sync (slice 7):
+`neomail daemon`, with desktop notifications, IMAP IDLE push and a one-minute Outlook check through
+Graph's delta query. Triage in the CLI (slice 8) has begun: `neomail mark read|unread`, the first
+actions, then `neomail archive` and `neomail delete` for IMAP and Outlook accounts.
 
 ## Crates
 
@@ -16,8 +16,8 @@ check through Graph's delta query. Triage in the CLI (slice 8) has begun with it
 | ----- | ------------- | ----------------- |
 | `crates/neomail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, the daemon and its locks, output, wiring. | The composition root. Nothing depends on it. |
 | `crates/nm-core` | Domain types, the `MailSource`, `IdSource` and `MailWriter` traits, the SQLite cache, the sync engines, the actions, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
-| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap); `store_seen`, its one write. | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
-| `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
+| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap); its two writes, `store_seen` and `move_to`. | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
+| `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port; its two writes, `set_read` and `move_to`. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
 
 A new crate needs a reason of the same kind: a second implementation of a seam, or a heavy
 dependency to isolate.
@@ -64,8 +64,9 @@ defaults rather than a second trait, because the engine is one engine either way
 source that implements it also implements `IdSource`. `Cursor`'s `Debug` is redacted, so it is
 never printed.
 
-**`Transport`** (`nm-graph/src/lib.rs`) is the port `GraphSource` reads Graph through: one HTTPS GET
-with request headers and a body cap, answered with the status, `Retry-After` and the body.
+**`Transport`** (`nm-graph/src/lib.rs`) is the port `GraphSource` reads and writes Graph through:
+one HTTPS GET, or a PATCH or POST with a JSON body, with request headers and a body cap, answered
+with the status, `Retry-After` and the body.
 `neomail/src/graph.rs` implements it with neomail's HTTP client, and `nm-graph/tests/graph.rs` with
 a fake Graph: a mailbox model that pages with next page links, plus scripted replies. That fake
 passes `nm_core::conformance::id_source`. `GraphSource` sends `Authorization: Bearer`, `Prefer:
@@ -278,9 +279,12 @@ off.
 **The action registry** (`nm-core/src/action.rs`) is how mail is changed. It is the typed set of
 actions that the TUI's keys, the CLI, scripts and agents share (the first bullet of
 [CLI, scripting, agents, extensibility](decisions.md#cli-scripting-agents-extensibility)). It
-starts small: `Action` is `MarkRead` or `MarkUnread`, each with a stable name (`mark-read`,
-`mark-unread`). `action::apply(action, ids, cache, writer)` is the one way to apply an action to
-cache ids; `neomail mark` calls it. For each account of the ids, in the order first asked, it:
+starts small: `Action` is `MarkRead`, `MarkUnread`, `Archive` or `Delete`, each with a stable
+name (`mark-read`, `mark-unread`, `archive`, `delete`). `Action::change` says what it does:
+`Change::Seen(bool)` or `Change::Move(Folder)`, where `Folder` is a role (`Archive` or `Trash`)
+that only the account's server resolves to a folder name. `action::apply(action, ids, cache,
+writer)` is the one way to apply an action to cache ids; `neomail mark`, `archive` and `delete`
+call it. For each account of the ids, in the order first asked, it:
 
 1. takes the account's lock (`MailWriter::lock`);
 2. reads the ids' locations again under the lock;
@@ -300,12 +304,21 @@ are the server's, and replace the cached ones. A confirmation without flags sets
 `\Seen` in the cached flags. A key in neither list is not confirmed, and its row is left alone.
 An `Err` confirms none of the call's messages: the server may still have changed some of them
 (Graph writes one message per request), so the cache is left alone for all of them and the next
-sync reads their state. neomail's writer (`neomail/src/mark.rs`) does three things:
+sync reads their state.
+
+A move goes through `move_by_uid` and `move_by_id` the same way, with the `Folder` role, and the
+writer answers with `Moved { folder, moved, gone }`: `folder` is the destination as the server
+names it, which the report carries to the output. A message in `moved` leaves the cache
+(`Cache::remove`), as when a sync finds it gone; its id is never handed out again
+(AUTOINCREMENT). A gone one stays for the next sync, as for a mark, and a key in neither list is
+not confirmed. A done message's `State` is its flags after a mark, or the folder after a move.
+
+neomail's writer (`neomail/src/triage.rs`) does three things:
 
 - it takes the same per-account `flock` as `sync` (`neomail/src/lock.rs`), printing once that it
   waits for the daemon;
-- it logs in through `sync::Logins`, which owns the logins of `sync`, `daemon` and `mark`;
-- it reaches IMAP through `nm_imap::store_seen`.
+- it logs in through `sync::Logins`, which owns the logins of `sync`, `daemon` and the actions;
+- it reaches IMAP through `nm_imap::store_seen` and `nm_imap::move_to`.
 
 `store_seen` selects INBOX read-write (every other path keeps `EXAMINE`) and refuses to store when
 UIDVALIDITY changed. It sends `UID STORE +FLAGS (\Seen)` or `-FLAGS (\Seen)` (RFC 3501, section
@@ -313,6 +326,28 @@ UIDVALIDITY changed. It sends `UID STORE +FLAGS (\Seen)` or `-FLAGS (\Seen)` (RF
 response is fetched with `UID FETCH (UID FLAGS)`, and a UID in neither is gone. The session ends
 with LOGOUT, never CLOSE, which expunges (RFC 3501, section 6.4.2). The wire tests check that no
 `EXPUNGE`, `CLOSE`, `MOVE`, `COPY` or `\Deleted` is ever sent.
+
+`move_to` checks the MOVE capability ([RFC 6851](https://www.rfc-editor.org/rfc/rfc6851.html)),
+then finds the destination with `LIST "" *` from the special-use attributes
+([RFC 6154, section 2](https://www.rfc-editor.org/rfc/rfc6154.html#section-2)): the archive is
+the first selectable mailbox with `\Archive`, else the one with `\All` (Gmail's All Mail); the
+trash is the one with `\Trash`. Servers send these on a plain LIST without the SPECIAL-USE
+capability: Proton Mail Bridge does, and so does Gmail
+([IMAP extensions](https://developers.google.com/workspace/gmail/imap/imap-extensions#special-use_extension_of_the_list_command)).
+A server without MOVE, or without the folder, is an error and nothing moves; neomail never creates
+a mailbox and never falls back to COPY, `\Deleted` and EXPUNGE. Then it selects INBOX read-write
+after the same UIDVALIDITY check as `store_seen` and confirms the move by asking INBOX twice with
+`UID FETCH (UID FLAGS)`:
+
+1. before: a UID INBOX does not have is gone (RFC 3501, section 6.4.8, ignores it) and is not sent;
+2. `UID MOVE` the rest to the destination;
+3. after: a UID INBOX no longer has moved; one it still has is not confirmed. A MOVE "might fail
+   partway through" (RFC 6851, section 3.3), so its tagged OK alone is not trusted per message.
+
+A message another client expunged between the two fetches counts as moved; its row would leave
+the cache at the next sync anyway. The wire tests check the commands, the destination for each
+LIST, which UIDs are confirmed, and that no `EXPUNGE`, `CLOSE`, `COPY`, `CREATE`, `RENAME`,
+`DELETE`, `STORE` or `\Deleted` is ever sent.
 
 For Outlook, the writer calls `graph::set_read`, which calls `GraphSource::set_read`. Changing mail
 needs Mail.ReadWrite, which new sign-ins ask for along with Mail.Read. A sign-in records what it was
@@ -325,8 +360,17 @@ grant travels with the access token (`sync::AccessToken`), so two things follow 
 - `set_read` refuses a `Read` sign-in before any request, and says to run `neomail account login
   NAME`.
 
-The action tests (`nm-core/tests/action.rs`) drive `apply` with a
-fake writer.
+For an Outlook move, the writer's `move_by_id` calls `graph::move_to`, which refuses a `Read`
+sign-in the same way and calls `GraphSource::move_to`. That resolves the role to Graph's well-known
+folder name (`nm_graph::well_known`: `archive` or `deleteditems`), so the role stays a role until
+the account's server side turns it into a name. It reads that folder first
+(`GET /me/mailFolders/{name}?$select=id`): a 404 there is `GraphError::NoFolder` and nothing moves,
+so a 404 on a move can only mean the message is gone. Then it sends `POST /me/messages/{id}/move`
+with `{"destinationId": name}` through `Transport::post_json`, at most four at once and retried as
+reads are: 201 is moved, 404 is gone, and anything else fails the account. Both Graph writes share
+the writer's one Graph login helper (`triage::Writer::graph`), as the IMAP ones share `imap`.
+
+The action tests (`nm-core/tests/action.rs`) drive `apply` with a fake writer.
 
 ## How sync works
 
@@ -587,7 +631,10 @@ The order of the slices is in [roadmap.md](roadmap.md). What they change in the 
   adds the Gmail API for that part only
   ([DEC-2026-10-12-gmail-imap](decisions.md#dec-2026-10-12-gmail-imap)).
 - **More mail:** folders beyond INBOX, and CONDSTORE/QRESYNC to refresh flags cheaply.
-- **Actions:** marking read and unread works for IMAP and Outlook through `MailWriter`. Archive,
-  delete and move come next, as more `Action`s and `MailWriter` methods. Everything is online
-  only: an offline queue would record pending changes in the cache.
+- **Actions:** marking read and unread works for IMAP and Outlook through `MailWriter`, and archive
+  and delete for IMAP and Outlook (`neomail archive`, `neomail delete`). Next: moving to a folder
+  the user names and listing folders, as more `Action`s and `MailWriter` methods. Later: a fallback
+  for servers without MOVE, a per-account archive or trash for servers without special-use
+  attributes, and undo. Everything is online only: an offline queue would record pending changes in
+  the cache.
 - **The TUI** builds on the same cache and actions as the CLI.

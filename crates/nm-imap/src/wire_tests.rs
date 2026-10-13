@@ -1,8 +1,9 @@
 //! The read-only guarantee on the wire: `ImapSource` driven by the sync engine against a scripted
 //! IMAP server over an in-memory pipe. It must open INBOX with EXAMINE and fetch with
 //! BODY.PEEK[], and never send a command that can change the server. The push [`Watcher`] keeps
-//! the same guarantee. The one write, `store_seen`, selects INBOX, stores `\Seen` and never
-//! sends a command that can remove a message.
+//! the same guarantee. The writes select INBOX: `store_seen` stores `\Seen` and never sends a
+//! command that can remove a message; `move_to` moves with UID MOVE and never sends one that can
+//! destroy a message or change the folder tree.
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
 
 use std::num::NonZeroU32;
@@ -670,4 +671,348 @@ async fn a_uid_the_server_no_longer_has_is_gone() {
     assert_eq!(written.gone, [nm_core::Uid::new(3).unwrap()]);
     assert_eq!(commands[3], "UID FETCH 2,3 (UID FLAGS)");
     assert_never_removes(&commands);
+}
+
+/// Proton Mail Bridge's LIST, as a read-only probe of a test account showed it: special-use
+/// attributes on a plain LIST, without the SPECIAL-USE capability.
+const BRIDGE_LIST: &str = "* LIST (\\Noselect) \"/\" \"Folders\"\r\n\
+    * LIST (\\Noselect) \"/\" \"Labels\"\r\n\
+    * LIST () \"/\" \"INBOX\"\r\n\
+    * LIST (\\Archive) \"/\" \"Archive\"\r\n\
+    * LIST (\\Trash) \"/\" \"Trash\"\r\n\
+    * LIST (\\All) \"/\" \"All Mail\"\r\n\
+    * LIST (\\Junk) \"/\" \"Spam\"\r\n\
+    * LIST (\\Sent) \"/\" \"Sent\"\r\n";
+
+/// Gmail's LIST: no `\Archive`, so the archive is `\All` (All Mail).
+const GMAIL_LIST: &str = "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n\
+    * LIST (\\HasChildren \\Noselect) \"/\" \"[Gmail]\"\r\n\
+    * LIST (\\All \\HasNoChildren) \"/\" \"[Gmail]/All Mail\"\r\n\
+    * LIST (\\HasNoChildren \\Trash) \"/\" \"[Gmail]/Trash\"\r\n\
+    * LIST (\\HasNoChildren \\Junk) \"/\" \"[Gmail]/Spam\"\r\n";
+
+/// A small server for moves: `capability` and `list` are its answers to CAPABILITY and LIST;
+/// SELECT reports UIDVALIDITY 7; INBOX holds the UIDs in `inbox`; `UID FETCH` answers for the
+/// asked UIDs INBOX holds; `UID MOVE` takes the asked UIDs out of INBOX, except those in `stuck`,
+/// and answers as RFC 6851 section 4.3 shows: `* OK [COPYUID ...]`, then one `* N EXPUNGE` per
+/// moved message, highest sequence number first. With `refuse_move`, it moves only the first
+/// asked UID and then answers NO.
+struct MoveScript {
+    capability: &'static str,
+    list: &'static str,
+    inbox: Vec<u32>,
+    stuck: Vec<u32>,
+    refuse_move: bool,
+}
+
+impl MoveScript {
+    fn new(list: &'static str) -> Self {
+        Self {
+            capability: "IMAP4rev1 MOVE UIDPLUS UNSELECT IDLE ID",
+            list,
+            inbox: vec![1, 2, 3],
+            stuck: Vec::new(),
+            refuse_move: false,
+        }
+    }
+}
+
+/// The UIDs of a `UID FETCH` or `UID MOVE` command line: its third word.
+fn set_of(command: &str) -> Vec<u32> {
+    let set = command.split_whitespace().nth(2).unwrap();
+    set.split(',').map(|u| u.parse().unwrap()).collect()
+}
+
+async fn move_server(stream: DuplexStream, mut script: MoveScript) -> Vec<String> {
+    let (read, mut write) = tokio::io::split(stream);
+    let mut lines = BufReader::new(read).lines();
+    let mut seen = Vec::new();
+    write
+        .write_all(b"* OK scripted IMAP ready\r\n")
+        .await
+        .unwrap();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let (tag, command) = line.split_once(' ').unwrap_or((&line, ""));
+        let upper = command.to_ascii_uppercase();
+        seen.push(command.to_owned());
+        let untagged = if upper.starts_with("LOGIN") {
+            String::new()
+        } else if upper == "CAPABILITY" {
+            format!("* CAPABILITY {}\r\n", script.capability)
+        } else if upper.starts_with("LIST") {
+            script.list.to_owned()
+        } else if upper.starts_with("SELECT") {
+            "* 3 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n".to_owned()
+        } else if upper.starts_with("UID FETCH") {
+            set_of(command)
+                .into_iter()
+                .filter_map(|u| {
+                    let n = script.inbox.iter().position(|&i| i == u)? + 1;
+                    Some(format!("* {n} FETCH (UID {u} FLAGS ())\r\n"))
+                })
+                .collect()
+        } else if upper.starts_with("UID MOVE") {
+            let mut asked = set_of(command);
+            if script.refuse_move {
+                asked.truncate(1);
+            }
+            let moved: Vec<(usize, u32)> = script
+                .inbox
+                .iter()
+                .enumerate()
+                .filter(|(_, u)| asked.contains(u) && !script.stuck.contains(u))
+                .map(|(i, &u)| (i + 1, u))
+                .collect();
+            script
+                .inbox
+                .retain(|u| !moved.iter().any(|&(_, m)| m == *u));
+            let mut untagged = String::new();
+            if !moved.is_empty() {
+                let join = |v: Vec<String>| v.join(",");
+                let from = join(moved.iter().map(|(_, u)| u.to_string()).collect());
+                let to = join((0..moved.len()).map(|i| (100 + i).to_string()).collect());
+                untagged += &format!("* OK [COPYUID 1 {from} {to}] Moved UIDs.\r\n");
+            }
+            // `moved` is in INBOX order, so reversed it gives the highest sequence number first.
+            for (n, _) in moved.into_iter().rev() {
+                untagged += &format!("* {n} EXPUNGE\r\n");
+            }
+            if script.refuse_move {
+                let reply = format!("{untagged}{tag} NO [CANNOT] move failed part way\r\n");
+                write.write_all(reply.as_bytes()).await.unwrap();
+                continue;
+            }
+            untagged
+        } else if upper.starts_with("LOGOUT") {
+            "* BYE logging out\r\n".to_owned()
+        } else {
+            let reply = format!("{tag} BAD not scripted\r\n");
+            write.write_all(reply.as_bytes()).await.unwrap();
+            continue;
+        };
+        let reply = format!("{untagged}{tag} OK done\r\n");
+        write.write_all(reply.as_bytes()).await.unwrap();
+        if upper.starts_with("LOGOUT") {
+            break;
+        }
+    }
+    seen
+}
+
+/// Runs `move_on` against [`move_server`] and returns its result and the commands sent.
+async fn move_uids(
+    validity: u32,
+    uids: &[u32],
+    to: nm_core::Folder,
+    script: MoveScript,
+) -> (Result<nm_core::Moved<nm_core::Uid>, ImapError>, Vec<String>) {
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(move_server(server_end, script));
+    let mut client = Client::new(client_end);
+    greeting(&mut client).await.unwrap();
+    let session = log_in(client, "user", Login::Password("password"))
+        .await
+        .unwrap();
+    let uids: Vec<nm_core::Uid> = uids
+        .iter()
+        .map(|&u| nm_core::Uid::new(u).unwrap())
+        .collect();
+    let validity = nm_core::UidValidity::new(validity).unwrap();
+    let result = super::move_on(session, validity, &uids, to).await;
+    (result, server.await.unwrap())
+}
+
+/// Nothing that can destroy a message or change the folder tree: no EXPUNGE, CLOSE (it
+/// expunges, RFC 3501 6.4.2), COPY, CREATE, RENAME or DELETE, and no `\Deleted`.
+fn assert_never_destroys(commands: &[String]) {
+    assert!(!commands.is_empty());
+    assert_eq!(commands.last().unwrap(), "LOGOUT", "{commands:?}");
+    for c in commands.iter().map(|c| c.to_ascii_uppercase()) {
+        let mut words = c.split_whitespace();
+        let verb = match words.next() {
+            Some("UID") => words.next().unwrap_or(""),
+            Some(verb) => verb,
+            None => "",
+        };
+        for forbidden in [
+            "EXPUNGE", "CLOSE", "COPY", "CREATE", "RENAME", "DELETE", "STORE",
+        ] {
+            assert_ne!(verb, forbidden, "sent {c}");
+        }
+        assert!(!c.contains("\\DELETED"), "sent {c}");
+    }
+}
+
+fn uids(list: &[nm_core::Uid]) -> Vec<u32> {
+    list.iter().map(|u| u.get()).collect()
+}
+
+fn sent_move(commands: &[String]) -> bool {
+    commands
+        .iter()
+        .any(|c| c.to_ascii_uppercase().starts_with("UID MOVE"))
+}
+
+#[tokio::test]
+async fn archive_moves_to_the_archive_mailbox_and_confirms_from_inbox() {
+    let (moved, commands) = move_uids(
+        7,
+        &[1, 2, 3],
+        nm_core::Folder::Archive,
+        MoveScript::new(BRIDGE_LIST),
+    )
+    .await;
+    let moved = moved.unwrap();
+    assert_eq!(moved.folder, "Archive");
+    assert_eq!(uids(&moved.moved), [1, 2, 3]);
+    assert!(moved.gone.is_empty());
+    assert_eq!(
+        commands,
+        [
+            "LOGIN \"user\" \"password\"",
+            "CAPABILITY",
+            "LIST \"\" *",
+            "SELECT \"INBOX\"",
+            "UID FETCH 1,2,3 (UID FLAGS)",
+            "UID MOVE 1,2,3 \"Archive\"",
+            "UID FETCH 1,2,3 (UID FLAGS)",
+            "LOGOUT",
+        ]
+    );
+    assert_never_destroys(&commands);
+}
+
+#[tokio::test]
+async fn without_an_archive_mailbox_gmail_archives_to_all_mail() {
+    let (moved, commands) = move_uids(
+        7,
+        &[2],
+        nm_core::Folder::Archive,
+        MoveScript::new(GMAIL_LIST),
+    )
+    .await;
+    let moved = moved.unwrap();
+    assert_eq!(moved.folder, "[Gmail]/All Mail");
+    assert_eq!(uids(&moved.moved), [2]);
+    assert!(commands.contains(&"UID MOVE 2 \"[Gmail]/All Mail\"".to_owned()));
+    assert_never_destroys(&commands);
+}
+
+#[tokio::test]
+async fn delete_moves_to_the_trash_mailbox() {
+    for (list, trash) in [(BRIDGE_LIST, "Trash"), (GMAIL_LIST, "[Gmail]/Trash")] {
+        let (moved, commands) =
+            move_uids(7, &[1], nm_core::Folder::Trash, MoveScript::new(list)).await;
+        let moved = moved.unwrap();
+        assert_eq!(moved.folder, trash);
+        assert_eq!(uids(&moved.moved), [1]);
+        assert!(commands.contains(&format!("UID MOVE 1 \"{trash}\"")));
+        assert_never_destroys(&commands);
+    }
+}
+
+/// A `\Noselect` mailbox and INBOX never qualify, whatever their attributes.
+#[tokio::test]
+async fn a_server_without_the_folder_moves_nothing_and_names_it() {
+    let list = "* LIST (\\Archive \\Trash) \"/\" \"INBOX\"\r\n\
+        * LIST (\\Noselect \\Archive \\All \\Trash) \"/\" \"Folders\"\r\n\
+        * LIST (\\Sent) \"/\" \"Sent\"\r\n";
+    for (to, words) in [
+        (
+            nm_core::Folder::Archive,
+            "no archive folder: no mailbox has the \\Archive or \\All",
+        ),
+        (
+            nm_core::Folder::Trash,
+            "no trash folder: no mailbox has the \\Trash",
+        ),
+    ] {
+        let (moved, commands) = move_uids(7, &[1], to, MoveScript::new(list)).await;
+        let e = moved.unwrap_err();
+        assert!(matches!(e, ImapError::NoFolder(f) if f == to), "{e:?}");
+        assert!(e.to_string().contains(words), "{e}");
+        assert!(e.to_string().contains("nothing was moved"), "{e}");
+        assert!(e.to_string().contains("Show in IMAP"), "{e}");
+        assert!(!sent_move(&commands), "{commands:?}");
+        assert_never_destroys(&commands);
+    }
+}
+
+#[tokio::test]
+async fn a_server_without_move_moves_nothing() {
+    let mut script = MoveScript::new(BRIDGE_LIST);
+    script.capability = "IMAP4rev1 UIDPLUS IDLE";
+    let (moved, commands) = move_uids(7, &[1], nm_core::Folder::Trash, script).await;
+    let e = moved.unwrap_err();
+    assert!(matches!(e, ImapError::NoMove), "{e:?}");
+    assert!(e.to_string().contains("nothing was moved"), "{e}");
+    assert_eq!(
+        commands,
+        ["LOGIN \"user\" \"password\"", "CAPABILITY", "LOGOUT"]
+    );
+}
+
+#[tokio::test]
+async fn another_uidvalidity_moves_nothing_and_says_to_sync() {
+    let (moved, commands) = move_uids(
+        8,
+        &[1],
+        nm_core::Folder::Archive,
+        MoveScript::new(BRIDGE_LIST),
+    )
+    .await;
+    let e = moved.unwrap_err();
+    assert!(matches!(e, ImapError::UidValidityChanged), "{e:?}");
+    assert!(!sent_move(&commands), "{commands:?}");
+    assert_never_destroys(&commands);
+}
+
+/// UID 2 is not in INBOX before the MOVE: gone, and not sent. UID 3 is still there after it:
+/// neither moved nor gone, so not confirmed.
+#[tokio::test]
+async fn gone_uids_are_not_moved_and_a_uid_still_in_inbox_is_not_confirmed() {
+    let mut script = MoveScript::new(BRIDGE_LIST);
+    script.inbox = vec![1, 3];
+    script.stuck = vec![3];
+    let (moved, commands) = move_uids(7, &[1, 2, 3], nm_core::Folder::Archive, script).await;
+    let moved = moved.unwrap();
+    assert_eq!(uids(&moved.moved), [1]);
+    assert_eq!(uids(&moved.gone), [2]);
+    assert_eq!(
+        commands[4..7],
+        [
+            "UID FETCH 1,2,3 (UID FLAGS)",
+            "UID MOVE 1,3 \"Archive\"",
+            "UID FETCH 1,3 (UID FLAGS)",
+        ]
+    );
+    assert_never_destroys(&commands);
+}
+
+#[tokio::test]
+async fn when_every_uid_is_gone_nothing_is_moved() {
+    let mut script = MoveScript::new(BRIDGE_LIST);
+    script.inbox = Vec::new();
+    let (moved, commands) = move_uids(7, &[4, 5], nm_core::Folder::Trash, script).await;
+    let moved = moved.unwrap();
+    assert!(moved.moved.is_empty());
+    assert_eq!(uids(&moved.gone), [4, 5]);
+    assert!(!sent_move(&commands), "{commands:?}");
+    assert_never_destroys(&commands);
+}
+
+/// A NO to UID MOVE, even after part of the set moved, fails the account: nothing is confirmed,
+/// so its cache stays as it was.
+#[tokio::test]
+async fn a_move_the_server_refuses_fails_and_still_logs_out() {
+    let mut script = MoveScript::new(BRIDGE_LIST);
+    script.refuse_move = true;
+    let (moved, commands) = move_uids(7, &[1, 2, 3], nm_core::Folder::Archive, script).await;
+    let e = moved.unwrap_err();
+    assert!(
+        matches!(e, ImapError::Command { op: "UID MOVE", .. }),
+        "{e:?}"
+    );
+    assert!(sent_move(&commands), "{commands:?}");
+    assert_never_destroys(&commands);
 }

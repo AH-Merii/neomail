@@ -1,6 +1,6 @@
-//! `neomail`: the neomail command line: the INBOX (sync, list, show, mark), passwords in the OS
-//! keyring, Gmail and Outlook through the user's own OAuth client (Outlook read through Microsoft
-//! Graph), and setup (`account add`, `account list`, `config path|check`).
+//! `neomail`: the neomail command line: the INBOX (sync, list, show, mark, archive, delete),
+//! passwords in the OS keyring, Gmail and Outlook through the user's own OAuth client (Outlook read
+//! through Microsoft Graph), and setup (`account add`, `account list`, `config path|check`).
 
 mod account;
 mod browser;
@@ -11,7 +11,6 @@ mod graph;
 mod http;
 mod keyring;
 mod lock;
-mod mark;
 #[cfg(unix)]
 mod notify;
 mod oauth;
@@ -22,6 +21,7 @@ mod secret;
 mod setup;
 mod style;
 mod sync;
+mod triage;
 
 use std::ffi::OsString;
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
@@ -55,6 +55,7 @@ Examples:
   neomail list | fzf -m | neomail show -
                                     Pick messages with fzf, then read them
   neomail mark read 42 43           Mark messages 42 and 43 read, on the server too
+  neomail archive 42                Move message 42 to its account's archive
   neomail config check              Check the config file
 
 Guide: https://github.com/AH-Merii/neomail#try-it";
@@ -71,6 +72,36 @@ The change is made on the server first, then in the cache, so `neomail list` sho
 It needs the server: nothing is queued. Exit 1 when any id was unknown, gone or not confirmed.
 An Outlook account added before neomail could change mail needs `neomail account login NAME`
 once.";
+
+const ARCHIVE_EXAMPLES: &str = "\
+Examples:
+  neomail archive 42                Archive message 42
+  neomail archive 42 57             Archive two messages
+  neomail list | fzf -m | neomail archive -
+                                    Pick messages with fzf, then archive them
+  neomail archive --json 42         Print the archived messages and their folder as JSON
+
+Each message moves from the INBOX to its account's archive: the mailbox the server marks
+\\Archive, else \\All (Gmail's All Mail); on Outlook, the folder Outlook's own Archive uses.
+The server moves it first, then it leaves the cache, so `neomail list` no longer shows it. It
+needs the server: nothing is queued. Exit 1 when any id was unknown, gone or not confirmed, or
+its account has no archive. An Outlook account added before neomail could change mail needs
+`neomail account login NAME` once.";
+
+const DELETE_EXAMPLES: &str = "\
+Examples:
+  neomail delete 42                 Move message 42 to the trash
+  neomail delete 42 57              Move two messages to the trash
+  neomail list | fzf -m | neomail delete -
+                                    Pick messages with fzf, then move them to the trash
+  neomail delete --json 42          Print the moved messages and their folder as JSON
+
+Nothing is deleted for good: each message moves from the INBOX to its account's trash (the
+mailbox the server marks \\Trash; on Outlook, Deleted Items), and neomail never empties it. The
+server moves it first, then it leaves the cache, so `neomail list` no longer shows it. It needs
+the server: nothing is queued. Exit 1 when any id was unknown, gone or not confirmed, or its
+account has no trash. An Outlook account added before neomail could change mail needs
+`neomail account login NAME` once.";
 
 const ADD_EXAMPLES: &str = "\
 Examples:
@@ -244,6 +275,24 @@ enum Command {
         /// The state to put the messages in
         #[arg(value_enum)]
         state: MarkState,
+        /// Message ids, the first column of `neomail list`, or - to read them from standard input, one per line
+        #[arg(value_name = "ID", required = true, value_parser = parse_id_arg)]
+        ids: Vec<IdArg>,
+        #[command(flatten)]
+        format: ListingFormat,
+    },
+    /// Archive messages: move them from the INBOX to the account's archive, by the ids from `neomail list`
+    #[command(after_help = ARCHIVE_EXAMPLES)]
+    Archive {
+        /// Message ids, the first column of `neomail list`, or - to read them from standard input, one per line
+        #[arg(value_name = "ID", required = true, value_parser = parse_id_arg)]
+        ids: Vec<IdArg>,
+        #[command(flatten)]
+        format: ListingFormat,
+    },
+    /// Move messages from the INBOX to the account's trash, never deleting them for good, by the ids from `neomail list`
+    #[command(after_help = DELETE_EXAMPLES)]
+    Delete {
         /// Message ids, the first column of `neomail list`, or - to read them from standard input, one per line
         #[arg(value_name = "ID", required = true, value_parser = parse_id_arg)]
         ids: Vec<IdArg>,
@@ -658,33 +707,33 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
         } => show(
             &ids, &format, no_pager, cli.config, terminal, colors, &mut out,
         )?,
-        Command::Mark { state, ids, format } => {
-            let ids = read_ids(&ids)?;
-            let config = Config::load(&config::config_path(cli.config.clone())?)?;
-            let Some(mut cache) = open_cache(false)? else {
-                bail!("{}", no_cache_hint(cli.config));
-            };
-            let runtime = account::runtime()?;
-            let data_dir = config::data_dir()?;
-            let mut marker = mark::Marker {
-                runtime: &runtime,
-                config: &config,
-                data_dir: &data_dir,
-                logins: sync::Logins::default(),
-            };
-            let ids: Vec<MessageId> = ids.into_iter().map(MessageId::new).collect();
-            let action = state.action();
-            let report = nm_core::action::apply(action, &ids, &mut cache, &mut marker)?;
-            let code = mark::finish(
-                action,
-                &report,
-                format.mode(terminal),
-                &mut out,
-                &mut io::stderr().lock(),
-                colors.stderr,
-            )?;
-            ExitCode::from(code)
-        }
+        Command::Mark { state, ids, format } => run_action(
+            state.action(),
+            &ids,
+            &format,
+            cli.config,
+            terminal,
+            colors,
+            &mut out,
+        )?,
+        Command::Archive { ids, format } => run_action(
+            nm_core::Action::Archive,
+            &ids,
+            &format,
+            cli.config,
+            terminal,
+            colors,
+            &mut out,
+        )?,
+        Command::Delete { ids, format } => run_action(
+            nm_core::Action::Delete,
+            &ids,
+            &format,
+            cli.config,
+            terminal,
+            colors,
+            &mut out,
+        )?,
         Command::Completions { shell } => {
             // Into memory first: clap_complete panics when a write fails.
             let mut script = Vec::new();
@@ -798,6 +847,43 @@ fn terminal_width() -> usize {
     terminal_size::terminal_size_of(io::stdout()).map_or(output::WIDTH, |(w, _)| usize::from(w.0))
 }
 
+/// `mark`, `archive` and `delete`: applies `action` to the ids on their servers, then in the
+/// cache, and prints the report.
+fn run_action(
+    action: nm_core::Action,
+    ids: &[IdArg],
+    format: &ListingFormat,
+    config: Option<PathBuf>,
+    terminal: bool,
+    colors: Colors,
+    out: &mut dyn Write,
+) -> Result<ExitCode> {
+    let ids = read_ids(ids)?;
+    let settings = Config::load(&config::config_path(config.clone())?)?;
+    let Some(mut cache) = open_cache(false)? else {
+        bail!("{}", no_cache_hint(config));
+    };
+    let runtime = account::runtime()?;
+    let data_dir = config::data_dir()?;
+    let mut writer = triage::Writer {
+        runtime: &runtime,
+        config: &settings,
+        data_dir: &data_dir,
+        logins: sync::Logins::default(),
+    };
+    let ids: Vec<MessageId> = ids.into_iter().map(MessageId::new).collect();
+    let report = nm_core::action::apply(action, &ids, &mut cache, &mut writer)?;
+    let code = triage::finish(
+        action,
+        &report,
+        format.mode(terminal),
+        out,
+        &mut io::stderr().lock(),
+        colors.stderr,
+    )?;
+    Ok(ExitCode::from(code))
+}
+
 /// `neomail show`: one or more ids, or `-` for ids on standard input. Missing or unreadable
 /// messages are reported on standard error after the others are shown, and exit 1.
 fn show(
@@ -881,8 +967,8 @@ fn show(
     })
 }
 
-/// The ids of `show` and `mark`: the ones given, or with `-` the ones on standard input. `-` with
-/// other ids is a usage error.
+/// The ids of `show`, `mark`, `archive` and `delete`: the ones given, or with `-` the ones on
+/// standard input. `-` with other ids is a usage error.
 fn read_ids(ids: &[IdArg]) -> Result<Vec<i64>> {
     if !ids.contains(&IdArg::Stdin) {
         return Ok(ids
@@ -1297,6 +1383,43 @@ mod tests {
             &["read", "4", "--json", "--plain"],
         ] {
             assert_eq!(parse_mark(bad), Err(2), "{bad:?}");
+        }
+    }
+
+    /// `archive`'s or `delete`'s action and ids, or clap's usage error (exit 2).
+    fn parse_move(args: &[&str]) -> Result<(nm_core::Action, Vec<IdArg>), i32> {
+        match Cli::try_parse_from(["neomail"].iter().chain(args)) {
+            Ok(Cli {
+                command: Some(Command::Archive { ids, .. }),
+                ..
+            }) => Ok((nm_core::Action::Archive, ids)),
+            Ok(Cli {
+                command: Some(Command::Delete { ids, .. }),
+                ..
+            }) => Ok((nm_core::Action::Delete, ids)),
+            Ok(_) => panic!("not archive or delete"),
+            Err(e) => Err(e.exit_code()),
+        }
+    }
+
+    #[test]
+    fn archive_and_delete_take_ids_or_a_dash() {
+        use nm_core::Action::{Archive, Delete};
+        assert_eq!(
+            parse_move(&["archive", "4", "2"]),
+            Ok((Archive, vec![IdArg::Id(4), IdArg::Id(2)]))
+        );
+        assert_eq!(
+            parse_move(&["delete", "-", "--jsonl"]),
+            Ok((Delete, vec![IdArg::Stdin]))
+        );
+        for bad in [
+            &["archive"][..],
+            &["delete", "abc"],
+            &["archive", "4", "--json", "--plain"],
+            &["delete", "4", "--force"],
+        ] {
+            assert_eq!(parse_move(bad), Err(2), "{bad:?}");
         }
     }
 

@@ -1,9 +1,11 @@
 //! Microsoft Graph as an [`IdSource`]: the INBOX of an Outlook, Hotmail or Microsoft 365 mailbox,
 //! read through Graph's REST API (<https://learn.microsoft.com/en-us/graph/api/user-list-messages>).
-//! The one write is a message's read state ([`GraphSource::set_read`]).
+//! It writes a message's read state ([`GraphSource::set_read`]) and moves a message to the archive
+//! or the trash ([`GraphSource::move_to`]).
 //!
-//! [`Transport`] is the seam: one HTTPS GET, or one PATCH with a JSON body. neomail implements it
-//! with its own HTTP client; the tests give a scripted fake, so nothing here opens a connection.
+//! [`Transport`] is the seam: one HTTPS GET, or one PATCH or POST with a JSON body. neomail
+//! implements it with its own HTTP client; the tests give a scripted fake, so nothing here opens a
+//! connection.
 //!
 //! - Every request carries the access token and `Prefer: IdType="ImmutableId"`, which applies only
 //!   to the request that carries it, so ids stay the same when a message moves
@@ -31,8 +33,11 @@
 //! - 429 and 503 are retried after `Retry-After`, else after 1, 2, 4 and 8 s, for at most
 //!   [`MAX_TRIES`] tries (<https://learn.microsoft.com/en-us/graph/throttling>).
 //! - A read state is written with `PATCH /me/messages/{id}` and `{"isRead": ...}`, which needs
-//!   Mail.ReadWrite (<https://learn.microsoft.com/en-us/graph/api/message-update>). Nothing here
-//!   deletes or moves a message.
+//!   Mail.ReadWrite (<https://learn.microsoft.com/en-us/graph/api/message-update>).
+//! - A move is `POST /me/messages/{id}/move` with a well-known folder name as `destinationId`,
+//!   which also needs Mail.ReadWrite and answers `201 Created`
+//!   (<https://learn.microsoft.com/en-us/graph/api/message-move>). Nothing here deletes a message
+//!   for good, or creates, renames or deletes a folder.
 //! - At most [`CONCURRENT_FETCHES`] message downloads or writes run at once: Outlook allows four concurrent
 //!   requests per app and mailbox (<https://learn.microsoft.com/en-us/graph/throttling-limits>).
 //! - Errors never quote a response body or the token.
@@ -46,7 +51,7 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use nm_core::{
-    Cursor, Flags, IdChange, IdChanges, IdFetched, IdListed, IdSource, RemoteId, Written,
+    Cursor, Flags, IdChange, IdChanges, IdFetched, IdListed, IdSource, Moved, RemoteId, Written,
 };
 use serde::Deserialize;
 
@@ -117,6 +122,16 @@ pub trait Transport {
         body: &[u8],
         max_body: usize,
     ) -> impl Future<Output = Result<Reply, TransportError>>;
+
+    /// A POST with `body`, sent as `Content-Type: application/json`, as for
+    /// [`Self::patch_json`].
+    fn post_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> impl Future<Output = Result<Reply, TransportError>>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -142,6 +157,9 @@ pub enum GraphError {
     Malformed,
     #[error("Microsoft Graph's next page or delta link points outside {GRAPH_ORIGIN}; refused")]
     ForeignLink,
+    /// 404 for a well-known folder: the mailbox has no folder with that name, so nothing moved.
+    #[error("the mailbox has no {0:?} folder in Microsoft Graph")]
+    NoFolder(&'static str),
 }
 
 fn code_suffix(code: &Option<String>) -> String {
@@ -344,6 +362,13 @@ impl<T: Transport> GraphSource<T> {
         retrying(|| self.transport.patch_json(url, &headers, body, max_body)).await
     }
 
+    /// POSTs the JSON `body` to `url`, under the same rules as [`Self::get`].
+    async fn post(&self, url: &str, body: &[u8], max_body: usize) -> Result<Reply, GraphError> {
+        let auth = ("Authorization", self.authorization.as_str());
+        let headers = [auth, PREFER, ACCEPT_JSON];
+        retrying(|| self.transport.post_json(url, &headers, body, max_body)).await
+    }
+
     async fn get_json<D: serde::de::DeserializeOwned>(&self, url: &str) -> Result<D, GraphError> {
         let reply = self.get(url, true, MAX_JSON).await?;
         if reply.status != 200 {
@@ -429,6 +454,82 @@ impl<T: Transport> GraphSource<T> {
                 raw: reply.body,
             })),
             404 => Ok(None),
+            _ => Err(status_error(&reply)),
+        }
+    }
+}
+
+/// Graph's well-known name for the folder with role `to`
+/// (<https://learn.microsoft.com/en-us/graph/api/resources/mailfolder>): `archive` is the folder
+/// Outlook's one-click Archive moves to, and `deleteditems` the one a deleted message goes to.
+pub fn well_known(to: nm_core::Folder) -> &'static str {
+    match to {
+        nm_core::Folder::Archive => "archive",
+        nm_core::Folder::Trash => "deleteditems",
+    }
+}
+
+impl<T: Transport> GraphSource<T> {
+    /// Moves the messages `ids` to the folder with role `to`, by its well-known name, at most
+    /// [`CONCURRENT_FETCHES`] at once. First a `GET` of that folder shows the mailbox has it: a
+    /// 404 there is [`GraphError::NoFolder`] and nothing moves, so that a 404 on a move means the
+    /// message is gone, not the folder. Then each message gets `POST /me/messages/{id}/move`
+    /// (<https://learn.microsoft.com/en-us/graph/api/message-move>): 201 is moved, 404 is gone.
+    /// Needs Mail.ReadWrite: without it Graph answers 403, [`GraphError::Forbidden`]. On an error
+    /// some messages may have moved already; the next sync finds them gone from the INBOX.
+    pub async fn move_to(
+        &self,
+        ids: &[RemoteId],
+        to: nm_core::Folder,
+    ) -> Result<Moved<RemoteId>, GraphError> {
+        let name = well_known(to);
+        let mut result = Moved {
+            folder: name.to_owned(),
+            moved: Vec::new(),
+            gone: Vec::new(),
+        };
+        if ids.is_empty() {
+            return Ok(result);
+        }
+        let reply = self
+            .get(
+                &format!("{API}/me/mailFolders/{name}?$select=id"),
+                true,
+                MAX_JSON,
+            )
+            .await?;
+        match reply.status {
+            200 => {}
+            404 => return Err(GraphError::NoFolder(name)),
+            _ => return Err(status_error(&reply)),
+        }
+        let body = serde_json::json!({ "destinationId": name }).to_string();
+        let answers: Vec<(RemoteId, bool)> = stream::iter(ids)
+            .map(|id| async {
+                let moved = self.move_one(id, body.as_bytes()).await?;
+                Ok::<_, GraphError>((id.clone(), moved))
+            })
+            .buffer_unordered(CONCURRENT_FETCHES)
+            .try_collect()
+            .await?;
+        for id in ids {
+            match answers.iter().find(|(a, _)| a == id) {
+                Some((_, true)) => result.moved.push(id.clone()),
+                Some((_, false)) => result.gone.push(id.clone()),
+                None => {}
+            }
+        }
+        Ok(result)
+    }
+
+    /// One move: `true` when Graph moved the message (201), `false` when it is gone (404). The
+    /// answer is the whole message, its body included, so it gets [`MAX_MIME`].
+    async fn move_one(&self, id: &RemoteId, body: &[u8]) -> Result<bool, GraphError> {
+        let url = format!("{API}/me/messages/{}/move", encode_segment(id.as_str()));
+        let reply = self.post(&url, body, MAX_MIME).await?;
+        match reply.status {
+            201 => Ok(true),
+            404 => Ok(false),
             _ => Err(status_error(&reply)),
         }
     }

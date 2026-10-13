@@ -3,51 +3,87 @@
 //! scripts and agents will call the same function.
 //!
 //! An action reaches a server through a [`MailWriter`], one per run, which owns the logins and
-//! the account locks. The writer gets UIDs (with their UIDVALIDITY) or [`RemoteId`]s through two
+//! the account locks. The writer gets UIDs (with their UIDVALIDITY) or [`RemoteId`]s through
 //! separate methods, so a UID never reaches Microsoft Graph and a Graph id never reaches IMAP.
-//! The cache changes only for what the server confirmed.
+//! A move names its destination by [`Folder`] role; only the account's server resolves it to a
+//! folder name. The cache changes only for what the server confirmed.
 
 use std::fmt;
 
 use crate::cache::{Cache, CacheError, Located, MessageKey};
 use crate::types::{Flags, MessageId, RemoteId, Uid, UidValidity};
 
-/// What can be done to a message. Archive, delete and move come later.
+/// What can be done to a message. Moving to a named folder comes later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     MarkRead,
     MarkUnread,
+    /// Moves a message from the INBOX to its account's archive.
+    Archive,
+    /// Moves a message from the INBOX to its account's trash. Never deletes it for good.
+    Delete,
+}
+
+/// A folder named by its role. The account's server resolves the role to one of its folders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Folder {
+    Archive,
+    Trash,
+}
+
+impl fmt::Display for Folder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Archive => "archive",
+            Self::Trash => "trash",
+        })
+    }
+}
+
+/// What an action does to a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// Sets (`true`) or clears `\Seen`.
+    Seen(bool),
+    /// Moves it out of the INBOX to the folder with this role.
+    Move(Folder),
 }
 
 impl Action {
-    pub const ALL: [Self; 2] = [Self::MarkRead, Self::MarkUnread];
+    pub const ALL: [Self; 4] = [
+        Self::MarkRead,
+        Self::MarkUnread,
+        Self::Archive,
+        Self::Delete,
+    ];
 
     /// The action's stable name, for keys, scripts and agents: it never changes once released.
     pub fn name(self) -> &'static str {
         match self {
             Self::MarkRead => "mark-read",
             Self::MarkUnread => "mark-unread",
+            Self::Archive => "archive",
+            Self::Delete => "delete",
         }
     }
 
-    /// Whether a message is read (`\Seen`) once the action is done.
-    pub fn seen(self) -> bool {
-        self == Self::MarkRead
-    }
-
-    /// Whether `flags` are in the state the action asks for.
-    pub fn is_done(self, flags: &Flags) -> bool {
-        flags.is_seen() == self.seen()
-    }
-
-    /// `flags` with the action done to them, for a server that confirms without sending flags.
-    fn done_to(self, flags: &Flags) -> Flags {
-        let others = flags.iter().filter(|f| *f != Flags::SEEN);
-        if self.seen() {
-            Flags::new(others.chain([Flags::SEEN]))
-        } else {
-            Flags::new(others)
+    pub fn change(self) -> Change {
+        match self {
+            Self::MarkRead => Change::Seen(true),
+            Self::MarkUnread => Change::Seen(false),
+            Self::Archive => Change::Move(Folder::Archive),
+            Self::Delete => Change::Move(Folder::Trash),
         }
+    }
+}
+
+/// `flags` with `\Seen` set or cleared, for a server that confirms without sending flags.
+fn seen_to(seen: bool, flags: &Flags) -> Flags {
+    let others = flags.iter().filter(|f| *f != Flags::SEEN);
+    if seen {
+        Flags::new(others.chain([Flags::SEEN]))
+    } else {
+        Flags::new(others)
     }
 }
 
@@ -68,6 +104,16 @@ impl<K> Default for Written<K> {
     }
 }
 
+/// What a server confirmed of a move: the destination as the server names it, the messages it
+/// moved there, and the ones its INBOX no longer has. A key in neither was not confirmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved<K> {
+    /// An IMAP mailbox name such as `Archive` or `[Gmail]/Trash`, or a Graph folder name.
+    pub folder: String,
+    pub moved: Vec<K>,
+    pub gone: Vec<K>,
+}
+
 /// The seam between [`apply`] and the servers. neomail implements it with the logins `neomail
 /// sync` uses; the tests use fakes.
 ///
@@ -75,9 +121,12 @@ impl<K> Default for Written<K> {
 /// - [`lock`](Self::lock) is taken before an account's messages are written, and held until its
 ///   cache rows are updated: a sync of the same account cannot run in between.
 /// - `Err` means none of the call's messages is confirmed. The server may still have changed some
-///   of them (Graph writes one message per request); the cache is left alone for all of them, and
-///   the next sync reads their state.
-/// - Nothing a writer does may delete, expunge or move a message.
+///   of them (Graph writes one message per request, and an IMAP MOVE can fail partway, RFC 6851
+///   section 3.3); the cache is left alone for all of them, and the next sync reads their state.
+/// - Nothing a writer does may delete or expunge a message for good, or create, rename or delete
+///   a folder. Only the move methods move a message, and only to the folder asked: by UID, only
+///   from the INBOX; by id, from wherever the server holds it now (Graph moves a message by its
+///   id), which is the INBOX unless it moved since the last sync.
 pub trait MailWriter {
     /// Held while an account is written and its cache rows are updated.
     type Lock;
@@ -102,14 +151,42 @@ pub trait MailWriter {
         ids: &[RemoteId],
         seen: bool,
     ) -> Result<Written<RemoteId>, Self::Error>;
+
+    /// Moves `uids` from the account's INBOX to its folder with the role `to`, refusing when the
+    /// server's UIDVALIDITY is not `uid_validity` or it has no such folder.
+    fn move_by_uid(
+        &mut self,
+        account: &str,
+        uid_validity: UidValidity,
+        uids: &[Uid],
+        to: Folder,
+    ) -> Result<Moved<Uid>, Self::Error>;
+
+    /// Moves messages named by their server ids to the account's folder with the role `to`,
+    /// refusing when it has no such folder.
+    fn move_by_id(
+        &mut self,
+        account: &str,
+        ids: &[RemoteId],
+        to: Folder,
+    ) -> Result<Moved<RemoteId>, Self::Error>;
 }
 
-/// A message now in the asked state, with its flags as cached.
+/// A message now in the asked state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Done {
     pub id: MessageId,
     pub account: String,
-    pub flags: Flags,
+    pub state: State,
+}
+
+/// Where a done message stands: its flags as cached after a mark, or the folder a move put it in
+/// (its cache row is gone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum State {
+    Flags(Flags),
+    /// The destination as the server names it.
+    MovedTo(String),
 }
 
 /// Why a message is not confirmed in the asked state. The cache is unchanged for it, except for
@@ -141,8 +218,9 @@ pub struct Report<E> {
 }
 
 /// Applies `action` to the cached messages `ids`: per account, takes its lock, writes to its
-/// server, then updates the cache with what the server confirmed. One account failing never
-/// stops the others. Repeated ids count once. Only a cache error ends the run early.
+/// server, then updates the cache with what the server confirmed: new flags, or a moved message's
+/// row removed, as a sync does for a message gone from the INBOX. One account failing never stops
+/// the others. Repeated ids count once. Only a cache error ends the run early.
 pub fn apply<W: MailWriter>(
     action: Action,
     ids: &[MessageId],
@@ -192,13 +270,21 @@ pub fn apply<W: MailWriter>(
             }
         }
         let updates = write_account(action, account, &now, writer, &mut report);
-        cache.set_flags(&updates)?;
+        cache.set_flags(&updates.flags)?;
+        cache.remove(&updates.moved)?;
         drop(lock);
     }
     report
         .done
         .sort_by_key(|d| asked.iter().position(|&id| id == d.id));
     Ok(report)
+}
+
+/// The cache updates the server confirmed for one account.
+#[derive(Default)]
+struct Updates {
+    flags: Vec<(MessageId, Flags)>,
+    moved: Vec<MessageId>,
 }
 
 /// Writes one account's messages, the UID ones per UIDVALIDITY and the by-id ones together, and
@@ -209,8 +295,8 @@ fn write_account<W: MailWriter>(
     located: &[Located],
     writer: &mut W,
     report: &mut Report<W::Error>,
-) -> Vec<(MessageId, Flags)> {
-    let mut updates = Vec::new();
+) -> Updates {
+    let mut updates = Updates::default();
     let mut validities: Vec<UidValidity> = Vec::new();
     for l in located {
         if let MessageKey::Uid { uid_validity, .. } = l.key
@@ -228,8 +314,16 @@ fn write_account<W: MailWriter>(
             })
             .collect();
         let uids: Vec<Uid> = batch.iter().map(|(_, uid)| *uid).collect();
-        let written = writer.set_seen_by_uid(account, validity, &uids, action.seen());
-        settle(action, account, &batch, written, report, &mut updates);
+        match action.change() {
+            Change::Seen(seen) => {
+                let written = writer.set_seen_by_uid(account, validity, &uids, seen);
+                settle(seen, account, &batch, written, report, &mut updates);
+            }
+            Change::Move(to) => {
+                let moved = writer.move_by_uid(account, validity, &uids, to);
+                settle_move(account, &batch, moved, report, &mut updates);
+            }
+        }
     }
     let batch: Vec<(&Located, RemoteId)> = located
         .iter()
@@ -240,29 +334,43 @@ fn write_account<W: MailWriter>(
         .collect();
     if !batch.is_empty() {
         let ids: Vec<RemoteId> = batch.iter().map(|(_, id)| id.clone()).collect();
-        let written = writer.set_seen_by_id(account, &ids, action.seen());
-        settle(action, account, &batch, written, report, &mut updates);
+        match action.change() {
+            Change::Seen(seen) => {
+                let written = writer.set_seen_by_id(account, &ids, seen);
+                settle(seen, account, &batch, written, report, &mut updates);
+            }
+            Change::Move(to) => {
+                let moved = writer.move_by_id(account, &ids, to);
+                settle_move(account, &batch, moved, report, &mut updates);
+            }
+        }
     }
     updates
 }
 
-/// Records one write's outcome for `batch`, pairing the server's keys back with message ids.
+/// The failure for every message of `batch` when its account could not be written.
+fn account_failure<K, E>(account: &str, batch: &[(&Located, K)], error: E) -> Failure<E> {
+    Failure::Account {
+        account: account.to_owned(),
+        ids: batch.iter().map(|(l, _)| l.id).collect(),
+        error,
+    }
+}
+
+/// Records one read-state write's outcome for `batch`, pairing the server's keys back with
+/// message ids.
 fn settle<K: PartialEq, E>(
-    action: Action,
+    seen: bool,
     account: &str,
     batch: &[(&Located, K)],
     written: Result<Written<K>, E>,
     report: &mut Report<E>,
-    updates: &mut Vec<(MessageId, Flags)>,
+    updates: &mut Updates,
 ) {
     let written = match written {
         Ok(written) => written,
         Err(error) => {
-            report.failures.push(Failure::Account {
-                account: account.to_owned(),
-                ids: batch.iter().map(|(l, _)| l.id).collect(),
-                error,
-            });
+            report.failures.push(account_failure(account, batch, error));
             return;
         }
     };
@@ -270,15 +378,15 @@ fn settle<K: PartialEq, E>(
         let done = written.done.iter().find(|(k, _)| k == key);
         match done {
             Some((_, flags)) => {
-                let flags = flags.clone().unwrap_or_else(|| action.done_to(&l.flags));
+                let flags = flags.clone().unwrap_or_else(|| seen_to(seen, &l.flags));
                 if flags != l.flags {
-                    updates.push((l.id, flags.clone()));
+                    updates.flags.push((l.id, flags.clone()));
                 }
-                if action.is_done(&flags) {
+                if flags.is_seen() == seen {
                     report.done.push(Done {
                         id: l.id,
                         account: account.to_owned(),
-                        flags,
+                        state: State::Flags(flags),
                     });
                 } else {
                     report.failures.push(Failure::NotConfirmed {
@@ -296,5 +404,45 @@ fn settle<K: PartialEq, E>(
                 id: l.id,
             }),
         }
+    }
+}
+
+/// Records one move's outcome for `batch`: a moved message's row leaves the cache; a gone one
+/// stays for the next sync, as for a mark.
+fn settle_move<K: PartialEq, E>(
+    account: &str,
+    batch: &[(&Located, K)],
+    moved: Result<Moved<K>, E>,
+    report: &mut Report<E>,
+    updates: &mut Updates,
+) {
+    let moved = match moved {
+        Ok(moved) => moved,
+        Err(error) => {
+            report.failures.push(account_failure(account, batch, error));
+            return;
+        }
+    };
+    for (l, key) in batch {
+        let failure = if moved.moved.contains(key) {
+            updates.moved.push(l.id);
+            report.done.push(Done {
+                id: l.id,
+                account: account.to_owned(),
+                state: State::MovedTo(moved.folder.clone()),
+            });
+            continue;
+        } else if moved.gone.contains(key) {
+            Failure::Gone {
+                account: account.to_owned(),
+                id: l.id,
+            }
+        } else {
+            Failure::NotConfirmed {
+                account: account.to_owned(),
+                id: l.id,
+            }
+        };
+        report.failures.push(failure);
     }
 }

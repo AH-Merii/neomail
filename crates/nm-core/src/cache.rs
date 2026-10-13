@@ -743,6 +743,24 @@ impl Cache {
         Ok(())
     }
 
+    /// Removes cached messages by id, in one transaction, as a sync does for a message gone from
+    /// the INBOX. Ids that are not cached are skipped. A removed id is never handed out again
+    /// (AUTOINCREMENT).
+    pub fn remove(&mut self, ids: &[MessageId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut delete = tx.prepare("DELETE FROM message WHERE id = ?1")?;
+            for id in ids {
+                delete.execute([id.get()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn get(&self, id: MessageId) -> Result<Option<StoredMessage>> {
         let row = self
             .conn

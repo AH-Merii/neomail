@@ -1,12 +1,14 @@
 //! Microsoft Graph wiring: `nm_graph`'s [`Transport`] over neomail's [`Https`], the read-only
 //! check `account add outlook` runs before anything is saved, the sync of a Graph account, and
-//! marking its messages read or unread.
+//! the writes: marking its messages read or unread, and moving them to the archive or trash.
 
 use std::io;
 use std::num::NonZeroU32;
 
 use anyhow::{Result, anyhow};
-use nm_core::{Cache, RemoteId, SyncError, SyncReport, Written, sync_inbox_by_id_with_progress};
+use nm_core::{
+    Cache, Folder, Moved, RemoteId, SyncError, SyncReport, Written, sync_inbox_by_id_with_progress,
+};
 use nm_graph::{GraphError, GraphSource, Reply, Transport, TransportError};
 
 use crate::http::Https;
@@ -37,6 +39,21 @@ impl Transport for Https {
         max_body: usize,
     ) -> Result<Reply, TransportError> {
         let r = Https::patch_json(self, url, headers, body, max_body).await?;
+        Ok(Reply {
+            status: r.status,
+            retry_after: r.retry_after,
+            body: r.body,
+        })
+    }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> Result<Reply, TransportError> {
+        let r = Https::post_json(self, url, headers, body, max_body).await?;
         Ok(Reply {
             status: r.status,
             retry_after: r.retry_after,
@@ -103,16 +120,38 @@ pub async fn set_read(
     ids: &[RemoteId],
     read: bool,
 ) -> Result<Written<RemoteId>> {
+    may_write(account, token)?;
+    GraphSource::new(Https::new()?, token.expose())
+        .set_read(ids, read)
+        .await
+        .map_err(|e| explain_write(e, account))
+}
+
+/// Moves the messages `ids` of a Graph account to the folder with role `to`. Like
+/// [`set_read`], a Mail.Read sign-in fails before any request.
+pub async fn move_to(
+    account: &str,
+    token: &AccessToken,
+    ids: &[RemoteId],
+    to: Folder,
+) -> Result<Moved<RemoteId>> {
+    may_write(account, token)?;
+    GraphSource::new(Https::new()?, token.expose())
+        .move_to(ids, to)
+        .await
+        .map_err(|e| explain_write(e, account))
+}
+
+/// Fails when `token`'s sign-in grants only Mail.Read: changing or moving mail needs
+/// Mail.ReadWrite, which only a new sign-in can grant.
+fn may_write(account: &str, token: &AccessToken) -> Result<()> {
     if token.grant != MailGrant::ReadWrite {
         return Err(anyhow!(
             "this account's sign-in lets neomail read mail but not change it; run `neomail \
              account login {account}` to let neomail change mail"
         ));
     }
-    GraphSource::new(Https::new()?, token.expose())
-        .set_read(ids, read)
-        .await
-        .map_err(|e| explain_write(e, account))
+    Ok(())
 }
 
 /// A Graph error from a write, with what to do next.
@@ -124,6 +163,9 @@ fn explain_write(e: GraphError, account: &str) -> anyhow::Error {
              change your email; if it persists, a policy of the account's organisation may block \
              the app"
         ),
+        GraphError::NoFolder(_) => {
+            anyhow!("{e}, so nothing was moved; use Outlook on the web for these messages")
+        }
         other => anyhow::Error::new(other),
     }
 }
@@ -189,6 +231,16 @@ mod tests {
             "this account's sign-in lets neomail read mail but not change it; run `neomail \
              account login outlook` to let neomail change mail"
         );
+        // Nor move it, to either folder.
+        for to in [Folder::Archive, Folder::Trash] {
+            let id = RemoteId::new("AAMk1".to_owned()).unwrap();
+            let e = move_to("outlook", &token, &[id], to).await.unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "this account's sign-in lets neomail read mail but not change it; run `neomail \
+                 account login outlook` to let neomail change mail"
+            );
+        }
     }
 
     #[test]
@@ -198,6 +250,11 @@ mod tests {
             "Microsoft Graph refused access to the mailbox (HTTP 403); run `neomail account \
              login outlook` and accept the permission to read and change your email; if it \
              persists, a policy of the account's organisation may block the app"
+        );
+        assert_eq!(
+            explain_write(GraphError::NoFolder("archive"), "outlook").to_string(),
+            "the mailbox has no \"archive\" folder in Microsoft Graph, so nothing was moved; use \
+             Outlook on the web for these messages"
         );
         assert_eq!(
             explain_write(GraphError::Unauthorized, "outlook").to_string(),
