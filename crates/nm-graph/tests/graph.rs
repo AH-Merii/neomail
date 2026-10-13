@@ -8,7 +8,10 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use nm_core::{Cache, Cursor, Flags, Folder, IdChange, IdSource, RemoteId, sync_inbox_by_id};
+use nm_core::{
+    Cache, Cursor, Destination, Flags, Folder, FolderName, IdChange, IdSource, RemoteId, Role,
+    sync_inbox_by_id,
+};
 use nm_graph::{GraphError, GraphSource, MAX_JSON, MAX_MIME, Reply, Transport, TransportError};
 use serde_json::{Value, json};
 
@@ -50,6 +53,19 @@ struct FakeGraph {
     seen: RefCell<Vec<Seen>>,
     in_flight: Cell<usize>,
     max_in_flight: Cell<usize>,
+    /// The mailbox's folders, in Graph's order; empty for the tests that only move to a role.
+    folders: Vec<FakeFolder>,
+    folder_page: usize,
+    /// Where every listing page's next link points instead of the next page; `None` for Graph.
+    next_link: Option<&'static str>,
+}
+
+struct FakeFolder {
+    id: String,
+    name: &'static str,
+    parent: Option<String>,
+    well_known: Option<&'static str>,
+    search: bool,
 }
 
 impl FakeGraph {
@@ -68,7 +84,63 @@ impl FakeGraph {
             seen: RefCell::default(),
             in_flight: Cell::new(0),
             max_in_flight: Cell::new(0),
+            folders: Vec::new(),
+            folder_page: 100,
+            next_link: None,
         }
+    }
+
+    fn next_links_to(mut self, link: &'static str) -> Self {
+        self.next_link = Some(link);
+        self
+    }
+
+    /// A listing page's next link: Graph's own `next`, unless the test points it elsewhere.
+    fn next(&self, next: String) -> Value {
+        json!(self.next_link.map_or(next, str::to_owned))
+    }
+
+    fn folders(mut self, folders: Vec<FakeFolder>, page: usize) -> Self {
+        self.folders = folders;
+        self.folder_page = page;
+        self
+    }
+
+    /// A listing of the folders under `parent`, `folder_page` at a time from `$skip`.
+    fn serve_folders(&self, path: &str, query: &str, parent: Option<&str>) -> Reply {
+        let fields = "$select=id,displayName,childFolderCount&$top=100";
+        let skip: usize = match query.strip_prefix(fields) {
+            Some("") => 0,
+            Some(rest) => rest.strip_prefix("&$skip=").unwrap().parse().unwrap(),
+            None => panic!("{query}"),
+        };
+        let under: Vec<&FakeFolder> = self
+            .folders
+            .iter()
+            .filter(|f| f.parent.as_deref() == parent)
+            .collect();
+        let end = under.len().min(skip + self.folder_page);
+        let value: Vec<Value> = under[skip.min(end)..end]
+            .iter()
+            .map(|f| {
+                let children = self
+                    .folders
+                    .iter()
+                    .filter(|c| c.parent.as_deref() == Some(f.id.as_str()))
+                    .count();
+                let mut v = json!({"id": f.id, "displayName": f.name, "childFolderCount": children,
+                    "parentFolderId": f.parent, "totalItemCount": 3, "isHidden": false});
+                if f.search {
+                    v["@odata.type"] = json!("#microsoft.graph.mailSearchFolder");
+                }
+                v
+            })
+            .collect();
+        let mut page = json!({ "value": value });
+        if end < under.len() {
+            page["@odata.nextLink"] = self.next(format!("{API}{path}?{fields}&$skip={end}"));
+        }
+        json_reply(200, &page)
     }
 
     fn script(self, replies: impl IntoIterator<Item = Reply>) -> Self {
@@ -93,9 +165,25 @@ impl FakeGraph {
                 None => json_reply(404, &json!({"error": {"code": "ErrorItemNotFound"}})),
             };
         }
-        if let Some(name @ ("archive" | "deleteditems")) = path.strip_prefix("/me/mailFolders/") {
-            assert_eq!(query, "$select=id");
-            return json_reply(200, &json!({ "id": format!("{name}-id") }));
+        if path == "/me/mailFolders" {
+            return self.serve_folders(path, query, None);
+        }
+        if let Some(segment) = path
+            .strip_prefix("/me/mailFolders/")
+            .and_then(|p| p.strip_suffix("/childFolders"))
+        {
+            return self.serve_folders(path, query, Some(&decode(segment)));
+        }
+        if let Some(name) = path.strip_prefix("/me/mailFolders/")
+            && query == "$select=id"
+        {
+            if let Some(f) = self.folders.iter().find(|f| f.well_known == Some(name)) {
+                return json_reply(200, &json!({ "id": f.id }));
+            }
+            if self.folders.is_empty() && matches!(name, "archive" | "deleteditems") {
+                return json_reply(200, &json!({ "id": format!("{name}-id") }));
+            }
+            return json_reply(404, &json!({"error": {"code": "ErrorFolderNotFound"}}));
         }
         if path == "/me/mailFolders/inbox" {
             return json_reply(
@@ -153,7 +241,8 @@ impl FakeGraph {
                 .split('&')
                 .filter(|p| !p.starts_with("$skip="))
                 .collect();
-            page["@odata.nextLink"] = json!(format!("{API}{path}?{}&$skip={end}", base.join("&")));
+            page["@odata.nextLink"] =
+                self.next(format!("{API}{path}?{}&$skip={end}", base.join("&")));
         }
         json_reply(200, &page)
     }
@@ -446,21 +535,51 @@ async fn fetch_encodes_ids_leaves_out_gone_ones_and_runs_four_at_once() {
     }
 }
 
+/// Every paging read refuses a next link off Graph's origin before following it, so the
+/// bearer token never leaves Graph. Delta rounds: `a_link_off_graph_is_refused`.
 #[tokio::test]
-async fn a_next_link_off_graph_is_refused_without_a_request() {
+async fn a_next_link_off_graph_is_refused_by_every_paging_read() {
     for link in [
         "https://graph.microsoft.com.evil.example/v1.0/x",
         "http://graph.microsoft.com/v1.0/x",
         "https://evil.example/https://graph.microsoft.com/",
     ] {
-        let fake = FakeGraph::new([]).script([json_reply(
-            200,
-            &json!({"value": [], "@odata.nextLink": link}),
-        )]);
-        let mut s = source(fake);
-        let e = s.newest(n(5)).await.unwrap_err();
-        assert!(matches!(e, GraphError::ForeignLink), "{link}: {e}");
-        assert_eq!(transport(&s).urls().len(), 1, "{link}");
+        // One entry to a page, so every listing has a next page.
+        let fake = || {
+            let mut fake = FakeGraph::new(1..=2).folders(tree(), 1).next_links_to(link);
+            fake.page_size = 1;
+            fake
+        };
+        let mut newest = source(fake());
+        let newest_result = newest.newest(n(5)).await.map(drop);
+        let folders = source(fake());
+        let folders_result = folders.folders().await.map(drop);
+        let mover = source(fake());
+        let move_result = mover
+            .move_to(&ids([1]), &named("Inbox/Receipts"))
+            .await
+            .map(drop);
+        for (read, s, result) in [
+            ("newest", &newest, newest_result),
+            ("folders", &folders, folders_result),
+            ("move_to", &mover, move_result),
+        ] {
+            assert!(
+                matches!(result, Err(GraphError::ForeignLink)),
+                "{read} {link}: {result:?}"
+            );
+            let fake = transport(s);
+            let urls = fake.urls();
+            assert!(!urls.is_empty(), "{read} {link}");
+            assert!(
+                urls.iter().all(|u| u.starts_with(API)),
+                "{read}: {link} is never fetched: {urls:?}"
+            );
+            assert!(
+                fake.seen.borrow().iter().all(|r| r.method == "GET"),
+                "{read} {link}: nothing moves"
+            );
+        }
     }
 }
 
@@ -995,7 +1114,7 @@ async fn move_to_checks_the_folder_then_posts_each_message_to_its_well_known_nam
         (Folder::Trash, "deleteditems"),
     ] {
         let s = source(FakeGraph::new(1..=6));
-        let moved = s.move_to(&ids(1..=6), to).await.unwrap();
+        let moved = s.move_to(&ids(1..=6), &to.into()).await.unwrap();
         assert_eq!(moved.folder, name);
         assert_eq!(moved.moved, ids(1..=6));
         assert!(moved.gone.is_empty());
@@ -1032,7 +1151,10 @@ async fn move_to_checks_the_folder_then_posts_each_message_to_its_well_known_nam
 async fn move_to_reports_a_404_as_gone_and_a_missing_folder_moves_nothing() {
     // The fake has no message 2, so its move answers 404.
     let s = source(FakeGraph::new([1, 3]));
-    let moved = s.move_to(&ids([1, 2, 3]), Folder::Trash).await.unwrap();
+    let moved = s
+        .move_to(&ids([1, 2, 3]), &Folder::Trash.into())
+        .await
+        .unwrap();
     assert_eq!(moved.moved, ids([1, 3]));
     assert_eq!(moved.gone, ids([2]));
 
@@ -1041,7 +1163,10 @@ async fn move_to_reports_a_404_as_gone_and_a_missing_folder_moves_nothing() {
         404,
         &json!({"error": {"code": "ErrorItemNotFound"}}),
     )]));
-    let e = s.move_to(&ids([1]), Folder::Archive).await.unwrap_err();
+    let e = s
+        .move_to(&ids([1]), &Folder::Archive.into())
+        .await
+        .unwrap_err();
     assert!(matches!(e, GraphError::NoFolder("archive")), "{e:?}");
     assert_eq!(
         e.to_string(),
@@ -1051,7 +1176,7 @@ async fn move_to_reports_a_404_as_gone_and_a_missing_folder_moves_nothing() {
 
     // No ids, no requests.
     let s = source(FakeGraph::new([1]));
-    let moved = s.move_to(&[], Folder::Archive).await.unwrap();
+    let moved = s.move_to(&[], &Folder::Archive.into()).await.unwrap();
     assert!(moved.moved.is_empty() && moved.gone.is_empty());
     assert!(transport(&s).seen.borrow().is_empty());
 }
@@ -1063,7 +1188,7 @@ async fn move_to_retries_throttling_and_fails_on_403_and_other_answers() {
     let s =
         source(FakeGraph::new([1]).script([folder, throttled(429, Some(3)), throttled(503, None)]));
     let start = tokio::time::Instant::now();
-    let moved = s.move_to(&ids([1]), Folder::Archive).await.unwrap();
+    let moved = s.move_to(&ids([1]), &Folder::Archive.into()).await.unwrap();
     assert_eq!(start.elapsed(), Duration::from_secs(3 + 2));
     assert_eq!(moved.moved, ids([1]));
     {
@@ -1084,7 +1209,10 @@ async fn move_to_retries_throttling_and_fails_on_403_and_other_answers() {
             &json!({"error": {"code": "ErrorAccessDenied", "message": TOKEN}}),
         ),
     ]));
-    let e = s.move_to(&ids([1]), Folder::Archive).await.unwrap_err();
+    let e = s
+        .move_to(&ids([1]), &Folder::Archive.into())
+        .await
+        .unwrap_err();
     assert!(matches!(e, GraphError::Forbidden), "{e:?}");
     assert!(!format!("{e:?} {e}").contains("not-a-real-token"));
     assert_eq!(transport(&s).seen.borrow().len(), 2);
@@ -1095,10 +1223,240 @@ async fn move_to_retries_throttling_and_fails_on_403_and_other_answers() {
             json_reply(200, &json!({"id": "archive-id"})),
             reply(status, Vec::new()),
         ]));
-        let e = s.move_to(&ids([1]), Folder::Trash).await.unwrap_err();
+        let e = s
+            .move_to(&ids([1]), &Folder::Trash.into())
+            .await
+            .unwrap_err();
         assert_eq!(
             e.to_string(),
             format!("Microsoft Graph answered HTTP {status}")
         );
     }
+}
+
+fn fake_folder(
+    id: &str,
+    name: &'static str,
+    parent: Option<&str>,
+    well_known: Option<&'static str>,
+) -> FakeFolder {
+    FakeFolder {
+        // Ids need encoding in a path, as Graph's do.
+        id: format!("AQMk/{id}+="),
+        name,
+        parent: parent.map(|p| format!("AQMk/{p}+=")),
+        well_known,
+        search: false,
+    }
+}
+
+/// A mailbox with the default folders, a child of the Inbox, a search folder, a top-level
+/// "Receipts", and two folders that share the path "a/b": "a/b" itself, and "b" inside "a".
+fn tree() -> Vec<FakeFolder> {
+    let mut digests = fake_folder("digests", "Weekly digests", Some("inbox"), None);
+    digests.search = true;
+    vec![
+        fake_folder("archive", "Archive", None, Some("archive")),
+        fake_folder("deleted", "Deleted Items", None, Some("deleteditems")),
+        fake_folder("inbox", "Inbox", None, Some("inbox")),
+        fake_folder("inbox-receipts", "Receipts", Some("inbox"), None),
+        digests,
+        fake_folder("junk", "Junk Email", None, Some("junkemail")),
+        fake_folder("sent", "Sent Items", None, Some("sentitems")),
+        fake_folder("drafts", "Drafts", None, Some("drafts")),
+        fake_folder("receipts", "Receipts", None, None),
+        fake_folder("ab", "a/b", None, None),
+        fake_folder("a", "a", None, None),
+        fake_folder("a-b", "b", Some("a"), None),
+        fake_folder("outbox", "Outbox", None, Some("outbox")),
+    ]
+}
+
+fn named(path: &str) -> Destination {
+    Destination::Name(FolderName::new(path).unwrap())
+}
+
+#[tokio::test]
+async fn folders_lists_the_tree_depth_first_by_path_with_roles_through_every_page() {
+    // Two folders to a page, so each level takes several pages.
+    let s = source(FakeGraph::new([]).folders(tree(), 2));
+    let listed = s.folders().await.unwrap();
+    let got: Vec<(&str, Option<Role>)> = listed.iter().map(|f| (f.name.as_str(), f.role)).collect();
+    assert_eq!(
+        got,
+        [
+            ("Archive", Some(Role::Archive)),
+            ("Deleted Items", Some(Role::Trash)),
+            ("Inbox", Some(Role::Inbox)),
+            // The search folder under the Inbox cannot hold a message: left out.
+            ("Inbox/Receipts", None),
+            ("Junk Email", Some(Role::Junk)),
+            ("Sent Items", Some(Role::Sent)),
+            ("Drafts", Some(Role::Drafts)),
+            ("Receipts", None),
+            ("a/b", None),
+            ("a", None),
+            ("a/b", None),
+            // Graph's outbox is not one of the roles neomail shows.
+            ("Outbox", None),
+        ]
+    );
+    let fake = transport(&s);
+    let seen = fake.seen.borrow();
+    // Six well-known names, five pages of the top, one page of the Inbox's children and one of
+    // a's: only folders with children are asked for theirs. Nothing but reads.
+    assert_eq!(seen.len(), 6 + 5 + 1 + 1, "{:?}", fake.urls());
+    assert!(
+        seen.iter()
+            .all(|r| r.method == "GET" && r.headers == headers())
+    );
+    let children: Vec<&str> = seen
+        .iter()
+        .filter(|r| r.url.contains("/childFolders"))
+        .map(|r| r.url.as_str())
+        .collect();
+    let fields = "$select=id,displayName,childFolderCount&$top=100";
+    assert_eq!(
+        children,
+        [
+            format!("{API}/me/mailFolders/AQMk%2Finbox%2B%3D/childFolders?{fields}"),
+            format!("{API}/me/mailFolders/AQMk%2Fa%2B%3D/childFolders?{fields}"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn move_to_a_path_lists_only_the_levels_on_its_way_and_sends_the_folder_id() {
+    for (path, id, gets) in [
+        ("Inbox/Receipts", "AQMk/inbox-receipts+=", 3),
+        ("Receipts", "AQMk/receipts+=", 2),
+    ] {
+        let s = source(FakeGraph::new(1..=3).folders(tree(), 100));
+        let moved = s.move_to(&ids(1..=3), &named(path)).await.unwrap();
+        assert_eq!(moved.folder, path);
+        assert_eq!(moved.moved, ids(1..=3));
+        let fake = transport(&s);
+        let seen = fake.seen.borrow();
+        // The top, the Inbox's children for a path inside it, then the inbox's id, read-only;
+        // a's children, or any other folder's, are never asked for.
+        assert_eq!(seen.len(), gets + 3, "{:?}", fake.urls());
+        assert!(seen[..gets].iter().all(|r| r.method == "GET"));
+        assert_eq!(
+            seen[gets - 1].url,
+            format!("{API}/me/mailFolders/inbox?$select=id")
+        );
+        for request in &seen[gets..] {
+            assert_eq!(request.method, "POST");
+            assert!(request.url.ends_with("/move"), "{}", request.url);
+            assert_eq!(request.body, Some(json!({ "destinationId": id })));
+            assert_eq!(request.headers, headers());
+        }
+    }
+}
+
+/// The inbox is known by its id, not its display name, which follows the mailbox's language: in
+/// a German mailbox it is "Posteingang", and a user's own top-level "Inbox" is just a folder.
+#[tokio::test]
+async fn the_inbox_is_found_by_its_id_whatever_its_display_name() {
+    let german = || {
+        vec![
+            fake_folder("inbox", "Posteingang", None, Some("inbox")),
+            fake_folder("user-inbox", "Inbox", None, None),
+        ]
+    };
+    let s = source(FakeGraph::new([1]).folders(german(), 100));
+    let listed = s.folders().await.unwrap();
+    let got: Vec<(&str, Option<Role>)> = listed.iter().map(|f| (f.name.as_str(), f.role)).collect();
+    assert_eq!(got, [("Posteingang", Some(Role::Inbox)), ("Inbox", None)]);
+
+    let s = source(FakeGraph::new([1]).folders(german(), 100));
+    let e = s.move_to(&ids([1]), &named("Posteingang")).await;
+    assert!(matches!(e, Err(GraphError::IntoInbox)), "{e:?}");
+    let fake = transport(&s);
+    assert!(
+        fake.seen.borrow().iter().all(|r| r.method == "GET"),
+        "{:?}",
+        fake.urls()
+    );
+
+    let s = source(FakeGraph::new([1]).folders(german(), 100));
+    let moved = s.move_to(&ids([1]), &named("Inbox")).await.unwrap();
+    assert_eq!(moved.moved, ids([1]));
+    let fake = transport(&s);
+    let posts: Vec<_> = fake
+        .seen
+        .borrow()
+        .iter()
+        .filter(|r| r.method == "POST")
+        .map(|r| r.body.clone())
+        .collect();
+    assert_eq!(
+        posts,
+        [Some(json!({ "destinationId": "AQMk/user-inbox+=" }))]
+    );
+}
+
+#[tokio::test]
+async fn a_missing_shared_search_or_inbox_path_moves_nothing() {
+    let cases = [
+        // Exact: no other case, no level alone, no deeper level under a leaf.
+        (
+            "receipts",
+            "the mailbox has no folder named \"receipts\"; nothing was moved",
+        ),
+        (
+            "inbox/receipts",
+            "the mailbox has no folder named \"inbox/receipts\"; nothing was moved",
+        ),
+        (
+            "Receipts/Old",
+            "the mailbox has no folder named \"Receipts/Old\"; nothing was moved",
+        ),
+        (
+            "b",
+            "the mailbox has no folder named \"b\"; nothing was moved",
+        ),
+        (
+            "a/b",
+            "several folders are named \"a/b\" (a folder's name holds a \"/\"); nothing was \
+             moved, so use Outlook on the web to move to it",
+        ),
+        (
+            "Inbox/Weekly digests",
+            "\"Inbox/Weekly digests\" is a search folder, which cannot hold messages; nothing \
+             was moved",
+        ),
+        // The inbox, under its display name here; a localized one is in
+        // the_inbox_is_found_by_its_id_whatever_its_display_name.
+        (
+            "Inbox",
+            "the messages are in the Inbox already; nothing was moved",
+        ),
+    ];
+    for (path, error) in cases {
+        let s = source(FakeGraph::new([1]).folders(tree(), 100));
+        let e = s.move_to(&ids([1]), &named(path)).await.unwrap_err();
+        assert_eq!(e.to_string(), error, "{path}");
+        let fake = transport(&s);
+        assert!(
+            fake.seen.borrow().iter().all(|r| r.method == "GET"),
+            "{path}: {:?}",
+            fake.urls()
+        );
+    }
+    // A path the mailbox lacks costs one listing of the top: nothing under a leaf is asked for.
+    let s = source(FakeGraph::new([1]).folders(tree(), 100));
+    let e = s.move_to(&ids([1]), &named("Receipts/Old")).await;
+    assert!(matches!(e, Err(GraphError::NoSuchFolder(_))), "{e:?}");
+    assert_eq!(transport(&s).seen.borrow().len(), 1);
+    // No ids, no requests, even for a name.
+    let s = source(FakeGraph::new([1]).folders(tree(), 100));
+    assert!(
+        s.move_to(&[], &named("Nope"))
+            .await
+            .unwrap()
+            .moved
+            .is_empty()
+    );
+    assert!(transport(&s).seen.borrow().is_empty());
 }

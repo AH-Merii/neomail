@@ -1,8 +1,14 @@
 //! The IMAP [`MailSource`]: TLS or STARTTLS over rustls, then read-only IMAP on INBOX; and the
 //! two writes: [`store_seen`], which sets or clears `\Seen`, and [`move_to`], which moves
-//! messages from INBOX to the archive or the trash. Neither ever expunges.
+//! messages from INBOX to the archive, the trash or a folder the user names. Neither ever
+//! expunges. [`list_folders`] lists the mailboxes a message can be in.
+//!
+//! A mailbox name is decoded from modified UTF-7 (RFC 3501 section 5.1.3) for the user, and the
+//! server's own encoded name is the one sent back: a user's name never reaches the wire, and an
+//! encoded name never leaves this crate.
 
 mod tls;
+mod utf7;
 mod watch;
 #[cfg(test)]
 mod wire_tests;
@@ -16,8 +22,8 @@ use async_imap::types::{Fetch, Flag, Name, NameAttribute};
 use async_imap::{Client, Session};
 use futures_util::TryStreamExt;
 use nm_core::{
-    FetchedMessage, Flags, Folder, ListedMessage, MailSource, MailboxStatus, Moved, Uid, UidFlags,
-    UidValidity, Written,
+    Destination, FetchedMessage, Flags, Folder, FolderName, ListedFolder, ListedMessage,
+    MailSource, MailboxStatus, Moved, Role, Uid, UidFlags, UidValidity, Written,
 };
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
@@ -167,6 +173,20 @@ pub enum ImapError {
         role_attributes(*.0)
     )]
     NoFolder(Folder),
+    #[error("the server has no folder named \"{0}\"; nothing was moved")]
+    NoSuchFolder(FolderName),
+    #[error("the messages are in the INBOX already; nothing was moved")]
+    IntoInbox,
+    #[error(
+        "\"{0}\" cannot hold messages (the server marks it \\Noselect or \\NonExistent); \
+         nothing was moved"
+    )]
+    NotSelectable(FolderName),
+    #[error(
+        "the server has several mailboxes named \"{0}\" once decoded; nothing was moved, so use \
+         another mail app to move to it"
+    )]
+    SharedName(FolderName),
     #[error("timed out during {0}")]
     Timeout(&'static str),
     #[error("the server closed the connection")]
@@ -263,10 +283,12 @@ async fn store_seen_on<T: Transport>(
     result
 }
 
-/// Moves `uids` from INBOX to the mailbox with the role `to`, after checking that INBOX's
-/// UIDVALIDITY is still `uid_validity`, with `UID MOVE` (RFC 6851). The destination is the
-/// mailbox [`destination`] picks from LIST's special-use attributes (RFC 6154); a server without
-/// one, or without the MOVE capability, gets an error and nothing moves.
+/// Moves `uids` from INBOX to the mailbox `to`, after checking that INBOX's UIDVALIDITY is still
+/// `uid_validity`, with `UID MOVE` (RFC 6851). The destination is the mailbox [`destination`]
+/// picks from LIST: by role, from the special-use attributes (RFC 6154); by name, the one whose
+/// decoded name is exactly `to`'s. A server without one, or without the MOVE capability, gets an
+/// error and nothing moves; so does a name that is INBOX's or a mailbox's that cannot hold
+/// messages. The mailbox is named on the wire as LIST named it.
 ///
 /// Which UIDs moved is confirmed by `UID FETCH`: a UID INBOX has before the MOVE and no longer
 /// has after it moved; a UID it does not have before is gone ("a non-existent unique identifier
@@ -278,7 +300,7 @@ pub async fn move_to(
     login: Login<'_>,
     uid_validity: UidValidity,
     uids: &[Uid],
-    to: Folder,
+    to: &Destination,
 ) -> Result<Moved<Uid>, ImapError> {
     let tls = tls::client_config(config.cert_pin).map_err(ImapError::TlsConfig)?;
     let client = open(config, tls).await?;
@@ -291,7 +313,7 @@ async fn move_on<T: Transport>(
     session: Session<T>,
     uid_validity: UidValidity,
     uids: &[Uid],
-    to: Folder,
+    to: &Destination,
 ) -> Result<Moved<Uid>, ImapError> {
     let mut source = ImapSource { session, exists: 0 };
     let result = source.move_uids(uid_validity, uids, to).await;
@@ -307,26 +329,137 @@ fn role_attributes(to: Folder) -> &'static str {
     }
 }
 
-/// The mailbox that holds the role `to`, from LIST's answer: for the archive, the first with
-/// `\Archive`, else the first with `\All` ("all messages in the user's message store", RFC 6154
-/// section 2: Gmail's `[Gmail]/All Mail`); for the trash, the first with `\Trash`. A
-/// `\Noselect` mailbox and INBOX never qualify.
-fn destination(names: &[Name], to: Folder) -> Option<String> {
-    let usable = |n: &&Name| {
-        !n.name().eq_ignore_ascii_case("INBOX")
-            && !n.attributes().contains(&NameAttribute::NoSelect)
-    };
-    let with = |attribute: NameAttribute<'static>| {
-        names
+/// A mailbox LIST reported: the name the server sends and takes back (`wire`, modified UTF-7),
+/// the name the user sees (`name`, decoded, or `wire` when it does not decode), whether it can
+/// hold messages, and its roles.
+#[derive(Debug)]
+struct Mailbox {
+    wire: String,
+    name: String,
+    selectable: bool,
+    inbox: bool,
+    roles: Vec<Role>,
+}
+
+impl Mailbox {
+    fn new(listed: &Name) -> Self {
+        let wire = listed.name().to_owned();
+        let attributes = listed.attributes();
+        // RFC 5258 section 3: a \NonExistent mailbox is also \Noselect; some servers send only
+        // the first.
+        let selectable = !attributes.iter().any(|a| match a {
+            NameAttribute::NoSelect => true,
+            NameAttribute::Extension(e) => e.eq_ignore_ascii_case("\\NonExistent"),
+            _ => false,
+        });
+        let roles = attributes
             .iter()
-            .filter(usable)
-            .find(|n| n.attributes().contains(&attribute))
-            .map(|n| n.name().to_owned())
-    };
-    match to {
-        Folder::Archive => with(NameAttribute::Archive).or_else(|| with(NameAttribute::All)),
-        Folder::Trash => with(NameAttribute::Trash),
+            .filter_map(|a| match a {
+                NameAttribute::Archive => Some(Role::Archive),
+                NameAttribute::Trash => Some(Role::Trash),
+                NameAttribute::Junk => Some(Role::Junk),
+                NameAttribute::Sent => Some(Role::Sent),
+                NameAttribute::Drafts => Some(Role::Drafts),
+                NameAttribute::All => Some(Role::All),
+                NameAttribute::Flagged => Some(Role::Flagged),
+                _ => None,
+            })
+            .collect();
+        Self {
+            name: utf7::display(&wire),
+            inbox: wire.eq_ignore_ascii_case("INBOX"),
+            wire,
+            selectable,
+            roles,
+        }
     }
+
+    /// The folder as `folder list` shows it, when a message can be in it.
+    fn listed(&self) -> Option<ListedFolder> {
+        if !self.selectable {
+            return None;
+        }
+        let role = if self.inbox {
+            Some(Role::Inbox)
+        } else {
+            self.roles.first().copied()
+        };
+        Some(ListedFolder {
+            name: FolderName::new(self.name.clone())?,
+            role,
+        })
+    }
+}
+
+/// The mailbox `to` is, from LIST's answer.
+///
+/// By role: for the archive, the first with `\Archive`, else the first with `\All` ("all
+/// messages in the user's message store", RFC 6154 section 2: Gmail's `[Gmail]/All Mail`); for
+/// the trash, the first with `\Trash`. A mailbox that cannot hold messages and INBOX never
+/// qualify.
+///
+/// By name: the one whose decoded name is exactly the name; INBOX in any case (RFC 3501 section
+/// 5.1) is refused, as is a mailbox that cannot hold messages, a missing name, and a name several
+/// mailboxes share.
+fn destination<'m>(mailboxes: &'m [Mailbox], to: &Destination) -> Result<&'m Mailbox, ImapError> {
+    match to {
+        Destination::Role(role) => {
+            let with = |wanted: Role| {
+                mailboxes
+                    .iter()
+                    .filter(|m| m.selectable && !m.inbox)
+                    .find(|m| m.roles.contains(&wanted))
+            };
+            match role {
+                Folder::Archive => with(Role::Archive).or_else(|| with(Role::All)),
+                Folder::Trash => with(Role::Trash),
+            }
+            .ok_or(ImapError::NoFolder(*role))
+        }
+        Destination::Name(name) => {
+            if name.is_inbox() {
+                return Err(ImapError::IntoInbox);
+            }
+            let mut named = mailboxes.iter().filter(|m| m.name == name.as_str());
+            let mailbox = named
+                .next()
+                .ok_or_else(|| ImapError::NoSuchFolder(name.clone()))?;
+            if named.next().is_some() {
+                return Err(ImapError::SharedName(name.clone()));
+            }
+            if mailbox.inbox {
+                return Err(ImapError::IntoInbox);
+            }
+            if !mailbox.selectable {
+                return Err(ImapError::NotSelectable(name.clone()));
+            }
+            Ok(mailbox)
+        }
+    }
+}
+
+/// Lists the mailboxes a message can be in, with `LIST "" *` (RFC 3501 section 6.3.8), in the
+/// server's order: names decoded, roles from the special-use attributes (RFC 6154), INBOX with
+/// the role inbox, and a `\Noselect` or `\NonExistent` mailbox left out. Read-only: nothing is
+/// selected.
+pub async fn list_folders(
+    config: &ImapConfig,
+    login: Login<'_>,
+) -> Result<Vec<ListedFolder>, ImapError> {
+    let tls = tls::client_config(config.cert_pin).map_err(ImapError::TlsConfig)?;
+    let client = open(config, tls).await?;
+    let session = log_in(client, &config.username, login).await?;
+    list_folders_on(session).await
+}
+
+/// [`list_folders`] on a logged-in session, which it logs out. Shared with the wire tests.
+async fn list_folders_on<T: Transport>(
+    session: Session<T>,
+) -> Result<Vec<ListedFolder>, ImapError> {
+    let mut source = ImapSource { session, exists: 0 };
+    let result = source.mailboxes().await;
+    source.logout().await;
+    Ok(result?.iter().filter_map(Mailbox::listed).collect())
 }
 
 /// The SHA-256 of the certificate the server at `config` presents, for the user to compare and
@@ -442,13 +575,23 @@ impl<T: Transport> ImapSource<T> {
         Ok(written)
     }
 
+    /// Every mailbox, from `LIST "" *`.
+    async fn mailboxes(&mut self) -> Result<Vec<Mailbox>, ImapError> {
+        let op = "LIST";
+        let stream = step(op, self.session.list(Some(""), Some("*")))
+            .await?
+            .map_err(|source| ImapError::Command { op, source })?;
+        let names: Vec<Name> = collect(op, stream).await?;
+        Ok(names.iter().map(Mailbox::new).collect())
+    }
+
     /// Checks MOVE, finds the destination, SELECTs INBOX read-write, checks its UIDVALIDITY,
     /// then moves and confirms. See [`move_to`].
     async fn move_uids(
         &mut self,
         uid_validity: UidValidity,
         uids: &[Uid],
-        to: Folder,
+        to: &Destination,
     ) -> Result<Moved<Uid>, ImapError> {
         let op = "CAPABILITY";
         let capabilities = step(op, self.session.capabilities())
@@ -457,15 +600,11 @@ impl<T: Transport> ImapSource<T> {
         if !capabilities.has_str("MOVE") {
             return Err(ImapError::NoMove);
         }
-        let op = "LIST";
-        let stream = step(op, self.session.list(Some(""), Some("*")))
-            .await?
-            .map_err(|source| ImapError::Command { op, source })?;
-        let names = collect(op, stream).await?;
-        let folder = destination(&names, to).ok_or(ImapError::NoFolder(to))?;
+        let mailboxes = self.mailboxes().await?;
+        let mailbox = destination(&mailboxes, to)?;
         self.select_inbox(uid_validity).await?;
         let mut moved = Moved {
-            folder,
+            folder: mailbox.name.clone(),
             moved: Vec::new(),
             gone: Vec::new(),
         };
@@ -482,7 +621,7 @@ impl<T: Transport> ImapSource<T> {
             return Ok(moved);
         }
         let op = "UID MOVE";
-        step(op, self.session.uid_mv(uid_set(&before), &moved.folder))
+        step(op, self.session.uid_mv(uid_set(&before), &mailbox.wire))
             .await?
             .map_err(|source| ImapError::Command { op, source })?;
         let after = self.present("UID FETCH", &before).await?;

@@ -8,8 +8,8 @@ use std::rc::Rc;
 use chrono::DateTime;
 use nm_core::action::{Failure, Report, State, apply};
 use nm_core::{
-    Action, Cache, FetchedMessage, Flags, Folder, IdListed, MailWriter, MessageId, Moved, RemoteId,
-    Uid, UidValidity, Written,
+    Action, Cache, Destination, FetchedMessage, Flags, Folder, FolderName, IdListed, MailWriter,
+    MessageId, Moved, RemoteId, Uid, UidValidity, Written,
 };
 
 const VALIDITY: u32 = 7;
@@ -74,27 +74,33 @@ fn seed(cache: &mut Cache) -> (Vec<MessageId>, MessageId) {
 type UidAnswer = Box<dyn Fn(&[Uid], bool) -> Result<Written<Uid>, String>>;
 
 /// What the fake server answers for a UID move.
-type MoveAnswer = Box<dyn Fn(&[Uid], Folder) -> Result<Moved<Uid>, String>>;
+type MoveAnswer = Box<dyn Fn(&[Uid], &Destination) -> Result<Moved<Uid>, String>>;
 
 /// What a lock reports about its account as it is released.
 type AtUnlock = Rc<dyn Fn(&str) -> String>;
 
-/// The fake IMAP server's name for each folder role.
-fn imap_name(to: Folder) -> &'static str {
+/// The fake IMAP server's name for each destination.
+fn imap_name(to: &Destination) -> String {
     match to {
-        Folder::Archive => "Archive",
-        Folder::Trash => "Trash",
+        Destination::Role(Folder::Archive) => "Archive".to_owned(),
+        Destination::Role(Folder::Trash) => "Trash".to_owned(),
+        Destination::Name(name) => name.to_string(),
     }
+}
+
+fn name(name: &str) -> FolderName {
+    FolderName::new(name).unwrap()
 }
 
 /// Records every call in order. `uid_answer` and `move_answer` decide the IMAP side; by-id
 /// writes confirm every id without flags, and by-id moves every id; writes to the accounts in
-/// `fail_write` fail.
+/// `fail_write` fail, and so do moves to a named folder on the accounts in `no_folder`.
 struct Fake {
     log: Rc<RefCell<Vec<String>>>,
     uid_answer: UidAnswer,
     move_answer: MoveAnswer,
     fail_write: Vec<&'static str>,
+    no_folder: Vec<&'static str>,
     at_unlock: Option<AtUnlock>,
 }
 
@@ -110,18 +116,31 @@ impl Fake {
             }),
             move_answer: Box::new(|uids, to| {
                 Ok(Moved {
-                    folder: imap_name(to).to_owned(),
+                    folder: imap_name(to),
                     moved: uids.to_vec(),
                     gone: Vec::new(),
                 })
             }),
             fail_write: Vec::new(),
+            no_folder: Vec::new(),
             at_unlock: None,
         }
     }
 
     fn log(&self) -> Vec<String> {
         self.log.borrow().clone()
+    }
+
+    fn check_move(&self, account: &str, to: &Destination) -> Result<(), String> {
+        if self.fail_write.contains(&account) {
+            return Err(format!("{account} cannot be reached"));
+        }
+        match to {
+            Destination::Name(name) if self.no_folder.contains(&account) => {
+                Err(format!("{account} has no folder named {name}"))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -198,16 +217,14 @@ impl MailWriter for Fake {
         account: &str,
         uid_validity: UidValidity,
         uids: &[Uid],
-        to: Folder,
+        to: &Destination,
     ) -> Result<Moved<Uid>, String> {
         let list: Vec<String> = uids.iter().map(Uid::to_string).collect();
         self.log.borrow_mut().push(format!(
             "move uid {account} v{uid_validity} {} to {to}",
             list.join(",")
         ));
-        if self.fail_write.contains(&account) {
-            return Err(format!("{account} cannot be reached"));
-        }
+        self.check_move(account, to)?;
         (self.move_answer)(uids, to)
     }
 
@@ -215,15 +232,13 @@ impl MailWriter for Fake {
         &mut self,
         account: &str,
         ids: &[RemoteId],
-        to: Folder,
+        to: &Destination,
     ) -> Result<Moved<RemoteId>, String> {
         let list: Vec<&str> = ids.iter().map(RemoteId::as_str).collect();
         self.log
             .borrow_mut()
             .push(format!("move id {account} {} to {to}", list.join(",")));
-        if self.fail_write.contains(&account) {
-            return Err(format!("{account} cannot be reached"));
-        }
+        self.check_move(account, to)?;
         Ok(Moved {
             folder: format!("{to}-by-id"),
             moved: ids.to_vec(),
@@ -249,8 +264,19 @@ fn done_ids(report: &Report<String>) -> Vec<MessageId> {
 
 #[test]
 fn the_actions_have_stable_names() {
-    let names: Vec<&str> = Action::ALL.iter().map(|a| a.name()).collect();
-    assert_eq!(names, ["mark-read", "mark-unread", "archive", "delete"]);
+    let actions = [
+        Action::MarkRead,
+        Action::MarkUnread,
+        Action::Archive,
+        Action::Delete,
+        Action::Move(name("Receipts")),
+    ];
+    let names: Vec<&str> = actions.iter().map(Action::name).collect();
+    assert_eq!(
+        names,
+        ["mark-read", "mark-unread", "archive", "delete", "move"]
+    );
+    assert_eq!(names, Action::NAMES);
 }
 
 #[test]
@@ -437,10 +463,14 @@ fn moved_to(report: &Report<String>) -> Vec<(MessageId, &str)> {
 }
 
 #[test]
-fn a_move_reaches_each_server_by_role_and_removes_the_moved_rows() {
+fn a_move_reaches_each_server_by_role_or_name_and_removes_the_moved_rows() {
     for (action, to) in [
-        (Action::Archive, Folder::Archive),
-        (Action::Delete, Folder::Trash),
+        (Action::Archive, Destination::Role(Folder::Archive)),
+        (Action::Delete, Destination::Role(Folder::Trash)),
+        (
+            Action::Move(name("Folders/Re\u{E7}us")),
+            Destination::Name(name("Folders/Re\u{E7}us")),
+        ),
     ] {
         let (mut cache, work, outlook) = seeded();
         let mut fake = Fake::new();
@@ -461,8 +491,8 @@ fn a_move_reaches_each_server_by_role_and_removes_the_moved_rows() {
             moved_to(&report),
             [
                 (outlook, by_id.as_str()),
-                (work[1], imap_name(to)),
-                (work[0], imap_name(to))
+                (work[1], imap_name(&to).as_str()),
+                (work[0], imap_name(&to).as_str())
             ]
         );
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -562,4 +592,74 @@ fn a_moved_row_is_removed_before_the_lock_is_released_and_its_id_never_returns()
         .unwrap();
     let new = cache.list(Some("work"), 10).unwrap()[0].id;
     assert!(new != newest && new != outlook, "{new} reused a moved id");
+}
+
+/// The name reaches each account as typed; an account without that folder fails as a whole and
+/// keeps its rows, and another account's messages move.
+#[test]
+fn a_named_move_fails_on_an_account_without_the_folder_while_another_moves() {
+    let (mut cache, work, outlook) = seeded();
+    let mut fake = Fake::new();
+    fake.no_folder = vec!["work"];
+    let action = Action::Move(name("Receipts"));
+    let report = apply(action, &[work[0], outlook, work[1]], &mut cache, &mut fake).unwrap();
+    assert_eq!(
+        fake.log(),
+        [
+            "lock work",
+            "move uid work v7 1,2 to Receipts",
+            "unlock work",
+            "lock outlook",
+            "move id outlook AAA to Receipts",
+            "unlock outlook",
+        ]
+    );
+    assert_eq!(moved_to(&report), [(outlook, "Receipts-by-id")]);
+    assert!(!cached(&cache, outlook));
+    assert!(cached(&cache, work[0]) && cached(&cache, work[1]));
+    match report.failures.as_slice() {
+        [
+            Failure::Account {
+                account,
+                ids,
+                error,
+            },
+        ] => {
+            assert_eq!(account, "work");
+            assert_eq!(ids, &[work[0], work[1]]);
+            assert_eq!(error, "work has no folder named Receipts");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// As for `archive`: a row moved to a named folder is gone from the cache before the account's
+/// lock is released.
+#[test]
+fn a_named_move_removes_the_row_before_the_lock_is_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.sqlite3");
+    let mut cache = Cache::open(&path).unwrap();
+    let (work, _) = seed(&mut cache);
+    let mut fake = Fake::new();
+    let first = work[0];
+    fake.at_unlock = Some(Rc::new(move |_: &str| {
+        format!("cached={}", cached(&Cache::open(&path).unwrap(), first))
+    }));
+    let report = apply(
+        Action::Move(name("Labels/Work")),
+        &[first],
+        &mut cache,
+        &mut fake,
+    )
+    .unwrap();
+    assert_eq!(moved_to(&report), [(first, "Labels/Work")]);
+    assert_eq!(
+        fake.log(),
+        [
+            "lock work",
+            "move uid work v7 1 to Labels/Work",
+            "unlock work: cached=false",
+        ]
+    );
 }

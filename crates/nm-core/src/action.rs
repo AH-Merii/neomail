@@ -5,16 +5,18 @@
 //! An action reaches a server through a [`MailWriter`], one per run, which owns the logins and
 //! the account locks. The writer gets UIDs (with their UIDVALIDITY) or [`RemoteId`]s through
 //! separate methods, so a UID never reaches Microsoft Graph and a Graph id never reaches IMAP.
-//! A move names its destination by [`Folder`] role; only the account's server resolves it to a
-//! folder name. The cache changes only for what the server confirmed.
+//! A move names its destination by [`Folder`] role or by the [`FolderName`] the user typed
+//! ([`Destination`]); only the account's server resolves it to one of its folders. The cache
+//! changes only for what the server confirmed.
 
 use std::fmt;
 
 use crate::cache::{Cache, CacheError, Located, MessageKey};
+use crate::folder::FolderName;
 use crate::types::{Flags, MessageId, RemoteId, Uid, UidValidity};
 
-/// What can be done to a message. Moving to a named folder comes later.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// What can be done to a message.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Action {
     MarkRead,
     MarkUnread,
@@ -22,6 +24,8 @@ pub enum Action {
     Archive,
     /// Moves a message from the INBOX to its account's trash. Never deletes it for good.
     Delete,
+    /// Moves a message from the INBOX to its account's folder of this name. Never creates one.
+    Move(FolderName),
 }
 
 /// A folder named by its role. The account's server resolves the role to one of its folders.
@@ -40,39 +44,60 @@ impl fmt::Display for Folder {
     }
 }
 
+/// Where a move puts a message: the account's folder with a role, or the one with the name the
+/// user gave. It stays this until the account's server resolves it to one of its folders.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Destination {
+    Role(Folder),
+    Name(FolderName),
+}
+
+impl fmt::Display for Destination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Role(role) => role.fmt(f),
+            Self::Name(name) => name.fmt(f),
+        }
+    }
+}
+
+impl From<Folder> for Destination {
+    fn from(role: Folder) -> Self {
+        Self::Role(role)
+    }
+}
+
 /// What an action does to a message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     /// Sets (`true`) or clears `\Seen`.
     Seen(bool),
-    /// Moves it out of the INBOX to the folder with this role.
-    Move(Folder),
+    /// Moves it out of the INBOX to this destination.
+    Move(Destination),
 }
 
 impl Action {
-    pub const ALL: [Self; 4] = [
-        Self::MarkRead,
-        Self::MarkUnread,
-        Self::Archive,
-        Self::Delete,
-    ];
+    /// Every action's [`name`](Self::name).
+    pub const NAMES: [&'static str; 5] = ["mark-read", "mark-unread", "archive", "delete", "move"];
 
     /// The action's stable name, for keys, scripts and agents: it never changes once released.
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             Self::MarkRead => "mark-read",
             Self::MarkUnread => "mark-unread",
             Self::Archive => "archive",
             Self::Delete => "delete",
+            Self::Move(_) => "move",
         }
     }
 
-    pub fn change(self) -> Change {
+    pub fn change(&self) -> Change {
         match self {
             Self::MarkRead => Change::Seen(true),
             Self::MarkUnread => Change::Seen(false),
-            Self::Archive => Change::Move(Folder::Archive),
-            Self::Delete => Change::Move(Folder::Trash),
+            Self::Archive => Change::Move(Destination::Role(Folder::Archive)),
+            Self::Delete => Change::Move(Destination::Role(Folder::Trash)),
+            Self::Move(name) => Change::Move(Destination::Name(name.clone())),
         }
     }
 }
@@ -104,11 +129,12 @@ impl<K> Default for Written<K> {
     }
 }
 
-/// What a server confirmed of a move: the destination as the server names it, the messages it
-/// moved there, and the ones its INBOX no longer has. A key in neither was not confirmed.
+/// What a server confirmed of a move: the folder it moved to, the messages it moved there, and
+/// the ones its INBOX no longer has. A key in neither was not confirmed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Moved<K> {
-    /// An IMAP mailbox name such as `Archive` or `[Gmail]/Trash`, or a Graph folder name.
+    /// The folder as the user sees it: an IMAP mailbox name decoded from modified UTF-7, such as
+    /// `Archive` or `[Gmail]/Trash`, or a Graph folder name.
     pub folder: String,
     pub moved: Vec<K>,
     pub gone: Vec<K>,
@@ -123,10 +149,12 @@ pub struct Moved<K> {
 /// - `Err` means none of the call's messages is confirmed. The server may still have changed some
 ///   of them (Graph writes one message per request, and an IMAP MOVE can fail partway, RFC 6851
 ///   section 3.3); the cache is left alone for all of them, and the next sync reads their state.
-/// - Nothing a writer does may delete or expunge a message for good, or create, rename or delete
-///   a folder. Only the move methods move a message, and only to the folder asked: by UID, only
-///   from the INBOX; by id, from wherever the server holds it now (Graph moves a message by its
-///   id), which is the INBOX unless it moved since the last sync.
+/// - Nothing a writer does may delete or expunge a message for good, or create, rename or delete a
+///   folder. A [`Destination::Name`] the account has no folder for is an `Err`, and so is one
+///   naming the INBOX or a folder that cannot hold messages: nothing moves. Only the move methods
+///   move a message, and only to the folder asked: by UID, only from the INBOX; by id, from
+///   wherever the server holds it now (Graph moves a message by its id), which is the INBOX unless
+///   it moved since the last sync.
 pub trait MailWriter {
     /// Held while an account is written and its cache rows are updated.
     type Lock;
@@ -152,23 +180,23 @@ pub trait MailWriter {
         seen: bool,
     ) -> Result<Written<RemoteId>, Self::Error>;
 
-    /// Moves `uids` from the account's INBOX to its folder with the role `to`, refusing when the
-    /// server's UIDVALIDITY is not `uid_validity` or it has no such folder.
+    /// Moves `uids` from the account's INBOX to its folder `to`, refusing when the server's
+    /// UIDVALIDITY is not `uid_validity` or it has no such folder.
     fn move_by_uid(
         &mut self,
         account: &str,
         uid_validity: UidValidity,
         uids: &[Uid],
-        to: Folder,
+        to: &Destination,
     ) -> Result<Moved<Uid>, Self::Error>;
 
-    /// Moves messages named by their server ids to the account's folder with the role `to`,
-    /// refusing when it has no such folder.
+    /// Moves messages named by their server ids to the account's folder `to`, refusing when it
+    /// has no such folder.
     fn move_by_id(
         &mut self,
         account: &str,
         ids: &[RemoteId],
-        to: Folder,
+        to: &Destination,
     ) -> Result<Moved<RemoteId>, Self::Error>;
 }
 
@@ -269,7 +297,7 @@ pub fn apply<W: MailWriter>(
                 report.failures.push(Failure::Unknown(id));
             }
         }
-        let updates = write_account(action, account, &now, writer, &mut report);
+        let updates = write_account(&action, account, &now, writer, &mut report);
         cache.set_flags(&updates.flags)?;
         cache.remove(&updates.moved)?;
         drop(lock);
@@ -290,7 +318,7 @@ struct Updates {
 /// Writes one account's messages, the UID ones per UIDVALIDITY and the by-id ones together, and
 /// returns the cache updates the server confirmed.
 fn write_account<W: MailWriter>(
-    action: Action,
+    action: &Action,
     account: &str,
     located: &[Located],
     writer: &mut W,
@@ -320,7 +348,7 @@ fn write_account<W: MailWriter>(
                 settle(seen, account, &batch, written, report, &mut updates);
             }
             Change::Move(to) => {
-                let moved = writer.move_by_uid(account, validity, &uids, to);
+                let moved = writer.move_by_uid(account, validity, &uids, &to);
                 settle_move(account, &batch, moved, report, &mut updates);
             }
         }
@@ -340,7 +368,7 @@ fn write_account<W: MailWriter>(
                 settle(seen, account, &batch, written, report, &mut updates);
             }
             Change::Move(to) => {
-                let moved = writer.move_by_id(account, &ids, to);
+                let moved = writer.move_by_id(account, &ids, &to);
                 settle_move(account, &batch, moved, report, &mut updates);
             }
         }

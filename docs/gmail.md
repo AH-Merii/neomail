@@ -128,6 +128,27 @@ Gmail shows a label to IMAP apps only when its **Show in IMAP** box is checked u
 All Mail or Trash is not shown to IMAP, LIST does not name it, and `archive` or `delete` fails for
 the account without moving anything.
 
+## Move to a folder or label
+
+`neomail folder list --account NAME` lists the labels shown to IMAP, which Gmail "treats ... as
+folders for the purposes of IMAP"
+([IMAP extensions](https://developers.google.com/workspace/gmail/imap/imap-extensions)), and
+Gmail's own folders under `[Gmail]/`, with their roles from the special-use attributes:
+`[Gmail]/All Mail` is `all`, `[Gmail]/Spam` `junk`, `[Gmail]/Trash` `trash` (the same page's LIST
+example shows `* LIST (\HasNoChildren \Junk) "/" "[Gmail]/Spam"`). A label's name is
+its IMAP mailbox name, decoded from modified UTF-7, with `/` between a nested label and its
+parent as LIST reports it. A label hidden from IMAP (its **Show in IMAP** box unchecked) is not
+listed and cannot be moved to.
+
+`neomail move LABEL ID...` moves a message from INBOX to the label's mailbox with `UID MOVE`, as
+`archive` does. That this does what Gmail's own "Move to" does, adding the label and taking the
+message out of the INBOX, is unverified: Google's IMAP pages above and its
+[IMAP client settings](https://support.google.com/mail/answer/78892) do not say what a MOVE into a
+label's mailbox does, and no live check has tried it yet. neomail confirms the move by UID: if a
+message were still in the INBOX afterwards, it would report it as not confirmed and keep it in the
+cache. `neomail move "[Gmail]/Spam" ID...` moves a message to Spam the same way: a live check on a
+test account moved one, and it was then in `[Gmail]/Spam` and no longer in the INBOX.
+
 ## Where things are kept
 
 - The config file holds the account's name, address and client ID, which are not secret:

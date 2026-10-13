@@ -8,7 +8,8 @@ in [decisions.md](decisions.md). The slices so far follow
 through Microsoft Graph with the user's own Entra app (slice 6) and background sync (slice 7):
 `neomail daemon`, with desktop notifications, IMAP IDLE push and a one-minute Outlook check through
 Graph's delta query. Triage in the CLI (slice 8) has begun: `neomail mark read|unread`, the first
-actions, then `neomail archive` and `neomail delete` for IMAP and Outlook accounts.
+actions, then `neomail archive` and `neomail delete` for IMAP and Outlook accounts, then
+`neomail folder list` and `neomail move` for IMAP and Outlook accounts.
 
 ## Crates
 
@@ -16,8 +17,8 @@ actions, then `neomail archive` and `neomail delete` for IMAP and Outlook accoun
 | ----- | ------------- | ----------------- |
 | `crates/neomail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, the daemon and its locks, output, wiring. | The composition root. Nothing depends on it. |
 | `crates/nm-core` | Domain types, the `MailSource`, `IdSource` and `MailWriter` traits, the SQLite cache, the sync engines, the actions, mail parsing. | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
-| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap); its two writes, `store_seen` and `move_to`. | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
-| `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port; its two writes, `set_read` and `move_to`. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
+| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap); its two writes, `store_seen` and `move_to`, and `list_folders`, with modified UTF-7 names decoded. | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
+| `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port; its two writes, `set_read` and `move_to`, and `folders`, the read behind `folder list`. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
 
 A new crate needs a reason of the same kind: a second implementation of a seam, or a heavy
 dependency to isolate.
@@ -279,12 +280,13 @@ off.
 **The action registry** (`nm-core/src/action.rs`) is how mail is changed. It is the typed set of
 actions that the TUI's keys, the CLI, scripts and agents share (the first bullet of
 [CLI, scripting, agents, extensibility](decisions.md#cli-scripting-agents-extensibility)). It
-starts small: `Action` is `MarkRead`, `MarkUnread`, `Archive` or `Delete`, each with a stable
-name (`mark-read`, `mark-unread`, `archive`, `delete`). `Action::change` says what it does:
-`Change::Seen(bool)` or `Change::Move(Folder)`, where `Folder` is a role (`Archive` or `Trash`)
-that only the account's server resolves to a folder name. `action::apply(action, ids, cache,
-writer)` is the one way to apply an action to cache ids; `neomail mark`, `archive` and `delete`
-call it. For each account of the ids, in the order first asked, it:
+starts small: `Action` is `MarkRead`, `MarkUnread`, `Archive`, `Delete` or `Move(FolderName)`,
+each with a stable name (`mark-read`, `mark-unread`, `archive`, `delete`, `move`).
+`Action::change` says what it does: `Change::Seen(bool)` or `Change::Move(Destination)`. A
+`Destination` is `Role(Folder)`, a role (`Archive` or `Trash`), or `Name(FolderName)`, the name
+the user typed; it stays that until the account's server resolves it to one of its folders.
+`action::apply(action, ids, cache, writer)` is the one way to apply an action to cache ids;
+`neomail mark`, `archive`, `delete` and `move` call it. For each account of the ids, in the order first asked, it:
 
 1. takes the account's lock (`MailWriter::lock`);
 2. reads the ids' locations again under the lock;
@@ -306,9 +308,11 @@ An `Err` confirms none of the call's messages: the server may still have changed
 (Graph writes one message per request), so the cache is left alone for all of them and the next
 sync reads their state.
 
-A move goes through `move_by_uid` and `move_by_id` the same way, with the `Folder` role, and the
-writer answers with `Moved { folder, moved, gone }`: `folder` is the destination as the server
-names it, which the report carries to the output. A message in `moved` leaves the cache
+A move goes through `move_by_uid` and `move_by_id` the same way, with the `Destination`, and the
+writer answers with `Moved { folder, moved, gone }`: `folder` is the destination as the user sees
+it (an IMAP name decoded), which the report carries to the output. A `Destination::Name` the
+account has no folder for, or one naming INBOX or a folder that cannot hold messages, is an `Err`:
+nothing of that account moves. A message in `moved` leaves the cache
 (`Cache::remove`), as when a sync finds it gone; its id is never handed out again
 (AUTOINCREMENT). A gone one stays for the next sync, as for a mark, and a key in neither list is
 not confirmed. A done message's `State` is its flags after a mark, or the folder after a move.
@@ -328,10 +332,13 @@ with LOGOUT, never CLOSE, which expunges (RFC 3501, section 6.4.2). The wire tes
 `EXPUNGE`, `CLOSE`, `MOVE`, `COPY` or `\Deleted` is ever sent.
 
 `move_to` checks the MOVE capability ([RFC 6851](https://www.rfc-editor.org/rfc/rfc6851.html)),
-then finds the destination with `LIST "" *` from the special-use attributes
+then finds the destination with `LIST "" *`. By role, from the special-use attributes
 ([RFC 6154, section 2](https://www.rfc-editor.org/rfc/rfc6154.html#section-2)): the archive is
 the first selectable mailbox with `\Archive`, else the one with `\All` (Gmail's All Mail); the
-trash is the one with `\Trash`. Servers send these on a plain LIST without the SPECIAL-USE
+trash is the one with `\Trash`. By name, the one mailbox whose decoded name is exactly the
+`FolderName`; INBOX in any case, a `\Noselect` or `\NonExistent` mailbox, a missing name and a
+name two mailboxes share are errors (`ImapError::IntoInbox`, `NotSelectable`, `NoSuchFolder`,
+`SharedName`), before INBOX is selected. Servers send these on a plain LIST without the SPECIAL-USE
 capability: Proton Mail Bridge does, and so does Gmail
 ([IMAP extensions](https://developers.google.com/workspace/gmail/imap/imap-extensions#special-use_extension_of_the_list_command)).
 A server without MOVE, or without the folder, is an error and nothing moves; neomail never creates
@@ -348,6 +355,25 @@ A message another client expunged between the two fetches counts as moved; its r
 the cache at the next sync anyway. The wire tests check the commands, the destination for each
 LIST, which UIDs are confirmed, and that no `EXPUNGE`, `CLOSE`, `COPY`, `CREATE`, `RENAME`,
 `DELETE`, `STORE` or `\Deleted` is ever sent.
+
+**Folders.** nm-imap keeps each LIST answer as a private `Mailbox`: `wire`, the name exactly as
+the server sent it (modified UTF-7,
+[RFC 3501 section 5.1.3](https://www.rfc-editor.org/rfc/rfc3501#section-5.1.3)); `name`, that
+name decoded (`nm-imap/src/utf7.rs`, or `wire` when it does not decode); whether it can hold
+messages; and its roles. Matching and output use `name`, and `UID MOVE` sends `wire`, so a user's
+name never reaches the wire and an encoded name never leaves nm-imap. `nm_imap::list_folders` is
+the read behind `neomail folder list` (`neomail/src/folders.rs`): one `LIST "" *`, then LOGOUT,
+nothing selected. It returns nm-core's `ListedFolder { name: FolderName, role: Option<Role> }`,
+leaving out mailboxes that cannot hold messages; INBOX gets `Role::Inbox`. Listing is a read, not
+an action, so it is not in the action set and takes no account lock: it does not touch the cache.
+On Outlook, `GraphSource::folders` is that read (`neomail/src/graph.rs` `folders`): the folder tree
+through `GET /me/mailFolders` and `.../childFolders`, every page, named by paths of display names,
+with roles from one `GET` per well-known name. A `Destination::Name` reaches
+`GraphSource::move_to`, which resolves the path with `find`: it lists only the levels whose
+folder names start the rest of the path, never the whole tree, and refuses a missing, shared or
+search-folder path and the inbox (by its id). The moves then send the folder's id as
+`destinationId`. A Graph folder id never leaves nm-graph, as an encoded mailbox name never leaves
+nm-imap.
 
 For Outlook, the writer calls `graph::set_read`, which calls `GraphSource::set_read`. Changing mail
 needs Mail.ReadWrite, which new sign-ins ask for along with Mail.Read. A sign-in records what it was
@@ -632,9 +658,10 @@ The order of the slices is in [roadmap.md](roadmap.md). What they change in the 
   ([DEC-2026-10-12-gmail-imap](decisions.md#dec-2026-10-12-gmail-imap)).
 - **More mail:** folders beyond INBOX, and CONDSTORE/QRESYNC to refresh flags cheaply.
 - **Actions:** marking read and unread works for IMAP and Outlook through `MailWriter`, and archive
-  and delete for IMAP and Outlook (`neomail archive`, `neomail delete`). Next: moving to a folder
-  the user names and listing folders, as more `Action`s and `MailWriter` methods. Later: a fallback
-  for servers without MOVE, a per-account archive or trash for servers without special-use
-  attributes, and undo. Everything is online only: an offline queue would record pending changes in
-  the cache.
+  and delete for IMAP and Outlook (`neomail archive`, `neomail delete`), and listing folders and
+  moving to a folder the user names for IMAP and Outlook (`neomail folder list`, `neomail move`).
+  Later: moving by role across accounts (to each account's junk, say), creating folders, folders
+  beyond INBOX in the cache and in `list`, a fallback for servers without MOVE, a per-account
+  archive or trash for servers without special-use attributes, and undo. Everything is online only:
+  an offline queue would record pending changes in the cache.
 - **The TUI** builds on the same cache and actions as the CLI.

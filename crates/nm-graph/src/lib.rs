@@ -51,7 +51,8 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use nm_core::{
-    Cursor, Flags, IdChange, IdChanges, IdFetched, IdListed, IdSource, Moved, RemoteId, Written,
+    Cursor, Destination, Flags, FolderName, IdChange, IdChanges, IdFetched, IdListed, IdSource,
+    ListedFolder, Moved, RemoteId, Role, Written,
 };
 use serde::Deserialize;
 
@@ -160,6 +161,21 @@ pub enum GraphError {
     /// 404 for a well-known folder: the mailbox has no folder with that name, so nothing moved.
     #[error("the mailbox has no {0:?} folder in Microsoft Graph")]
     NoFolder(&'static str),
+    /// No folder has this path of display names, so nothing moved.
+    #[error("the mailbox has no folder named \"{0}\"; nothing was moved")]
+    NoSuchFolder(FolderName),
+    /// The path names the inbox, found by its id.
+    #[error("the messages are in the Inbox already; nothing was moved")]
+    IntoInbox,
+    /// The path names a search folder, whose messages are a query's results.
+    #[error("\"{0}\" is a search folder, which cannot hold messages; nothing was moved")]
+    SearchFolder(FolderName),
+    /// Several folders have this path, because a display name holds a `/`.
+    #[error(
+        "several folders are named \"{0}\" (a folder's name holds a \"/\"); nothing was moved, \
+         so use Outlook on the web to move to it"
+    )]
+    SharedPath(FolderName),
 }
 
 fn code_suffix(code: &Option<String>) -> String {
@@ -301,6 +317,16 @@ fn encode_segment(s: &str) -> String {
 }
 
 /// The first request of a delta round over the INBOX's messages that arrived at or after `from`.
+/// A next or delta link Graph answered with, refused unless it is on [`GRAPH_ORIGIN`]: every
+/// paging read follows links only through here, so the bearer token never leaves Graph.
+fn on_graph(link: String) -> Result<String, GraphError> {
+    if link.starts_with(GRAPH_ORIGIN) {
+        Ok(link)
+    } else {
+        Err(GraphError::ForeignLink)
+    }
+}
+
 fn delta_url(from: DateTime<Utc>) -> String {
     format!(
         "{API}/me/mailFolders/inbox/messages/delta?$filter=receivedDateTime%20ge%20{}&{SELECT}",
@@ -395,8 +421,7 @@ impl<T: Transport> GraphSource<T> {
                 return Ok(listed);
             }
             match page.next_link {
-                Some(next) if next.starts_with(GRAPH_ORIGIN) => url = next,
-                Some(_) => return Err(GraphError::ForeignLink),
+                Some(next) => url = on_graph(next)?,
                 None => return Ok(listed),
             }
         }
@@ -432,12 +457,11 @@ impl<T: Transport> GraphSource<T> {
                 return Ok(None);
             }
             match (page.next_link, page.delta_link) {
-                (Some(next), _) if next.starts_with(GRAPH_ORIGIN) => url = next,
-                (None, Some(delta)) if delta.starts_with(GRAPH_ORIGIN) => {
-                    let cursor = Cursor::new(delta).ok_or(GraphError::Malformed)?;
+                (Some(next), _) => url = on_graph(next)?,
+                (None, Some(delta)) => {
+                    let cursor = Cursor::new(on_graph(delta)?).ok_or(GraphError::Malformed)?;
                     return Ok(Some(IdChanges { changes, cursor }));
                 }
-                (Some(_), _) | (None, Some(_)) => return Err(GraphError::ForeignLink),
                 (None, None) => return Err(GraphError::Malformed),
             }
         }
@@ -470,40 +494,55 @@ pub fn well_known(to: nm_core::Folder) -> &'static str {
 }
 
 impl<T: Transport> GraphSource<T> {
-    /// Moves the messages `ids` to the folder with role `to`, by its well-known name, at most
-    /// [`CONCURRENT_FETCHES`] at once. First a `GET` of that folder shows the mailbox has it: a
-    /// 404 there is [`GraphError::NoFolder`] and nothing moves, so that a 404 on a move means the
-    /// message is gone, not the folder. Then each message gets `POST /me/messages/{id}/move`
+    /// Moves the messages `ids` to the folder `to`, at most [`CONCURRENT_FETCHES`] at once.
+    ///
+    /// First the folder is found, read-only, so that nothing moves without it and a 404 on a
+    /// move means the message is gone, not the folder:
+    /// - a role is its well-known name, which a `GET` shows the mailbox has (a 404 there is
+    ///   [`GraphError::NoFolder`]), and the moves send that name;
+    /// - a name is a path of display names, found by [`Self::find`]; the moves send the
+    ///   folder's id. The inbox is refused by its id ([`GraphError::IntoInbox`]), since its
+    ///   display name follows the mailbox's language.
+    ///
+    /// Then each message gets `POST /me/messages/{id}/move`
     /// (<https://learn.microsoft.com/en-us/graph/api/message-move>): 201 is moved, 404 is gone.
     /// Needs Mail.ReadWrite: without it Graph answers 403, [`GraphError::Forbidden`]. On an error
     /// some messages may have moved already; the next sync finds them gone from the INBOX.
+    /// `Moved::folder` is the well-known name for a role and the path for a name.
     pub async fn move_to(
         &self,
         ids: &[RemoteId],
-        to: nm_core::Folder,
+        to: &Destination,
     ) -> Result<Moved<RemoteId>, GraphError> {
-        let name = well_known(to);
+        let folder = match to {
+            Destination::Role(role) => well_known(*role).to_owned(),
+            Destination::Name(path) => path.as_str().to_owned(),
+        };
         let mut result = Moved {
-            folder: name.to_owned(),
+            folder,
             moved: Vec::new(),
             gone: Vec::new(),
         };
         if ids.is_empty() {
             return Ok(result);
         }
-        let reply = self
-            .get(
-                &format!("{API}/me/mailFolders/{name}?$select=id"),
-                true,
-                MAX_JSON,
-            )
-            .await?;
-        match reply.status {
-            200 => {}
-            404 => return Err(GraphError::NoFolder(name)),
-            _ => return Err(status_error(&reply)),
-        }
-        let body = serde_json::json!({ "destinationId": name }).to_string();
+        let destination = match to {
+            Destination::Role(role) => {
+                let name = well_known(*role);
+                if self.well_known_id(name).await?.is_none() {
+                    return Err(GraphError::NoFolder(name));
+                }
+                name.to_owned()
+            }
+            Destination::Name(path) => {
+                let id = self.find(path).await?;
+                if self.well_known_id("inbox").await?.as_ref() == Some(&id) {
+                    return Err(GraphError::IntoInbox);
+                }
+                id
+            }
+        };
+        let body = serde_json::json!({ "destinationId": destination }).to_string();
         let answers: Vec<(RemoteId, bool)> = stream::iter(ids)
             .map(|id| async {
                 let moved = self.move_one(id, body.as_bytes()).await?;
@@ -532,6 +571,200 @@ impl<T: Transport> GraphSource<T> {
             404 => Ok(false),
             _ => Err(status_error(&reply)),
         }
+    }
+}
+
+/// A listing of mail folders: their id, display name and child count, 100 to a page (the
+/// default is 10: <https://learn.microsoft.com/en-us/graph/api/user-list-mailfolders>).
+const FOLDER_FIELDS: &str = "$select=id,displayName,childFolderCount&$top=100";
+
+/// A search folder's `@odata.type`: its messages are a query's results, so it cannot hold a moved
+/// message, and it is left out
+/// (<https://learn.microsoft.com/en-us/graph/api/user-list-mailfolders>).
+const SEARCH_FOLDER: &str = "#microsoft.graph.mailSearchFolder";
+
+/// The roles `folder list` shows and Graph's well-known name for each
+/// (<https://learn.microsoft.com/en-us/graph/api/resources/mailfolder>). Graph has no folder for
+/// all mail or for flagged mail.
+const ROLES: [(Role, &str); 6] = [
+    (Role::Inbox, "inbox"),
+    (Role::Archive, "archive"),
+    (Role::Trash, "deleteditems"),
+    (Role::Junk, "junkemail"),
+    (Role::Sent, "sentitems"),
+    (Role::Drafts, "drafts"),
+];
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MailFolder {
+    id: Option<String>,
+    display_name: Option<String>,
+    child_folder_count: Option<u64>,
+    #[serde(rename = "@odata.type")]
+    odata_type: Option<String>,
+}
+
+impl MailFolder {
+    /// Its id and display name; `None` for a search folder or one without either.
+    fn usable(&self) -> Option<(&str, &str)> {
+        if self.odata_type.as_deref() == Some(SEARCH_FOLDER) {
+            return None;
+        }
+        let name = self.display_name.as_deref().filter(|n| !n.is_empty())?;
+        Some((self.id.as_deref()?, name))
+    }
+
+    fn has_children(&self) -> bool {
+        self.child_folder_count.is_some_and(|n| n > 0)
+    }
+}
+
+#[derive(Deserialize)]
+struct FolderPage {
+    #[serde(default)]
+    value: Vec<MailFolder>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FolderId {
+    id: Option<String>,
+}
+
+/// A folder found while listing, waiting for its children.
+struct Found {
+    id: String,
+    path: String,
+    has_children: bool,
+}
+
+impl<T: Transport> GraphSource<T> {
+    /// The folders of the mailbox a message can be in, each a [`ListedFolder`] named by its
+    /// path of display names from the top of the mailbox (`Inbox/Receipts`), depth first in
+    /// Graph's order. `GET /me/mailFolders`, then `GET /me/mailFolders/{id}/childFolders` for
+    /// each folder with children, each through every next link
+    /// (<https://learn.microsoft.com/en-us/graph/api/mailfolder-list-childfolders>); hidden and
+    /// search folders are left out. Roles come from one `GET` per well-known name in [`ROLES`].
+    /// Needs Mail.Read or Mail.ReadBasic; changes nothing.
+    pub async fn folders(&self) -> Result<Vec<ListedFolder>, GraphError> {
+        let roles: Vec<(Role, Option<String>)> = stream::iter(ROLES)
+            .map(|(role, name)| async move { Ok((role, self.well_known_id(name).await?)) })
+            .buffered(CONCURRENT_FETCHES)
+            .try_collect()
+            .await?;
+        let mut listed = Vec::new();
+        let mut pending = Vec::new();
+        push_found(&mut pending, self.child_folders(None).await?, "");
+        while let Some(found) = pending.pop() {
+            if found.has_children {
+                let children = self.child_folders(Some(&found.id)).await?;
+                push_found(&mut pending, children, &found.path);
+            }
+            let role = roles
+                .iter()
+                .find(|(_, id)| id.as_deref() == Some(found.id.as_str()))
+                .map(|(role, _)| *role);
+            if let Some(name) = FolderName::new(found.path) {
+                listed.push(ListedFolder { name, role });
+            }
+        }
+        Ok(listed)
+    }
+
+    /// The id of the folder at `path`, a path of display names joined with `/` as
+    /// [`Self::folders`] prints it. Only the levels that lead to `path` are listed: the top, then
+    /// the children of each folder whose name starts what is left of the path, so a move never
+    /// walks the whole tree. A display name may hold a `/`, so a path can lead to several
+    /// folders: that is [`GraphError::SharedPath`]. None is [`GraphError::NoSuchFolder`]; a
+    /// search folder is [`GraphError::SearchFolder`].
+    async fn find(&self, path: &FolderName) -> Result<String, GraphError> {
+        let mut found: Vec<(String, bool)> = Vec::new();
+        let mut pending: Vec<(Option<String>, &str)> = vec![(None, path.as_str())];
+        while let Some((parent, rest)) = pending.pop() {
+            for folder in self.child_folders(parent.as_deref()).await? {
+                let search = folder.odata_type.as_deref() == Some(SEARCH_FOLDER);
+                let (Some(id), Some(name)) = (&folder.id, &folder.display_name) else {
+                    continue;
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                if name == rest {
+                    found.push((id.clone(), search));
+                } else if let Some(deeper) = rest.strip_prefix(name.as_str())
+                    && let Some(deeper) = deeper.strip_prefix('/')
+                    && folder.has_children()
+                    && !search
+                {
+                    pending.push((Some(id.clone()), deeper));
+                }
+            }
+        }
+        match found.as_slice() {
+            [] => Err(GraphError::NoSuchFolder(path.clone())),
+            [(_, true)] => Err(GraphError::SearchFolder(path.clone())),
+            [(id, false)] => Ok(id.clone()),
+            _ => Err(GraphError::SharedPath(path.clone())),
+        }
+    }
+
+    /// The folders directly under the folder `parent`, or at the top of the mailbox, through
+    /// every next link.
+    async fn child_folders(&self, parent: Option<&str>) -> Result<Vec<MailFolder>, GraphError> {
+        let mut url = match parent {
+            None => format!("{API}/me/mailFolders?{FOLDER_FIELDS}"),
+            Some(id) => format!(
+                "{API}/me/mailFolders/{}/childFolders?{FOLDER_FIELDS}",
+                encode_segment(id)
+            ),
+        };
+        let mut folders = Vec::new();
+        loop {
+            let page: FolderPage = self.get_json(&url).await?;
+            folders.extend(page.value);
+            match page.next_link {
+                Some(next) => url = on_graph(next)?,
+                None => return Ok(folders),
+            }
+        }
+    }
+
+    /// The id of the folder with the well-known name `name`; `None` when the mailbox has no
+    /// such folder (404).
+    async fn well_known_id(&self, name: &str) -> Result<Option<String>, GraphError> {
+        let url = format!("{API}/me/mailFolders/{name}?$select=id");
+        let reply = self.get(&url, true, MAX_JSON).await?;
+        match reply.status {
+            200 => serde_json::from_slice::<FolderId>(&reply.body)
+                .ok()
+                .and_then(|f| f.id)
+                .map(Some)
+                .ok_or(GraphError::Malformed),
+            404 => Ok(None),
+            _ => Err(status_error(&reply)),
+        }
+    }
+}
+
+/// Pushes the usable `folders` under `prefix` onto `pending`, last first, so that they come off
+/// it in Graph's order.
+fn push_found(pending: &mut Vec<Found>, folders: Vec<MailFolder>, prefix: &str) {
+    for folder in folders.iter().rev() {
+        let Some((id, name)) = folder.usable() else {
+            continue;
+        };
+        let path = if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        pending.push(Found {
+            id: id.to_owned(),
+            path,
+            has_children: folder.has_children(),
+        });
     }
 }
 
