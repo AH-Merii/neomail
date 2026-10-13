@@ -89,6 +89,9 @@ the new entry.
 - **Redaction uses our own rules** ([DEC-2026-10-11-pii-rules](#dec-2026-10-11-pii-rules)): the PII
   redaction that runs before text goes to jev is neomail's own rule redactor. No model is part of
   the default.
+- **The redaction preview** is `neomail redact ID...`: the subject and the first 1,500 characters
+  of the body, redacted as they will go to jev, offline
+  ([DEC-2026-10-13-redact](#dec-2026-10-13-redact), proposed).
 
 ## Data and storage
 
@@ -815,3 +818,28 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
     `folder list` is a read, not an action.
 - **Builds on:** [DEC-2026-10-13-archive-delete](#dec-2026-10-13-archive-delete),
   [DEC-2026-10-13-mark](#dec-2026-10-13-mark) and [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).
+
+### <a id="dec-2026-10-13-redact"></a>DEC-2026-10-13-redact: the redaction preview and what it masks
+
+- **Status:** proposed by Claude on 2026-10-13, after the owner asked to "go autopilot and
+  continue" (f679d889:9128). Roadmap slice 9 follows it.
+- **Proposal:**
+  - `neomail redact ID...` prints, for each cached message, the text that classification will
+    send to jev: the subject, whole, and the start of the body, both redacted. It reads the cache
+    only and sends nothing; `--json` gives the text exactly, with a count of masks per kind.
+  - The body is the text `neomail show` renders. It is redacted whole and then cut to its first
+    1,500 characters, the excerpt size the PII benchmark measured, never inside a mask, so a value
+    at the edge can't slip past its rule.
+  - A new pure crate, nm-redact, owns the rules and how masks are spelled. Its result, an
+    `Excerpt`, can only be made by redacting, and slice 10's request will take nothing else.
+  - The rules are neomail's own, ported from the benchmark's prototype: an address's local part,
+    the owner's logins whole, links down to their host, IBANs and cards that pass their checksums,
+    amounts, one-time codes and passwords after their keyword, phone numbers, any other run of 4 or
+    more digits, and the capitalised words of the display names in From, To, Cc and Reply-To.
+    Domains, link hosts, dates, times and numbers of 1 to 3 digits stay.
+  - Where rules overlap, the more specific one names the mask, in the order email, link, IBAN,
+    card, amount, code, phone, number, name: a valid card number is never called a phone number.
+  - [docs/privacy.md](privacy.md) says what the rules mask and keep, and what still gets through.
+- **Builds on:** [DEC-2026-10-11-pii-rules](#dec-2026-10-11-pii-rules),
+  [DEC-2026-10-11-redaction-gaps](#dec-2026-10-11-redaction-gaps) and
+  [DEC-2026-10-11-redaction-default](#dec-2026-10-11-redaction-default).
