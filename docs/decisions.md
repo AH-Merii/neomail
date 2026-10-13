@@ -29,6 +29,11 @@ the new entry.
   Microsoft client registrations. Each user registers their own OAuth app ("bring your own client"),
   guided by an in-app wizard (`neomail account add`) and step-by-step docs that explain *why* each
   step exists. Never embed or borrow another application's client ID (e.g. Thunderbird's).
+- **Setup wizards** ([DEC-2026-10-13-wizards](#dec-2026-10-13-wizards)): `neomail account add`
+  takes the user through setup one step at a time for Gmail (their own OAuth client, or an app
+  password), Outlook and Proton Mail. Other IMAP servers get no wizard and keep today's
+  questions. A wizard may check a client ID or secret with Google or Microsoft before the
+  sign-in, once a live check has shown that their answers tell a wrong one apart.
 - **Gmail sign-in modes:** (1) the user's own Google OAuth client, (2) app password over
   IMAP/SMTP (requires Google 2-Step Verification). Both read mail over IMAP, with IDLE push. A
   slice that needs what IMAP can't do adds the Gmail API for that part only, in an entry of its
@@ -767,6 +772,28 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   labels alone do not call for the API.
 - **Supersedes:** the "Gmail API, with IMAP as a fallback" part of the "Gmail sign-in modes"
   bullet under [Accounts and providers](#accounts-and-providers).
+
+### <a id="dec-2026-10-13-wizards"></a>DEC-2026-10-13-wizards: setup wizards for Gmail, Outlook and Proton, none for other IMAP servers
+
+- **Status:** recorded. **Source:** owner, chat, 2026-10-13, answering questions about the
+  setup-wizard issues #47 to #51 (f679d889:13442).
+- **Context:** the issues ask for `neomail account add` to guide a new user through each
+  provider's setup. #51 asked the same for other IMAP servers, where the user may not know the
+  server settings, while [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux) rules out server
+  autodiscovery for IMAP for now. A wrong OAuth client ID shows today only when the 5-minute
+  browser sign-in times out (`SIGN_IN_TIMEOUT`, crates/neomail/src/oauth/mod.rs:29).
+- **Owner's words:**
+  - Asked what may fill in an IMAP server's settings (a table shipped with neomail, an
+    explanation only, or network lookups): "no need for a wizard for imap".
+  - Asked whether the Gmail and Outlook wizards may contact Google or Microsoft right after a
+    client ID or secret is typed, before the sign-in: "Yes, if a live check confirms it
+    (Recommended)".
+- **Ruling:** the "Setup wizards" bullet under [Accounts and providers](#accounts-and-providers).
+  #51 is closed as not planned. Claude's reading: a third question, which changes the wizards'
+  live checks may make to the test accounts (2-Step Verification on the test Gmail, settings on
+  the duplicate Entra app, a restart of the isolated Bridge), got no answer, so they make none.
+- **Builds on:** [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux) and "No built-in OAuth client
+  IDs" under [Accounts and providers](#accounts-and-providers).
 
 ### <a id="dec-2026-10-13-mark"></a>DEC-2026-10-13-mark: marking mail read or unread from the CLI
 
