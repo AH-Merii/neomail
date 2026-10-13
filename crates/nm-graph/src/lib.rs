@@ -316,7 +316,6 @@ fn encode_segment(s: &str) -> String {
     out
 }
 
-/// The first request of a delta round over the INBOX's messages that arrived at or after `from`.
 /// A next or delta link Graph answered with, refused unless it is on [`GRAPH_ORIGIN`]: every
 /// paging read follows links only through here, so the bearer token never leaves Graph.
 fn on_graph(link: String) -> Result<String, GraphError> {
@@ -327,6 +326,7 @@ fn on_graph(link: String) -> Result<String, GraphError> {
     }
 }
 
+/// The first request of a delta round over the INBOX's messages that arrived at or after `from`.
 fn delta_url(from: DateTime<Utc>) -> String {
     format!(
         "{API}/me/mailFolders/inbox/messages/delta?$filter=receivedDateTime%20ge%20{}&{SELECT}",

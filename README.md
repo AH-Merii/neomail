@@ -88,16 +88,18 @@ input, or come from `--password-command`. `--no-check` skips the login. `neomail
   `openssl s_client -connect 127.0.0.1:1143 -starttls imap </dev/null | openssl x509 -noout
   -fingerprint -sha256 | cut -d= -f2`.
 
-  Bridge's IMAP LIST shows your folders under `Folders/` and your labels under `Labels/`: Proton's
-  [Labels and folders in Bridge](https://proton.me/support/labels-in-bridge) says "your existing
-  labels will appear as folders within the Labels folder", and a test account's LIST has both
-  parents, `Folders` and `Labels`. So `neomail move Folders/Receipts 42` moves a message to the
-  folder Receipts. Moving into a label applies the label, and "the message will appear in both the
-  Labels and the Folder it resides in" (the same page): `neomail move Labels/Work 42` labels the
-  message, but it stays in the INBOX, so neomail reports it as not confirmed (exit 1), keeps it in
-  the cache, and the next sync shows it still there. Trying again labels it again; archive it, or
-  move it to a folder under `Folders/`, to take it out of the INBOX. This rests on Proton's page; a
-  live check has not tried it yet.
+  Bridge's IMAP LIST shows your folders under `Folders/` and your labels under `Labels/`. Proton has
+  you create folders under the Folders group and labels under the Labels group
+  (["This computer only" folders in Outlook](https://proton.me/support/this-computer-only-folder-outlook)),
+  and says "your existing labels will appear as folders within the Labels folder"
+  ([Labels and folders in Bridge](https://proton.me/support/labels-in-bridge)). So
+  `neomail move Folders/Receipts 42` moves a message to the folder Receipts. Moving into a label
+  applies the label, and "the message will appear in both the Labels and the Folder it resides in"
+  (the same page): `neomail move Labels/Work 42` labels the message, but it stays in the INBOX, so
+  neomail reports it as not confirmed (exit 1), keeps it in the cache, and the next sync shows it
+  still there. Moving it there again changes nothing; archive it, or move it to a folder under
+  `Folders/`, to take it out of the INBOX. Both rest on Proton's pages: the test account has no
+  folder or label of its own, so a live check has tried neither.
 - **Gmail with an app password:** `neomail account add gmail-app-password`. Google: "To create an
   app password, you need 2-Step Verification on your Google Account"
   ([Google's help](https://support.google.com/accounts/answer/185833)).
