@@ -189,6 +189,11 @@ fn setup(config: &str) -> tempfile::TempDir {
 /// Runs the binary with its config and data in `data`, standard input `stdin` (not a terminal),
 /// a test keyring and none of the caller's settings.
 fn neomail(data: &Path, args: &[&str], stdin: &str) -> Output {
+    neomail_to(data, args, stdin, Stdio::piped())
+}
+
+/// [`neomail`] with standard output on `stdout`.
+fn neomail_to(data: &Path, args: &[&str], stdin: &str, stdout: Stdio) -> Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_neomail"));
     c.args(args)
         .env("NEOMAIL_DATA_DIR", data)
@@ -198,7 +203,7 @@ fn neomail(data: &Path, args: &[&str], stdin: &str) -> Output {
         .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
         .env("BROWSER", "true")
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(stdout)
         .stderr(Stdio::piped());
     for var in [
         "XDG_CONFIG_HOME",
@@ -509,6 +514,45 @@ fn a_copy_in_sent_that_fails_still_exits_0_with_a_warning() {
     assert_eq!(*imap_connections.lock().unwrap(), 1);
 }
 
+/// Once the server has the message, standard output that cannot be written (here /dev/full, so
+/// ENOSPC) is a warning naming the message, and the exit is 0: a script that retries on exit 1
+/// must not send it twice.
+#[test]
+fn a_sent_message_whose_output_cannot_be_written_still_exits_0() {
+    let smtp = FakeSmtp::start(&[]);
+    let (imap, _) = closed_imap();
+    let dir = setup(&account("work", "me@example.com", &smtp, imap, false));
+    for format in ["--json", "--jsonl", "--plain"] {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let args = [
+            "send",
+            "--to",
+            "ada@example.com",
+            "--subject",
+            "Hi",
+            "--body",
+            "-",
+            "--yes",
+            format,
+        ];
+        let o = neomail_to(dir.path(), &args, BODY, full.into());
+        assert_eq!(o.status.code(), Some(0), "{format}: {}", stderr(&o));
+        let seen = smtp.seen();
+        let message = seen.messages.last().unwrap();
+        let id = header(message, "Message-ID").unwrap();
+        let err = stderr(&o);
+        assert!(
+            err.contains(&format!("the message {id} was sent")),
+            "{format}: {id}: {err}"
+        );
+        assert!(err.contains("No space left on device"), "{format}: {err}");
+    }
+    assert_eq!(smtp.seen().messages.len(), 3);
+}
+
 /// Caches `raw` in `account`'s inbox and returns its id, as `neomail list` prints it.
 fn cache(dir: &Path, account: &str, raw: &str) -> String {
     let mut cache = Cache::open(&dir.join("cache.sqlite3")).unwrap();
@@ -578,6 +622,44 @@ fn a_reply_all_threads_on_the_original_and_never_lists_me() {
             .any(|c| c.eq_ignore_ascii_case("rcpt to:<me@example.com>"))
     );
     assert!(message.contains("> Shall we?"), "{message}");
+}
+
+/// With an alias in `address`, the login (in the original's To) gets no copy of a reply to all.
+#[test]
+fn a_reply_all_from_an_alias_never_lists_the_login() {
+    let smtp = FakeSmtp::start(&[]);
+    let (imap, _) = closed_imap();
+    let config = account("work", "me@example.com", &smtp, imap, false).replacen(
+        "display_name",
+        "address = \"alias@example.com\"\ndisplay_name",
+        1,
+    );
+    let dir = setup(&config);
+    let id = cache(dir.path(), "work", ORIGINAL);
+    let o = neomail(
+        dir.path(),
+        &["reply", &id, "--all", "--body", "-", "--yes", "--json"],
+        "Yes.\n",
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let json: Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(json["from"]["address"], "alias@example.com");
+    let cc: Vec<&str> = json["cc"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(cc, ["bob@example.com", "cy@example.com", "ada@example.com"]);
+    let seen = smtp.seen();
+    assert!(
+        !seen
+            .commands
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("rcpt to:<me@example.com>")),
+        "{:?}",
+        seen.commands
+    );
 }
 
 #[test]
@@ -806,4 +888,16 @@ fn a_comma_in_a_quoted_name_does_not_split_the_address() {
         .unwrap_or_default();
     assert!(bcc.contains("Roe, Ann <ann@example.com>"), "{summary}");
     assert!(bcc.contains("cy@example.com"), "{summary}");
+}
+
+/// `send` has no original, so its --from default is the only account; reply's is the original's.
+#[test]
+fn from_help_fits_each_command() {
+    let dir = setup("");
+    let help = |command: &str| stdout(&neomail(dir.path(), &[command, "--help"], ""));
+    let send = help("send");
+    assert!(send.contains("[default: the only one]"), "{send}");
+    assert!(!send.contains("original"), "{send}");
+    assert!(help("reply").contains("[default: the original's, else the only one]"));
+    assert!(help("forward").contains("[default: the original's, else the only one]"));
 }

@@ -447,7 +447,7 @@ enum Command {
         format: ListingFormat,
     },
     /// Send a message written in Markdown from one of your accounts, after asking
-    #[command(after_help = send::SEND_EXAMPLES)]
+    #[command(after_help = send::SEND_EXAMPLES, mut_arg("from", send::from_for_send))]
     Send(send::SendArgs),
     /// Reply to a cached message, by its id from `neomail list`, after asking
     #[command(after_help = send::REPLY_EXAMPLES)]
@@ -612,7 +612,7 @@ struct AddCommand {
     /// imap: the SMTP server to send through, with TLS [default: none, so the account cannot send until the config names one]
     #[arg(long, value_name = "HOST")]
     smtp_host: Option<String>,
-    /// imap: the SMTP port [default: 465]
+    /// imap: the SMTP port [default: 587 with starttls, else 465]
     #[arg(long, value_name = "PORT", requires = "smtp_host")]
     smtp_port: Option<u16>,
     /// imap: how the SMTP connection is secured [default: starttls on port 587, else tls]
@@ -981,10 +981,16 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
             colors,
             &mut out,
         )?,
-        Command::Send(args) => send::send(args, send_env(cli.config, input, terminal, &mut out))?,
-        Command::Reply(args) => send::reply(args, send_env(cli.config, input, terminal, &mut out))?,
+        // These flush standard output themselves: once a message is sent, a failure to print is
+        // only a warning, so the flush below must not turn it into an error.
+        Command::Send(args) => {
+            return send::send(args, send_env(cli.config, input, terminal, &mut out));
+        }
+        Command::Reply(args) => {
+            return send::reply(args, send_env(cli.config, input, terminal, &mut out));
+        }
         Command::Forward(args) => {
-            send::forward(args, send_env(cli.config, input, terminal, &mut out))?
+            return send::forward(args, send_env(cli.config, input, terminal, &mut out));
         }
         Command::Folder {
             command: FolderCommand::List { account, format },

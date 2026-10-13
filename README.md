@@ -152,11 +152,13 @@ cert_sha256 = "AB:CD:…"   # 64 hex digits
   Bridge need none: neomail sends through smtp.gmail.com (port 465, TLS) and through Bridge's
   127.0.0.1 port 1025 ([Proton's port list](https://proton.me/support/port-already-occupied-error)),
   and both keep the copy in Sent themselves, so neomail adds none. Proton does not say how
-  Bridge's SMTP is secured; neomail uses STARTTLS with the IMAP pin, which the live check has
-  not confirmed yet. `account add proton` and `gmail-app-password` write this out. Any other
-  server needs its `smtp` before it can send: `account add imap --smtp-host HOST` writes it
-  (`--smtp-port 587` uses STARTTLS, any other port TLS; `--smtp-security starttls|tls` says
-  otherwise).
+  Bridge's SMTP is secured; neomail uses STARTTLS with the IMAP pin. The live check sent through
+  Bridge's SMTP that way, from a hand-written `smtp` table, as its Bridge listened on other ports
+  and the preset only matches IMAP on port 1143. `account add proton` and `gmail-app-password`
+  write this out. An `smtp` table naming smtp.gmail.com also defaults to `save_sent = false`.
+  Any other server needs its `smtp` before it can send: `account add imap --smtp-host HOST`
+  writes it (`--smtp-port 587` uses STARTTLS, any other port TLS; `--smtp-security starttls|tls`
+  says otherwise, on port 587 or 465 unless `--smtp-port` names one).
 
 An optional `[classify]` table sets up classification with jev; every key has a default:
 

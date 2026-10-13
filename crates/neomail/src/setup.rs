@@ -270,9 +270,10 @@ pub fn gather(
 }
 
 /// `--smtp-host`, `--smtp-port` and `--smtp-security`: without `--smtp-security`, port 587 is
-/// submission with STARTTLS (RFC 6409 section 3.1), any other port TLS from the first byte, 465 by
-/// default (RFC 8314 section 3.3). A server named here keeps no copy of sent mail, so neomail
-/// appends one to Sent.
+/// submission with STARTTLS (RFC 6409 section 3.1), any other port TLS from the first byte (RFC
+/// 8314 section 3.3). Without `--smtp-port`, 587 for STARTTLS and 465 for TLS, as the config
+/// file has it. A server named here keeps no copy of sent mail, so neomail appends one to Sent,
+/// except Gmail's ([`config::keeps_sent_copy`]).
 fn smtp_settings(
     host: Option<String>,
     port: Option<u16>,
@@ -284,17 +285,22 @@ fn smtp_settings(
     if host.is_empty() {
         return Err(crate::usage("--smtp-host is empty"));
     }
-    let port = port.unwrap_or(465);
+    let security = security.unwrap_or(if port == Some(587) {
+        Security::StartTls
+    } else {
+        Security::Tls
+    });
+    let port = port.unwrap_or(match security {
+        Security::Tls => 465,
+        Security::StartTls => 587,
+    });
+    let save_sent = !config::keeps_sent_copy(&host);
     Ok(Some(config::SmtpSettings {
         host,
         port,
-        security: security.unwrap_or(if port == 587 {
-            Security::StartTls
-        } else {
-            Security::Tls
-        }),
+        security,
         cert_pin: None,
-        save_sent: true,
+        save_sent,
     }))
 }
 
@@ -623,6 +629,8 @@ mod tests {
                 (2525, Security::StartTls),
             ),
             (Some(587), Some(Security::Tls), (587, Security::Tls)),
+            (None, Some(Security::StartTls), (587, Security::StartTls)),
+            (None, Some(Security::Tls), (465, Security::Tls)),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("config.toml");
@@ -646,6 +654,20 @@ mod tests {
                 "a server neomail does not know keeps no copy"
             );
         }
+        // Gmail's SMTP keeps its own copy in Sent, so neomail appends none.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let args = Args {
+            name: Some("work".into()),
+            username: Some("user@mail.example".into()),
+            host: Some("imap.mail.example".into()),
+            smtp_host: Some("smtp.gmail.com".into()),
+            ..Args::default()
+        };
+        let plan = gather(&IMAP, &path, args, OFF_TERMINAL).unwrap();
+        Fakes::new().run(plan, &path).unwrap();
+        let config = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!config.find("work").unwrap().smtp.clone().unwrap().save_sent);
         // Without one, a server neomail does not know gets no smtp at all.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

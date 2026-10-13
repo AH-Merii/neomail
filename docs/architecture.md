@@ -435,9 +435,10 @@ nm-imap.
 
 For Outlook, the writer calls `graph::set_read`, which calls `GraphSource::set_read`. Changing mail
 needs Mail.ReadWrite, which new sign-ins ask for along with Mail.Read. A sign-in records what it was
-granted as `oauth::MailGrant` (`Read` or `ReadWrite`) in its keyring entry (`mail_grant`). An entry
-without it comes from an earlier version, which asked only for Mail.Read, and counts as `Read`. The
-grant travels with the access token (`sync::AccessToken`), so two things follow from it:
+granted as `oauth::MailGrant` (`Read`, `ReadWrite` or `ReadWriteSend`) in its keyring entry
+(`mail_grant`). An entry without it comes from an earlier version, which asked only for Mail.Read,
+and counts as `Read`. The grant travels with the access token (`sync::AccessToken`), so two things
+follow from it:
 
 - The refresh asks for no more than the sign-in granted: `Provider::refresh_scope` holds one
   scope per grant, since Microsoft's refresh scope must be the original's or a subset.

@@ -265,7 +265,7 @@ fn replies_thread_as_rfc_5322_says() {
         ("", None, &[]),
     ];
     for (headers, in_reply_to, references) in cases {
-        let d = reply(&original(headers, "hi\r\n"), false, &me(), "ok").unwrap();
+        let d = reply(&original(headers, "hi\r\n"), false, &me(), &[], "ok").unwrap();
         assert_eq!(d.in_reply_to.as_deref(), in_reply_to, "{headers:?}");
         assert_eq!(d.references, references, "{headers:?}");
         let msg = d.build(now()).unwrap();
@@ -295,7 +295,7 @@ fn re_and_fwd_are_never_doubled() {
     ] {
         let mut o = original("", "x");
         o.subject = Some(subject.to_owned());
-        assert_eq!(reply(&o, false, &me(), "").unwrap().subject, re);
+        assert_eq!(reply(&o, false, &me(), &[], "").unwrap().subject, re);
         assert_eq!(forward(&o, &me(), Vec::new(), "").subject, fwd);
     }
 }
@@ -319,7 +319,7 @@ fn a_control_character_in_the_original_subject_still_builds() {
                 .is_some_and(|s| s.chars().any(char::is_control)),
             "the case must hold a control character after parsing: {subject:?}"
         );
-        let r = reply(&o, false, &me(), "ok").unwrap();
+        let r = reply(&o, false, &me(), &[], "ok").unwrap();
         assert_eq!(r.subject, "Re: Lunch plans", "{subject:?}");
         assert!(r.build(now()).is_ok(), "{subject:?}");
         let f = forward(
@@ -335,7 +335,7 @@ fn a_control_character_in_the_original_subject_still_builds() {
 
 #[test]
 fn a_reply_goes_to_reply_to_else_from() {
-    let d = reply(&original("", "x"), false, &me(), "").unwrap();
+    let d = reply(&original("", "x"), false, &me(), &[], "").unwrap();
     assert_eq!(
         (addresses(&d.to), addresses(&d.cc)),
         (vec!["ann@example.org"], vec![])
@@ -344,6 +344,7 @@ fn a_reply_goes_to_reply_to_else_from() {
         &original("Reply-To: list@example.org\r\n", "x"),
         false,
         &me(),
+        &[],
         "",
     )
     .unwrap();
@@ -369,7 +370,7 @@ fn an_unusable_sender_address_is_an_error_not_a_reroute() {
         let o = parse(raw.as_bytes()).unwrap();
         for all in [false, true] {
             assert_eq!(
-                reply(&o, all, &me(), ""),
+                reply(&o, all, &me(), &[], ""),
                 Err(ComposeError::Unsendable(
                     address.to_owned(),
                     "only ASCII addresses can be sent for now"
@@ -393,7 +394,7 @@ fn an_unusable_to_or_cc_address_is_an_error_not_a_smaller_reply() {
     let o = parse(own.as_bytes()).unwrap();
     for all in [false, true] {
         assert_eq!(
-            reply(&o, all, &me(), ""),
+            reply(&o, all, &me(), &[], ""),
             unsendable,
             "own message, all={all}"
         );
@@ -404,10 +405,10 @@ fn an_unusable_to_or_cc_address_is_an_error_not_a_smaller_reply() {
     ] {
         let raw = format!("From: ann@example.org\r\n{headers}Subject: s\r\n\r\nx");
         let o = parse(raw.as_bytes()).unwrap();
-        assert_eq!(reply(&o, true, &me(), ""), unsendable, "{headers:?}");
+        assert_eq!(reply(&o, true, &me(), &[], ""), unsendable, "{headers:?}");
         // Without --all the To and Cc are not copied, so the reply to Ann goes.
         assert_eq!(
-            addresses(&reply(&o, false, &me(), "").unwrap().to),
+            addresses(&reply(&o, false, &me(), &[], "").unwrap().to),
             ["ann@example.org"]
         );
     }
@@ -420,7 +421,7 @@ fn a_bad_display_name_keeps_its_address() {
                team@example.org\r\nSubject: s\r\n\r\nx";
     let o = parse(raw.as_bytes()).unwrap();
     assert!(o.from[0].name.as_deref().is_some_and(|n| n.contains('\n')));
-    let d = reply(&o, false, &me(), "").unwrap();
+    let d = reply(&o, false, &me(), &[], "").unwrap();
     assert_eq!(addresses(&d.to), ["ann@example.org"]);
     assert_eq!(d.to[0].name(), None);
 }
@@ -431,7 +432,7 @@ fn reply_all_lists_everyone_once_and_never_the_sender_identity() {
         "Reply-To: Ann Two <ANN@example.org>, ann@example.org\r\n",
         "x",
     );
-    let d = reply(&o, true, &me(), "").unwrap();
+    let d = reply(&o, true, &me(), &[], "").unwrap();
     assert_eq!(addresses(&d.to), ["ANN@example.org"]);
     assert_eq!(addresses(&d.cc), ["bob@example.org", "cat@example.org"]);
     assert!(d.bcc.is_empty());
@@ -441,11 +442,11 @@ fn reply_all_lists_everyone_once_and_never_the_sender_identity() {
 fn a_reply_to_ones_own_message_goes_to_its_recipients() {
     let raw =
         "From: Me <me@example.com>\r\nTo: bob@example.org, me@example.com\r\nSubject: s\r\n\r\nx";
-    let d = reply(&parse(raw.as_bytes()).unwrap(), false, &me(), "").unwrap();
+    let d = reply(&parse(raw.as_bytes()).unwrap(), false, &me(), &[], "").unwrap();
     assert_eq!(addresses(&d.to), ["bob@example.org"]);
     let alone = "From: me@example.com\r\nTo: me@example.com\r\nSubject: s\r\n\r\nx";
     assert_eq!(
-        reply(&parse(alone.as_bytes()).unwrap(), true, &me(), ""),
+        reply(&parse(alone.as_bytes()).unwrap(), true, &me(), &[], ""),
         Err(ComposeError::NoRecipients)
     );
 }
@@ -456,6 +457,7 @@ fn a_reply_quotes_the_original_below_the_answer() {
         &original("", "First line\r\n\r\n<b>third</b>\r\n"),
         false,
         &me(),
+        &[],
         "Sure!\n\n",
     )
     .unwrap();
@@ -490,4 +492,24 @@ fn a_forward_carries_the_original_headers_and_text_inline() {
     // Each header keeps its own line in the HTML part.
     let html = render_html(&d.markdown);
     assert!(html.contains("Lunch<br />"), "{html}");
+}
+
+/// When `me` is an alias, the account's login is never a recipient either, and a message sent
+/// from the login is one's own.
+#[test]
+fn reply_all_never_lists_the_accounts_other_addresses() {
+    let login = ["login@example.com"];
+    let raw = "From: ann@example.org\r\nTo: me@example.com, LOGIN@example.com\r\n\
+               Cc: bob@example.org, login@example.com\r\nSubject: s\r\n\r\nx";
+    let d = reply(&parse(raw.as_bytes()).unwrap(), true, &me(), &login, "").unwrap();
+    assert_eq!(
+        (addresses(&d.to), addresses(&d.cc)),
+        (vec!["ann@example.org"], vec!["bob@example.org"])
+    );
+    let own = "From: login@example.com\r\nTo: bob@example.org\r\nSubject: s\r\n\r\nx";
+    let d = reply(&parse(own.as_bytes()).unwrap(), true, &me(), &login, "").unwrap();
+    assert_eq!(
+        (addresses(&d.to), addresses(&d.cc)),
+        (vec!["bob@example.org"], vec![])
+    );
 }

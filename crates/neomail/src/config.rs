@@ -635,7 +635,7 @@ fn identity(
 
 /// `[accounts.smtp]`, checked. The port defaults to 465 for TLS and 587 for STARTTLS (RFC 8314
 /// section 7.3, RFC 6409 section 3.1); a server named here keeps no copy of sent mail unless
-/// `save_sent = false` says it does.
+/// `save_sent = false` says it does, or it is one [`keeps_sent_copy`] knows.
 fn smtp_settings(name: &str, raw: RawSmtp) -> Result<SmtpSettings> {
     let host = raw.host.trim().to_owned();
     if host.is_empty() {
@@ -652,15 +652,22 @@ fn smtp_settings(name: &str, raw: RawSmtp) -> Result<SmtpSettings> {
         .transpose()
         .with_context(|| format!("account {name:?}: smtp.cert_sha256"))?;
     Ok(SmtpSettings {
-        host,
         port: raw.port.unwrap_or(match security {
             Security::Tls => 465,
             Security::StartTls => 587,
         }),
         security,
         cert_pin,
-        save_sent: raw.save_sent.unwrap_or(true),
+        save_sent: raw.save_sent.unwrap_or(!keeps_sent_copy(&host)),
+        host,
     })
+}
+
+/// Whether the SMTP server at `host` keeps its own copy of what it sends, so neomail appends
+/// none: Gmail's ("Sent messages are automatically copied to the Gmail/Sent folder if your email
+/// client uses SMTP", <https://support.google.com/mail/answer/78892>).
+pub fn keeps_sent_copy(host: &str) -> bool {
+    host.eq_ignore_ascii_case("smtp.gmail.com")
 }
 
 /// The TOML for a new OAuth account, ready to append to the config file.
@@ -1348,6 +1355,22 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
                     pin.parse().ok(),
                     false,
                 ),
+            ),
+            // Gmail keeps its own copy, so an smtp table naming it appends none, unless the
+            // config says otherwise.
+            (
+                IMAP_ACCOUNT,
+                "[accounts.imap]\nhost = \"imap.example.com\"\n\
+                 [accounts.smtp]\nhost = \"SMTP.gmail.com\"\nport = 587\nsecurity = \"starttls\""
+                    .into(),
+                smtp("SMTP.gmail.com", 587, Security::StartTls, None, false),
+            ),
+            (
+                IMAP_ACCOUNT,
+                "[accounts.imap]\nhost = \"imap.gmail.com\"\n\
+                 [accounts.smtp]\nhost = \"smtp.gmail.com\"\nsave_sent = true"
+                    .into(),
+                smtp("smtp.gmail.com", 465, Security::Tls, None, true),
             ),
             (microsoft, String::new(), Outbound::Graph),
         ];

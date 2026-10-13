@@ -124,6 +124,11 @@ pub struct ForwardArgs {
     common: Common,
 }
 
+/// `--from`'s help for `send`, which has no original to send from the account of.
+pub fn from_for_send(arg: clap::Arg) -> clap::Arg {
+    arg.help("The account to send from, by name or address [default: the only one]")
+}
+
 /// The flags `send`, `reply` and `forward` share.
 #[derive(clap::Args)]
 pub struct Common {
@@ -133,7 +138,8 @@ pub struct Common {
     /// Copy to these addresses; repeat the flag or separate them with commas
     #[arg(long, value_name = "ADDR")]
     cc: Vec<String>,
-    /// Blind copy: these addresses get the message, but no header names them
+    /// Blind copy: these addresses get the message, but no header names them; repeat the flag or
+    /// separate them with commas
     #[arg(long, value_name = "ADDR")]
     bcc: Vec<String>,
     /// Send the Markdown as plain text only, without the HTML part
@@ -205,13 +211,17 @@ pub fn reply(args: ReplyArgs, cx: Env<'_>) -> Result<ExitCode> {
     )?;
     let me = account.identity()?;
     let markdown = read_body(&args.body)?;
-    let draft = compose::reply(&original, args.all, &me, &markdown).map_err(|e| match e {
-        ComposeError::NoRecipients => anyhow!(
-            "message {} has no one to reply to but you; use `neomail send --to ADDR` instead",
-            args.id
-        ),
-        e => anyhow!("message {} cannot be answered: {e}", args.id),
-    })?;
+    // The login is the account's too when `address` is an alias: never a recipient either.
+    let login = account.username();
+    let also_me: &[&str] = if login.contains('@') { &[login] } else { &[] };
+    let draft =
+        compose::reply(&original, args.all, &me, also_me, &markdown).map_err(|e| match e {
+            ComposeError::NoRecipients => anyhow!(
+                "message {} has no one to reply to but you; use `neomail send --to ADDR` instead",
+                args.id
+            ),
+            e => anyhow!("message {} cannot be answered: {e}", args.id),
+        })?;
     deliver(account, draft, &args.common, cx)
 }
 
@@ -438,6 +448,7 @@ fn deliver(account: &Account, mut draft: Draft, common: &Common, cx: Env<'_>) ->
         // names it.
         eprint!("{}", summary(account, &draft));
         cx.out.write_all(&outgoing.mime)?;
+        cx.out.flush()?;
         return Ok(ExitCode::SUCCESS);
     }
     if outbound == Outbound::Graph {
@@ -460,8 +471,25 @@ fn deliver(account: &Account, mut draft: Draft, common: &Common, cx: Env<'_>) ->
         sent_copy,
     };
     let mode = Mode::choose(common.plain, common.json, common.jsonl, cx.terminal);
-    write_sent(cx.out, mode, &sent, &outgoing)?;
+    // The server has the message now: a failure to print says so and is no failure, or a script
+    // that retries on exit 1 would send it twice. A closed standard output stays quiet.
+    let printed = write_sent(cx.out, mode, &sent, &outgoing).and_then(|()| Ok(cx.out.flush()?));
+    if let Err(e) = printed
+        && !is_broken_pipe(&e)
+    {
+        eprintln!(
+            "neomail: {}: warning: the message <{}> was sent, but standard output could not be              written: {e:#}; do not send it again",
+            account.name, outgoing.message_id
+        );
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Whether `e` is a closed standard output: its reader went away.
+fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<io::Error>())
+        .any(|io| io.kind() == io::ErrorKind::BrokenPipe)
 }
 
 /// Refuses, before the question, an Outlook sign-in that does not let neomail send: one from
@@ -609,7 +637,7 @@ fn write_sent(out: &mut dyn Write, mode: Mode, sent: &Sent<'_>, outgoing: &Outgo
     match mode {
         Mode::Json => output::write_json(out, sent)?,
         Mode::Jsonl => {
-            serde_json::to_writer(&mut *out, sent)?;
+            serde_json::to_writer(&mut *out, sent).map_err(io::Error::from)?;
             writeln!(out)?;
         }
         Mode::Plain => writeln!(out, "{}", sent.message_id)?,

@@ -303,12 +303,14 @@ pub fn render_html(markdown: &str) -> String {
 /// It goes to the original's Reply-To, else its From; to its To when those are only `me` (a reply
 /// to one's own message). With `all` the original's To and Cc are copied too. An address taken
 /// from the original that cannot be sent to is an error, never dropped or rerouted. No address
-/// is listed twice, and `me` is never a recipient. The subject gets `Re: ` unless it has one already,
-/// in any case. In-Reply-To and References follow RFC 5322 section 3.6.4.
+/// is listed twice, and `me` is never a recipient, nor any of `also_me`: the account's other
+/// addresses, such as its login when `me` is an alias. The subject gets `Re: ` unless it has one
+/// already, in any case. In-Reply-To and References follow RFC 5322 section 3.6.4.
 pub fn reply(
     original: &ParsedMessage,
     all: bool,
     me: &Mailbox,
+    also_me: &[&str],
     markdown: &str,
 ) -> Result<Draft, ComposeError> {
     fn with_address(list: &[EmailAddress]) -> Vec<&EmailAddress> {
@@ -328,7 +330,13 @@ pub fn reply(
     if answer_to.is_empty() {
         answer_to = with_address(&original.from);
     }
-    let own = |e: &EmailAddress| e.address.as_deref().is_some_and(|a| me.is(a));
+    let is_me = |a: &str| {
+        me.is(a)
+            || also_me
+                .iter()
+                .any(|o| o.trim().eq_ignore_ascii_case(a.trim()))
+    };
+    let own = |e: &EmailAddress| e.address.as_deref().is_some_and(is_me);
     let primary = if !answer_to.is_empty() && answer_to.iter().all(|e| own(e)) {
         mailboxes(&original.to)?
     } else {
@@ -338,12 +346,12 @@ pub fn reply(
             .collect::<Result<Vec<_>, _>>()?
     };
     let mut to = Vec::new();
-    add_unique(&mut to, &[], me, primary);
+    add_unique(&mut to, &[], &is_me, primary);
     let mut cc = Vec::new();
     if all {
         let mut others = mailboxes(&original.to)?;
         others.extend(mailboxes(&original.cc)?);
-        add_unique(&mut cc, &to, me, others);
+        add_unique(&mut cc, &to, &is_me, others);
     }
     if to.is_empty() && cc.is_empty() {
         return Err(ComposeError::NoRecipients);
@@ -422,11 +430,17 @@ pub fn forward(original: &ParsedMessage, me: &Mailbox, to: Vec<Mailbox>, markdow
     }
 }
 
-/// Adds each of `new` to `into` unless it is `me`, already in `into` or in `besides`.
-fn add_unique(into: &mut Vec<Mailbox>, besides: &[Mailbox], me: &Mailbox, new: Vec<Mailbox>) {
+/// Adds each of `new` to `into` unless it is the account's (`is_me`), already in `into` or in
+/// `besides`.
+fn add_unique(
+    into: &mut Vec<Mailbox>,
+    besides: &[Mailbox],
+    is_me: &dyn Fn(&str) -> bool,
+    new: Vec<Mailbox>,
+) {
     for m in new {
         let taken = |list: &[Mailbox]| list.iter().any(|o| o.is(&m.address));
-        if !me.is(&m.address) && !taken(into) && !taken(besides) {
+        if !is_me(&m.address) && !taken(into) && !taken(besides) {
             into.push(m);
         }
     }
