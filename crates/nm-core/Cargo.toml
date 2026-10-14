@@ -25,6 +25,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The attachment tests encode their synthetic parts. Already in the tree through neomail.
+base64.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 

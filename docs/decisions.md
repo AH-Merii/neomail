@@ -221,6 +221,7 @@ the new entry.
 - **Attachments are searchable.**
   - An attachments picker searches all accounts by name, type, sender and date.
   - The CLI and agents get the same commands (`neomail attachment list|save|open --json`). Agents read attachment text as data, never as instructions.
+- **Attachments in the CLI** are `neomail attachment list|save|open`, read from the cached message offline, with real types, safe names and a question before an executable opens ([DEC-2026-10-14-attachments](#dec-2026-10-14-attachments), proposed).
 - **Drafting with files and images:**
   - Attach with `:attach` and a fuzzy file picker, by pasting or dropping a file path, or by pasting an image from the clipboard.
   - Markdown images (`![alt](path)`) are sent as inline images. Per-identity signatures can include a logo. The composer previews images inline.
@@ -1167,3 +1168,59 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   [Classification](#classification-jev), and slice 11 in [the roadmap](roadmap.md).
 - **Retires:** `classify.daemon` defaulting to `true`, and the consent text's line that the daemon
   then also sends each new message.
+
+### <a id="dec-2026-10-14-attachments"></a>DEC-2026-10-14-attachments: attachments in the CLI
+
+- **Status:** proposed by Claude on 2026-10-14, for roadmap slice 14.
+- **Context:** the cache already holds every message's whole MIME source, attachments included:
+  IMAP fetches `BODY.PEEK[]` and Outlook fetches Graph's `/messages/{id}/$value`, both stored in
+  `message.raw`. So attachments need no fetch, no new table and no cache migration, and every
+  provider gets them the same way.
+- **Proposal:**
+  - `neomail attachment list ID` names each attachment by an index from 1, in MIME order (the
+    order mail-parser gives), which `save` and `open` take. It shows the safe name, the real type,
+    the declared type, the decoded size and three notes: `mismatch`, `inline` and `executable`.
+    A nested `message/rfc822` is one attachment, its name ending in `.eml` (added when missing);
+    its own attachments stay inside it.
+  - The bytes are the ones sent: mail-parser turns a text part (any `text/*`, and a part
+    without a Content-Type) into UTF-8, which would corrupt a binary file sent that way, so for
+    those only the transfer encoding (base64 or quoted-printable) is undone on the raw part and
+    the charset is left as it is.
+  - The real type comes from the content: a table of signatures (PDF, images, archives, Office
+    and OpenDocument files told apart inside ZIP and OLE, audio and video, ELF, Windows PE,
+    Mach-O, shortcuts, `#!` scripts), else HTML, SVG, XML or text for UTF-8 without NUL bytes,
+    else `application/octet-stream`. No new dependency: the table is small and the standard
+    library does the rest. `mismatch` is set when a recognised real type contradicts the
+    declared type or the name's extension; aliases (`image/jpg`) and containers (a `.docx` sent
+    as `application/zip`) are not mismatches, and unknown content never is.
+  - `inline` marks a part whose Content-ID an HTML body of the message points at with `cid:`.
+  - `executable` marks executables, installers, shortcuts and scripts: by real type, or by the
+    safe name's extension (`.exe`, `.js`, `.sh`, `.desktop`, `.docm`, `.xlam`, `.flatpakref` and
+    the like).
+  - Safe names: the last path component only, without control, bidi or invisible characters,
+    `:*?"<>|` as `_`, no leading dots, dashes or spaces and no trailing dots or spaces, at most
+    200 bytes keeping a short extension; `attachment-INDEX` with the real type's extension when
+    nothing is left; `-INDEX` added when two attachments of a message would share a name, then
+    `-2`, `-3` and so on while that is taken too.
+  - `save ID [INDEX...]` writes into `--dir` (default: the current directory), mode 0600 so a
+    file is never executable, without following a symbolic link, and never replaces a file
+    unless `--overwrite`: then it writes a temporary file and renames it over the old one. It
+    prints where each file went; a file that exists or an unknown index is reported on standard
+    error after the others are saved, and exits 1.
+  - `open ID INDEX` writes the file to `attachments/ID-INDEX/NAME` under neomail's data
+    directory (never `/tmp`), directories 0700 and the file 0600, and runs the opener on it:
+    `NEOMAIL_OPENER` when set (which is also how the tests swap in a stub), else `open` on
+    macOS, `wslview` on WSL, else `xdg-open`. neomail waits for the opener and reports its
+    failure (exit 1). A later `open` removes a copy whose newest file is more than a day old, since
+    an app may read the file after the opener returned and a user may edit it in place; the
+    message after opening says the copy is temporary. Before an executable or script it warns on standard error
+    and asks on a terminal (a no exits 1); without a terminal, or with `--no-input`, it refuses
+    with exit 2 unless `--yes`. neomail never runs a file itself.
+  - Output follows [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux): `list` and `save` are
+    listings (human, TSV, `--json`, `--jsonl`); `open` prints the file's path, or one object with
+    `--json`. Shapes in [json.md](json.md).
+- **Known limits:** macOS quarantine flags, a downloads
+  folder in the config, terminal previews and the attachments picker are left for later.
+- **Builds on:** "Attachments" and "The CLI and agents get the same commands" in
+  [Images and attachments](#images-and-attachments), and
+  [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).

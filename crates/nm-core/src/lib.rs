@@ -4,6 +4,7 @@
 //! [`MailWriter`] seam. Nothing here touches the network.
 
 pub mod action;
+pub mod attachment;
 pub mod cache;
 pub mod compose;
 #[cfg(feature = "conformance")]

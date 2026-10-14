@@ -427,6 +427,84 @@ server, or Bcc from Outlook, exits 1 as the real send would. It reads no keyring
 nothing, so a login or an Outlook sign-in without `Mail.Send` shows only when sending. Exit 0
 means the server accepted the message, not that it was delivered.
 
+## `neomail attachment list|save|open`
+
+The attachments of one cached message, read from the cache: nothing is fetched. `list` and `save`
+print listings (an array with `--json`, one object per line with `--jsonl`, TSV off a terminal);
+`open` prints one object with `--json`. A message without attachments lists `[]`.
+
+`neomail attachment list ID --json`:
+
+```json
+[
+  {
+    "id": 42,
+    "account": "work",
+    "index": 1,
+    "name": "report.pdf",
+    "safe_name": "report.pdf",
+    "declared_type": "application/pdf",
+    "real_type": "application/pdf",
+    "type_mismatch": false,
+    "size": 5120,
+    "inline": false,
+    "content_id": null,
+    "executable": false
+  }
+]
+```
+
+- `index` counts from 1 in the message's MIME order; `save` and `open` take it.
+- `name` is the name the sender gave, as sent, or `null`; `safe_name` is the name `save` and
+  `open` write: no directories, control, bidi or invisible characters, leading dots or dashes, at
+  most 200 bytes, `attachment-INDEX` when nothing is left, `.eml` added to a nested message's,
+  and `-INDEX` (then `-2`, `-3` and so on) added when two attachments would share it.
+- `declared_type` is the part's Content-Type, lower case (`application/octet-stream` without
+  one). `real_type` is told from the content, `application/octet-stream` when neomail cannot
+  tell, and `message/rfc822` for a nested message, which is one attachment.
+- `type_mismatch` is `true` when the real type contradicts the declared type or the safe name's
+  extension. `executable` is `true` for an executable, installer, shortcut or script, by real
+  type or by extension. `inline` is `true` when an HTML body shows the part through a `cid:`
+  reference to its `content_id` (without angle brackets, or `null`).
+- `size` is the decoded size in bytes: the bytes as sent, with only the transfer encoding
+  undone and no charset conversion.
+
+`neomail attachment save ID [INDEX...] --json` (all attachments without an index):
+
+```json
+[
+  { "id": 42, "index": 1, "path": "/home/you/report.pdf", "size": 5120 }
+]
+```
+
+`path` is absolute, in `--dir` or the current directory. Files get mode 0600 and never replace
+one that exists unless `--overwrite`.
+
+`neomail attachment open ID INDEX --json`:
+
+```json
+{ "id": 42, "index": 1, "path": "/home/you/.local/share/neomail/attachments/42-1/report.pdf", "opener": "xdg-open" }
+```
+
+`opener` is the program run on the file: `NEOMAIL_OPENER`'s first word when set, else `open`
+(macOS), `wslview` (WSL) or `xdg-open`.
+
+Plain output:
+
+| Command | Fields |
+| ------- | ------ |
+| `attachment list` | index, safe name, real type, declared type, size in bytes, notes (`inline`, `mismatch`, `executable`, comma-separated, or empty) |
+| `attachment save` | index, path |
+
+Without `--json`, `open` prints the file's path on standard output and `opened NAME with
+PROGRAM`, and that the copy is removed after a day, on standard error.
+
+Exit codes: 1 for an unknown id, an unreadable message or an unknown index; for `save`, also a
+file that exists without `--overwrite` or cannot be written, after saving the others; for
+`open`, a no at its question about an executable or script, or an opener that failed. 2 when
+`open` meets an executable or script without `--yes` and nothing can be asked (standard input is
+not a terminal, or `--no-input`): nothing is opened.
+
 ## Exit codes
 
 | Code | Meaning |

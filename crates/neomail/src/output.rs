@@ -665,7 +665,7 @@ pub fn write_show(out: &mut dyn Write, item: &ShowItem<'_>, paint: Paint) -> io:
     Ok(())
 }
 
-fn size(bytes: usize) -> String {
+pub(crate) fn size(bytes: usize) -> String {
     match bytes {
         b if b < 1024 => format!("{b} B"),
         b if b < 1024 * 1024 => format!("{:.1} KiB", b as f64 / 1024.0),
