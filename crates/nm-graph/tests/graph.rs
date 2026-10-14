@@ -14,8 +14,8 @@ use nm_core::{
     sync_inbox_by_id,
 };
 use nm_graph::{
-    CategoryEdit, CategoryResult, GraphError, GraphSource, MAX_JSON, MAX_MIME, Reply, Transport,
-    TransportError,
+    CategoryEdit, CategoryResult, DraftLeft, GraphError, GraphSource, MAX_JSON, MAX_MIME, Reply,
+    Transport, TransportError,
 };
 use serde_json::{Value, json};
 
@@ -316,7 +316,8 @@ impl Transport for FakeGraph {
         body: &[u8],
         max_body: usize,
     ) -> Result<Reply, TransportError> {
-        let body: Value = serde_json::from_slice(body).unwrap();
+        // Sending a draft posts no body at all.
+        let body: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
         let seen = Seen {
             method: "POST",
             url: url.to_owned(),
@@ -352,6 +353,44 @@ impl Transport for FakeGraph {
             return Err("connection reset by peer".into());
         }
         Ok(answer)
+    }
+
+    /// Records the bytes base64-encoded, as a JSON string; scripted replies only.
+    async fn put_bytes(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> Result<Reply, TransportError> {
+        use base64::Engine;
+        let seen = Seen {
+            method: "PUT",
+            url: url.to_owned(),
+            body: Some(Value::String(
+                base64::engine::general_purpose::STANDARD.encode(body),
+            )),
+            headers: owned(headers),
+            max_body,
+        };
+        Ok(self.answer(seen, || reply(404, Vec::new())).await)
+    }
+
+    /// Answers 204 unless scripted.
+    async fn delete(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        max_body: usize,
+    ) -> Result<Reply, TransportError> {
+        let seen = Seen {
+            method: "DELETE",
+            url: url.to_owned(),
+            body: None,
+            headers: owned(headers),
+            max_body,
+        };
+        Ok(self.answer(seen, || reply(204, Vec::new())).await)
     }
 }
 
@@ -1808,4 +1847,338 @@ async fn set_categories_retries_throttling() {
         seen[3].body,
         Some(json!({"categories": ["Red", "nm-main"]}))
     );
+}
+
+const UPLOAD_URL: &str = "https://outlook.office.com/api/v2.0/Users('u')/Messages('d')/AttachmentSessions('s')?authtoken=t";
+
+/// `len` bytes that differ from one position to the next, so a range sent twice or skipped shows.
+fn file_bytes(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn header<'a>(seen: &'a Seen, name: &str) -> Option<&'a str> {
+    seen.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+fn session_reply() -> Reply {
+    json_reply(
+        201,
+        &json!({"uploadUrl": UPLOAD_URL, "expirationDateTime": "2026-10-14T10:00:00Z",
+                "nextExpectedRanges": ["0-"]}),
+    )
+}
+
+fn draft_created() -> Reply {
+    json_reply(201, &json!({"id": "draft/1=", "isDraft": true}))
+}
+
+/// Microsoft's steps for large files: the message as a draft, a small file in one POST, a large
+/// one through an upload session in ordered ranges under 4 MB without the bearer token, then the
+/// draft sent once.
+#[tokio::test]
+async fn large_files_go_through_a_draft_and_an_upload_session_then_one_send() {
+    use nm_core::compose::AttachedFile;
+    let small = AttachedFile::new("notes.txt", b"small file\n".to_vec());
+    let large = AttachedFile::new("video.mp4", file_bytes(7_000_000));
+    let fake = FakeGraph::new([]).script([
+        draft_created(),
+        json_reply(201, &json!({"id": "att1"})),
+        session_reply(),
+        json_reply(200, &json!({"nextExpectedRanges": ["3276800-"]})),
+        json_reply(200, &json!({"nextExpectedRanges": ["6553600"]})),
+        reply(201, Vec::new()),
+        reply(202, Vec::new()),
+    ]);
+    let s = source(fake);
+    let bare = outgoing(&[]);
+    s.send_with_files(&bare, &[small, large.clone()])
+        .await
+        .unwrap();
+
+    let seen = transport(&s).seen.borrow();
+    let draft = format!("{API}/me/messages/draft%2F1%3D");
+    let steps: Vec<(&str, &str)> = seen.iter().map(|x| (x.method, x.url.as_str())).collect();
+    assert_eq!(
+        steps,
+        [
+            ("POST text/plain", format!("{API}/me/messages").as_str()),
+            ("POST", format!("{draft}/attachments").as_str()),
+            (
+                "POST",
+                format!("{draft}/attachments/createUploadSession").as_str()
+            ),
+            ("PUT", UPLOAD_URL),
+            ("PUT", UPLOAD_URL),
+            ("PUT", UPLOAD_URL),
+            ("POST", format!("{draft}/send").as_str()),
+        ]
+    );
+    assert_eq!(
+        seen[0].body.as_ref().unwrap().as_str().unwrap(),
+        b64(&bare.mime)
+    );
+    assert_eq!(
+        seen[1].body.as_ref().unwrap(),
+        &json!({"@odata.type": "#microsoft.graph.fileAttachment", "name": "notes.txt",
+                "contentType": "text/plain", "contentBytes": b64(b"small file\n")})
+    );
+    assert_eq!(
+        seen[2].body.as_ref().unwrap(),
+        &json!({"AttachmentItem": {"attachmentType": "file", "name": "video.mp4",
+                "size": 7_000_000, "contentType": "video/mp4"}})
+    );
+    let puts = &seen[3..6];
+    assert_eq!(
+        puts.iter()
+            .map(|p| header(p, "Content-Range").unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "bytes 0-3276799/7000000",
+            "bytes 3276800-6553599/7000000",
+            "bytes 6553600-6999999/7000000",
+        ]
+    );
+    for put in puts {
+        assert_eq!(
+            header(put, "Authorization"),
+            None,
+            "the URL carries its own token"
+        );
+    }
+    // Each range decodes on its own; together they are the file.
+    let joined: Vec<u8> = puts
+        .iter()
+        .flat_map(|p| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(p.body.as_ref().unwrap().as_str().unwrap())
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(joined, large.bytes());
+    for authorised in [&seen[0], &seen[1], &seen[2], &seen[6]] {
+        assert_eq!(
+            header(authorised, "Authorization"),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+    }
+}
+
+/// Before the draft is sent nothing is: a failure deletes the draft and says so, and never sends
+/// it. A session that points off Outlook's upload host gets no byte.
+#[tokio::test]
+async fn a_failed_upload_deletes_the_draft_and_sends_nothing() {
+    use nm_core::compose::AttachedFile;
+    let large = AttachedFile::new("big.bin", file_bytes(3_000_000));
+    let foreign = || {
+        json_reply(
+            201,
+            &json!({"uploadUrl": "https://attacker.example/upload", "nextExpectedRanges": ["0-"]}),
+        )
+    };
+    let backwards = json_reply(200, &json!({"nextExpectedRanges": ["0-"]}));
+    for (name, replies, deleted) in [
+        ("foreign URL", vec![draft_created(), foreign()], true),
+        (
+            "a range sent again",
+            vec![draft_created(), session_reply(), backwards],
+            true,
+        ),
+        (
+            "a refused range",
+            vec![draft_created(), session_reply(), reply(400, Vec::new())],
+            true,
+        ),
+        (
+            "the delete fails too",
+            vec![draft_created(), foreign(), reply(500, Vec::new())],
+            false,
+        ),
+    ] {
+        let s = source(FakeGraph::new([]).script(replies));
+        let err = s
+            .send_with_files(&outgoing(&[]), std::slice::from_ref(&large))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GraphError::Unsent { draft_left, .. }
+                if draft_left == if deleted { DraftLeft::No } else { DraftLeft::Yes }),
+            "{name}: {err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("nothing was sent"), "{name}: {text}");
+        assert_eq!(text.contains("left in Drafts"), !deleted, "{name}: {text}");
+        let seen = transport(&s).seen.borrow();
+        let last = seen.last().unwrap();
+        assert_eq!(
+            (last.method, last.url.as_str()),
+            ("DELETE", format!("{API}/me/messages/draft%2F1%3D").as_str()),
+            "{name}"
+        );
+        assert!(!seen.iter().any(|x| x.url.ends_with("/send")), "{name}");
+        assert!(
+            !seen
+                .iter()
+                .any(|x| x.url.starts_with("https://attacker.example")),
+            "{name}"
+        );
+    }
+}
+
+/// A file is added to the draft with a POST that is not retried after a 503, which may come
+/// after Graph attached it: a retry would attach it twice. The draft is deleted instead.
+#[tokio::test(start_paused = true)]
+async fn a_503_on_attaching_a_file_is_not_retried_and_deletes_the_draft() {
+    use nm_core::compose::AttachedFile;
+    let small = AttachedFile::new("a.txt", b"a".to_vec());
+    let large = AttachedFile::new("big.bin", file_bytes(3_000_000));
+    for (name, file, step) in [
+        ("small file", small, "/attachments"),
+        ("large file", large, "/attachments/createUploadSession"),
+    ] {
+        let s = source(FakeGraph::new([]).script([
+            draft_created(),
+            reply(503, Vec::new()),
+            reply(204, Vec::new()),
+        ]));
+        let err = s
+            .send_with_files(&outgoing(&[]), &[file])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GraphError::Unsent {
+                    draft_left: DraftLeft::No,
+                    ..
+                }
+            ),
+            "{name}: {err:?}"
+        );
+        let seen = transport(&s).seen.borrow();
+        let methods: Vec<&str> = seen.iter().map(|x| x.method).collect();
+        assert_eq!(methods, ["POST text/plain", "POST", "DELETE"], "{name}");
+        assert!(seen[1].url.ends_with(step), "{name}: {}", seen[1].url);
+    }
+}
+
+/// Saving the draft sends nothing, so its failure says so. A 5xx or a lost answer may come
+/// after Exchange saved it, which neomail cannot delete without its id, so the error says a
+/// draft may be left; a 4xx saved none.
+#[tokio::test]
+async fn a_failed_draft_save_says_nothing_was_sent_and_whether_a_draft_may_be_left() {
+    use nm_core::compose::AttachedFile;
+    for (name, answer, left) in [
+        ("500", reply(500, Vec::new()), DraftLeft::Maybe),
+        (
+            "201 without an id",
+            json_reply(201, &json!({})),
+            DraftLeft::Maybe,
+        ),
+        ("400", reply(400, Vec::new()), DraftLeft::No),
+    ] {
+        let s = source(FakeGraph::new([]).script([answer]));
+        let small = AttachedFile::new("a.txt", b"a".to_vec());
+        let err = s
+            .send_with_files(&outgoing(&[]), &[small])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GraphError::Unsent { draft_left, .. } if draft_left == left),
+            "{name}: {err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("nothing was sent"), "{name}: {text}");
+        assert_eq!(
+            text.contains("may be left in Drafts"),
+            left == DraftLeft::Maybe,
+            "{name}: {text}"
+        );
+        assert_eq!(transport(&s).seen.borrow().len(), 1, "{name}");
+    }
+}
+
+/// A 4xx on the draft's send refused it: nothing was sent, and the draft stays in Drafts for
+/// the user to send or delete, which the error says.
+#[tokio::test]
+async fn a_refused_draft_send_says_nothing_was_sent_and_the_draft_is_kept() {
+    use nm_core::compose::AttachedFile;
+    let small = AttachedFile::new("a.txt", b"a".to_vec());
+    let s = source(FakeGraph::new([]).script([
+        draft_created(),
+        json_reply(201, &json!({"id": "att1"})),
+        reply(400, Vec::new()),
+    ]));
+    let err = s
+        .send_with_files(&outgoing(&[]), &[small])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            GraphError::Unsent {
+                draft_left: DraftLeft::Yes,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("nothing was sent") && text.contains("left in Drafts"),
+        "{text}"
+    );
+    let seen = transport(&s).seen.borrow();
+    assert_eq!(seen.iter().filter(|x| x.url.ends_with("/send")).count(), 1);
+    assert!(!seen.iter().any(|x| x.method == "DELETE"));
+}
+
+/// The draft's send is the one step that sends: a 5xx or a lost answer there may hide a sent
+/// message, so it is not retried and the draft is not deleted.
+#[tokio::test]
+async fn a_draft_send_that_is_not_confirmed_may_have_been_sent_and_is_kept() {
+    use nm_core::compose::AttachedFile;
+    let small = AttachedFile::new("a.txt", b"a".to_vec());
+    let s = source(FakeGraph::new([]).script([
+        draft_created(),
+        json_reply(201, &json!({"id": "att1"})),
+        reply(503, Vec::new()),
+    ]));
+    let err = s
+        .send_with_files(&outgoing(&[]), &[small])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GraphError::Unconfirmed(_)), "{err:?}");
+    let seen = transport(&s).seen.borrow();
+    assert_eq!(seen.iter().filter(|x| x.url.ends_with("/send")).count(), 1);
+    assert!(!seen.iter().any(|x| x.method == "DELETE"));
+}
+
+#[test]
+fn a_message_goes_in_one_sendmail_only_under_3_mb_a_file_and_4_mb_a_request() {
+    use nm_core::compose::AttachedFile;
+    let message = |len: usize| nm_core::compose::Outgoing {
+        mime: vec![b'a'; len],
+        ..outgoing(&[])
+    };
+    let file = |len: usize| AttachedFile::new("f.bin", vec![0; len]);
+    // 2,999,999 bytes are 4,000,000 in base64; one more byte is 4,000,004.
+    assert!(nm_graph::fits_send_mail(
+        &message(2_999_999),
+        &[file(2_000_000)]
+    ));
+    assert!(!nm_graph::fits_send_mail(
+        &message(3_000_001),
+        &[file(1_000_000), file(1_000_000)]
+    ));
+    assert!(!nm_graph::fits_send_mail(&message(100), &[file(3_000_000)]));
+    assert!(nm_graph::fits_send_mail(&message(100), &[file(2_999_999)]));
 }

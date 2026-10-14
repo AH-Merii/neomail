@@ -26,6 +26,8 @@ struct Script {
     inject: bool,
     /// Closes the connection after the message's final "." instead of answering it.
     hang_up_after_data: bool,
+    /// The SIZE line its EHLO reply offers (RFC 1870), such as `SIZE 1000`.
+    size: Option<&'static str>,
 }
 
 impl Default for Script {
@@ -37,6 +39,7 @@ impl Default for Script {
             offer_starttls: true,
             inject: false,
             hang_up_after_data: false,
+            size: None,
         }
     }
 }
@@ -71,7 +74,11 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(stream: S, script: &Script, 
         let upper = line.to_ascii_uppercase();
         seen.commands.push(line.clone());
         let reply = if upper.starts_with("EHLO") {
-            "250-fake.example\r\n250-AUTH PLAIN XOAUTH2\r\n250 8BITMIME\r\n".to_owned()
+            let size = script
+                .size
+                .map(|s| format!("250-{s}\r\n"))
+                .unwrap_or_default();
+            format!("250-fake.example\r\n{size}250-AUTH PLAIN XOAUTH2\r\n250 8BITMIME\r\n")
         } else if upper.starts_with("AUTH XOAUTH2") && script.auth_fails {
             "334 eyJzdGF0dXMiOiI0MDEifQ==\r\n".to_owned()
         } else if upper.starts_with("AUTH") || line.is_empty() || line == "*" {
@@ -523,4 +530,40 @@ async fn the_auth_check_logs_in_and_quits_without_sending_anything() {
         // A failed PLAIN with an initial response gets its final reply at once: no "*" follows.
         assert_eq!(seen.verbs(), ["EHLO", "AUTH", "QUIT"], "{seen:?}");
     }
+}
+
+/// RFC 1870: a server that names its largest message never gets a larger one, and is told the
+/// size of each message it does get.
+#[tokio::test]
+async fn a_message_over_the_servers_size_is_never_sent_and_one_within_it_declares_its_size() {
+    let msg = message(&["ann@example.org"]);
+    let size = msg.mime.len();
+    let script = |line| Script {
+        size: Some(line),
+        ..Script::default()
+    };
+
+    let limit = format!("SIZE {}", size - 1).leak();
+    let (result, seen) = over_pipe(script(limit), Login::Password(PASSWORD), &msg).await;
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, SmtpError::TooBig { size: s, limit: l } if s == size as u64 && l == size as u64 - 1),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("nothing was sent"), "{err}");
+    assert_eq!(seen.verbs()[1..], ["QUIT"], "not even a login");
+
+    let exact = format!("SIZE {size}").leak();
+    let (result, seen) = over_pipe(script(exact), Login::Password(PASSWORD), &msg).await;
+    result.unwrap();
+    assert!(
+        seen.commands
+            .contains(&format!("MAIL FROM:<me@example.com> SIZE={size}")),
+        "{seen:?}"
+    );
+
+    // SIZE 0 names no limit (RFC 1870 section 4).
+    let (result, seen) = over_pipe(script("SIZE 0"), Login::Password(PASSWORD), &msg).await;
+    result.unwrap();
+    assert!(seen.data.is_some());
 }

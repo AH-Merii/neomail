@@ -392,6 +392,16 @@ off.
   through `sync::Logins` as `mark` does, and sends. The copy in Sent comes after the send and
   only warns when it fails. It owns the output: one line, the Message-ID, or the JSON object.
 
+**Files** (`--attach`, slice 15) follow the same split. `nm_core::compose::files` owns an
+`AttachedFile` (its cleaned name, its type from `attachment::sniff`, its bytes) and the
+forgotten-attachment words; `Draft::build` puts the files in multipart/mixed after the body,
+base64, and `build_without_files` makes the same message without them. `send/files.rs` reads
+the files once and holds each provider's limit. `nm_imap::smtp` honours the server's SIZE
+(RFC 1870). `nm_graph::fits_send_mail` decides between sendMail and
+`GraphSource::send_with_files` (`nm-graph/src/upload.rs`): a draft, small files by POST, large
+ones through an upload session in ranges (`Transport::put_bytes`, without the bearer token),
+then the draft's send; a failure before that send deletes the draft (`Transport::delete`).
+
 The tests run a scripted SMTP server over a pipe and a TLS one with an rcgen certificate on
 127.0.0.1 (`nm-imap/src/smtp/tests.rs`), an APPEND server (`wire_tests.rs`) and the fake Graph.
 `neomail/tests/send.rs` drives the binary against a TLS SMTP server on 127.0.0.1 that records

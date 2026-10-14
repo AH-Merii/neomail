@@ -236,6 +236,8 @@ the new entry.
   - Markdown images (`![alt](path)`) are sent as inline images. Per-identity signatures can include a logo. The composer previews images inline.
   - Before sending, neomail warns about a forgotten attachment (the draft says "attached" but has none) and about provider size limits.
   - Large files use the provider's upload sessions.
+  - From the CLI, `--attach` on send, reply and forward, with both warnings and Outlook's upload
+    sessions ([DEC-2026-10-14-send-files](#dec-2026-10-14-send-files), proposed).
 
 ## CLI, scripting, agents, extensibility
 
@@ -1305,3 +1307,79 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Builds on:** [DEC-2026-10-13-classify](#dec-2026-10-13-classify),
   [DEC-2026-10-13-classify-send](#dec-2026-10-13-classify-send) and
   [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).
+
+### <a id="dec-2026-10-14-send-files"></a>DEC-2026-10-14-send-files: files from the CLI
+
+- **Status:** proposed by Claude on 2026-10-14, for roadmap slice 15.
+- **Proposal:**
+  - `--attach PATH` on `send`, `reply` and `forward`, repeated for more files. Each file is read
+    once, before the message is built; a missing file, a folder, anything that is not a regular
+    file (a device or a pipe, which have no size and may never end) or one that cannot be read
+    stops the command with its path, before any connection (exit 1). neomail reads at most 150 MB
+    of files a message, the largest message any of the three providers allows, and stops reading
+    past it, so a wrong path to a huge file cannot fill the memory.
+  - A file goes after the body in multipart/mixed, the body's own parts unchanged inside it, and
+    is base64-encoded whatever its type, so a text file keeps its exact bytes. Its name is the
+    last part of its path, without control or bidirectional formatting characters; a name that
+    is not ASCII is written as RFC 2231 says. Its type comes from its content, as
+    `neomail attachment` tells the attachments it reads
+    ([DEC-2026-10-14-attachments](#dec-2026-10-14-attachments)); the extension decides only when
+    the content names no type, names a container several formats share (ZIP for Office and
+    OpenDocument files, OLE for Office before 2007), or is plain text whose extension names a
+    kind of text. No new dependency: mail-builder already writes RFC 2231.
+  - The compose side owns the rest: `nm_core::compose::files` (`AttachedFile`), apart from the
+    module that reads the attachments of cached mail, whose type detection
+    (`nm_core::attachment::sniff`) both use.
+  - **Forgotten attachment:** when the writer's own words say `attach`, `attached`, `attaches`,
+    `attaching`, `attachment` or `attachments` (whole words, any case) and no file is attached,
+    neomail asks on a terminal. Without one, or with `--yes`, which answers only the question to
+    send, it sends nothing and exits 2 unless `--no-attachment-check` is given. The words are the
+    three the roadmap names ("the draft says 'attached'") and their inflections: they are what
+    such a sentence uses in English, and a missed case only skips a reminder. Other languages and
+    phrases such as "enclosed" are left for later. Only the writer's words count: a new
+    message's subject and body; for a reply or forward the body alone, as its subject and the
+    quoted original are someone else's; and never a line starting with `>`.
+  - **Size limits**, on the files' total size as each provider states it, "MB" read as 1,000,000
+    bytes, the smaller reading:
+    - Gmail: "For personal Gmail accounts, the limit is 25 MB"
+      (<https://support.google.com/mail/answer/6584>).
+    - Proton Mail through Bridge: "25 MB for outgoing emails"
+      (<https://proton.me/support/attaching-multiple-documents-to-a-message>).
+    - Outlook through Graph: 25 MB, the Outlook.com limit ("The attachment size limit for files
+      is 25 MB", <https://support.microsoft.com/en-us/outlook/sending-limits-in-outlook-com>);
+      Microsoft 365 mailboxes send 35 MB by default
+      (<https://learn.microsoft.com/en-us/office365/servicedescriptions/exchange-online-service-description/exchange-online-limits>),
+      so 25 MB holds for both.
+    - Any other server: none known; one that names its limit with SMTP's SIZE extension
+      (RFC 1870) never gets a larger message, and is told each message's size on MAIL FROM.
+
+    Over the limit, nothing is sent, the dry run included, and the error names the files' size
+    and the limit. The provider is told from the config: Graph is Outlook, smtp.gmail.com is
+    Gmail, and an SMTP server on 127.0.0.1 with a pinned certificate is Bridge.
+  - **Outlook's upload sessions**, as Microsoft documents them
+    (<https://learn.microsoft.com/en-us/graph/outlook-large-attachments>): a message with a file
+    of 3 MB or more, or whose sendMail request would pass 4 MB, is saved as a draft from its MIME
+    without the files (`POST /me/messages`); each file under 3 MB is added with one `POST` to
+    the draft's attachments, and each larger one through an upload session, its bytes in order
+    in ranges of 3,276,800 bytes (under the 4 MB Microsoft asks for), sent to the session's URL
+    without the bearer token, which that URL carries itself; then the draft is sent
+    (`POST /me/messages/{id}/send`). A session URL off outlook.office.com or
+    outlook.office365.com is refused. These steps need Mail.ReadWrite, which every sign-in that
+    can send already grants. Anything else is sent with sendMail, files inside the MIME, as
+    before.
+  - **Nothing is sent twice:** before the draft's send nothing has been sent, so every failure
+    there says nothing was sent. A failed save of the draft that may still have saved it (a 5xx,
+    a lost answer) also says a draft may be left in Drafts; a failure while adding the files
+    deletes the draft (and says when it could not). Adding a file retries only 429, never a 503,
+    which may come after Graph added it. A draft's send refused with a 4xx keeps the draft and
+    says so; after a 5xx or a lost answer it is never retried: it is reported as maybe sent, and
+    the draft is kept. SMTP and sendMail keep the rules of
+    [DEC-2026-10-13-send](#dec-2026-10-13-send).
+  - `--json` gains `attachments`: each file's name, type and size; the question on a terminal
+    lists them too.
+  - Left for later: forwarding the original's attachments (a forward still warns that they stay
+    behind), a per-account limit for a Microsoft 365 or Workspace mailbox set above 25 MB, and
+    inline images.
+- **Builds on:** [DEC-2026-10-13-send](#dec-2026-10-13-send), the "Drafting with files and
+  images" bullets under [Images and attachments](#images-and-attachments) and
+  [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux) for asking and exit codes.

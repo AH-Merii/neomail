@@ -9,6 +9,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# Files attached to a message are base64-encoded (crates/nm-core/src/compose.rs). Already in the
+# tree through nm-imap and nm-graph.
+base64.workspace = true
 chrono.workspace = true
 html2text.workspace = true
 html5ever.workspace = true
@@ -25,8 +28,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# The attachment tests encode their synthetic parts. Already in the tree through neomail.
-base64.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 

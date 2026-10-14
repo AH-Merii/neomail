@@ -384,7 +384,15 @@ neomail forward 42 --to ada@example.com                          # forward its t
   sending it again. Gmail, Proton Mail Bridge and Outlook keep the copy in Sent themselves; for
   any other server neomail appends one to the mailbox marked `\Sent`, and a copy that fails is a
   warning, not a failure, so a retry never sends it twice. `--plain` prints the Message-ID alone
-  even on a terminal. Attachments come later.
+  even on a terminal. Files go with `--attach`, below.
+- `--attach PATH` sends a file with `send`, `reply` or `forward`; repeat it for more. The file
+  goes under its own name without its folder, and its type comes from its content. Every file is
+  read before anything is sent, and one that cannot be read stops the command (exit 1). Gmail,
+  Proton Mail and Outlook take 25 MB of files a message: more is refused before anything is
+  sent, naming both sizes. Outlook takes a file of 3 MB or more through an upload session
+  ([docs/outlook.md](docs/outlook.md#large-files)). When your subject or text says attach,
+  attached or attachment and no file is attached, neomail asks on a terminal; without one, or
+  with `--yes`, it sends nothing (exit 2) unless `--no-attachment-check` is given.
 - `neomail reply ID [--all] --body PATH|-` answers a cached message from the account it is in:
   to its Reply-To, else its From (its To when the original is yours), and with `--all` its To
   and Cc too, never you. If any of those addresses cannot be sent to yet (it is not ASCII),

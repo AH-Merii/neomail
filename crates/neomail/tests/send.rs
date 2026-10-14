@@ -4,7 +4,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -414,6 +414,7 @@ fn a_sent_message_goes_to_every_recipient_and_no_header_names_bcc() {
             "subject": "Plans",
             "message_id": id.trim_start_matches('<').trim_end_matches('>'),
             "in_reply_to": null,
+            "attachments": [],
             "sent_copy": "server",
         })
     );
@@ -905,4 +906,256 @@ fn from_help_fits_each_command() {
     assert!(!send.contains("original"), "{send}");
     assert!(help("reply").contains("[default: the original's, else the only one]"));
     assert!(help("forward").contains("[default: the original's, else the only one]"));
+}
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01";
+
+/// The attachments of a received message: name, type and decoded size.
+fn received_files(message: &str) -> Vec<(String, String, usize)> {
+    nm_core::parse::parse(message.as_bytes())
+        .unwrap()
+        .attachments
+        .into_iter()
+        .map(|a| (a.name.unwrap_or_default(), a.content_type, a.size))
+        .collect()
+}
+
+#[test]
+fn attached_files_go_out_after_the_body_with_their_names_types_and_sizes() {
+    let smtp = FakeSmtp::start(&[]);
+    let (imap, _) = closed_imap();
+    let dir = setup(&account("work", "me@example.com", &smtp, imap, false));
+    let folder = dir.path().join("private folder");
+    std::fs::create_dir(&folder).unwrap();
+    // A PNG whose extension says JPEG: the content decides.
+    let photo = folder.join("photo.jpg");
+    std::fs::write(&photo, PNG).unwrap();
+    let notes = dir.path().join("Résumé notes.txt");
+    std::fs::write(&notes, "line one\nline two\n").unwrap();
+    let o = neomail(
+        dir.path(),
+        &[
+            "send",
+            "--to",
+            "ada@example.com",
+            "--subject",
+            "The plan",
+            "--body",
+            "-",
+            "--attach",
+            photo.to_str().unwrap(),
+            "--attach",
+            notes.to_str().unwrap(),
+            "--yes",
+            "--json",
+        ],
+        "Here it is.\n",
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let messages = smtp.seen().messages.clone();
+    assert_eq!(messages.len(), 1);
+    let message = &messages[0];
+    assert!(
+        header(message, "Content-Type")
+            .unwrap()
+            .starts_with("multipart/mixed"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("private folder"),
+        "no folder of mine leaves"
+    );
+    assert_eq!(
+        received_files(message),
+        [
+            ("photo.jpg".to_owned(), "image/png".to_owned(), PNG.len()),
+            ("Résumé notes.txt".to_owned(), "text/plain".to_owned(), 18),
+        ]
+    );
+    let parsed = nm_core::parse::parse(message.as_bytes()).unwrap();
+    assert_eq!(parsed.body.trim(), "Here it is.");
+    let json: Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(
+        json["attachments"],
+        serde_json::json!([
+            {"name": "photo.jpg", "content_type": "image/png", "size": PNG.len()},
+            {"name": "Résumé notes.txt", "content_type": "text/plain", "size": 18},
+        ])
+    );
+}
+
+/// The commands that send, each with what it needs besides the flag under test.
+fn sending_commands(id: &str) -> Vec<Vec<String>> {
+    let own = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    vec![
+        own(&[
+            "send",
+            "--to",
+            "ada@example.com",
+            "--subject",
+            "Hi",
+            "--body",
+            "-",
+        ]),
+        own(&["reply", id, "--body", "-"]),
+        own(&["forward", id, "--to", "cy@example.com", "--body", "-"]),
+    ]
+}
+
+fn with(command: &[String], extra: &[&str]) -> Vec<String> {
+    let mut args = command.to_vec();
+    args.extend(extra.iter().map(|s| (*s).to_owned()));
+    args
+}
+
+fn run(dir: &Path, args: &[String], stdin: &str) -> Output {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    neomail(dir, &args, stdin)
+}
+
+/// Any file that cannot be read stops send, reply and forward before a connection. So does a
+/// device such as /dev/zero, which reports no size and never ends.
+#[test]
+fn a_file_that_cannot_be_read_stops_every_command_before_anything_is_sent() {
+    let smtp = FakeSmtp::start(&[]);
+    let (imap, _) = closed_imap();
+    let dir = setup(&account("work", "me@example.com", &smtp, imap, false));
+    let id = cache(dir.path(), "work", ORIGINAL);
+    let good = dir.path().join("good.txt");
+    std::fs::write(&good, "ok").unwrap();
+    let missing = dir.path().join("missing.pdf");
+    let folder = dir.path().join("a folder");
+    std::fs::create_dir(&folder).unwrap();
+    let zero = PathBuf::from("/dev/zero");
+    let commands = sending_commands(&id);
+    assert_eq!(commands.len(), 3);
+    for command in &commands {
+        for bad in [&missing, &folder, &zero] {
+            // The bad file comes second: the first was fine, and still nothing goes.
+            let args = with(
+                command,
+                &[
+                    "--attach",
+                    good.to_str().unwrap(),
+                    "--attach",
+                    bad.to_str().unwrap(),
+                    "--yes",
+                ],
+            );
+            let o = run(dir.path(), &args, "Hi\n");
+            assert_eq!(o.status.code(), Some(1), "{args:?}: {}", stderr(&o));
+            let err = stderr(&o);
+            assert!(err.contains(bad.to_str().unwrap()), "{err}");
+            assert!(err.contains("nothing was sent"), "{err}");
+            if bad == &zero {
+                assert!(err.contains("not a regular file"), "{err}");
+            }
+        }
+    }
+    assert_eq!(smtp.seen().connections, 0);
+}
+
+/// Text that says something is attached, with no file: refused off a terminal unless
+/// --no-attachment-check says to send it anyway; never set off by the quoted original.
+#[test]
+fn a_forgotten_attachment_is_refused_off_a_terminal_unless_the_flag_says_send() {
+    let smtp = FakeSmtp::start(&[]);
+    let (imap, _) = closed_imap();
+    let dir = setup(&account("work", "me@example.com", &smtp, imap, false));
+    let attached_original =
+        ORIGINAL.replace("Shall we?", "I attached the plan, see the attachment.");
+    let id = cache(dir.path(), "work", &attached_original);
+    let file = dir.path().join("plan.pdf");
+    std::fs::write(&file, b"%PDF-1.7\n").unwrap();
+    let commands = sending_commands(&id);
+    for command in &commands {
+        let o = run(
+            dir.path(),
+            &with(command, &["--yes"]),
+            "I've attached the plan.\n",
+        );
+        assert_eq!(o.status.code(), Some(2), "{command:?}: {}", stderr(&o));
+        let err = stderr(&o);
+        assert!(err.contains("nothing was sent"), "{err}");
+        assert!(err.contains("--no-attachment-check"), "{err}");
+    }
+    assert_eq!(smtp.seen().connections, 0);
+
+    for command in &commands {
+        let flagged = with(command, &["--yes", "--no-attachment-check"]);
+        let o = run(dir.path(), &flagged, "I've attached the plan.\n");
+        assert_eq!(o.status.code(), Some(0), "{command:?}: {}", stderr(&o));
+        let attached = with(command, &["--yes", "--attach", file.to_str().unwrap()]);
+        let o = run(dir.path(), &attached, "I've attached the plan.\n");
+        assert_eq!(o.status.code(), Some(0), "{command:?}: {}", stderr(&o));
+        // The original says "attached"; the writer's own words do not.
+        let o = run(dir.path(), &with(command, &["--yes"]), "Sounds good.\n");
+        assert_eq!(o.status.code(), Some(0), "{command:?}: {}", stderr(&o));
+    }
+    assert_eq!(smtp.seen().messages.len(), 9);
+
+    // A subject of one's own counts too.
+    let o = neomail(
+        dir.path(),
+        &[
+            "send",
+            "--to",
+            "ada@example.com",
+            "--subject",
+            "Attachment",
+            "--body",
+            "-",
+            "--yes",
+        ],
+        "See below.\n",
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+}
+
+/// Files over the provider's documented limit are refused before any connection, and the error
+/// names both sizes. The fake server is on 127.0.0.1 with a pinned certificate, as Bridge is,
+/// so Proton Mail's 25 MB applies.
+#[test]
+fn files_over_the_providers_limit_are_refused_before_anything_is_sent() {
+    let smtp = FakeSmtp::start(&[]);
+    let (imap, _) = closed_imap();
+    let dir = setup(&account("work", "me@example.com", &smtp, imap, false));
+    let big = dir.path().join("big.bin");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(24_000_000)
+        .unwrap();
+    let small = dir.path().join("small.bin");
+    std::fs::File::create(&small)
+        .unwrap()
+        .set_len(1_000_001)
+        .unwrap();
+    let send = |extra: &[&str]| {
+        let mut args = vec![
+            "send",
+            "--to",
+            "ada@example.com",
+            "--subject",
+            "Files",
+            "--body",
+            "-",
+            "--yes",
+            "--attach",
+            big.to_str().unwrap(),
+            "--attach",
+            small.to_str().unwrap(),
+        ];
+        args.extend(extra);
+        neomail(dir.path(), &args, "Two files.\n")
+    };
+    for extra in [&[][..], &["--dry-run"]] {
+        let o = send(extra);
+        assert_eq!(o.status.code(), Some(1), "{extra:?}: {}", stderr(&o));
+        let err = stderr(&o);
+        assert!(err.contains("25.1 MB"), "{err}");
+        assert!(err.contains("25 MB Proton Mail"), "{err}");
+        assert!(err.contains("nothing was sent"), "{err}");
+        assert!(o.stdout.is_empty());
+    }
+    assert_eq!(smtp.seen().connections, 0);
 }

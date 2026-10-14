@@ -155,6 +155,42 @@ impl Https {
         .await
     }
 
+    /// PUTs the bytes `body` (`application/octet-stream`) to `url` with `headers`, as
+    /// [`Self::post_json`]: one range of a Graph upload session.
+    pub async fn put_bytes(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> Result<Response> {
+        self.send(Request {
+            method: "PUT",
+            url,
+            headers,
+            body: Some(("application/octet-stream", body)),
+            max_body,
+        })
+        .await
+    }
+
+    /// DELETEs `url` with `headers`, as [`Self::get`].
+    pub async fn delete(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        max_body: usize,
+    ) -> Result<Response> {
+        self.send(Request {
+            method: "DELETE",
+            url,
+            headers,
+            body: None,
+            max_body,
+        })
+        .await
+    }
+
     async fn send(&self, request: Request<'_>) -> Result<Response> {
         let target = split_url(request.url)?;
         let host = target.host;
