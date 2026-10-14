@@ -825,6 +825,13 @@ stray end tags and reopens formatting elements. Control
 characters and bidirectional overrides in mail are neutralised before they reach the terminal.
 `--json` shapes and exit codes are in [json.md](json.md) and only grow by adding fields.
 
+`neomail attachment` reads attachments from the cached MIME source, so it works offline for every
+provider. `nm_core::attachment` owns what an attachment is (its index, safe name, real type from
+the content's signature, and the `mismatch`, `inline` and `executable` notes) and has no I/O;
+`crates/neomail/src/attachment` prints it, writes files (mode 0600, never through a symbolic link)
+and runs the opener, which `NEOMAIL_OPENER` replaces so the tests run a stub
+([DEC-2026-10-14-attachments](decisions.md#dec-2026-10-14-attachments)).
+
 ## CI and edge builds
 
 `.github/workflows/ci.yml` runs `cargo fmt --check`, clippy with `-D warnings` and the tests on

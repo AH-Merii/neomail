@@ -252,6 +252,7 @@ The cache lives in `~/.local/share/neomail/` (`$XDG_DATA_HOME/neomail/`, or `NEO
 neomail sync                 # fetch new mail for every account: "work: 12 new, 1 updated, 0 removed"
 neomail list                 # newest first; * marks unread
 neomail show 42              # headers, body, attachments
+neomail attachment list 42   # message 42's attachments: index, name, real type, size
 neomail redact 42            # what classification sends for a message, personal data masked
 neomail key set              # store your jev key in the OS keyring (or set JEV_API_KEY)
 neomail classify             # sort the last year's mail into groups with jev, at most 1,000
@@ -273,6 +274,14 @@ neomail forward 42 --to ada@example.com                          # forward its t
   or `all` on `list` and `sync`.
 - `neomail show 42 43` shows several messages; `neomail show 42 --raw` prints one message's source.
   On a terminal `show` goes through `$NEOMAIL_PAGER`, `$PAGER` or `less`; `--no-pager` turns it off.
+- `neomail attachment list 42` lists a message's attachments from the cache, offline: an index,
+  the name it saves under, the type told from its content, the size, and notes for a type that
+  contradicts the declared one or the name (`mismatch`), an image the HTML shows (`inline`) and
+  an executable or script (`executable`). `neomail attachment save 42 [INDEX...] [--dir DIR]`
+  saves them under safe names, mode 0600, never replacing a file without `--overwrite`.
+  `neomail attachment open 42 1` hands a private copy to `xdg-open` (`open` on macOS, or
+  `NEOMAIL_OPENER`), and asks first for an executable or script; without a terminal it needs
+  `--yes`. neomail never runs a file itself. Output shapes: [docs/json.md](docs/json.md).
 - `neomail redact ID...` prints exactly what `neomail classify` sends for each message: the
   subject and the body's first 1,500 characters, with email addresses, links, phone, card and IBAN
   numbers, amounts, one-time codes, runs of 4 or more digits and the names in the headers replaced

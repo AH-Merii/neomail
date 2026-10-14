@@ -64,7 +64,7 @@ pub fn ssh_without_display(env: impl Fn(&str) -> Option<String>) -> bool {
     (set("SSH_CONNECTION") || set("SSH_TTY")) && !set("DISPLAY") && !set("WAYLAND_DISPLAY")
 }
 
-fn on_path(program: &str) -> bool {
+pub(crate) fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
         .unwrap_or(false)

@@ -3,6 +3,7 @@
 //! through Microsoft Graph), and setup (`account add`, `account list`, `config path|check`).
 
 mod account;
+mod attachment;
 mod browser;
 mod classify;
 mod config;
@@ -495,6 +496,12 @@ Guide: https://github.com/AH-Merii/neomail/blob/main/docs/daemon.md"
     /// Forward a cached message, by its id from `neomail list`, after asking
     #[command(after_help = send::FORWARD_EXAMPLES)]
     Forward(send::ForwardArgs),
+    /// List, save and open a cached message's attachments, offline
+    #[command(after_help = attachment::EXAMPLES)]
+    Attachment {
+        #[command(subcommand)]
+        command: attachment::Command,
+    },
     /// List each account's folders, the names `neomail move` takes
     Folder {
         #[command(subcommand)]
@@ -1096,6 +1103,9 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
         }
         Command::Forward(args) => {
             return send::forward(args, send_env(cli.config, input, terminal, &mut out));
+        }
+        Command::Attachment { command } => {
+            attachment::run(command, cli.config, input, terminal, colors, &mut out)?
         }
         Command::Folder {
             command: FolderCommand::List { account, format },
