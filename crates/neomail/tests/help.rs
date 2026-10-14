@@ -4,11 +4,15 @@
 #![allow(clippy::unwrap_used)] // Test helpers outside #[test] functions.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 
 /// The lockup the top-level help opens with.
+#[cfg(target_os = "linux")]
 const LOCKUP: &str = include_str!("../../../assets/logo/logo.txt");
 /// The first line of the top-level help after the logo.
+#[cfg(target_os = "linux")]
 const ABOUT: &str = "neomail: a terminal email client\n";
 /// The ways to ask for the top-level help, besides bare `neomail` with a config.
 const TOP: [&[&str]; 3] = [&["--help"], &["-h"], &["help"]];
@@ -16,6 +20,7 @@ const TOP: [&[&str]; 3] = [&["--help"], &["-h"], &["help"]];
 const COMMAND: [&[&str]; 3] = [&["list", "--help"], &["help", "list"], &["account", "-h"]];
 
 /// The mark alone: the first 21 columns of each lockup row.
+#[cfg(target_os = "linux")]
 fn mark() -> String {
     let rows: Vec<String> = LOCKUP
         .lines()
