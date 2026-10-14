@@ -5,6 +5,7 @@
 
 pub mod cli;
 pub mod gmail;
+pub mod proton;
 #[cfg(test)]
 mod tests;
 

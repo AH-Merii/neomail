@@ -212,19 +212,15 @@ directory, then a rename). A new file gets mode 0600 in a directory created with
 existing one keeps its mode.
 
 **Setup** (`neomail/src/setup.rs`, DEC-2026-10-12-cli-ux): a password **provider is data**, a
-`Preset` (`IMAP`, `PROTON`: fixed host, port and security, prompts, an intro,
-and whether to pin the certificate), and one flow serves them all. `gather` takes the flags and asks
+`Preset` (`IMAP`: its port and security, and prompts), and one flow serves them all. `gather` takes the flags and asks
 for the rest only when `Input::can_prompt` (standard input is a terminal and neither `--no-input`
 nor `NEOMAIL_NO_INPUT` is set); otherwise a missing value is a `UsageError` (exit 2) naming the
-flags. `execute` then runs, in order: `check_append`, before any network or keyring step; for
-Proton, `nm_imap::server_certificate` reads Bridge's certificate over a connection that accepts any
-certificate and sends nothing, shows its SHA-256 and pins it only when it equals `--cert-sha256` or
-the user confirms; the secret (the keyring is opened before it is asked for, or the
+flags. `execute` then runs, in order: `check_append`, before any network or keyring step; the secret (the keyring is opened before it is asked for, or the
 `--password-command` is run); `nm_imap::check_login`, a read-only login that opens INBOX with
 `EXAMINE` and logs out; and only then the keyring write and `append_account`. A step that fails
 before the keyring write writes nothing and stores nothing; if the final `append_account` fails, the
 password stays in the keyring and the error says so. The steps that leave the process are fields of
-`Deps`, plain function values, so the tests give a mock keyring and fake certificate and login
+`Deps`, plain function values, so the tests give a mock keyring and fake login
 steps; the login check itself is tested on the wire against the scripted server
 (`nm-imap/src/wire_tests.rs`). Gmail and Outlook with OAuth keep their own flow (`account.rs`); `main.rs` picks
 the provider, from a numbered menu on a terminal. No new trait: the presets are values, `Deps` has
@@ -246,6 +242,18 @@ password (issue #49): its checks are the config and keyring before the secret, t
 `nm_imap::check_login` and `nm_imap::smtp::check_auth` (EHLO, AUTH, QUIT) against `Servers`,
 Gmail's or fakes on 127.0.0.1 in the tests. The other providers keep `setup.rs` and `account.rs`
 until their wizards land.
+
+`wizard/proton.rs` is Proton Mail through Bridge (issue #50). Bridge's mailbox details (username,
+IMAP and SMTP ports and security) are asked before its readiness check, which reads the
+certificate on both ports as answered (`wizard/proton/probe.rs`, with `nm_imap::capture_config`).
+The probe sends a TLS hello first: a TLS record back means TLS from the first byte, a greeting
+means plain text, so a security answer Bridge does not speak is named without waiting for a
+greeting that never comes, and a refused connection is told apart from both. The certificate
+question takes `y`, a SHA-256 (`--cert-sha256`) or the path of Bridge's exported cert.pem
+(`--bridge-cert`), which is hashed and must equal the IMAP certificate; a different SMTP
+certificate is pinned on its own. `nm_imap::check_login` and `nm_imap::smtp::check_auth` then
+check the Bridge password with those pins before the keyring write and `append_account`.
+`find_bridge` (Bridge's program on PATH) only adds a warning to a refused connection.
 
 **Getting started** (`main.rs`): bare `neomail` without a config file prints the start lines and
 the README's "Try it" URL on standard error and exits 2, never prompting; with a config it prints

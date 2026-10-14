@@ -36,7 +36,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
-pub use tls::{CertPin, InvalidPin};
+pub use tls::{CertPin, InvalidPin, capture_config};
 pub use watch::{IDLE_RENEW, WatchEvent, Watcher};
 
 /// How long one network step may take: connecting, the handshake, a command's reply, or the
