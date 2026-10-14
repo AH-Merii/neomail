@@ -2,7 +2,7 @@
 
 Real-world examples of common workflows.
 
-**Note on CLI IDs:** Examples below use full branch names for branch-targeting mutations. Illustrative IDs like `nn` and `a1` keep other commands readable; in practice, **always read actual IDs from `but status -fv`** because they are generated for the current workspace snapshot. Commit IDs are short change-ID prefixes that stay stable across history edits (e.g., `kyn`; commits without a change ID fall back to a sha prefix), and file/hunk/stack IDs are auto-generated (e.g., `r`, `r:c`, `h0`). All IDs are unique across entity types within one snapshot.
+**Note on CLI IDs:** Examples use illustrative IDs such as `nn` and `a1`; copy actual IDs from current `but status` or `but diff` output. Real output may use longer IDs (e.g., `mzm:uvw:2e4`). Use full branch names for mutations. Commit change-ID prefixes survive history edits; SHA prefixes can go stale.
 
 ## Example 1: Starting Independent Parallel Work
 
@@ -57,7 +57,7 @@ but status -fv
 but commit -b add-authentication -m "Add JWT authentication" <file-ids>
 
 # 4. Create stacked branch anchored on authentication
-but branch new user-profile -a add-authentication
+but branch new user-profile --above add-authentication
 
 # 5. Implement profile page (depends on auth)
 # (edit pages/profile.js)
@@ -116,9 +116,9 @@ but squash feature -m "Implement feature"
 but squash rr pp nn mm -t kk -m "Implement feature"
 ```
 
-### Scenario B: Moving Files Between Commits
+### Scenario B: Moving Committed Changes
 
-**Situation:** A file was committed in the wrong commit, need to move it.
+**Situation:** A change was committed in the wrong commit, need to move it.
 
 ```bash
 # 1. See which files are in which commits
@@ -133,6 +133,19 @@ but status -fv
 
 # 2. Move utils.js from nn to mm
 but squash nn:a2 -t mm -u    # Committed file nn:a2 (utils.js) → commit mm, keep mm's message
+
+# Alternatively, move only one hunk from the file
+but diff nn                  # Read the committed hunk ID
+but squash nn:a2:5 -t mm     # Target message is reused
+
+# Or put that committed hunk in a new commit at a chosen position
+but move nn:a2:5 --above mm -m "Extract utility change"
+
+# Or split it into a named commit immediately above its source
+but split nn:a2:5 -m "Extract utility change"
+
+# Or move that committed hunk back to uncommitted
+but squash nn:a2:5 -t @
 ```
 
 ### Scenario C: Moving Commit to Different Branch
@@ -153,6 +166,12 @@ but branch new feature-b    # Creates branch bv
 
 # 3. Move the commit
 but move nn -b feature-b    # Move nn to top of feature-b
+
+# Alternatively, move onto a new named branch above feature-a
+but move nn --above feature-a -b extracted-work  # --below also works
+
+# Or move onto a new named independent branch
+but move nn --unstack -b independent-work
 ```
 
 ## Example 5: Stacking Existing Branches
@@ -209,6 +228,8 @@ but resolve nn
 # 3. Edit each conflicted file to resolve
 # IMPORTANT: You MUST edit the files — do NOT just run `but resolve finish`
 # NEVER use `git add`, `git checkout --theirs/--ours`, or any git write command — just edit the files directly with the Edit tool, then `but resolve finish`
+# Exception: a conflicted submodule has no markers and `but resolve finish` refuses until you select it —
+#   check out the commit to keep inside it, then `git add -- <path>` (or `git rm -- <path>` to drop it); never `git commit`
 # (edit to remove every marker — <<<<<<< ||||||| ======= >>>>>>> — and keep correct content;
 #  with several conflicted files, `but resolve status` re-lists what remains)
 
@@ -261,6 +282,8 @@ but pr new user-dashboard -m "Add user dashboard"
 # Created PR #123: https://github.com/org/repo/pull/123
 
 # 10. After PR is merged, update
+but pull --check                # is user-dashboard listed as [integrated]?
+but unapply user-dashboard      # only if it is not: `but pull` would rebase it instead
 but pull
 ```
 
