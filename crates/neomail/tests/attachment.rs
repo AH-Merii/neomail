@@ -192,7 +192,10 @@ fn save_writes_every_attachment_into_the_current_directory_under_safe_names() {
     let mut expected: Vec<_> = names.iter().map(|n| cwd.path().join(n)).collect();
     expected.sort();
     assert_eq!(listed, expected, "nothing written outside the directory");
-    assert_eq!(paths, names.map(|n| cwd.path().join(n)));
+    // neomail prints where each file went with the directory resolved: on macOS the temporary
+    // directory is under /var, a link to /private/var.
+    let dir = cwd.path().canonicalize().unwrap();
+    assert_eq!(paths, names.map(|n| dir.join(n)));
     assert_eq!(
         std::fs::read(&paths[0]).unwrap(),
         b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
