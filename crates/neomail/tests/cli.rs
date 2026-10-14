@@ -674,11 +674,9 @@ fn password_and_oauth_commands_refuse_the_other_kind_of_account() {
     }
 }
 
-/// No Secret Service on the bus: every OAuth command fails in one line before any sign-in
-/// starts (no URL is printed, so no browser could open). Linux only, like the test above.
-#[cfg(target_os = "linux")]
 /// The lines of a one-line error: `account add` gmail and outlook run a setup wizard, which
 /// names the failed step on the first line and says nothing was written on the second.
+#[cfg(target_os = "linux")]
 fn one_error_lines<S: AsRef<str>>(args: &[S]) -> usize {
     match args {
         [a, b, ..] if a.as_ref() == "account" && b.as_ref() == "add" => 2,
@@ -686,6 +684,9 @@ fn one_error_lines<S: AsRef<str>>(args: &[S]) -> usize {
     }
 }
 
+/// No Secret Service on the bus: every OAuth command fails in one line before any sign-in
+/// starts (no URL is printed, so no browser could open). Linux only, like the test above.
+#[cfg(target_os = "linux")]
 #[test]
 fn oauth_commands_without_a_keyring_fail_before_signing_in() {
     let dir = tempfile::tempdir().unwrap();
