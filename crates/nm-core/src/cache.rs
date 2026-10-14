@@ -10,13 +10,14 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::group::{Choice, Group, GroupRules};
 use crate::label::LabelPrefix;
 use crate::parse::{self, EmailAddress};
+use crate::search::{self, IndexText, Query, Scope};
 use crate::types::{
     Cursor, FetchedMessage, Flags, IdListed, MessageId, RemoteId, Uid, UidFlags, UidValidity,
 };
 
 /// The schema this build writes. A cache with a newer version is refused, not guessed at; an
 /// older one is migrated by [`Cache::open`].
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// The `mailbox` and `message` tables of schema 5, named `mailbox{suffix}` and `message{suffix}`: the migration from 1
 /// creates them under temporary names first. `message` refers to `mailbox` by its final name.
@@ -172,6 +173,29 @@ const MIGRATE_V5: &str = LABEL;
 /// Schema 6 to 7: the [`JUNK`] table. Every existing row stays; no message has moved yet, so
 /// every confident spam message is due a move once, 10c's included.
 const MIGRATE_V6: &str = JUNK;
+
+/// The full-text index (schema 8): `message_fts`, a contentless FTS5 table whose rowid is
+/// `message.id`, so it keeps no second copy of the text (the raw message is in `message`); and
+/// per message `indexed`, the [`search::TEXT_VERSION`] it was indexed under (NULL until then),
+/// and `thread`, its thread's key. Deleting a message deletes its index row, a cascade from its
+/// mailbox included. Search always joins `message`, so a row that is gone is never found.
+/// <https://www.sqlite.org/fts5.html#contentless_delete_tables>
+const SEARCH: &str = "
+ALTER TABLE message ADD COLUMN indexed INTEGER;
+ALTER TABLE message ADD COLUMN thread TEXT;
+CREATE INDEX message_thread ON message (thread);
+CREATE VIRTUAL TABLE message_fts USING fts5 (
+    subject, sender, recipients, body,
+    content = '', contentless_delete = 1, tokenize = 'unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER message_fts_delete AFTER DELETE ON message BEGIN
+    DELETE FROM message_fts WHERE rowid = old.id;
+END;
+";
+
+/// Schema 7 to 8: [`SEARCH`]. No row is parsed here: every row starts unindexed, and
+/// [`Cache::index_pending`] indexes them.
+const MIGRATE_V7: &str = SEARCH;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
@@ -379,6 +403,7 @@ impl Cache {
                 tx.execute_batch(LABEL)?;
                 tx.execute_batch(JUNK)?;
                 tx.execute_batch(INDEX)?;
+                tx.execute_batch(SEARCH)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             tx.commit()?;
@@ -400,6 +425,9 @@ impl Cache {
         }
         if schema_version(&conn)? == 6 {
             migrate_step(&mut conn, 6, MIGRATE_V6)?;
+        }
+        if schema_version(&conn)? == 7 {
+            migrate_step(&mut conn, 7, MIGRATE_V7)?;
         }
         conn.pragma_update(None, "foreign_keys", true)?;
         match schema_version(&conn)? {
@@ -571,7 +599,8 @@ impl Cache {
                  ON CONFLICT (mailbox_id, uid) DO UPDATE SET
                      flags = excluded.flags, received = excluded.received, date = excluded.date,
                      from_name = excluded.from_name, from_address = excluded.from_address,
-                     subject = excluded.subject, raw = excluded.raw, msg_key = excluded.msg_key
+                     subject = excluded.subject, raw = excluded.raw, msg_key = excluded.msg_key,
+                     indexed = NULL
                  RETURNING id",
             )?;
             for m in messages {
@@ -722,7 +751,8 @@ impl Cache {
                  ON CONFLICT (mailbox_id, remote_id) DO UPDATE SET
                      flags = excluded.flags, received = excluded.received, date = excluded.date,
                      from_name = excluded.from_name, from_address = excluded.from_address,
-                     subject = excluded.subject, raw = excluded.raw, msg_key = excluded.msg_key
+                     subject = excluded.subject, raw = excluded.raw, msg_key = excluded.msg_key,
+                     indexed = NULL
                  RETURNING id",
             )?;
             for (listed, raw) in messages {
@@ -1001,36 +1031,102 @@ impl Cache {
              WHERE ?1 IS NULL OR b.account = ?1
              ORDER BY COALESCE(m.received, m.date, 0) DESC, m.id DESC",
         )?;
-        let mut rows = stmt.query(params![account])?;
-        let mut found = Vec::new();
-        while found.len() < usize::try_from(limit).unwrap_or(usize::MAX) {
-            let Some(r) = rows.next()? else { break };
-            let received: Option<i64> = r.get(8)?;
-            let group = match (r.get::<_, Option<String>>(9)?, r.get::<_, Option<f64>>(10)?) {
-                (Some(choice), Some(confidence)) => Some(rules.effective(
-                    Choice::from_name(&choice).ok_or(CacheError::Corrupt("choice"))?,
-                    confidence,
-                    received.and_then(|t| DateTime::from_timestamp(t, 0)),
-                    now,
-                )),
-                _ => None,
-            };
-            if !filter.admits(group) {
-                continue;
+        let rows = stmt.query(params![account])?;
+        collect_grouped(rows, filter, limit, rules, now)
+    }
+
+    /// Indexes up to `batch` messages that are not indexed under the current
+    /// [`search::TEXT_VERSION`] (new, upserted, or cached before schema 7), in one transaction.
+    /// Returns how many it indexed: 0 once nothing is left. A stopped run keeps the batches it
+    /// committed.
+    pub fn index_pending(&mut self, batch: usize) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows: Vec<(i64, Vec<u8>)> = tx
+            .prepare("SELECT id, raw FROM message WHERE indexed IS NOT ?1 LIMIT ?2")?
+            .query_map(
+                params![
+                    search::TEXT_VERSION,
+                    i64::try_from(batch).unwrap_or(i64::MAX)
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?
+            .collect::<Result<_, _>>()?;
+        {
+            let mut forget = tx.prepare("DELETE FROM message_fts WHERE rowid = ?1")?;
+            let mut add = tx.prepare(
+                "INSERT INTO message_fts (rowid, subject, sender, recipients, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            let mut done =
+                tx.prepare("UPDATE message SET indexed = ?2, thread = ?3 WHERE id = ?1")?;
+            for (id, raw) in &rows {
+                let text = IndexText::of(raw);
+                forget.execute([id])?;
+                add.execute(params![
+                    id,
+                    text.subject,
+                    text.sender,
+                    text.recipients,
+                    text.body
+                ])?;
+                done.execute(params![id, search::TEXT_VERSION, text.thread])?;
             }
-            let entry = list_entry((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-            ))?;
-            found.push(Grouped { entry, group });
         }
-        Ok(found)
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
+    /// How many messages [`Self::index_pending`] has still to index.
+    pub fn unindexed_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM message WHERE indexed IS NOT ?1",
+            [search::TEXT_VERSION],
+            |r| r.get(0),
+        )?;
+        usize::try_from(count).map_err(|_| CacheError::Corrupt("message count"))
+    }
+
+    /// The indexed messages in `scope` that match `query`, with their [`Group`], newest first as
+    /// [`Self::list_grouped`] orders and groups them: at most `limit`. An empty query matches
+    /// every message in scope. A message not yet indexed ([`Self::index_pending`]) is not found;
+    /// nor is any message when the scope's thread message is not cached.
+    pub fn search(
+        &self,
+        query: &Query,
+        scope: &Scope,
+        limit: u32,
+        rules: &GroupRules,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Grouped>> {
+        // The text condition only when there is text: FTS5 refuses an empty MATCH.
+        let text = query.fts();
+        let matching = if text.is_some() {
+            "AND m.id IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?3)"
+        } else {
+            "AND ?3 IS NULL"
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT m.id, b.account, m.uid, COALESCE(m.date, m.received), m.from_name,
+                    m.from_address, m.subject, m.flags, COALESCE(m.received, m.date),
+                    c.choice, c.confidence
+             FROM message m JOIN mailbox b ON b.id = m.mailbox_id
+             LEFT JOIN classification c ON c.account = b.account AND c.msg_key = m.msg_key
+             WHERE m.indexed IS NOT NULL
+               AND (?1 IS NULL OR b.account = ?1)
+               AND (?2 IS NULL OR (b.account, m.thread) = (
+                   SELECT tb.account, tm.thread FROM message tm
+                   JOIN mailbox tb ON tb.id = tm.mailbox_id WHERE tm.id = ?2))
+               {matching}
+             ORDER BY COALESCE(m.received, m.date, 0) DESC, m.id DESC"
+        ))?;
+        let rows = stmt.query(params![
+            scope.account,
+            scope.thread.map(MessageId::get),
+            text
+        ])?;
+        collect_grouped(rows, scope.group, limit, rules, now)
     }
 
     /// Every cached message with no stored classification (with `again`, every message), from
@@ -1366,6 +1462,7 @@ fn migrate_v1(conn: &mut Connection) -> Result<()> {
     tx.execute_batch(LABEL)?;
     tx.execute_batch(JUNK)?;
     tx.execute_batch(INDEX)?;
+    tx.execute_batch(SEARCH)?;
     let dangling = tx
         .prepare("PRAGMA foreign_key_check")?
         .query([])?
@@ -1390,6 +1487,46 @@ fn migrate_step(conn: &mut Connection, from: i64, sql: &str) -> Result<()> {
     tx.pragma_update(None, "user_version", from + 1)?;
     tx.commit()?;
     Ok(())
+}
+
+/// The first `limit` of `rows` that `filter` admits, each with its effective group. `rows` are
+/// list's eight columns, then the arrival time, the stored choice and its confidence.
+fn collect_grouped(
+    mut rows: rusqlite::Rows<'_>,
+    filter: GroupFilter,
+    limit: u32,
+    rules: &GroupRules,
+    now: DateTime<Utc>,
+) -> Result<Vec<Grouped>> {
+    let mut found = Vec::new();
+    while found.len() < usize::try_from(limit).unwrap_or(usize::MAX) {
+        let Some(r) = rows.next()? else { break };
+        let received: Option<i64> = r.get(8)?;
+        let group = match (r.get::<_, Option<String>>(9)?, r.get::<_, Option<f64>>(10)?) {
+            (Some(choice), Some(confidence)) => Some(rules.effective(
+                Choice::from_name(&choice).ok_or(CacheError::Corrupt("choice"))?,
+                confidence,
+                received.and_then(|t| DateTime::from_timestamp(t, 0)),
+                now,
+            )),
+            _ => None,
+        };
+        if !filter.admits(group) {
+            continue;
+        }
+        let entry = list_entry((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+            r.get(7)?,
+        ))?;
+        found.push(Grouped { entry, group });
+    }
+    Ok(found)
 }
 
 /// A row of `list`: id, account, uid, date, from name, from address, subject, flags.
@@ -1444,6 +1581,15 @@ fn uid_from_db(value: i64) -> Result<Uid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Turns a schema 8 cache back into schema 7's tables (the version is left to the caller).
+    const UNDO_SEARCH: &str = "
+        DROP TRIGGER message_fts_delete;
+        DROP TABLE message_fts;
+        DROP INDEX message_thread;
+        ALTER TABLE message DROP COLUMN thread;
+        ALTER TABLE message DROP COLUMN indexed;
+    ";
 
     fn msg(uid: u32, received: i64, subject: &str) -> FetchedMessage {
         FetchedMessage {
@@ -2039,12 +2185,13 @@ mod tests {
         }
         // Schema 5 is schema 7 without the label and junk tables.
         let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(UNDO_SEARCH).unwrap();
         conn.execute_batch("DROP TABLE label; DROP TABLE junk; PRAGMA user_version = 5;")
             .unwrap();
         drop(conn);
 
         let mut cache = Cache::open(&path).unwrap();
-        assert_eq!(schema_version(&cache.conn).unwrap(), 7);
+        assert_eq!(schema_version(&cache.conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(cache.list(None, 10).unwrap().len(), 2);
         let (account, key) = key_of(&cache, "a");
         assert_eq!(
@@ -2207,14 +2354,15 @@ mod tests {
             outlook(&mut cache, "out", "b", 2, None);
             written(&mut cache, "a", "nm-spam");
         }
-        // Schema 6 is schema 7 without the junk table.
+        // Schema 6 is schema 8 without search's index and the junk table.
         let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(UNDO_SEARCH).unwrap();
         conn.execute_batch("DROP TABLE junk; PRAGMA user_version = 6;")
             .unwrap();
         drop(conn);
 
         let cache = Cache::open(&path).unwrap();
-        assert_eq!(schema_version(&cache.conn).unwrap(), 7);
+        assert_eq!(schema_version(&cache.conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(cache.list(None, 10).unwrap().len(), 2);
         assert_eq!(
             due_for(&cache, &GroupRules::default(), BOTH),

@@ -257,6 +257,7 @@ neomail redact 42            # what classification sends for a message, personal
 neomail key set              # store your jev key in the OS keyring (or set JEV_API_KEY)
 neomail classify             # sort the last year's mail into groups with jev, at most 1,000
 neomail list --group follow-up   # list one group's mail
+neomail search invoice from:ada  # cached mail matching every word, listed as `list` does
 neomail mark read 42 43      # mark read on the server, then in the cache
 neomail archive 42           # move to the archive on the server, then drop from the cache
 neomail delete 43            # move to the trash; nothing is deleted for good
@@ -272,6 +273,13 @@ neomail forward 42 --to ada@example.com                          # forward its t
   much, refresh flags and drop deleted mail. Messages are fetched without marking them read.
 - `neomail list --account work --limit all` lists every cached message; `--limit` takes a number
   or `all` on `list` and `sync`.
+- `neomail search WORD...` searches the cache, offline: the INBOX mail synced so far, not the
+  server. Each word matches the start of a word in the subject, the sender, the To and Cc
+  recipients or the body, and every word must match; case, accents and Arabic short vowels are
+  ignored. `"quoted words"` match as a phrase, and `subject:`, `from:` or `to:` before a word or
+  phrase look only there. `--account NAME`, `--group GROUP` and `--thread ID` (message ID's
+  thread) narrow it; the output, `--limit` and the formats are `list`'s. Mail is indexed as it
+  syncs; mail cached before is indexed by the first search.
 - `neomail show 42 43` shows several messages; `neomail show 42 --raw` prints one message's source.
   On a terminal `show` goes through `$NEOMAIL_PAGER`, `$PAGER` or `less`; `--no-pager` turns it off.
 - `neomail attachment list 42` lists a message's attachments from the cache, offline: an index,

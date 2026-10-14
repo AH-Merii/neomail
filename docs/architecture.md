@@ -306,9 +306,29 @@ which names are neomail's (the prefix and one of the eleven group names, ignorin
 `merge`, which keeps every other name of an Outlook list in its order, and of `plan`, which
 picks the single names a Gmail or Proton label change adds and removes.
 
+Search (schema 8) is a full-text index in the same file: `message_fts`, a contentless FTS5 table
+(`unicode61 remove_diacritics 2`) whose rowid is `message.id`, so it stores no second copy of the
+text, with columns subject, sender, recipients (To and Cc) and body (`parse::parse`'s text, an
+HTML body as its text, at most 64 KiB). `message.indexed` holds the `search::TEXT_VERSION` a row
+was indexed under, NULL until then: both upserts set it back to NULL, and a new version re-indexes
+every row. `message.thread` holds the thread's key (the first References id, else the first
+In-Reply-To id, else the message's own key, skipping Proton Bridge's own
+`@protonmail.internalid` id, which it adds to every message). `Cache::index_pending` indexes the rows that are not
+current, 500 per transaction; `Syncer::sync` runs it after each account's sync, so the daemon
+keeps the index current, and `neomail search` runs it first, so mail cached before schema 8 (the
+step to 8 parses no row) is indexed by the first search. A trigger deletes a message's index row
+with it, a mailbox's cascade included, and `Cache::search` always joins `message`, so mail that is
+gone is never found. `nm-core/src/search.rs` owns the rest: `Query::parse` reads what the user
+typed into terms and fields, `Query::fts` writes each as one quoted FTS5 string (so FTS5's syntax
+in a query is text), and `fold` drops the Arabic marks and tatweel and folds hamza on alef, which
+the tokenizer does not, on both the indexed text and the query. `Scope` (account, group, thread)
+is what slice 24's picker will switch without retyping the query; the group is applied as
+`list_grouped` applies it, after the rows come back.
+
 Schema 2 added the by-id columns, schema 3 `mailbox.synced`, schema 4 `mailbox.cursor` and schema
-5 `message.msg_key` and the `classification` table, schema 6 the `label` table and schema 7 the
-`junk` table. The step to 5 parses no row; the steps to 6 and 7 only create a table. Each
+5 `message.msg_key` and the `classification` table, schema 6 the `label` table, schema 7 the
+`junk` table and schema 8 search's index. The step to 5 parses no row; the steps to 6 and 7 only
+create a table, and the step to 8 adds the index empty. Each
 step from 2 runs in one `BEGIN IMMEDIATE` transaction that reads the version again. A schema 2 cache
 gets `synced` with every existing mailbox counted as synced (a build without the column synced it);
 a schema 3 cache gets `cursor` empty, so its next sync lists and stores one. A schema 1 cache is
