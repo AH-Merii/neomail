@@ -84,9 +84,9 @@ fn utf16(encoded: &str) -> Option<Vec<u16>> {
     )
 }
 
-/// `name` in modified UTF-7. Only the tests encode: a move sends the name LIST sent.
-#[cfg(test)]
-fn encode(name: &str) -> String {
+/// `name` in modified UTF-7: for a mailbox or label neomail names itself (a label it creates).
+/// A move sends the name LIST sent.
+pub(crate) fn encode(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut run: Vec<u16> = Vec::new();
     for c in name.chars() {
@@ -104,7 +104,6 @@ fn encode(name: &str) -> String {
     out
 }
 
-#[cfg(test)]
 fn flush(out: &mut String, run: &mut Vec<u16>) {
     if run.is_empty() {
         return;

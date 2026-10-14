@@ -150,6 +150,9 @@ pub struct GroupRules {
     pub other_below: f64,
     /// A `follow-up` received more than this many days ago lists as `follow-up-old`.
     pub follow_up_old_days: u32,
+    /// Spam at or above this confidence moves to the account's Junk folder; `None` moves
+    /// nothing (`[classify] junk = false`). The decisions' "Spam" bullet: 0.9 by default.
+    pub junk_at: Option<f64>,
 }
 
 impl Default for GroupRules {
@@ -159,6 +162,7 @@ impl Default for GroupRules {
         GroupRules {
             other_below: 0.4,
             follow_up_old_days: 90,
+            junk_at: Some(0.9),
         }
     }
 }
@@ -188,6 +192,13 @@ impl GroupRules {
             return Group::FollowUpOld;
         }
         choice.group()
+    }
+
+    /// Whether a message classified `choice` at `confidence` moves to Junk: spam at or above
+    /// [`junk_at`](Self::junk_at), and nothing else. Lower-confidence spam stays where it is,
+    /// labelled `spam`.
+    pub fn junk(&self, choice: Choice, confidence: f64) -> bool {
+        choice == Choice::Spam && self.junk_at.is_some_and(|at| confidence >= at)
     }
 }
 
@@ -250,6 +261,7 @@ mod tests {
         let strict = GroupRules {
             other_below: 0.95,
             follow_up_old_days: 10,
+            ..GroupRules::default()
         };
         assert_eq!(
             strict.effective(Choice::Main, 0.9, at(999), now),
@@ -259,5 +271,21 @@ mod tests {
             strict.effective(Choice::FollowUp, 0.99, at(980), now),
             Group::FollowUpOld
         );
+    }
+
+    #[test]
+    fn only_spam_at_or_above_junk_at_moves_to_junk() {
+        let rules = GroupRules::default();
+        assert!(!rules.junk(Choice::Spam, 0.89));
+        assert!(rules.junk(Choice::Spam, 0.9));
+        assert!(rules.junk(Choice::Spam, 1.0));
+        for choice in Choice::ALL.into_iter().filter(|c| *c != Choice::Spam) {
+            assert!(!rules.junk(choice, 1.0), "{choice:?}");
+        }
+        let off = GroupRules {
+            junk_at: None,
+            ..rules
+        };
+        assert!(!off.junk(Choice::Spam, 1.0), "junk = false moves nothing");
     }
 }

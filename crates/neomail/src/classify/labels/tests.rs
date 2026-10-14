@@ -1,5 +1,5 @@
-//! The category pass against a fake [`CategoryWriter`] and a cache in memory: no Graph, no
-//! keyring, no lock file.
+//! The pass for groups on the server against a fake [`LabelWriter`] and a cache in memory: no
+//! Graph, no IMAP server, no keyring, no lock file.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::TimeDelta;
-use nm_core::{Choice, Classification, Flags, IdListed, UidValidity};
+use nm_core::{Choice, Classification, Flags, IdListed};
 
 use super::*;
 use crate::daemon::Line;
@@ -56,7 +56,39 @@ struct Fake {
     /// A warning each sign-in gives, as a token that could not be saved would.
     warn: Option<&'static str>,
     warnings: Vec<(String, String)>,
+    /// Each Graph Junk move's ids.
+    moves: Vec<Vec<String>>,
+    /// How a Graph Junk move ends for an id: moved unless told otherwise.
+    move_answers: HashMap<String, Move>,
+    /// What an IMAP server takes, and each probe's account.
+    takes: Option<Takes>,
+    probes: Vec<String>,
+    /// Each IMAP batch: (account, uid, want, last, junk).
+    batches: Vec<Vec<ImapSeen>>,
+    /// IMAP messages no longer in INBOX, and ones whose move the server does not confirm.
+    imap_gone: Vec<u32>,
+    imap_stuck: Vec<u32>,
+    /// An IMAP session that fails.
+    imap_fails: bool,
 }
+
+/// One IMAP edit as the fake saw it: (account, uid, want, last, junk).
+type ImapSeen = (String, u32, Option<String>, Option<String>, bool);
+
+/// What the fake answers for a Graph Junk move.
+#[derive(Clone, Copy)]
+enum Move {
+    Gone,
+    /// Graph answered nothing for it.
+    Unconfirmed,
+}
+
+/// Gmail as the probe sees it: labels and a Junk folder.
+const GMAIL: Takes = Takes {
+    labels: LabelKind::Gmail,
+    no_junk: None,
+    uidplus: true,
+};
 
 /// The fake's account lock: held until dropped.
 struct Held(Rc<Cell<bool>>);
@@ -67,7 +99,7 @@ impl Drop for Held {
     }
 }
 
-impl CategoryWriter for Fake {
+impl LabelWriter for Fake {
     type Lock = Held;
 
     fn lock(&mut self, _account: &str) -> Result<Option<Held>> {
@@ -148,6 +180,85 @@ impl CategoryWriter for Fake {
             })
             .collect())
     }
+
+    fn move_junk(
+        &mut self,
+        account: &Account,
+        ids: &[RemoteId],
+        _deadline: Option<Instant>,
+    ) -> Result<Option<Moved<RemoteId>>> {
+        assert!(self.held.get(), "moved without the account lock");
+        assert!(!matches!(account.server, Server::Imap(_)));
+        self.moves
+            .push(ids.iter().map(|id| id.as_str().to_owned()).collect());
+        let mut moved = Moved {
+            folder: "junkemail".into(),
+            moved: Vec::new(),
+            gone: Vec::new(),
+        };
+        for id in ids {
+            match self.move_answers.get(id.as_str()) {
+                None => moved.moved.push(id.clone()),
+                Some(Move::Gone) => moved.gone.push(id.clone()),
+                Some(Move::Unconfirmed) => {}
+            }
+        }
+        Ok(Some(moved))
+    }
+
+    fn probe(&mut self, account: &Account) -> Result<Takes> {
+        assert!(self.held.get(), "signed in without the account lock");
+        self.probes.push(account.name.clone());
+        Ok(self.takes.unwrap_or(GMAIL))
+    }
+
+    fn write_imap(
+        &mut self,
+        account: &Account,
+        prefix: &LabelPrefix,
+        _uid_validity: UidValidity,
+        edits: &[LabelEdit<'_>],
+        deadline: Option<Instant>,
+    ) -> Result<Option<LabelsWritten>> {
+        assert_eq!(prefix.as_str(), "nm-");
+        assert!(self.held.get(), "wrote without the account lock");
+        self.deadlines.push(deadline);
+        let takes = self.takes.unwrap_or(GMAIL);
+        self.batches.push(
+            edits
+                .iter()
+                .map(|e| {
+                    let (want, last) = (e.want.map(Into::into), e.last.map(Into::into));
+                    (account.name.clone(), e.uid.get(), want, last, e.junk)
+                })
+                .collect(),
+        );
+        if self.imap_fails {
+            anyhow::bail!("IMAP UID STORE failed");
+        }
+        let mut out = LabelsWritten {
+            takes: Some(takes),
+            ..LabelsWritten::default()
+        };
+        for (i, e) in edits.iter().enumerate() {
+            if self.imap_gone.contains(&e.uid.get()) {
+                out.gone.push(i);
+                continue;
+            }
+            let labelled = e.want.is_some() && takes.labels != LabelKind::None;
+            if labelled {
+                out.labelled.push((i, true));
+            }
+            if e.junk && takes.no_junk.is_none() && (e.want.is_none() || labelled) {
+                if self.imap_stuck.contains(&e.uid.get()) {
+                    out.unmoved.push(i);
+                } else {
+                    out.moved.push(i);
+                }
+            }
+        }
+        Ok(Some(out))
+    }
 }
 
 const CONFIG: &str = "\
@@ -156,6 +267,8 @@ oauth = { provider = \"microsoft\", client_id = \"00000000-0000-0000-0000-000000
 [[accounts]]\nname = \"second\"\nusername = \"me@outlook.example\"\n\
 oauth = { provider = \"microsoft\", client_id = \"00000000-0000-0000-0000-000000000000\" }\n\
 [[accounts]]\nname = \"work\"\nusername = \"you@example.com\"\n\
+imap = { host = \"imap.gmail.com\" }\n\
+[[accounts]]\nname = \"plain\"\nusername = \"you@example.com\"\n\
 imap = { host = \"imap.example.com\" }\n";
 
 fn now() -> DateTime<Utc> {
@@ -183,6 +296,16 @@ fn outlook(cache: &mut Cache, account: &str, name: &str, days: i64, choice: Opti
 }
 
 fn classify(cache: &mut Cache, account: &str, message_id: &str, choice: Choice) {
+    classify_at(cache, account, message_id, choice, 0.9);
+}
+
+fn classify_at(
+    cache: &mut Cache,
+    account: &str,
+    message_id: &str,
+    choice: Choice,
+    confidence: f64,
+) {
     let key = cache
         .pending(Some(account), true)
         .unwrap()
@@ -192,8 +315,8 @@ fn classify(cache: &mut Cache, account: &str, message_id: &str, choice: Choice) 
         .unwrap();
     let result = Classification {
         choice,
-        confidence: 0.9,
-        probabilities: vec![(choice, 0.9)],
+        confidence,
+        probabilities: vec![(choice, confidence)],
         model: "jev-1.13.0".into(),
         request_version: 1,
         input_tokens: None,
@@ -208,7 +331,13 @@ struct Run {
 }
 
 impl Run {
+    /// Categories alone, as before spam moved: `junk = false`.
     fn new(extra: &str) -> Self {
+        Self::with(&format!("junk = false\n{extra}"))
+    }
+
+    /// The `[classify]` table `extra` and nothing more.
+    fn with(extra: &str) -> Self {
         Self {
             config: Config::parse(&format!("{CONFIG}[classify]\n{extra}")).unwrap(),
             stop: AtomicBool::new(false),
@@ -259,18 +388,6 @@ fn each_classified_outlook_message_gets_its_effective_group_once_and_again_when_
     outlook(&mut cache, "outlook", "b", 2, Some(Choice::FollowUp));
     outlook(&mut cache, "outlook", "c", 1, Some(Choice::Spam));
     outlook(&mut cache, "outlook", "d", 0, None);
-    // A classified IMAP message: its label is slice 10d's.
-    let mb = cache
-        .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
-        .unwrap();
-    let imap = nm_core::FetchedMessage {
-        uid: nm_core::Uid::new(1).unwrap(),
-        flags: Flags::default(),
-        received: Some(now()),
-        raw: b"Message-ID: <e@acme.example>\r\nSubject: e\r\n\r\nhi\r\n".to_vec(),
-    };
-    cache.insert_messages(mb.id, &[imap]).unwrap();
-    classify(&mut cache, "work", "<e@acme.example>", Choice::Main);
 
     let run = Run::new("follow_up_old_days = 30\n");
     let mut fake = Fake::default();
@@ -282,7 +399,7 @@ fn each_classified_outlook_message_gets_its_effective_group_once_and_again_when_
             edit("outlook", "b", "nm-follow-up", None),
             edit("outlook", "a", "nm-main", None),
         ],
-        "newest first, Outlook only, classified only"
+        "newest first, classified only"
     );
     assert_eq!(counts(&outcomes), [("outlook".into(), 3, 0, 0)]);
     assert_eq!(
@@ -481,10 +598,10 @@ fn a_stop_ends_the_pass_after_the_writes_in_flight() {
 fn the_daemon_says_why_an_account_is_off_once_per_state() {
     let off = |off: Option<Off>, written: usize| AccountOutcome {
         account: "outlook".into(),
+        labels: true,
         written,
-        failed: 0,
-        waiting: 0,
         off,
+        ..AccountOutcome::default()
     };
     let mut reports = Reports::default();
     let read_only = "neomail: outlook: groups are not written to Outlook: run `neomail account \
@@ -717,10 +834,11 @@ fn the_daemon_prints_a_sign_in_warning_once_per_account_state() {
 fn the_daemon_says_the_same_counts_once_and_a_locked_wake_changes_nothing() {
     let outcome = |off: Option<Off>, written: usize, failed: usize| AccountOutcome {
         account: "outlook".into(),
+        labels: true,
         written,
         failed,
-        waiting: 0,
         off,
+        ..AccountOutcome::default()
     };
     let mut reports = Reports::default();
     let failing = "outlook: 0 categories written, 1 failed (tried again next wake)";
@@ -758,4 +876,306 @@ fn the_daemon_says_the_same_counts_once_and_a_locked_wake_changes_nothing() {
         [],
         "nothing was said in between"
     );
+}
+
+/// IMAP message `uid` of `account`, received `days` before [`now`], Message-ID
+/// `<name@acme.example>`, classified as `choice` unless `None`.
+fn imap(
+    cache: &mut Cache,
+    account: &str,
+    uid: u32,
+    name: &str,
+    days: i64,
+    choice: Option<(Choice, f64)>,
+) {
+    let mb = match cache.mailbox(account, "INBOX").unwrap() {
+        Some(mb) => mb,
+        None => cache
+            .reset_mailbox(account, "INBOX", UidValidity::new(1).unwrap())
+            .unwrap(),
+    };
+    let message = nm_core::FetchedMessage {
+        uid: Uid::new(uid).unwrap(),
+        flags: Flags::default(),
+        received: Some(now() - TimeDelta::days(days)),
+        raw: format!("Message-ID: <{name}@acme.example>\r\nSubject: {name}\r\n\r\nhi\r\n")
+            .into_bytes(),
+    };
+    cache.insert_messages(mb.id, &[message]).unwrap();
+    if let Some((choice, confidence)) = choice {
+        let id = format!("<{name}@acme.example>");
+        classify_at(cache, account, &id, choice, confidence);
+    }
+}
+
+fn seen(uid: u32, want: Option<&str>, last: Option<&str>, junk: bool) -> ImapSeen {
+    (
+        "work".into(),
+        uid,
+        want.map(Into::into),
+        last.map(Into::into),
+        junk,
+    )
+}
+
+/// (account, written, moved, failed, waiting) of each outcome.
+fn moves(outcomes: &[AccountOutcome]) -> Vec<(String, usize, usize, usize, usize)> {
+    outcomes
+        .iter()
+        .map(|o| (o.account.clone(), o.written, o.junked, o.failed, o.waiting))
+        .collect()
+}
+
+/// The subjects the cache lists.
+fn listed(cache: &Cache) -> Vec<String> {
+    let mut subjects: Vec<String> = cache
+        .list(None, 100)
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| e.subject)
+        .collect();
+    subjects.sort();
+    subjects
+}
+
+#[test]
+fn imap_mail_gets_its_label_and_confident_spam_moves_to_junk_once() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    imap(&mut cache, "work", 1, "a", 3, Some((Choice::Main, 0.9)));
+    imap(&mut cache, "work", 2, "b", 2, Some((Choice::Spam, 0.95)));
+    imap(&mut cache, "work", 3, "c", 1, Some((Choice::Spam, 0.6)));
+    imap(&mut cache, "work", 4, "d", 0, None);
+    let run = Run::with("");
+    let mut fake = Fake::default();
+    let outcomes = run.pass(&mut cache, &mut fake, PER_RUN, now());
+    assert_eq!(fake.probes, ["work"]);
+    assert_eq!(
+        fake.batches,
+        [vec![
+            seen(3, Some("nm-spam"), None, false),
+            seen(2, Some("nm-spam"), None, true),
+            seen(1, Some("nm-main"), None, false),
+        ]],
+        "newest first; only spam at or above junk_at moves"
+    );
+    assert_eq!(moves(&outcomes), [("work".into(), 3, 1, 0, 0)]);
+    assert_eq!(
+        summary(&outcomes[0], "run").as_deref(),
+        Some("work: 3 labels written, 1 moved to Junk")
+    );
+    assert_eq!(
+        listed(&cache),
+        ["a", "c", "d"],
+        "a move takes it out of the cache"
+    );
+
+    // Nothing is due: no sign-in, no session.
+    let mut again = Fake::default();
+    assert!(run.pass(&mut cache, &mut again, PER_RUN, now()).is_empty());
+    assert!(again.probes.is_empty() && again.batches.is_empty());
+    // The user moves it back: listed again, its label still written, never moved again.
+    imap(&mut cache, "work", 9, "b", 2, None);
+    assert!(run.pass(&mut cache, &mut again, PER_RUN, now()).is_empty());
+    assert!(again.batches.is_empty());
+}
+
+#[test]
+fn a_server_is_asked_only_for_what_it_takes_and_says_what_it_cannot_do_once() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    for uid in 1..=3 {
+        imap(
+            &mut cache,
+            "work",
+            uid,
+            &format!("m{uid}"),
+            3,
+            Some((Choice::Main, 0.9)),
+        );
+    }
+    imap(&mut cache, "work", 4, "s", 9, Some((Choice::Spam, 0.99)));
+    // A server with Junk and no labels: the move is not left behind the labels it cannot take.
+    let plain = Takes {
+        labels: LabelKind::None,
+        no_junk: None,
+        uidplus: true,
+    };
+    let mut fake = Fake {
+        takes: Some(plain),
+        ..Fake::default()
+    };
+    let run = Run::with("");
+    let outcomes = run.pass(&mut cache, &mut fake, 1, now());
+    assert_eq!(fake.batches, [vec![seen(4, None, None, true)]]);
+    assert_eq!(moves(&outcomes), [("work".into(), 0, 1, 0, 0)]);
+    assert_eq!(
+        summary(&outcomes[0], "run").as_deref(),
+        Some("work: 1 moved to Junk")
+    );
+
+    // Gmail without a Junk folder: labels only, and a warning, said once by the daemon.
+    let mut cache = Cache::open_in_memory().unwrap();
+    imap(&mut cache, "work", 4, "s", 9, Some((Choice::Spam, 0.99)));
+    let mut fake = Fake {
+        takes: Some(Takes {
+            no_junk: Some(NoJunk::NoFolder),
+            ..GMAIL
+        }),
+        ..Fake::default()
+    };
+    let outcomes = run.pass(&mut cache, &mut fake, PER_RUN, now());
+    assert_eq!(fake.batches, [vec![seen(4, Some("nm-spam"), None, false)]]);
+    let note = "work: spam is not moved to Junk: the server has no Junk folder: no mailbox has \
+                the \\Junk attribute (RFC 6154)";
+    assert_eq!(outcomes[0].notes, [note]);
+    assert!(!failed(&outcomes), "a warning, not a failure");
+    let mut reports = Reports::default();
+    let said = reports.lines(&outcomes);
+    assert_eq!(said[0], Line::Error(format!("neomail: {note}")));
+    let mut quiet = Fake {
+        takes: fake.takes,
+        ..Fake::default()
+    };
+    let outcomes = run.pass(&mut cache, &mut quiet, PER_RUN, now());
+    assert_eq!(outcomes[0].notes, [note]);
+    assert_eq!(reports.lines(&outcomes), [], "the same warning again");
+}
+
+#[test]
+fn a_server_that_cannot_take_labels_is_signed_in_to_only_for_spam() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    imap(&mut cache, "plain", 1, "m", 3, Some((Choice::Main, 0.9)));
+    let run = Run::with("");
+    let mut fake = Fake::default();
+    assert!(run.pass(&mut cache, &mut fake, PER_RUN, now()).is_empty());
+    assert!(
+        fake.probes.is_empty(),
+        "no sign-in for labels it cannot take"
+    );
+
+    imap(&mut cache, "plain", 2, "s", 2, Some((Choice::Spam, 0.95)));
+    let mut fake = Fake {
+        imap_fails: true,
+        ..Fake::default()
+    };
+    let outcomes = run.pass(&mut cache, &mut fake, PER_RUN, now());
+    assert_eq!(fake.probes, ["plain"]);
+    assert_eq!(
+        off_line(&outcomes[0]).as_deref(),
+        Some("plain: spam not moved to Junk: IMAP UID STORE failed")
+    );
+    let mut fake = Fake::default();
+    let outcomes = run.pass(&mut cache, &mut fake, PER_RUN, now());
+    assert_eq!(
+        fake.batches,
+        [vec![("plain".into(), 2, None, None, true)]],
+        "the move alone, no label"
+    );
+    assert_eq!(
+        summary(&outcomes[0], "run").as_deref(),
+        Some("plain: 1 moved to Junk")
+    );
+}
+
+#[test]
+fn a_failed_session_stops_that_account_and_its_move_stays_due() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    imap(&mut cache, "work", 2, "b", 2, Some((Choice::Spam, 0.95)));
+    outlook(&mut cache, "outlook", "a", 1, Some(Choice::Main));
+    let run = Run::with("");
+    let mut fake = Fake {
+        imap_fails: true,
+        ..Fake::default()
+    };
+    let outcomes = run.pass(&mut cache, &mut fake, PER_RUN, now());
+    assert_eq!(
+        moves(&outcomes),
+        [("outlook".into(), 1, 0, 0, 0), ("work".into(), 0, 0, 0, 1)]
+    );
+    assert!(failed(&outcomes));
+    assert_eq!(
+        off_line(&outcomes[1]).as_deref(),
+        Some("work: labels not written: IMAP UID STORE failed")
+    );
+    let mut next = Fake::default();
+    run.pass(&mut cache, &mut next, PER_RUN, now());
+    assert_eq!(next.batches, [vec![seen(2, Some("nm-spam"), None, true)]]);
+}
+
+#[test]
+fn an_unconfirmed_move_is_tried_again_and_a_message_gone_from_inbox_is_never_moved() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    imap(&mut cache, "work", 2, "b", 2, Some((Choice::Spam, 0.95)));
+    imap(&mut cache, "work", 3, "c", 2, Some((Choice::Spam, 0.95)));
+    let run = Run::with("");
+    let mut fake = Fake {
+        imap_stuck: vec![2],
+        imap_gone: vec![3],
+        ..Fake::default()
+    };
+    let outcomes = run.pass(&mut cache, &mut fake, PER_RUN, now());
+    assert_eq!(moves(&outcomes), [("work".into(), 1, 0, 1, 0)]);
+    assert!(failed(&outcomes));
+    // b's label is written and its move is due again. c's label is asked for until the next
+    // sync drops it, as for any message gone from INBOX, but its move never is.
+    let mut next = Fake::default();
+    let outcomes = run.pass(&mut cache, &mut next, PER_RUN, now());
+    assert_eq!(
+        next.batches,
+        [vec![
+            seen(3, Some("nm-spam"), None, false),
+            seen(2, None, Some("nm-spam"), true)
+        ]]
+    );
+    assert_eq!(moves(&outcomes), [("work".into(), 1, 1, 0, 0)]);
+}
+
+#[test]
+fn outlook_spam_moves_to_junkemail_after_its_category_and_only_once() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    outlook(&mut cache, "outlook", "a", 1, Some(Choice::Spam));
+    outlook(&mut cache, "outlook", "b", 2, Some(Choice::Main));
+    outlook(&mut cache, "outlook", "c", 3, Some(Choice::Spam));
+    let run = Run::with("junk_at = 0.9\n");
+    let mut fake = Fake::default();
+    fake.move_answers.insert("a".into(), Move::Unconfirmed);
+    // The user moved c away already: it is never moved, even if it comes back.
+    fake.move_answers.insert("c".into(), Move::Gone);
+    let outcomes = run.pass(&mut cache, &mut fake, PER_RUN, now());
+    assert_eq!(
+        edits(&fake),
+        [
+            edit("outlook", "a", "nm-spam", None),
+            edit("outlook", "b", "nm-main", None),
+            edit("outlook", "c", "nm-spam", None)
+        ]
+    );
+    assert_eq!(fake.moves, [vec!["a".to_owned(), "c".to_owned()]]);
+    assert_eq!(moves(&outcomes), [("outlook".into(), 3, 0, 1, 0)]);
+    // Its category is written: the move alone is tried again.
+    let mut next = Fake::default();
+    let outcomes = run.pass(&mut cache, &mut next, PER_RUN, now());
+    assert!(edits(&next).is_empty());
+    assert_eq!(next.moves, [vec!["a".to_owned()]]);
+    assert_eq!(moves(&outcomes), [("outlook".into(), 0, 1, 0, 0)]);
+    assert_eq!(
+        summary(&outcomes[0], "run").as_deref(),
+        Some("outlook: 1 moved to Junk")
+    );
+    assert_eq!(listed(&cache), ["b", "c"]);
+    let mut last = Fake::default();
+    assert!(run.pass(&mut cache, &mut last, PER_RUN, now()).is_empty());
+}
+
+#[test]
+fn junk_false_moves_nothing_and_labels_false_still_moves_spam() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    imap(&mut cache, "work", 2, "b", 2, Some((Choice::Spam, 0.95)));
+    let mut fake = Fake::default();
+    Run::new("").pass(&mut cache, &mut fake, PER_RUN, now());
+    assert_eq!(fake.batches, [vec![seen(2, Some("nm-spam"), None, false)]]);
+    let mut cache = Cache::open_in_memory().unwrap();
+    imap(&mut cache, "work", 2, "b", 2, Some((Choice::Spam, 0.95)));
+    let mut fake = Fake::default();
+    Run::with("labels = false\n").pass(&mut cache, &mut fake, PER_RUN, now());
+    assert_eq!(fake.batches, [vec![seen(2, None, None, true)]]);
 }

@@ -2,12 +2,15 @@
 //! two writes: [`store_seen`], which sets or clears `\Seen`, and [`move_to`], which moves
 //! messages from INBOX to the archive, the trash or a folder the user names. Neither ever
 //! expunges. [`list_folders`] lists the mailboxes a message can be in. [`append_sent`] keeps a
-//! copy of a sent message, and [`smtp`] submits mail, over the same TLS and pinning.
+//! copy of a sent message, and [`smtp`] submits mail, over the same TLS and pinning. [`labels`]
+//! writes groups as Gmail and Proton labels and moves confident spam to Junk; its one expunge is
+//! by UID, inside a Proton label's mailbox, and removes the label, not the message.
 //!
 //! A mailbox name is decoded from modified UTF-7 (RFC 3501 section 5.1.3) for the user, and the
 //! server's own encoded name is the one sent back: a user's name never reaches the wire, and an
 //! encoded name never leaves this crate.
 
+pub mod labels;
 pub mod smtp;
 mod tls;
 mod utf7;
@@ -333,6 +336,7 @@ fn role_attributes(to: Folder) -> &'static str {
     match to {
         Folder::Archive => "\\Archive or \\All",
         Folder::Trash => "\\Trash",
+        Folder::Junk => "\\Junk",
     }
 }
 
@@ -420,6 +424,7 @@ fn destination<'m>(mailboxes: &'m [Mailbox], to: &Destination) -> Result<&'m Mai
             match role {
                 Folder::Archive => with(Role::Archive).or_else(|| with(Role::All)),
                 Folder::Trash => with(Role::Trash),
+                Folder::Junk => with(Role::Junk),
             }
             .ok_or(ImapError::NoFolder(*role))
         }

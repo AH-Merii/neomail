@@ -84,6 +84,7 @@ fn imap_name(to: &Destination) -> String {
     match to {
         Destination::Role(Folder::Archive) => "Archive".to_owned(),
         Destination::Role(Folder::Trash) => "Trash".to_owned(),
+        Destination::Role(Folder::Junk) => "Spam".to_owned(),
         Destination::Name(name) => name.to_string(),
     }
 }

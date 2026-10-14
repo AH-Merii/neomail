@@ -406,19 +406,22 @@ or a timeout, has no stored answer, so its message is asked about again later an
 for twice. If `neomail classify` runs at the same time as the daemon, both may ask about the same
 message, and it is paid for twice.
 
-### Groups as Outlook categories
+### Groups on the server
 
-While the switch is on, after classifying, each wake that synced writes the groups of Outlook
-accounts' classified mail as categories, as `neomail classify` does
-([outlook.md](outlook.md#groups-as-categories)): whatever is due, not only this wake's new mail,
-so mail classified earlier and a `follow-up` that grows old get theirs too. It writes at most 100
-per account per wake, and the rest at the next. Gmail and Proton accounts get nothing yet. With
-`[classify] daemon` off (the default) the daemon writes nothing; with it on, `labels = false`
-stops the writes. An account the daemon writes to prints one line on standard output when it
-wrote some, or when its failed or waiting counts changed:
+While the switch is on, after classifying, each wake that synced writes the groups of classified
+mail to each account's server, as `neomail classify` does: Outlook categories
+([outlook.md](outlook.md#groups-as-categories)) and Gmail and Proton labels
+([labels.md](labels.md)), then moves confident spam to Junk
+([labels.md](labels.md#spam-to-junk)). It writes whatever is due, not only this wake's new mail,
+so mail classified earlier and a `follow-up` that grows old get theirs too: at most 100 per
+account per wake, and the rest at the next. With `[classify] daemon` off (the default) the daemon
+writes nothing; with it on, `labels = false` stops the writes and `junk = false` the moves. An
+account the daemon writes to prints one line on standard output when it wrote or moved some, or
+when its failed or waiting counts changed:
 
 ```text
 14:05:00 outlook: 12 categories written, 1 failed (tried again next wake), 30 wait for the next wake
+14:05:02 work: 3 labels written, 1 moved to Junk
 ```
 
 Writes take the account's lock: an account `neomail sync` or `mark` holds is skipped for that
@@ -427,18 +430,23 @@ wake. A sign-in that grants only `Mail.Read` sends nothing; standard error says 
 neomail change mail``, and again only after the account wrote without it or the reason changed;
 a wake that skipped the account for its lock changes nothing. A refused token or grant, a failed
 sign-in, or Graph still throttling after its retries or out of reach, ends that account's writes
-for the wake and says once `neomail: outlook: categories not written: WHY`; the rest wait for the
-next wake. A refused token is fetched afresh at the next wake, with nothing to run. A warning
+for the wake and says once `neomail: outlook: categories not written: WHY`; on Gmail and Proton, a
+failed sign-in or session says `labels not written: WHY`, or `spam not moved to Junk: WHY` where
+only moves were due. The rest wait for the next wake. A refused token is fetched afresh at the
+next wake, with nothing to run. A server without a Junk folder, and Proton labels that stay
+beside the new ones, are warnings said once, and again only when they change. A warning
 from the sign-in, such as a new refresh token that could not be saved, is printed like the sync's
 and only when it differs from the account's last one. The writes stop starting when their
 budget is spent, as classifying does (60 seconds, or the interval when that is shorter, counted
 from when the writes start), and writes still in flight then are dropped and tried again next
 wake. So a wake's writes can delay the next sync by little more than that budget, and accounts
 not reached by then wait for the next wake. However a write fails, classifying, the sync and the
-notifications go on as before. `[classify] labels = false` turns writing off from the next
-round, and `label_prefix` sets the prefix. The writes use their own copy of the account's access
-token, refreshed as the sync's is, and only while a category is due. Ctrl-C or SIGTERM ends the
-writes after the four in flight.
+notifications go on as before. `[classify] labels = false` turns writing off and `junk = false`
+moving from the next round, and `label_prefix` sets the prefix. On Outlook the writes use their
+own copy of the account's access token, refreshed as the sync's is, and only while something is
+due; on Gmail and Proton each IMAP session signs in on its own, one per 50 messages, after one
+that asks the server what it takes, which the daemon remembers until a session fails. Ctrl-C or SIGTERM ends the writes after the four Outlook requests
+or the IMAP session in flight.
 
 ## What the output means
 

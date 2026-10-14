@@ -158,14 +158,15 @@ group `neomail list --group` shows, such as `nm-receipts-invoices`
 ([DEC-2026-10-13-categories](decisions.md#dec-2026-10-13-categories)). `neomail classify` writes
 them after it stores its results, and, once `daemon = true` under `[classify]` switches background
 classifying on, `neomail daemon` after each wake that synced
-([daemon.md](daemon.md#groups-as-outlook-categories)). There is no command of its own.
+([daemon.md](daemon.md#groups-on-the-server)). There is no command of its own. Gmail and Proton
+get labels the same way ([labels.md](labels.md)).
 
 - **What is written.** The effective group, worked out when the cache is read, so a category
   changes when the group does: a `follow-up` that grows old becomes `nm-follow-up-old`, and a new
   `other_below`, `classify --again` or a new prefix rewrites what they change. Nothing else is
   written again: a category you remove or change in Outlook stays as you left it until the
-  message's group changes. Spam gets `nm-spam` and stays where it is; moving it to Junk is a later
-  slice's.
+  message's group changes. Spam gets `nm-spam`, and spam at or above `junk_at` then moves to
+  Junk Email, once ([labels.md](labels.md#spam-to-junk)).
 - **What is kept.** For each message neomail reads its categories
   (`GET /me/messages/{id}?$select=categories`), removes only its own (the prefix followed by one
   of the eleven group names, ignoring ASCII case, or the exact name it wrote on that message
@@ -201,9 +202,9 @@ classifying on, `neomail daemon` after each wake that synced
   on. In the daemon the writes also stop at a time budget (60 seconds, or the interval when that
   is shorter), so they hold up the next sync by little more than that, and accounts not reached
   by then wait for the next wake.
-  `neomail classify` exits 1 when a category write or an account's sign-in failed; classifying,
-  syncing and notifying go on whatever happens. Lines about categories name the account only,
-  never a subject, a sender or a category of yours.
+  `neomail classify` exits 1 when a category write, a move to Junk or an account's sign-in
+  failed; classifying, syncing and notifying go on whatever happens. Lines about categories name
+  the account only, never a subject, a sender or a category of yours.
 
 `[classify] label_prefix` (default `nm-`, never empty) sets the prefix, and `labels = false`
 turns writing off: nothing more is written, and the categories already written stay on the

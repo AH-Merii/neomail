@@ -211,6 +211,9 @@ impl Words {
             Change::Move(Destination::Role(Folder::Trash)) => {
                 format!("Moved {n} message{s} to the trash.")
             }
+            Change::Move(Destination::Role(Folder::Junk)) => {
+                format!("Moved {n} message{s} to Junk.")
+            }
             Change::Move(Destination::Name(name)) => {
                 format!(
                     "Moved {n} message{s} to {}.",

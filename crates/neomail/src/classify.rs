@@ -759,7 +759,8 @@ pub fn run(
             per.map_or(String::new(), |p| format!(" (tokens from {})", p.basis())),
         );
     }
-    // Groups as Outlook categories: this run's results and whatever is still due from before.
+    // Groups on the servers, and spam to Junk: this run's results and whatever is still due from
+    // before.
     let ids: Vec<MessageId> = ids.into_iter().map(MessageId::new).collect();
     let account = args.account.as_deref();
     let labels_failed = labels::cli_pass(&mut cache, loaded.as_ref(), account, &ids, colors)?;
