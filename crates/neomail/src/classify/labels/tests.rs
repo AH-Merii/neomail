@@ -47,10 +47,14 @@ struct Fake {
     logins: usize,
     /// Set during the first write call, as a signal would be.
     stop_on_write: Option<Arc<AtomicBool>>,
-    /// A clock each write call moves on by the duration, as a slow Graph would.
+    /// A clock each write call moves on by the duration, as a slow Graph would, up to the
+    /// call's deadline, where the real writer cuts it off.
     slow: Option<(Rc<Cell<Instant>>, Duration)>,
     /// The deadline each write call was given.
     deadlines: Vec<Option<Instant>>,
+    /// The deadline each sign-in was given, and whether it is cut off there.
+    sign_in_deadlines: Vec<Option<Instant>>,
+    sign_in_cut_off: bool,
     /// Whether the account's lock is held now.
     held: Rc<Cell<bool>>,
     /// A warning each sign-in gives, as a token that could not be saved would.
@@ -110,13 +114,17 @@ impl LabelWriter for Fake {
         Ok(Some(Held(self.held.clone())))
     }
 
-    fn may_write(&mut self, account: &Account) -> Result<bool> {
+    fn may_write(&mut self, account: &Account, deadline: Option<Instant>) -> Result<Option<bool>> {
         assert!(self.held.get(), "signed in without the account lock");
         self.logins += 1;
+        self.sign_in_deadlines.push(deadline);
+        if self.sign_in_cut_off {
+            return Ok(None);
+        }
         if let Some(warning) = self.warn {
             self.warnings.push((account.name.clone(), warning.into()));
         }
-        Ok(!self.read_only)
+        Ok(Some(!self.read_only))
     }
 
     fn warnings(&mut self) -> Vec<(String, String)> {
@@ -134,7 +142,8 @@ impl LabelWriter for Fake {
         assert!(self.held.get(), "wrote without the account lock");
         self.deadlines.push(deadline);
         if let Some((clock, took)) = &self.slow {
-            clock.set(clock.get() + *took);
+            let end = clock.get() + *took;
+            clock.set(deadline.map_or(end, |d| end.min(d)));
         }
         assert!(edits.len() <= 4, "at most 4 at once");
         if let Some(stop) = &self.stop_on_write {
@@ -206,10 +215,14 @@ impl LabelWriter for Fake {
         Ok(Some(moved))
     }
 
-    fn probe(&mut self, account: &Account) -> Result<Takes> {
+    fn probe(&mut self, account: &Account, deadline: Option<Instant>) -> Result<Option<Takes>> {
         assert!(self.held.get(), "signed in without the account lock");
         self.probes.push(account.name.clone());
-        Ok(self.takes.unwrap_or(GMAIL))
+        self.sign_in_deadlines.push(deadline);
+        if self.sign_in_cut_off {
+            return Ok(None);
+        }
+        Ok(Some(self.takes.unwrap_or(GMAIL)))
     }
 
     fn write_imap(
@@ -381,6 +394,14 @@ fn counts(outcomes: &[AccountOutcome]) -> Vec<(String, usize, usize, usize)> {
         .collect()
 }
 
+/// Each outcome's account and how many it held back after a failure.
+fn held(outcomes: &[AccountOutcome]) -> Vec<(String, usize)> {
+    outcomes
+        .iter()
+        .map(|o| (o.account.clone(), o.held))
+        .collect()
+}
+
 #[test]
 fn each_classified_outlook_message_gets_its_effective_group_once_and_again_when_it_changes() {
     let mut cache = Cache::open_in_memory().unwrap();
@@ -461,7 +482,7 @@ fn the_cap_leaves_the_rest_for_the_next_pass() {
 }
 
 #[test]
-fn a_failed_write_stays_due_and_fails_the_run_and_a_gone_one_does_not() {
+fn a_failed_write_waits_before_it_is_tried_again_and_a_gone_one_is_not_asked_again() {
     let mut cache = Cache::open_in_memory().unwrap();
     for name in ["a", "b", "c", "d"] {
         outlook(&mut cache, "outlook", name, 1, Some(Choice::Main));
@@ -476,16 +497,66 @@ fn a_failed_write_stays_due_and_fails_the_run_and_a_gone_one_does_not() {
     assert!(failed(&outcomes));
     assert_eq!(
         summary(&outcomes[0], "run").as_deref(),
-        Some("outlook: 1 category written, 1 failed (tried again next run)")
+        Some("outlook: 1 category written, 1 failed (tried again later)")
     );
-    // a is tried again; b is tried again until a sync drops it; c is done, and so is d, which
-    // carried its category already and is not counted as written.
+    // Right after, nothing is asked: a waits, b is gone until a sync drops it, c is done, and
+    // so is d, which carried its category already and is not counted as written.
+    // The run says a is held back, and does not fail for it.
     let mut next = Fake::default();
     let outcomes = run.pass(&mut cache, &mut next, PER_RUN, now());
-    let ids: Vec<String> = edits(&next).into_iter().map(|e| e.1).collect();
-    assert_eq!(ids.len(), 2);
-    assert!(ids.contains(&"a".to_owned()) && ids.contains(&"b".to_owned()));
+    assert_eq!((next.logins, next.writes.len()), (0, 0));
+    assert_eq!(held(&outcomes), [("outlook".into(), 1)]);
     assert!(!failed(&outcomes));
+    assert_eq!(
+        summary(&outcomes[0], "run").as_deref(),
+        Some("outlook: 1 held back after a failure (tried again later)")
+    );
+    // a fails again after 15 minutes; then it waits 30.
+    let later = |minutes| now() + TimeDelta::minutes(minutes);
+    next.answers.insert("a".into(), Answer::Fails);
+    let outcomes = run.pass(&mut cache, &mut next, PER_RUN, later(15));
+    assert_eq!(counts(&outcomes), [("outlook".into(), 0, 1, 0)]);
+    let outcomes = run.pass(&mut cache, &mut next, PER_RUN, later(44));
+    assert_eq!(held(&outcomes), [("outlook".into(), 1)]);
+    assert_eq!(
+        edits(&next).len(),
+        1,
+        "not asked again before its wait is over"
+    );
+    next.answers.clear();
+    let outcomes = run.pass(&mut cache, &mut next, PER_RUN, later(45));
+    let ids: Vec<String> = edits(&next).into_iter().map(|e| e.1).collect();
+    assert_eq!(ids, ["a", "a"], "b is never asked again");
+    assert_eq!(counts(&outcomes), [("outlook".into(), 1, 0, 0)]);
+    assert!(!failed(&outcomes));
+}
+
+#[test]
+fn a_failed_write_is_tried_at_once_when_its_group_changes() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    outlook(&mut cache, "outlook", "a", 1, Some(Choice::FollowUp));
+    let run = Run::new(
+        "follow_up_old_days = 30
+",
+    );
+    let mut fake = Fake::default();
+    fake.answers.insert("a".into(), Answer::Fails);
+    run.pass(&mut cache, &mut fake, PER_RUN, now());
+    // The follow-up grows old a minute later: its new group is written at once.
+    let old = now() + TimeDelta::days(29) + TimeDelta::minutes(1);
+    let mut next = Fake::default();
+    run.pass(
+        &mut cache,
+        &mut next,
+        PER_RUN,
+        now() + TimeDelta::minutes(1),
+    );
+    assert!(edits(&next).is_empty(), "still waiting for the same name");
+    run.pass(&mut cache, &mut next, PER_RUN, old);
+    assert_eq!(
+        edits(&next),
+        [edit("outlook", "a", "nm-follow-up-old", None)]
+    );
 }
 
 #[test]
@@ -677,20 +748,13 @@ fn a_throttled_or_unreachable_graph_ends_that_accounts_pass_and_the_rest_wait() 
     }
 }
 
-#[test]
-fn the_deadline_ends_the_pass_between_writes_and_what_is_cut_off_waits() {
-    let mut cache = Cache::open_in_memory().unwrap();
-    ten_and_one(&mut cache);
-    let run = Run::new("");
-    let start = Instant::now();
-    let clock = Rc::new(Cell::new(start));
-    let deadline = start + Duration::from_secs(60);
-    let mut fake = Fake {
-        slow: Some((clock.clone(), Duration::from_secs(90))),
-        ..Fake::default()
-    };
-    // The writer drops it at the deadline: it gets no answer.
-    fake.answers.insert("m2".into(), Answer::CutOff);
+/// A pass over `run`'s four accounts with a deadline 60 seconds after `start`, on `clock`.
+fn timed_pass(
+    run: &Run,
+    cache: &mut Cache,
+    fake: &mut Fake,
+    clock: &Rc<Cell<Instant>>,
+) -> Vec<AccountOutcome> {
     let accounts: Vec<&Account> = run.config.accounts.iter().collect();
     let read = || clock.get();
     let pass = Pass {
@@ -698,23 +762,74 @@ fn the_deadline_ends_the_pass_between_writes_and_what_is_cut_off_waits() {
         ids: None,
         cap: PER_RUN,
         stop: &run.stop,
-        deadline: Some(deadline),
+        deadline: Some(clock.get() + Duration::from_secs(60)),
         clock: &read,
         now: now(),
     };
-    let outcomes = write_labels(&mut cache, &accounts, &pass, &mut fake);
-    assert_eq!(fake.writes.len(), 1, "no write starts after the deadline");
+    write_labels(cache, &accounts, &pass, fake)
+}
+
+#[test]
+fn a_slow_account_gets_its_share_of_the_deadline_and_the_next_one_still_gets_its_turn() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    ten_and_one(&mut cache);
+    let run = Run::new("");
+    let start = Instant::now();
+    let clock = Rc::new(Cell::new(start));
+    let mut fake = Fake {
+        slow: Some((clock.clone(), Duration::from_secs(90))),
+        ..Fake::default()
+    };
+    // The writer drops it at the deadline: it gets no answer.
+    fake.answers.insert("m2".into(), Answer::CutOff);
+    let outcomes = timed_pass(&run, &mut cache, &mut fake, &clock);
+    let secs = |n| Some(start + Duration::from_secs(n));
+    // Four accounts: the first gets a quarter of the 60 seconds, the next a third of what is
+    // left, and so on.
     assert_eq!(
         fake.deadlines,
-        [Some(deadline)],
+        [secs(15), secs(30)],
         "the writer cuts off at it"
     );
-    assert_eq!(fake.logins, 1, "no sign-in after the deadline either");
+    assert_eq!(
+        fake.sign_in_deadlines,
+        [secs(15), secs(30)],
+        "the sign-in counts against it too"
+    );
     assert_eq!(
         counts(&outcomes),
-        [("outlook".into(), 3, 0, 7), ("second".into(), 0, 0, 1)]
+        [("outlook".into(), 3, 0, 7), ("second".into(), 1, 0, 0)]
     );
     assert!(outcomes.iter().all(|o| o.off.is_none()));
+    assert!(!failed(&outcomes));
+}
+
+#[test]
+fn a_sign_in_cut_off_at_the_deadline_leaves_everything_waiting_and_is_no_failure() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    ten_and_one(&mut cache);
+    imap(&mut cache, "work", 2, "b", 2, Some((Choice::Main, 0.9)));
+    let run = Run::new("");
+    let clock = Rc::new(Cell::new(Instant::now()));
+    let mut fake = Fake {
+        sign_in_cut_off: true,
+        ..Fake::default()
+    };
+    let outcomes = timed_pass(&run, &mut cache, &mut fake, &clock);
+    assert_eq!(
+        counts(&outcomes),
+        [
+            ("outlook".into(), 0, 0, 10),
+            ("second".into(), 0, 0, 1),
+            ("work".into(), 0, 0, 1)
+        ]
+    );
+    assert!(fake.writes.is_empty() && fake.batches.is_empty());
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.off.is_none() && off_line(o).is_none())
+    );
     assert!(!failed(&outcomes));
 }
 
@@ -776,10 +891,18 @@ fn a_daemon_wake_writes_up_to_its_cap_within_its_budget() {
     let budget = Duration::from_secs(60);
     let before = Instant::now();
     let pass = Pass::wake(&run.config.classify, &run.stop, budget, now());
-    let after = Instant::now();
     let mut fake = Fake::default();
     let mut reports = Reports::default();
-    let lines = daemon_wake(&mut cache, &accounts, &pass, &mut fake, &mut reports);
+    let mut sign_in = crate::daemon::Reports::default();
+    let lines = daemon_wake(
+        &mut cache,
+        &accounts,
+        &pass,
+        &mut fake,
+        &mut reports,
+        &mut sign_in,
+    );
+    let after = Instant::now();
     assert_eq!(
         lines,
         [Line::Report(
@@ -790,13 +913,13 @@ fn a_daemon_wake_writes_up_to_its_cap_within_its_budget() {
     assert!(
         fake.deadlines
             .iter()
-            .all(|d| d.is_some_and(|d| d >= before + budget && d <= after + budget)),
-        "every write is cut off at the budget"
+            .all(|d| d.is_some_and(|d| d >= before + budget / 4 && d <= after + budget / 4)),
+        "every write is cut off at the first of four accounts' share of the budget"
     );
 }
 
 #[test]
-fn the_daemon_prints_a_sign_in_warning_once_per_account_state() {
+fn the_daemon_prints_a_sign_in_warning_once_whether_the_sync_or_the_writes_signed_in() {
     let mut cache = Cache::open_in_memory().unwrap();
     let run = Run::new("");
     let accounts: Vec<&Account> = run.config.accounts.iter().collect();
@@ -805,7 +928,15 @@ fn the_daemon_prints_a_sign_in_warning_once_per_account_state() {
         ..Fake::default()
     };
     let mut reports = Reports::default();
+    let mut sign_in = crate::daemon::Reports::default();
     let warning = "neomail: outlook: the new refresh token could not be saved";
+    // The sync signed in first and printed it, as `neomail daemon` shares its reports.
+    assert_eq!(
+        sign_in.warning("second", "the new refresh token could not be saved"),
+        Some(Line::Error(
+            "neomail: second: the new refresh token could not be saved".into()
+        ))
+    );
     let mut wake = |cache: &mut Cache, fake: &mut Fake| {
         let pass = Pass::wake(
             &run.config.classify,
@@ -813,7 +944,7 @@ fn the_daemon_prints_a_sign_in_warning_once_per_account_state() {
             Duration::from_secs(60),
             now(),
         );
-        daemon_wake(cache, &accounts, &pass, fake, &mut reports)
+        daemon_wake(cache, &accounts, &pass, fake, &mut reports, &mut sign_in)
     };
     outlook(&mut cache, "outlook", "a", 1, Some(Choice::Main));
     assert_eq!(
@@ -828,6 +959,12 @@ fn the_daemon_prints_a_sign_in_warning_once_per_account_state() {
         wake(&mut cache, &mut fake),
         [Line::Report("outlook: 1 category written".into())]
     );
+    outlook(&mut cache, "second", "c", 1, Some(Choice::Main));
+    assert_eq!(
+        wake(&mut cache, &mut fake),
+        [Line::Report("second: 1 category written".into())],
+        "printed by the sync already"
+    );
 }
 
 #[test]
@@ -841,7 +978,7 @@ fn the_daemon_says_the_same_counts_once_and_a_locked_wake_changes_nothing() {
         ..AccountOutcome::default()
     };
     let mut reports = Reports::default();
-    let failing = "outlook: 0 categories written, 1 failed (tried again next wake)";
+    let failing = "outlook: 0 categories written, 1 failed (tried again later)";
     assert_eq!(
         reports.lines(&[outcome(None, 0, 1)]),
         [Line::Report(failing.into())]
@@ -850,6 +987,20 @@ fn the_daemon_says_the_same_counts_once_and_a_locked_wake_changes_nothing() {
         reports.lines(&[outcome(None, 0, 1)]),
         [],
         "the same failure again"
+    );
+    let held_back = AccountOutcome {
+        held: 1,
+        ..outcome(None, 0, 0)
+    };
+    assert_eq!(
+        reports.lines(&[held_back]),
+        [],
+        "a wake while the failed message waits"
+    );
+    assert_eq!(
+        reports.lines(&[outcome(None, 0, 1)]),
+        [],
+        "the same failure at its retry"
     );
     let untried = AccountOutcome {
         waiting: 5,
@@ -863,7 +1014,7 @@ fn the_daemon_says_the_same_counts_once_and_a_locked_wake_changes_nothing() {
     assert_eq!(
         reports.lines(&[outcome(None, 1, 1)]),
         [Line::Report(
-            "outlook: 1 category written, 1 failed (tried again next wake)".into()
+            "outlook: 1 category written, 1 failed (tried again later)".into()
         )],
         "a write is news"
     );
@@ -1115,18 +1266,16 @@ fn an_unconfirmed_move_is_tried_again_and_a_message_gone_from_inbox_is_never_mov
     let outcomes = run.pass(&mut cache, &mut fake, PER_RUN, now());
     assert_eq!(moves(&outcomes), [("work".into(), 1, 0, 1, 0)]);
     assert!(failed(&outcomes));
-    // b's label is written and its move is due again. c's label is asked for until the next
-    // sync drops it, as for any message gone from INBOX, but its move never is.
+    // b's label is written and its move waits, then is tried again. c, gone from INBOX, is
+    // never asked about again until the next sync drops it.
     let mut next = Fake::default();
     let outcomes = run.pass(&mut cache, &mut next, PER_RUN, now());
-    assert_eq!(
-        next.batches,
-        [vec![
-            seen(3, Some("nm-spam"), None, false),
-            seen(2, None, Some("nm-spam"), true)
-        ]]
-    );
-    assert_eq!(moves(&outcomes), [("work".into(), 1, 1, 0, 0)]);
+    assert_eq!(held(&outcomes), [("work".into(), 1)], "b alone: c is gone");
+    assert!(next.batches.is_empty());
+    let later = now() + TimeDelta::minutes(15);
+    let outcomes = run.pass(&mut cache, &mut next, PER_RUN, later);
+    assert_eq!(next.batches, [vec![seen(2, None, Some("nm-spam"), true)]]);
+    assert_eq!(moves(&outcomes), [("work".into(), 0, 1, 0, 0)]);
 }
 
 #[test]
@@ -1151,9 +1300,13 @@ fn outlook_spam_moves_to_junkemail_after_its_category_and_only_once() {
     );
     assert_eq!(fake.moves, [vec!["a".to_owned(), "c".to_owned()]]);
     assert_eq!(moves(&outcomes), [("outlook".into(), 3, 0, 1, 0)]);
-    // Its category is written: the move alone is tried again.
+    // Its category is written: the move alone is tried again, after a wait.
     let mut next = Fake::default();
     let outcomes = run.pass(&mut cache, &mut next, PER_RUN, now());
+    assert_eq!(held(&outcomes), [("outlook".into(), 1)]);
+    assert!(next.moves.is_empty());
+    let later = now() + TimeDelta::minutes(15);
+    let outcomes = run.pass(&mut cache, &mut next, PER_RUN, later);
     assert!(edits(&next).is_empty());
     assert_eq!(next.moves, [vec!["a".to_owned()]]);
     assert_eq!(moves(&outcomes), [("outlook".into(), 0, 1, 0, 0)]);
@@ -1163,7 +1316,7 @@ fn outlook_spam_moves_to_junkemail_after_its_category_and_only_once() {
     );
     assert_eq!(listed(&cache), ["b", "c"]);
     let mut last = Fake::default();
-    assert!(run.pass(&mut cache, &mut last, PER_RUN, now()).is_empty());
+    assert!(run.pass(&mut cache, &mut last, PER_RUN, later).is_empty());
 }
 
 #[test]

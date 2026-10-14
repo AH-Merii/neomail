@@ -423,3 +423,106 @@ fn the_help_names_the_switch_both_key_sources_the_cap_per_sync_and_the_server_wr
         assert!(flat.contains(part), "{part}: {help}");
     }
 }
+
+/// A port of 127.0.0.1 that nothing listens on.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// Caches one message in `account`'s INBOX, classified as spam at 0.95: due a move to Junk.
+fn confident_spam(cache: &mut Cache, account: &str) {
+    let inbox = cache
+        .reset_mailbox(account, "INBOX", UidValidity::new(1).unwrap())
+        .unwrap();
+    let raw = format!(
+        "Message-ID: <{account}@acme.example>\r\nFrom: win@prize.example\r\n\
+         To: you@example.com\r\nSubject: You won\r\n\r\nClaim it.\r\n"
+    );
+    let message = FetchedMessage {
+        uid: Uid::new(1).unwrap(),
+        flags: Flags::new(Vec::<String>::new()),
+        received: Some(chrono::Utc::now()),
+        raw: raw.into_bytes(),
+    };
+    cache.insert_messages(inbox.id, &[message]).unwrap();
+    let pending = cache.pending(Some(account), true).unwrap();
+    let key = pending[0].msg_key.clone().unwrap();
+    let spam = nm_core::Classification {
+        choice: nm_core::Choice::Spam,
+        confidence: 0.95,
+        probabilities: vec![(nm_core::Choice::Spam, 0.95)],
+        model: "jev-1.13.0".into(),
+        request_version: 1,
+        input_tokens: None,
+        classified_at: chrono::Utc::now(),
+    };
+    cache.store_classification(account, &key, &spam).unwrap();
+}
+
+/// The daemon's step for groups on the server, as `neomail daemon` runs it: after the wake's
+/// syncs it writes what is due, skipping an account whose lock someone else holds rather than
+/// waiting for it, so the accounts after it still get their turn.
+#[test]
+fn a_wake_writes_what_is_due_and_skips_an_account_whose_lock_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    let account = |name: &str| {
+        format!(
+            "[[accounts]]\nname = \"{name}\"\nusername = \"you@example.com\"\n\
+             password_command = \"echo not-a-secret\"\n\
+             imap = {{ host = \"127.0.0.1\", port = {} }}\n",
+            closed_port()
+        )
+    };
+    std::fs::write(
+        data.join("config.toml"),
+        format!(
+            "{}{}\n[classify]\nurl = \"http://127.0.0.1:{}\"\ndaemon = true\n",
+            account("held"),
+            account("work"),
+            closed_port()
+        ),
+    )
+    .unwrap();
+    std::fs::write(data.join("classify-consent"), "127.0.0.1\n").unwrap();
+    let mut cache = Cache::open(&data.join("cache.sqlite3")).unwrap();
+    confident_spam(&mut cache, "held");
+    confident_spam(&mut cache, "work");
+    drop(cache);
+    // "held" is held for the whole run, as a `neomail mark` would hold it.
+    std::fs::create_dir(data.join("locks")).unwrap();
+    let lock = std::fs::File::create(data.join("locks/held.lock")).unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+    let mut c = command(data, &["daemon", "--interval", "30s", "--no-notify"]);
+    c.env("JEV_API_KEY", "made-up-key");
+    let (mut daemon, lines) = spawn(c);
+    let start = next_line(&mut daemon, &lines);
+    assert!(
+        start.contains("classifying new mail with 127.0.0.1"),
+        "{start}"
+    );
+    // The sync of "work" fails at its closed port; "held" is skipped quietly. Then the writes:
+    // "held" is skipped again, and "work" tries to move its spam, which fails at the same port.
+    let mut seen = Vec::new();
+    let moved = loop {
+        let line = next_line(&mut daemon, &lines);
+        let report = line.split_once(' ').map_or("", |(_, r)| r).to_owned();
+        if report.starts_with("neomail: work: spam not moved to Junk: ") {
+            break report;
+        }
+        seen.push(line);
+    };
+    assert!(
+        seen.iter().all(|l| !l.contains("held")),
+        "nothing about the held account: {seen:?}"
+    );
+    assert!(
+        !moved.contains("You won") && !moved.contains("prize.example"),
+        "{moved}"
+    );
+    terminate(&daemon);
+    daemon.wait().unwrap();
+    drop(lock);
+}

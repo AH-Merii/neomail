@@ -4,7 +4,9 @@
 //! (DEC-2026-10-13-categories), or a Gmail or Proton label (DEC-2026-10-14-labels-junk). Spam at
 //! or above `classify.junk_at` then moves to the account's Junk folder, at most once. What is
 //! still to do comes from the cache ([`Cache::labels_due`]), so the backlog, failed writes and
-//! groups that change with age or a new threshold need no queue.
+//! groups that change with age or a new threshold need no queue. A write or move that fails for
+//! one message, and a message its server no longer has, are held back ([`Cache::label_tried`];
+//! DEC-2026-10-14-label-retries), so neither costs a request on every pass.
 //!
 //! [`write_labels`] owns the cap, the lock and the per-account error rules, so the CLI and the
 //! daemon share them; [`LabelWriter`] is the seam to the servers ([`ServerWriter`]; a fake in
@@ -20,8 +22,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use nm_core::{
-    Cache, Destination, DueFor, Folder, LabelDue, LabelPrefix, MessageId, MessageKey, Moved,
-    RemoteId, Uid, UidValidity,
+    Cache, Destination, DueFor, Folder, LabelDue, LabelPrefix, LabelsDue, MessageId, MessageKey,
+    Moved, RemoteId, Tried, Uid, UidValidity,
 };
 use nm_graph::{CONCURRENT_FETCHES, CategoryEdit, CategoryResult, GraphError};
 use nm_imap::labels::{LabelEdit, LabelKind, LabelsWritten, NoJunk, Takes};
@@ -31,7 +33,7 @@ use crate::config::{Account, ClassifySettings, Config, Server};
 use crate::graph;
 use crate::lock;
 use crate::style::Colors;
-use crate::sync::{Credential, Logins};
+use crate::sync::{Credential, Logins, SignInCutOff};
 
 /// The most messages one `neomail classify` run writes per account: its message cap.
 pub const PER_RUN: usize = super::DEFAULT_LIMIT as usize;
@@ -46,8 +48,9 @@ pub(crate) trait LabelWriter {
     /// The account's lock, as every write takes it; `None` when someone else holds it and the
     /// account is skipped this time.
     fn lock(&mut self, account: &str) -> Result<Option<Self::Lock>>;
-    /// Whether a Graph account's sign-in lets neomail change mail (Mail.ReadWrite). Signs in.
-    fn may_write(&mut self, account: &Account) -> Result<bool>;
+    /// Whether a Graph account's sign-in lets neomail change mail (Mail.ReadWrite). Signs in;
+    /// `None` when the sign-in was cut off at `deadline`.
+    fn may_write(&mut self, account: &Account, deadline: Option<Instant>) -> Result<Option<bool>>;
     /// Sets the categories of `edits` on a Graph account, at most [`CONCURRENT_FETCHES`] of
     /// them. At `deadline` the writes still in flight are dropped, and their messages get no
     /// answer.
@@ -66,8 +69,9 @@ pub(crate) trait LabelWriter {
         ids: &[RemoteId],
         deadline: Option<Instant>,
     ) -> Result<Option<Moved<RemoteId>>>;
-    /// What an IMAP account's server takes: labels, the Junk move. Signs in.
-    fn probe(&mut self, account: &Account) -> Result<Takes>;
+    /// What an IMAP account's server takes: labels, the Junk move. Signs in; `None` when cut
+    /// off at `deadline`.
+    fn probe(&mut self, account: &Account, deadline: Option<Instant>) -> Result<Option<Takes>>;
     /// Writes one batch on an IMAP account ([`nm_imap::labels::write_labels`]). `None` when
     /// cut off at `deadline`.
     fn write_imap(
@@ -107,10 +111,13 @@ pub(crate) struct AccountOutcome {
     pub written: usize,
     /// Messages moved to Junk.
     pub junked: usize,
-    /// Messages whose write or move failed: still due, so tried again next time.
+    /// Messages whose write or move failed: still due, and tried again after a wait
+    /// ([`nm_core::label_retry_wait`]).
     pub failed: usize,
     /// Messages left for next time: past the cap, or not reached.
     pub waiting: usize,
+    /// Messages held back after a failed write or move, until their wait is over: not tried.
+    pub held: usize,
     pub off: Option<Off>,
     /// What the account cannot do, said as a warning: no Junk move, earlier labels that stay.
     pub notes: Vec<String>,
@@ -118,8 +125,10 @@ pub(crate) struct AccountOutcome {
 
 /// What a pass writes: the settings' prefix and rules, at most `cap` per account, only the
 /// messages `ids` when given. `stop` ends the pass once the writes in flight are done; at
-/// `deadline`, as `clock` tells it, no write starts and the ones in flight are dropped, so the
-/// daemon's next round starts on time.
+/// `deadline`, as `clock` tells it, no write or sign-in starts and the ones in flight are
+/// dropped, so the daemon's next round starts on time. Each account gets an equal share of what
+/// is left of it when its turn comes ([`write_labels`]).
+#[derive(Clone, Copy)]
 pub(crate) struct Pass<'a> {
     pub settings: &'a ClassifySettings,
     pub ids: Option<&'a [MessageId]>,
@@ -180,13 +189,9 @@ impl<'a> Pass<'a> {
         }
     }
 
-    /// The due messages of `account` asked for by `for_`: at most the cap, and how many more.
-    fn due(
-        &self,
-        cache: &Cache,
-        account: &Account,
-        for_: DueFor,
-    ) -> Result<(Vec<LabelDue>, usize)> {
+    /// The due messages of `account` asked for by `for_`: at most the cap, how many more, and
+    /// how many are held back after a failure.
+    fn due(&self, cache: &Cache, account: &Account, for_: DueFor) -> Result<LabelsDue> {
         let settings = self.settings;
         Ok(cache.labels_due(
             Some(&account.name),
@@ -217,6 +222,10 @@ fn ends_pass(e: &GraphError) -> bool {
 /// Proton, Junk moves on all of them. With `labels = false` and `junk = false` it writes nothing.
 /// An account with nothing due is not signed in to. One account's failure never stops the
 /// others, and nothing here fails the caller: classifying, syncing and notifying go on.
+///
+/// With a deadline, each account in turn gets an equal share of the time left until it, so a
+/// slow or throttled account cannot use up the time of the accounts after it; an account that
+/// needs less leaves the rest to them.
 pub(crate) fn write_labels<W: LabelWriter>(
     cache: &mut Cache,
     accounts: &[&Account],
@@ -228,7 +237,8 @@ pub(crate) fn write_labels<W: LabelWriter>(
         return Vec::new();
     }
     let mut outcomes = Vec::new();
-    for account in accounts {
+    for (turn, account) in accounts.iter().enumerate() {
+        let pass = &share(pass, accounts.len() - turn);
         let imap = match &account.server {
             Server::Imap(imap) => Some(imap),
             Server::Graph { .. } => None,
@@ -250,15 +260,34 @@ pub(crate) fn write_labels<W: LabelWriter>(
         } else {
             write_graph_account(cache, account, pass, wanted, writer, &mut outcome)
         };
-        if let Err(e) = result {
-            outcome.off = Some(Off::Failed(e));
+        match result {
+            // A sign-in cut off at the deadline: all of it waits, as for a write cut off.
+            Err(e) if cut_off(&e) => {}
+            Err(e) => outcome.off = Some(Off::Failed(e)),
+            Ok(()) => {}
         }
-        let counts = outcome.written + outcome.junked + outcome.failed + outcome.waiting;
+        let counts =
+            outcome.written + outcome.junked + outcome.failed + outcome.waiting + outcome.held;
         if counts > 0 || outcome.off.is_some() || !outcome.notes.is_empty() {
             outcomes.push(outcome);
         }
     }
     outcomes
+}
+
+/// `pass` for one of `left` accounts still to write: its deadline an equal share of the time left.
+fn share<'a>(pass: &Pass<'a>, left: usize) -> Pass<'a> {
+    let deadline = pass.deadline.map(|at| {
+        let now = (pass.clock)();
+        let left = u32::try_from(left.max(1)).unwrap_or(u32::MAX);
+        now + at.saturating_duration_since(now) / left
+    });
+    Pass { deadline, ..*pass }
+}
+
+/// Whether `e` is a sign-in cut off at the deadline: nothing failed, and all of it waits.
+fn cut_off(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<SignInCutOff>().is_some()
 }
 
 /// Graph's id for a due message: only Graph messages carry one.
@@ -280,7 +309,8 @@ fn write_graph_account<W: LabelWriter>(
     outcome: &mut AccountOutcome,
 ) -> Result<()> {
     let settings = pass.settings;
-    let (due, more) = pass.due(cache, account, wanted)?;
+    let LabelsDue { due, more, held } = pass.due(cache, account, wanted)?;
+    outcome.held = held;
     if due.is_empty() {
         return Ok(());
     }
@@ -293,9 +323,14 @@ fn write_graph_account<W: LabelWriter>(
         outcome.off = Some(Off::Locked);
         return Ok(());
     };
-    if !writer.may_write(account)? {
-        outcome.off = Some(Off::ReadOnly);
-        return Ok(());
+    match writer.may_write(account, pass.deadline)? {
+        // Cut off at the deadline: all of it waits.
+        None => return Ok(()),
+        Some(false) => {
+            outcome.off = Some(Off::ReadOnly);
+            return Ok(());
+        }
+        Some(true) => {}
     }
     for chunk in due.chunks(CONCURRENT_FETCHES) {
         if pass.over() {
@@ -331,8 +366,11 @@ fn write_graph_account<W: LabelWriter>(
                         }
                         ready.push(d);
                     }
-                    // The next sync drops it from the cache.
-                    CategoryResult::Gone => done += 1,
+                    // Not asked about again until the next sync drops it from the cache.
+                    CategoryResult::Gone => {
+                        cache.label_tried(d.id, &d.want, Tried::Gone, pass.now)?;
+                        done += 1;
+                    }
                     // A refusal says more than throttling: it needs a new sign-in.
                     CategoryResult::Failed(e) if ends_pass(&e) => {
                         let refusal = matches!(e, GraphError::Unauthorized | GraphError::Forbidden);
@@ -341,13 +379,17 @@ fn write_graph_account<W: LabelWriter>(
                         }
                     }
                     CategoryResult::Failed(_) => {
+                        cache.label_tried(d.id, &d.want, Tried::Failed, pass.now)?;
                         done += 1;
                         outcome.failed += 1;
                     }
                 }
             }
         }
-        done += ready.iter().filter(|d| !d.junk).count();
+        for d in ready.iter().filter(|d| !d.junk) {
+            cache.label_tried(d.id, &d.want, Tried::Done, pass.now)?;
+            done += 1;
+        }
         let junk: Vec<&LabelDue> = ready.into_iter().filter(|d| d.junk).collect();
         if ended.is_none() && !junk.is_empty() && !pass.over() {
             done += move_graph_junk(cache, account, pass, writer, outcome, &junk)?;
@@ -393,7 +435,9 @@ fn move_graph_junk<W: LabelWriter>(
         } else if moved.gone.contains(id) {
             // It left the INBOX already: never moved now.
             cache.junk_moved(&account.name, &d.msg_key, pass.now)?;
+            cache.label_tried(d.id, &d.want, Tried::Done, pass.now)?;
         } else {
+            cache.label_tried(d.id, &d.want, Tried::Failed, pass.now)?;
             outcome.failed += 1;
         }
     }
@@ -412,7 +456,8 @@ fn write_imap_account<W: LabelWriter>(
     writer: &mut W,
     outcome: &mut AccountOutcome,
 ) -> Result<()> {
-    let (due, more) = pass.due(cache, account, wanted)?;
+    let LabelsDue { due, more, held } = pass.due(cache, account, wanted)?;
+    outcome.held = held;
     if due.is_empty() {
         return Ok(());
     }
@@ -424,7 +469,10 @@ fn write_imap_account<W: LabelWriter>(
         outcome.off = Some(Off::Locked);
         return Ok(());
     };
-    let takes = writer.probe(account)?;
+    let Some(takes) = writer.probe(account, pass.deadline)? else {
+        // Cut off at the deadline: all of it waits.
+        return Ok(());
+    };
     let can = DueFor {
         labels: wanted.labels && takes.labels != LabelKind::None,
         junk: wanted.junk && takes.no_junk.is_none(),
@@ -436,14 +484,15 @@ fn write_imap_account<W: LabelWriter>(
         outcome.notes.push(no_junk_note(&account.name, why));
     }
     // Again for what the server takes, so what it cannot do never fills the cap.
-    let (due, more) = if can == wanted {
-        (due, more)
+    let LabelsDue { due, more, held } = if can == wanted {
+        LabelsDue { due, more, held }
     } else if can.labels || can.junk {
         pass.due(cache, account, can)?
     } else {
-        (Vec::new(), 0)
+        LabelsDue::default()
     };
     outcome.waiting = due.len() + more;
+    outcome.held = held;
     let mut kept = 0;
     for chunk in due.chunks(IMAP_BATCH) {
         if pass.over() {
@@ -499,6 +548,8 @@ fn write_imap_account<W: LabelWriter>(
                     // It left the INBOX already: never moved now.
                     cache.junk_moved(&account.name, &d.msg_key, pass.now)?;
                 }
+                // Not asked about again until the next sync drops it from the cache.
+                cache.label_tried(d.id, &d.want, Tried::Gone, pass.now)?;
                 continue;
             }
             let mut missed = d.label && labelled.is_none();
@@ -516,6 +567,8 @@ fn write_imap_account<W: LabelWriter>(
                 }
             }
             outcome.failed += usize::from(missed);
+            let tried = if missed { Tried::Failed } else { Tried::Done };
+            cache.label_tried(d.id, &d.want, tried, pass.now)?;
         }
         // A confirmed move takes the message out of the cache, as archiving does.
         cache.remove(&moved)?;
@@ -568,7 +621,8 @@ pub(crate) fn cli_pass(
     }
     let runtime = crate::account::runtime()?;
     let data_dir = crate::config::data_dir()?;
-    let mut writer = ServerWriter::waiting(&runtime, &data_dir);
+    let (mut logins, mut probed) = (Logins::default(), Probed::default());
+    let mut writer = ServerWriter::waiting(&runtime, &data_dir, &mut logins, &mut probed);
     let stop = AtomicBool::new(false);
     let ids = (!ids.is_empty()).then_some(ids);
     let pass = Pass::run(settings, ids, &stop, Utc::now());
@@ -605,30 +659,38 @@ fn kind(o: &AccountOutcome) -> (&'static str, &'static str) {
 
 /// The line that counts an account's writes and moves, `None` when none was answered: nothing
 /// was tried (a held lock, a stop, a spent budget), or every message carried its group already.
-/// `next` is when the rest is tried: "run" or "wake".
+/// Messages held back after a failure are counted too, and alone they make a line when nothing
+/// else was due, so a run right after a failure does not read as fixed. `next` is when the rest
+/// is tried: "run" or "wake".
 pub(crate) fn summary(o: &AccountOutcome, next: &str) -> Option<String> {
-    if o.written + o.failed + o.junked == 0 {
+    let answered = o.written + o.failed + o.junked > 0;
+    if !answered && (o.held == 0 || o.waiting > 0) {
         return None;
     }
     let (one, many) = kind(o);
     let mut parts = Vec::new();
     // A pass that only moved spam says so alone.
-    if o.written > 0 || (o.junked == 0 && o.labels) {
+    if answered && (o.written > 0 || (o.junked == 0 && o.labels)) {
         let noun = if o.written == 1 { one } else { many };
         parts.push(format!("{} {noun} written", o.written));
     }
-    if o.junked > 0 || !o.labels {
+    if answered && (o.junked > 0 || !o.labels) {
         parts.push(format!("{} moved to Junk", o.junked));
     }
-    let mut line = format!("{}: {}", o.account, parts.join(", "));
     if o.failed > 0 {
-        line.push_str(&format!(", {} failed (tried again next {next})", o.failed));
+        parts.push(format!("{} failed (tried again later)", o.failed));
+    }
+    if o.held > 0 {
+        parts.push(format!(
+            "{} held back after a failure (tried again later)",
+            o.held
+        ));
     }
     if o.waiting > 0 {
         let verb = if o.waiting == 1 { "waits" } else { "wait" };
-        line.push_str(&format!(", {} {verb} for the next {next}", o.waiting));
+        parts.push(format!("{} {verb} for the next {next}", o.waiting));
     }
-    Some(line)
+    Some(format!("{}: {}", o.account, parts.join(", ")))
 }
 
 /// Why the account wrote nothing more, `None` for a lock someone else holds (the next time
@@ -656,17 +718,18 @@ pub(crate) fn failed(outcomes: &[AccountOutcome]) -> bool {
 }
 
 /// The daemon's lines about groups on the server, each said once per state as the sync's are:
-/// the counts when the wake wrote or moved some or the failed and waiting counts changed; why an
-/// account is off, or what it cannot do, when that differs from what was last said, and again
-/// only after the account wrote without it; the sign-in's warnings when they differ from the
-/// account's last one. A wake that tried nothing (a held lock, a stop, a spent budget) changes
-/// none of that.
+/// the counts when the wake wrote or moved some or the failed and waiting counts changed (a
+/// message held back after a failure counts as failed, so its retries that fail again are not
+/// news); why an account is off, or what it cannot do, when that differs from what was last
+/// said, and again only after the account wrote without it. A wake that tried nothing (a held
+/// lock, a stop, a spent budget) changes none of that. The sign-in's warnings go through the sync's reports
+/// ([`daemon_wake`]), as the sign-in is the sync's.
 #[derive(Default)]
 pub(crate) struct Reports {
     last_off: HashMap<String, String>,
-    /// The (failed, waiting) counts last printed, for the accounts that still have some due.
+    /// The (failed or held back, waiting) counts last printed, for the accounts that still have
+    /// some due or held back.
     last_counts: HashMap<String, (usize, usize)>,
-    last_warning: HashMap<String, String>,
     last_notes: HashMap<String, Vec<String>>,
 }
 
@@ -674,7 +737,8 @@ impl Reports {
     pub(crate) fn lines(&mut self, outcomes: &[AccountOutcome]) -> Vec<crate::daemon::Line> {
         use crate::daemon::Line;
         let mut lines = Vec::new();
-        // An account with nothing due has everything written: its counts start afresh.
+        // An account with nothing due and nothing held back has everything written: its counts
+        // start afresh.
         self.last_counts
             .retain(|account, _| outcomes.iter().any(|o| &o.account == account));
         for o in outcomes {
@@ -691,7 +755,7 @@ impl Reports {
                 lines.push(Line::Error(format!("neomail: {off}")));
                 self.last_off.insert(o.account.clone(), off.clone());
             }
-            let counts = (o.failed, o.waiting);
+            let counts = (o.failed + o.held, o.waiting);
             let news =
                 o.written + o.junked > 0 || self.last_counts.get(&o.account) != Some(&counts);
             if let Some(line) = summary(o, "wake").filter(|_| news) {
@@ -704,95 +768,108 @@ impl Reports {
         }
         lines
     }
-
-    /// A warning from an account's sign-in, unless it repeats the account's last one.
-    pub(crate) fn warning(&mut self, account: &str, warning: &str) -> Option<crate::daemon::Line> {
-        if self.last_warning.get(account).is_some_and(|w| w == warning) {
-            return None;
-        }
-        self.last_warning
-            .insert(account.to_owned(), warning.to_owned());
-        Some(crate::daemon::Line::Error(format!(
-            "neomail: {account}: {warning}"
-        )))
-    }
 }
 
 /// A daemon wake's step for groups on the server, after it classified: writes and moves what is
 /// due within `budget` and returns the lines to print. Each wake that synced runs it, as what is
-/// due changes with age.
+/// due changes with age. The sign-in's warnings go through `sign_in`, the sync's reports, so a
+/// warning the sync printed is not printed again.
 pub(crate) fn daemon_wake<W: LabelWriter>(
     cache: &mut Cache,
     accounts: &[&Account],
     pass: &Pass<'_>,
     writer: &mut W,
     reports: &mut Reports,
+    sign_in: &mut crate::daemon::Reports,
 ) -> Vec<crate::daemon::Line> {
     let outcomes = write_labels(cache, accounts, pass, writer);
     let mut lines: Vec<_> = writer
         .warnings()
         .into_iter()
-        .filter_map(|(account, warning)| reports.warning(&account, &warning))
+        .filter_map(|(account, warning)| sign_in.warning(&account, &warning))
         .collect();
     lines.extend(reports.lines(&outcomes));
     lines
 }
 
-/// The real writer: Graph and IMAP through the logins `neomail sync` uses, under the account
-/// locks. `wait` waits for a held lock (`neomail classify`); otherwise the account is skipped
-/// (the daemon, which must not stall its round). The sign-in's warnings are kept for the caller
-/// to print, so the daemon prints them with its time and once per state. What an IMAP server
-/// takes is kept from the last session with it, so the daemon asks once.
+/// What each IMAP server takes, from the last session with it: kept by the daemon across wakes,
+/// so it asks once, and dropped for an account whose session failed.
+#[derive(Default)]
+pub(crate) struct Probed(HashMap<String, Takes>);
+
+/// The real writer: Graph and IMAP through `logins`, under the account locks. `wait` waits for
+/// a held lock (`neomail classify`); otherwise the account is skipped (the daemon, which must not
+/// stall its round). The daemon passes the sync's logins, so an account's token is refreshed
+/// once for both; the sign-in's warnings are kept for the caller to print, so the daemon prints
+/// them with its time and once per state.
 pub(crate) struct ServerWriter<'a> {
     runtime: &'a Runtime,
     data_dir: &'a Path,
-    logins: Logins,
+    logins: &'a mut Logins,
+    probed: &'a mut Probed,
     wait: bool,
     warnings: Vec<(String, String)>,
-    takes: HashMap<String, Takes>,
 }
 
 impl<'a> ServerWriter<'a> {
     /// `neomail classify`'s: waits for an account's lock.
-    pub(crate) fn waiting(runtime: &'a Runtime, data_dir: &'a Path) -> Self {
-        Self::new(runtime, data_dir, true)
+    pub(crate) fn waiting(
+        runtime: &'a Runtime,
+        data_dir: &'a Path,
+        logins: &'a mut Logins,
+        probed: &'a mut Probed,
+    ) -> Self {
+        Self::new(runtime, data_dir, logins, probed, true)
     }
 
-    /// The daemon's: skips an account whose lock is held, so its round never stalls. Its own
-    /// logins: a token is refreshed only while something is due.
-    pub(crate) fn skipping(runtime: &'a Runtime, data_dir: &'a Path) -> Self {
-        Self::new(runtime, data_dir, false)
+    /// The daemon's: skips an account whose lock is held, so its round never stalls.
+    pub(crate) fn skipping(
+        runtime: &'a Runtime,
+        data_dir: &'a Path,
+        logins: &'a mut Logins,
+        probed: &'a mut Probed,
+    ) -> Self {
+        Self::new(runtime, data_dir, logins, probed, false)
     }
 
-    fn new(runtime: &'a Runtime, data_dir: &'a Path, wait: bool) -> Self {
+    fn new(
+        runtime: &'a Runtime,
+        data_dir: &'a Path,
+        logins: &'a mut Logins,
+        probed: &'a mut Probed,
+        wait: bool,
+    ) -> Self {
         Self {
             runtime,
             data_dir,
-            logins: Logins::default(),
+            logins,
+            probed,
             wait,
             warnings: Vec::new(),
-            takes: HashMap::new(),
         }
     }
 
     /// Keeps the login's warnings; after a failure the token may be what failed, so the next
-    /// write signs in afresh and asks the server again what it takes.
+    /// write signs in afresh and asks the server again what it takes. A sign-in cut off at the
+    /// deadline is not a failure.
     fn finish(&mut self, account: &Account, warnings: Vec<String>, failed: bool) {
         for warning in warnings {
             self.warnings.push((account.name.clone(), warning));
         }
         if failed {
             self.logins.forget(&account.name);
-            self.takes.remove(&account.name);
+            self.probed.0.remove(&account.name);
         }
     }
 
-    /// Runs `write` with the IMAP account's server and login.
+    /// Runs `write` with the IMAP account's server and login; `None` when the sign-in or the
+    /// session was cut off at `deadline`.
     fn imap<T>(
         &mut self,
         account: &Account,
-        write: impl FnOnce(&Runtime, &nm_imap::ImapConfig, nm_imap::Login<'_>) -> Result<T>,
-    ) -> Result<T> {
+        deadline: Option<Instant>,
+        write: impl FnOnce(&Runtime, &nm_imap::ImapConfig, nm_imap::Login<'_>) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
         let Server::Imap(imap) = &account.server else {
             anyhow::bail!("{} reads Microsoft Graph, not IMAP", account.name);
         };
@@ -800,10 +877,44 @@ impl<'a> ServerWriter<'a> {
         let mut warnings = Vec::new();
         let result = self
             .logins
-            .credential(runtime, account, &mut warnings)
+            .credential_until(runtime, account, &mut warnings, deadline)
             .and_then(|credential| write(runtime, imap, credential.imap()));
+        let result = match result {
+            Err(e) if cut_off(&e) => Ok(None),
+            result => result,
+        };
         self.finish(account, warnings, result.is_err());
         result
+    }
+
+    /// Runs `write` with the Graph account's access token; `None` when the sign-in was cut off
+    /// at `deadline`. `failed` says from its result whether the token may be what failed.
+    fn graph<T>(
+        &mut self,
+        account: &Account,
+        deadline: Option<Instant>,
+        write: impl FnOnce(&Runtime, &crate::sync::AccessToken) -> Result<T>,
+        failed: impl FnOnce(&Result<T>) -> bool,
+    ) -> Result<Option<T>> {
+        let runtime = self.runtime;
+        let mut warnings = Vec::new();
+        let result = match self
+            .logins
+            .credential_until(runtime, account, &mut warnings, deadline)
+        {
+            Ok(Credential::AccessToken(token)) => write(runtime, token),
+            Ok(Credential::Password(_)) => Err(not_oauth()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = &result
+            && cut_off(e)
+        {
+            self.finish(account, warnings, false);
+            return Ok(None);
+        }
+        let failed = failed(&result);
+        self.finish(account, warnings, failed);
+        result.map(Some)
     }
 }
 
@@ -829,15 +940,13 @@ impl LabelWriter for ServerWriter<'_> {
         }
     }
 
-    fn may_write(&mut self, account: &Account) -> Result<bool> {
-        let mut warnings = Vec::new();
-        let result = match self.logins.credential(self.runtime, account, &mut warnings) {
-            Ok(Credential::AccessToken(token)) => Ok(graph::may_write_categories(token)),
-            Ok(Credential::Password(_)) => Err(not_oauth()),
-            Err(e) => Err(e),
-        };
-        self.finish(account, warnings, result.is_err());
-        result
+    fn may_write(&mut self, account: &Account, deadline: Option<Instant>) -> Result<Option<bool>> {
+        self.graph(
+            account,
+            deadline,
+            |_, token| Ok(graph::may_write_categories(token)),
+            Result::is_err,
+        )
     }
 
     fn write(
@@ -847,25 +956,26 @@ impl LabelWriter for ServerWriter<'_> {
         edits: &[CategoryEdit],
         deadline: Option<Instant>,
     ) -> Result<Vec<(RemoteId, CategoryResult)>> {
-        let runtime = self.runtime;
-        let mut warnings = Vec::new();
-        let result = match self.logins.credential(runtime, account, &mut warnings) {
-            Ok(Credential::AccessToken(token)) => runtime.block_on(async {
-                // A write cut off is tried again next time: it reads the categories afresh.
-                until(deadline, graph::set_categories(token, prefix, edits))
-                    .await
-                    .unwrap_or_else(|| Ok(Vec::new()))
-            }),
-            Ok(Credential::Password(_)) => Err(not_oauth()),
-            Err(e) => Err(e),
-        };
-        let refused = result.as_ref().map_or(true, |results| {
-            results
-                .iter()
-                .any(|(_, r)| matches!(r, CategoryResult::Failed(GraphError::Unauthorized)))
-        });
-        self.finish(account, warnings, refused);
-        result
+        let written = self.graph(
+            account,
+            deadline,
+            |runtime, token| {
+                runtime.block_on(async {
+                    // A write cut off is tried again next time: it reads the categories afresh.
+                    until(deadline, graph::set_categories(token, prefix, edits))
+                        .await
+                        .unwrap_or_else(|| Ok(Vec::new()))
+                })
+            },
+            |result| {
+                result.as_ref().map_or(true, |results| {
+                    results
+                        .iter()
+                        .any(|(_, r)| matches!(r, CategoryResult::Failed(GraphError::Unauthorized)))
+                })
+            },
+        )?;
+        Ok(written.unwrap_or_default())
     }
 
     fn move_junk(
@@ -874,30 +984,33 @@ impl LabelWriter for ServerWriter<'_> {
         ids: &[RemoteId],
         deadline: Option<Instant>,
     ) -> Result<Option<Moved<RemoteId>>> {
-        let runtime = self.runtime;
-        let mut warnings = Vec::new();
         let to = Destination::Role(Folder::Junk);
-        let result = match self.logins.credential(runtime, account, &mut warnings) {
-            Ok(Credential::AccessToken(token)) => runtime.block_on(async {
-                until(deadline, graph::move_to(&account.name, token, ids, &to))
-                    .await
-                    .transpose()
-            }),
-            Ok(Credential::Password(_)) => Err(not_oauth()),
-            Err(e) => Err(e),
-        };
-        self.finish(account, warnings, result.is_err());
-        result
+        let moved = self.graph(
+            account,
+            deadline,
+            |runtime, token| {
+                runtime.block_on(async {
+                    until(deadline, graph::move_to(&account.name, token, ids, &to))
+                        .await
+                        .transpose()
+                })
+            },
+            Result::is_err,
+        )?;
+        Ok(moved.flatten())
     }
 
-    fn probe(&mut self, account: &Account) -> Result<Takes> {
-        if let Some(takes) = self.takes.get(&account.name) {
-            return Ok(*takes);
+    fn probe(&mut self, account: &Account, deadline: Option<Instant>) -> Result<Option<Takes>> {
+        if let Some(takes) = self.probed.0.get(&account.name) {
+            return Ok(Some(*takes));
         }
-        let takes = self.imap(account, |runtime, imap, login| {
-            Ok(runtime.block_on(nm_imap::labels::probe(imap, login))?)
+        let takes = self.imap(account, deadline, |runtime, imap, login| {
+            let probe = nm_imap::labels::probe(imap, login);
+            Ok(runtime.block_on(until(deadline, probe)).transpose()?)
         })?;
-        self.takes.insert(account.name.clone(), takes);
+        if let Some(takes) = takes {
+            self.probed.0.insert(account.name.clone(), takes);
+        }
         Ok(takes)
     }
 
@@ -909,14 +1022,14 @@ impl LabelWriter for ServerWriter<'_> {
         edits: &[LabelEdit<'_>],
         deadline: Option<Instant>,
     ) -> Result<Option<LabelsWritten>> {
-        let written = self.imap(account, |runtime, imap, login| {
+        let written = self.imap(account, deadline, |runtime, imap, login| {
             runtime.block_on(async {
                 let write = nm_imap::labels::write_labels(imap, login, uid_validity, prefix, edits);
                 Ok(until(deadline, write).await.transpose()?)
             })
         })?;
         if let Some(takes) = written.as_ref().and_then(|w| w.takes) {
-            self.takes.insert(account.name.clone(), takes);
+            self.probed.0.insert(account.name.clone(), takes);
         }
         Ok(written)
     }

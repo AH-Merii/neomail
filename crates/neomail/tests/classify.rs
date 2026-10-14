@@ -1210,3 +1210,56 @@ fn categories_are_not_written_when_turned_off_out_of_scope_or_estimating() {
     assert!(o.status.success(), "{}", stderr(&o));
     assert_eq!(category_lines(&o), Vec::<String>::new());
 }
+
+#[test]
+fn an_estimate_writes_and_moves_nothing_when_groups_are_due_from_an_earlier_run() {
+    let jev = FakeJev::start();
+    let dir = tempfile::tempdir().unwrap();
+    // The account's server: a port on 127.0.0.1 that counts connections and closes each.
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().unwrap().port();
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&connections);
+    std::thread::spawn(move || {
+        for stream in server.incoming() {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "[[accounts]]\nname = \"work\"\nusername = \"you@example.com\"\n\
+             password_command = \"echo not-a-secret\"\n\
+             imap = {{ host = \"127.0.0.1\", port = {port} }}\n\n[classify]\nurl = \"{}\"\n",
+            jev.url()
+        ),
+    )
+    .unwrap();
+    cache_mail(
+        dir.path(),
+        1,
+        &[mail(
+            1,
+            1,
+            "win@prize.example",
+            "spam Win a prize",
+            "Claim it.",
+        )],
+    );
+    let o = neomail(dir.path(), &["classify", "--yes"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("neomail: work: spam not moved to Junk: "),
+        "{}",
+        stderr(&o)
+    );
+    let tried = connections.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(tried > 0, "the first run tried to move it");
+
+    // Still due; an estimate neither connects nor says anything about it.
+    let o = neomail(dir.path(), &["classify", "--estimate"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("Junk"), "{}", stderr(&o));
+    assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), tried);
+}

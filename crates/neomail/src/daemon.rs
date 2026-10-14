@@ -785,7 +785,7 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
         data_dir: data_dir.clone(),
     };
     let mut classifier = Classifier::new(&config.classify, &mut access);
-    let mut label_writer = labels::ServerWriter::skipping(&runtime, &data_dir);
+    let mut label_probed = labels::Probed::default();
     let mut label_reports = labels::Reports::default();
     let count = config.accounts.len();
     eprintln!(
@@ -807,7 +807,9 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
     let mut wakes = Wakes::new(events);
     let mut config = config;
     let mut config_error = None;
-    let mut reports = Reports::default();
+    // Shared by the syncs, the notifications and the writes of groups, which print the sign-in's
+    // warnings through it: each is printed once, whoever signed in.
+    let reports = RefCell::new(Reports::default());
     let mut printer = Printer {
         out: io::stdout(),
         err: io::stderr(),
@@ -838,7 +840,7 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
                     |name| lock::try_account(&data_dir, name),
                     &stop,
                     &mut push,
-                    &mut reports,
+                    &mut reports.borrow_mut(),
                     &mut printer,
                     |account| syncer.sync(account, &mut cache),
                 )?;
@@ -861,7 +863,7 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
                             &stop,
                             |ids| Ok(cache.newest_of(ids, notify::SHOWN)?),
                             |n| notifier.send(&runtime, n),
-                            &mut reports,
+                            &mut reports.borrow_mut(),
                             printer,
                         )
                     };
@@ -889,12 +891,21 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
                             let accounts: Vec<&Account> = config.accounts.iter().collect();
                             let settings = &config.classify;
                             let pass = labels::Pass::wake(settings, &halt, wake.budget, wake.now);
+                            // The sync's logins: one token refresh for both, and an account
+                            // whose lock is held is skipped, never waited for.
+                            let mut writer = labels::ServerWriter::skipping(
+                                &runtime,
+                                &data_dir,
+                                syncer.logins(),
+                                &mut label_probed,
+                            );
                             labels::daemon_wake(
                                 cache,
                                 &accounts,
                                 &pass,
-                                &mut label_writer,
+                                &mut writer,
                                 &mut label_reports,
+                                &mut reports.borrow_mut(),
                             )
                         },
                     )
