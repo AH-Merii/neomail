@@ -67,12 +67,20 @@ impl<'a> Syncer<'a> {
         let mut stored = SyncReport::default();
         let mut watch = None;
         match self.sync_inner(account, cache, &mut stored, &mut warnings, &mut watch) {
-            Ok(()) => Synced {
-                report: Ok(stored),
-                partial: SyncReport::default(),
-                warnings,
-                watch,
-            },
+            Ok(()) => {
+                // The new mail is indexed now, so `neomail search` finds it without waiting.
+                if let Err(e) = index_for_search(cache) {
+                    warnings.push(format!(
+                        "indexing for search failed ({e}); `neomail search` will index it"
+                    ));
+                }
+                Synced {
+                    report: Ok(stored),
+                    partial: SyncReport::default(),
+                    warnings,
+                    watch,
+                }
+            }
             Err(e) => {
                 self.logins.forget(&account.name);
                 Synced {
@@ -128,6 +136,12 @@ impl<'a> Syncer<'a> {
             }
         }
     }
+}
+
+/// Indexes every cached message that is not yet indexed for search.
+fn index_for_search(cache: &mut Cache) -> Result<(), nm_core::CacheError> {
+    while cache.index_pending(crate::search::INDEX_BATCH)? > 0 {}
+    Ok(())
 }
 
 /// The secret an account logs in with: a password, or an OAuth access token, which reaches IMAP

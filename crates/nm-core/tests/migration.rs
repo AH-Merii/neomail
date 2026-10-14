@@ -416,11 +416,73 @@ fn a_v4_cache_gains_msg_key_and_the_classification_table_without_parsing_its_row
     assert!(cache.pending(None, false).unwrap().is_empty());
     drop(cache);
 
-    assert_eq!(user_version(&Connection::open(&path).unwrap()), 7);
-    assert_eq!(SCHEMA_VERSION, 7);
+    assert_eq!(
+        user_version(&Connection::open(&path).unwrap()),
+        SCHEMA_VERSION
+    );
     let cache = Cache::open(&path).unwrap();
     assert_eq!(
         cache.classification("work", "one@mail.example").unwrap(),
         Some(result)
     );
+}
+
+/// Schema 7's tables, from schema 8's: everything search added, gone. Pinned here as schema 7
+/// stood for caches on disk.
+const UNDO_SEARCH: &str = "
+    DROP TRIGGER message_fts_delete;
+    DROP TABLE message_fts;
+    DROP INDEX message_thread;
+    ALTER TABLE message DROP COLUMN thread;
+    ALTER TABLE message DROP COLUMN indexed;
+    PRAGMA user_version = 7;
+";
+
+#[test]
+fn a_v7_cache_is_searchable_once_its_rows_are_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.sqlite3");
+    {
+        let mut cache = Cache::open(&path).unwrap();
+        let inbox = cache
+            .reset_mailbox("work", "INBOX", UidValidity::new(7).unwrap())
+            .unwrap();
+        let mut old = msg(1);
+        old.raw = b"Subject: Quarterly invoice\r\n\r\nPlease pay.\r\n".to_vec();
+        cache.insert_messages(inbox.id, &[old, msg(2)]).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(UNDO_SEARCH)
+        .unwrap();
+
+    let mut cache = Cache::open(&path).unwrap();
+    assert_eq!(
+        user_version(&Connection::open(&path).unwrap()),
+        SCHEMA_VERSION
+    );
+    let query = nm_core::Query::parse("invoice").unwrap();
+    let find = |cache: &Cache| {
+        cache
+            .search(
+                &query,
+                &nm_core::Scope::everything(),
+                10,
+                &GroupRules::default(),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|g| g.entry.subject)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        cache.unindexed_count().unwrap(),
+        2,
+        "the migration parses no row"
+    );
+    assert!(find(&cache).is_empty());
+    assert_eq!(cache.index_pending(500).unwrap(), 2);
+    assert_eq!(find(&cache), [Some("Quarterly invoice".to_owned())]);
+    assert_eq!(cache.index_pending(500).unwrap(), 0);
 }

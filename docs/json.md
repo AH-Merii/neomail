@@ -55,6 +55,37 @@ when jev chose spam; `other` when jev's confidence is below `classify.other_belo
 for a `follow-up` received more than `classify.follow_up_old_days` ago; else jev's choice.
 `--group G` lists only that group, and `--group unclassified` only the messages with `null`.
 
+## `neomail search QUERY... --json`
+
+The same objects as `neomail list --json`, for the cached messages that match, newest first, at
+most `--limit` (50 by default, or `all`). `--jsonl` prints them one per line. Empty (`[]`, exit 0)
+when nothing matches or nothing is cached; in the human and plain formats standard error then
+says `neomail: no cached messages match`.
+
+It searches the local cache only: each account's INBOX as synced so far, never the server. The
+query's words are joined with spaces and read as:
+
+| Form | Matches |
+| ---- | ------- |
+| `word` | a word starting with `word` in the subject, the sender (name and address), the To and Cc recipients or the body text (an HTML body as its text; attachments are not searched) |
+| `"some words"` | those whole words, next to each other in that order |
+| `subject:word`, `from:word`, `to:word` | `word` (or a quoted phrase after the colon) in the subject, the sender, or To and Cc only; the name is matched in any case |
+
+Every word and phrase must match. Case, Latin accents, Arabic short vowels and other marks, the
+tatweel, and hamza on alef are ignored; `ي` and `ى`, and `ة` and `ه`, are not. Any other
+`name:word` is ordinary text, and a word with no letter or digit (`-`, `*`) is left out. An address
+is split into words, so `ada@mail` matches `ada@mail.example`.
+
+`--account NAME`, `--group GROUP` (or `unclassified`) and `--thread ID` narrow the search as
+`list`'s flags do; they combine. `--thread ID` is message ID's thread in ID's account: the
+messages that share its first References id (the thread's first message), else its first
+In-Reply-To id, else its own Message-ID. With `--thread`, the query may be empty, which lists
+the whole thread.
+
+Exit 2 when there is neither a query nor `--thread`, when every word was left out, or when
+`subject:`, `from:` or `to:` has no word after it. Exit 1 for an account with no cached mail or a
+`--thread` id that is not cached.
+
 ## `neomail account list --json`
 
 An array, in config order. Empty when there are no accounts. Secrets and password commands are
@@ -93,6 +124,7 @@ makes sure they carry none.
 | Command | Fields |
 | ------- | ------ |
 | `list` | id, unread (`*` or empty), date (RFC 3339 UTC as in `--json`, empty when unknown), account, from (`Name <address>`, the address, or empty), subject |
+| `search` | the same as `list` |
 | `account list` | name, login, username, host, port, security, `pinned` or empty |
 | `folder list` | name (exactly what `move` takes), account, role or empty |
 
@@ -514,6 +546,9 @@ not a terminal, or `--no-input`): nothing is opened.
 | 0 | `daemon` stopped by SIGINT or SIGTERM. A failing account does not stop it. |
 | 1 | Failure: no config, a bad config (`config check` too), an unknown account or id, a network, login or cache error. `sync` exits 1 if any account failed, after syncing the others. `show` exits 1 if any id was missing or unreadable, after showing the others; `redact` the same, after printing the others. `mark` exits 1 if any id was unknown, gone from the server, not confirmed or of an account that failed, after marking the others. `archive` and `delete` exit 1 the same way, after moving the others; an account without an archive or trash folder is an account that failed. `move` exits 1 the same way; an account without the folder named is an account that failed. `folder list` exits 1 if any account failed, after listing the others. A second `daemon` for the same data directory exits 1. `classify` exits 1 when any message failed or an id was unknown, when the run stopped (a refused key, a status it cannot retry, the backend out of reach; the results received are kept), without a key, or when consent was refused at the prompt; it exits 0 when everything asked was classified or there was nothing to do. `key status` exits 1 when there is no key; `key set` exits 1 when the key read is empty or blank, and stores nothing. `send`, `reply` and `forward` exit 1 when the server did not confirm the message. Nothing was sent when the server refused a recipient (then nobody gets the message), the message or the login; the account has no SMTP server or cannot send Bcc (Outlook); an Outlook sign-in lacks `Mail.Send`; a reply would go to an address neomail cannot send to yet (one that is not ASCII); or the question was answered no or standard input closed at it. But when the connection was lost or timed out after the whole message went out, or Microsoft Graph failed with a 5xx or its connection was lost, the message may have been sent: the error says so (`may have been sent`), so check Sent before sending it again ([RFC 1047](https://www.rfc-editor.org/rfc/rfc1047)). A failed copy in Sent is not a failure, nor is standard output that cannot be written once the server has accepted the message: a warning on standard error names its Message-ID and says it was sent. |
 | 2 | Bad usage: an unknown option or an invalid value; output flags that conflict (`--plain`, `--json`, `--jsonl`, `--raw`); `--raw` with more than one id; a line of `show -`'s, `redact -`'s, `classify -`'s, `mark -`'s, `archive -`'s, `delete -`'s or `move -`'s input without an id; `-` mixed with ids (`show`, `redact`, `classify`, `mark`, `archive`, `delete`, `move`); `move` without a folder or without ids; a value that would be asked for when nothing can be asked (standard input is not a terminal, or `--no-input`); an option that does not apply to the provider; bare `neomail`, which prints the start lines or help; `daemon` without a config file or accounts (the start lines) or with an invalid config; `classify` that would send to a backend it has no consent for, without a terminal or with `--no-input`, and without `--yes`; `list --group` with an unknown group; `classify` ids with `--account`, `--days`, `--limit` or `--all`; `key set --no-input` with nothing on standard input; `key` with a `--backend` that is not a usable URL; `send`, `reply` or `forward` without `--yes` when nothing can be asked (nothing is sent), without a required flag (`--to`, `--subject`, `--body`), with an address that is not one, with a `--from` that names no account, or without `--from` when there are several accounts and nothing to choose by. |
+| 0 | `search` with no match, printing `[]` with `--json`. |
+| 1 | `search --account NAME` with no cached mail for NAME, or `search --thread ID` with an id that is not cached. |
+| 2 | `search` without a query or `--thread`, with no letter or digit in its query, or with `subject:`, `from:` or `to:` and no word after it. |
 
 Errors go to standard error, in these forms:
 

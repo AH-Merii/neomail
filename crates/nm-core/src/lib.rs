@@ -14,6 +14,7 @@ pub mod group;
 pub mod id_source;
 pub mod label;
 pub mod parse;
+pub mod search;
 pub mod source;
 pub mod sync;
 pub mod types;
@@ -27,6 +28,7 @@ pub use folder::{FolderName, ListedFolder, Role};
 pub use group::{Choice, Group, GroupRules};
 pub use id_source::{IdSource, sync_inbox_by_id, sync_inbox_by_id_with_progress};
 pub use label::LabelPrefix;
+pub use search::{Query, QueryError, Scope};
 pub use source::MailSource;
 pub use sync::{Progress, SyncError, SyncReport, sync_inbox, sync_inbox_with_progress};
 pub use types::{

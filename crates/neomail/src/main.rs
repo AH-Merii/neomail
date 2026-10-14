@@ -23,6 +23,7 @@ mod output;
 mod pager;
 mod push;
 mod redact;
+mod search;
 mod secret;
 mod send;
 mod setup;
@@ -111,6 +112,23 @@ Groups: main, follow-up, follow-up-old, recruitment, receipts-invoices, orders-s
 newsletters, promotions, notifications, spam, other. A follow-up older than
 classify.follow_up_old_days (90) lists as follow-up-old, and an answer below
 classify.other_below (0.4) confidence as other.";
+
+const SEARCH_EXAMPLES: &str = "\
+Examples:
+  neomail search invoice            Cached mail with a word starting with invoice, newest first
+  neomail search from:ada '\"pay now\"'
+                                    Mail from Ada with the words pay now, in that order
+  neomail search report --account work --group follow-up
+                                    Search one account's follow-up mail
+  neomail search --thread 42        List message 42's thread
+  neomail search invoice --plain | cut -f1 | neomail show -
+                                    Read every match
+
+It searches the local cache only: the INBOX mail synced so far, offline, with the ids `show`
+takes. Each word matches the start of a word in the subject, the sender, the To and Cc
+recipients or the body (attachments are not searched); every word must match. Case, accents and
+Arabic short vowels are ignored. subject:, from: and to: (followed by a word or a quoted
+phrase) look in that part only. The output is `neomail list`'s. Exit 0 when nothing matches.";
 
 const CLASSIFY_EXAMPLES: &str = "\
 Examples:
@@ -416,6 +434,9 @@ Guide: https://github.com/AH-Merii/neomail/blob/main/docs/daemon.md"
         #[command(flatten)]
         format: ListingFormat,
     },
+    /// Search cached mail, across every account or within one, a group or a thread
+    #[command(after_help = SEARCH_EXAMPLES)]
+    Search(search::Args),
     /// Show cached messages by the ids from `neomail list`, through a pager on a terminal
     Show {
         /// Message ids, the first column of `neomail list`, or - to read them from standard input, one per line
@@ -1037,6 +1058,7 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
             )?;
             ExitCode::SUCCESS
         }
+        Command::Search(args) => search::run(&args, cli.config, terminal, colors, &mut out)?,
         Command::Show {
             ids,
             format,

@@ -200,6 +200,10 @@ the new entry.
 - **Very fast:**
   - Results start streaming within a frame of typing, even at 100k+ messages per account.
   - Matching is incremental and multi-threaded, and never blocks the UI. Study how Helix's nucleo matcher achieves this.
+- **Search from the CLI** is `neomail search`: the local cache through a full-text index, across
+  every account or within one, a group or a thread, printed as `neomail list` prints; the picker's
+  mail-search source will wrap the same query and scope
+  ([DEC-2026-10-14-search](#dec-2026-10-14-search), proposed).
 
 ## Images and attachments
 
@@ -1224,3 +1228,36 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Builds on:** "Attachments" and "The CLI and agents get the same commands" in
   [Images and attachments](#images-and-attachments), and
   [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).
+
+### <a id="dec-2026-10-14-search"></a>DEC-2026-10-14-search: searching cached mail from the CLI
+
+- **Status:** proposed by Claude on 2026-10-14, after the owner asked to continue the CLI slices
+  ("continue working on the slices now"). Roadmap slice 13 follows it.
+- **Proposal:**
+  - `neomail search [QUERY]... [--account NAME] [--group GROUP] [--thread ID] [--limit N|all]`
+    searches the local cache only: each account's INBOX as synced so far. No server search
+    (IMAP SEARCH, Gmail's X-GM-RAW, Graph's `$search`) in this slice: every result then has an id
+    `show` and the actions take, it works offline, and it is the same for all three providers.
+    The output, the formats and `--limit` are `neomail list`'s; nothing matching is exit 0, as an
+    empty `list` is.
+  - Each word matches as a prefix in the subject, the sender, the To and Cc recipients or the body
+    text, and every word must match; `"quoted words"` are a phrase, and `subject:`, `from:` and
+    `to:` look in one field. Other `name:` words are text. Results are newest first, as `list`
+    orders them, not by relevance: mail is read by date, and the TUI's picker will rank with its
+    own matcher.
+  - The index is a contentless SQLite FTS5 table in the cache (schema 8), filled as mail syncs and,
+    for mail cached before, by the first search. Case and Latin accents are folded by FTS5's
+    tokenizer; Arabic marks, the tatweel and hamza on alef are folded by neomail, with the same set
+    as redaction's name folding, so `علي` and `على` stay apart.
+  - The scopes are the decision's: an account, a group, a thread (in its message's account, keyed
+    on the thread's first References id, skipping the `@protonmail.internalid` id Proton Bridge
+    adds to every message, whose first message would otherwise never join its replies). They are
+    a `Scope` separate from the `Query`, so the
+    picker can switch scope without retyping. This slice builds only the mail-search source
+    (`Query`, `Scope`, `Cache::search`); the source registry waits for the picker (slice 24), as a
+    registry with one source and no picker would be a guess
+    ([DEC-2026-10-11-build-first](#dec-2026-10-11-build-first)).
+- **Left for later:** server search for mail that is not cached, folders beyond the INBOX, date
+  and unread filters, and attachment names.
+- **Builds on:** [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux) and
+  [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
