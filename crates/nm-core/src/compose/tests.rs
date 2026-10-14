@@ -203,7 +203,8 @@ fn bcc_is_in_the_envelope_only_and_each_recipient_once() {
     assert_eq!(out.bcc, ["hidden@example.net"]);
     let text = String::from_utf8_lossy(&out.mime).to_ascii_lowercase();
     assert!(!text.contains("hidden"), "{text}");
-    assert!(!text.contains("bcc"), "{text}");
+    // A header line, not a substring: the random MIME boundary can hold "bcc".
+    assert!(!text.lines().any(|l| l.starts_with("bcc:")), "{text}");
 }
 
 #[test]
