@@ -33,6 +33,9 @@ pub enum Action {
 pub enum Folder {
     Archive,
     Trash,
+    /// Where confident spam goes (DEC-2026-10-14-labels-junk). No user command moves here: only
+    /// the label pass does.
+    Junk,
 }
 
 impl fmt::Display for Folder {
@@ -40,6 +43,7 @@ impl fmt::Display for Folder {
         f.write_str(match self {
             Self::Archive => "archive",
             Self::Trash => "trash",
+            Self::Junk => "junk",
         })
     }
 }

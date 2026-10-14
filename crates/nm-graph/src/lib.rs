@@ -533,11 +533,13 @@ impl<T: Transport> GraphSource<T> {
 
 /// Graph's well-known name for the folder with role `to`
 /// (<https://learn.microsoft.com/en-us/graph/api/resources/mailfolder>): `archive` is the folder
-/// Outlook's one-click Archive moves to, and `deleteditems` the one a deleted message goes to.
+/// Outlook's one-click Archive moves to, `deleteditems` the one a deleted message goes to, and
+/// `junkemail` the junk email folder.
 pub fn well_known(to: nm_core::Folder) -> &'static str {
     match to {
         nm_core::Folder::Archive => "archive",
         nm_core::Folder::Trash => "deleteditems",
+        nm_core::Folder::Junk => "junkemail",
     }
 }
 

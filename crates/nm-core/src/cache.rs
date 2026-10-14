@@ -16,7 +16,7 @@ use crate::types::{
 
 /// The schema this build writes. A cache with a newer version is refused, not guessed at; an
 /// older one is migrated by [`Cache::open`].
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// The `mailbox` and `message` tables of schema 5, named `mailbox{suffix}` and `message{suffix}`: the migration from 1
 /// creates them under temporary names first. `message` refers to `mailbox` by its final name.
@@ -89,19 +89,41 @@ CREATE TABLE classification (
 );
 ";
 
-/// The name neomail last wrote on a message on its server (schema 6): an Outlook category now.
-/// Keyed by the server's id, not by `msg_key`: two copies of one mail (the same Message-ID in two
-/// folders) are two items, and each is written on its own. Graph's ids are immutable ids, which a
-/// rebuild of the mailbox lists again, so the row outlives it as the result does. What is still
-/// to write is worked out from it ([`Cache::labels_due`]): no queue.
+/// The name neomail last wrote on a message on its server (schema 6): an Outlook category, a
+/// Gmail label or a Proton label. On Outlook it is keyed by the server's id, not by `msg_key`:
+/// two copies of one mail (the same Message-ID in two folders) are two items, and each is written
+/// on its own. Graph's ids are immutable ids, which a rebuild of the mailbox lists again, so the
+/// row outlives it as the result does. Over IMAP a UID changes with a rebuild or a move, so the
+/// column holds the `msg_key` instead (an account is one or the other, never both). What is
+/// still to write is worked out from it ([`Cache::labels_due`]): no queue.
 const LABEL: &str = "
 CREATE TABLE label (
     account    TEXT    NOT NULL,
     remote_id  TEXT    NOT NULL CHECK (remote_id <> ''),
+    -- Graph's id, or over IMAP the message's msg_key (despite the column's name).
     -- The whole name as written, prefix included (label::LabelPrefix::name).
     name       TEXT    NOT NULL CHECK (name <> ''),
     written_at INTEGER NOT NULL,
     PRIMARY KEY (account, remote_id)
+);
+";
+
+/// Moves of confident spam to Junk (schema 7; DEC-2026-10-14-labels-junk). A row is written
+/// before the move is sent, so a message is moved at most once even when neomail stops between
+/// the server's answer and the record: `moved_at` stays NULL until the server confirms, and a
+/// row whose move was never confirmed counts as made once the message it was made for
+/// (`message_id`, never reused) has left the cache. Keyed by `msg_key`, so the record outlives
+/// the message's row: the user moving it back to the INBOX brings it back as a new row, which is
+/// never moved again. Apart from the label table, because a failed or skipped move must stay due
+/// after its label is written.
+const JUNK: &str = "
+CREATE TABLE junk (
+    account     TEXT    NOT NULL,
+    msg_key     TEXT    NOT NULL CHECK (msg_key <> ''),
+    message_id  INTEGER NOT NULL,
+    recorded_at INTEGER NOT NULL,
+    moved_at    INTEGER,
+    PRIMARY KEY (account, msg_key)
 );
 ";
 
@@ -146,6 +168,10 @@ fn migrate_v4() -> String {
 /// Schema 5 to 6: the [`LABEL`] table. Every existing row stays; no message has a label yet, so
 /// every classified Outlook message is due once.
 const MIGRATE_V5: &str = LABEL;
+
+/// Schema 6 to 7: the [`JUNK`] table. Every existing row stays; no message has moved yet, so
+/// every confident spam message is due a move once, 10c's included.
+const MIGRATE_V6: &str = JUNK;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
@@ -269,17 +295,43 @@ pub struct Classification {
     pub classified_at: DateTime<Utc>,
 }
 
-/// A classified message of a by-id mailbox whose name on the server is not the one its effective
-/// group wants: [`Cache::labels_due`].
+/// What a pass asks [`Cache::labels_due`] for: labels (or categories) whose name is not the
+/// wanted one, Junk moves of confident spam, or both. An account whose server takes no labels or
+/// has no Junk folder asks only for the other, so what it cannot do never fills its cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DueFor {
+    pub labels: bool,
+    pub junk: bool,
+}
+
+/// A classified message with something to write on its server: [`Cache::labels_due`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelDue {
     pub id: MessageId,
     pub account: String,
-    pub remote_id: RemoteId,
+    pub key: MessageKey,
+    /// What its result is stored under ([`parse::msg_key`]): over IMAP, also what its label row
+    /// is stored under, and the Message-ID a Proton label's removal searches for.
+    pub msg_key: String,
     /// The effective group's name with the prefix: what the message should carry.
     pub want: String,
     /// What neomail wrote last, `None` before the first write.
     pub last: Option<String>,
+    /// Whether `want` is still to write.
+    pub label: bool,
+    /// Whether the message is due its move to Junk.
+    pub junk: bool,
+}
+
+impl LabelDue {
+    /// What the message's label row is stored under ([`Cache::store_label`]): Graph's id, or the
+    /// `msg_key` over IMAP, whose UIDs change with a move or a rebuild.
+    pub fn item(&self) -> &str {
+        match &self.key {
+            MessageKey::Remote(id) => id.as_str(),
+            MessageKey::Uid { .. } => &self.msg_key,
+        }
+    }
 }
 
 /// Where a cached message lives, for an action to reach it on its server: [`Cache::locate`].
@@ -325,6 +377,7 @@ impl Cache {
                 tx.execute_batch(&tables(""))?;
                 tx.execute_batch(CLASSIFICATION)?;
                 tx.execute_batch(LABEL)?;
+                tx.execute_batch(JUNK)?;
                 tx.execute_batch(INDEX)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
@@ -344,6 +397,9 @@ impl Cache {
         }
         if schema_version(&conn)? == 5 {
             migrate_step(&mut conn, 5, MIGRATE_V5)?;
+        }
+        if schema_version(&conn)? == 6 {
+            migrate_step(&mut conn, 6, MIGRATE_V6)?;
         }
         conn.pragma_update(None, "foreign_keys", true)?;
         match schema_version(&conn)? {
@@ -1107,27 +1163,38 @@ impl Cache {
         Ok(())
     }
 
-    /// The classified messages of by-id mailboxes (Outlook) whose wanted name, `prefix` and the
-    /// effective group worked out now ([`GroupRules::effective`]), differs from the one stored by
-    /// [`Self::store_label`], newest first: at most `limit`, and how many more are due. From one
-    /// account or all of them, and only the messages `ids` when given. IMAP rows are never due:
-    /// their labels are slice 10d's.
+    /// The classified messages with something to write on their server, newest first: at most
+    /// `limit`, and how many more are due. From one account or all of them, and only the
+    /// messages `ids` when given.
+    ///
+    /// A label is due (`for_.labels`) when the wanted name, `prefix` and the effective group
+    /// worked out now ([`GroupRules::effective`]), differs from the one stored by
+    /// [`Self::store_label`]. A Junk move is due (`for_.junk`) apart from that, for spam
+    /// [`GroupRules::junk`] moves: when no move is recorded for its `msg_key`, or one was
+    /// recorded for this very row and never confirmed ([`Self::junk_attempt`]). So a move that
+    /// failed after its label was written is still due, and a message the user brought back is
+    /// not.
+    #[allow(clippy::too_many_arguments)] // The pass's scope, rules and cap, each used once.
     pub fn labels_due(
         &self,
         account: Option<&str>,
         ids: Option<&[MessageId]>,
         rules: &GroupRules,
         prefix: &LabelPrefix,
+        for_: DueFor,
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<(Vec<LabelDue>, usize)> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, b.account, m.remote_id, COALESCE(m.received, m.date),
-                    c.choice, c.confidence, l.name
+            "SELECT m.id, b.account, m.remote_id, m.uid, b.uid_validity,
+                    COALESCE(m.received, m.date), m.msg_key, c.choice, c.confidence, l.name,
+                    j.msg_key IS NOT NULL, j.moved_at IS NULL AND j.message_id = m.id
              FROM message m JOIN mailbox b ON b.id = m.mailbox_id
              JOIN classification c ON c.account = b.account AND c.msg_key = m.msg_key
-             LEFT JOIN label l ON l.account = b.account AND l.remote_id = m.remote_id
-             WHERE m.remote_id IS NOT NULL AND (?1 IS NULL OR b.account = ?1)
+             LEFT JOIN label l ON l.account = b.account
+                 AND l.remote_id = COALESCE(m.remote_id, m.msg_key)
+             LEFT JOIN junk j ON j.account = b.account AND j.msg_key = m.msg_key
+             WHERE ?1 IS NULL OR b.account = ?1
              ORDER BY COALESCE(m.received, m.date, 0) DESC, m.id DESC",
         )?;
         let mut rows = stmt.query(params![account])?;
@@ -1137,47 +1204,111 @@ impl Cache {
             if ids.is_some_and(|ids| !ids.contains(&id)) {
                 continue;
             }
-            let received: Option<i64> = r.get(3)?;
-            let choice: String = r.get(4)?;
+            let received: Option<i64> = r.get(5)?;
+            let choice =
+                Choice::from_name(&r.get::<_, String>(7)?).ok_or(CacheError::Corrupt("choice"))?;
+            let confidence: f64 = r.get(8)?;
             let group = rules.effective(
-                Choice::from_name(&choice).ok_or(CacheError::Corrupt("choice"))?,
-                r.get(5)?,
+                choice,
+                confidence,
                 received.and_then(|t| DateTime::from_timestamp(t, 0)),
                 now,
             );
             let want = prefix.name(group);
-            let last: Option<String> = r.get(6)?;
-            if last.as_deref() == Some(want.as_str()) {
+            let last: Option<String> = r.get(9)?;
+            let label = for_.labels && last.as_deref() != Some(want.as_str());
+            let (recorded, unconfirmed_here): (bool, Option<bool>) = (r.get(10)?, r.get(11)?);
+            let junk = for_.junk
+                && rules.junk(choice, confidence)
+                && (!recorded || unconfirmed_here == Some(true));
+            if !label && !junk {
                 continue;
             }
             if due.len() == limit {
                 more += 1;
                 continue;
             }
+            let key = match (r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?) {
+                (Some(remote), _) => MessageKey::Remote(
+                    RemoteId::new(remote).ok_or(CacheError::Corrupt("remote_id"))?,
+                ),
+                (None, Some(uid)) => MessageKey::Uid {
+                    uid_validity: r
+                        .get::<_, Option<i64>>(4)?
+                        .and_then(|v| u32::try_from(v).ok())
+                        .and_then(UidValidity::new)
+                        .ok_or(CacheError::Corrupt("uid_validity"))?,
+                    uid: uid_from_db(uid)?,
+                },
+                (None, None) => return Err(CacheError::Corrupt("a message without a key")),
+            };
             due.push(LabelDue {
                 id,
                 account: r.get(1)?,
-                remote_id: RemoteId::new(r.get::<_, String>(2)?)
-                    .ok_or(CacheError::Corrupt("remote_id"))?,
+                key,
+                msg_key: r.get(6)?,
                 want,
                 last,
+                label,
+                junk,
             });
         }
         Ok((due, more))
     }
 
-    /// Records that `account`'s item `remote_id` carries `name` on its server, as written at `at`.
+    /// Records that `account`'s item `item` ([`LabelDue::item`]) carries `name` on its server,
+    /// as written at `at`.
     pub fn store_label(
         &mut self,
         account: &str,
-        remote_id: &RemoteId,
+        item: &str,
         name: &str,
         at: DateTime<Utc>,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO label (account, remote_id, name, written_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![account, remote_id.as_str(), name, at.timestamp()],
+            params![account, item, name, at.timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Records, before the move is sent, that the message `id`, stored under `msg_key`, is
+    /// moving to Junk. A move already confirmed stays as it is.
+    pub fn junk_attempt(
+        &mut self,
+        account: &str,
+        msg_key: &str,
+        id: MessageId,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO junk (account, msg_key, message_id, recorded_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (account, msg_key) DO UPDATE
+                 SET message_id = excluded.message_id, recorded_at = excluded.recorded_at
+                 WHERE moved_at IS NULL",
+            params![account, msg_key, id.get(), at.timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Records that the server confirmed the move [`Self::junk_attempt`] recorded, or that the
+    /// message had left the INBOX already: either way it is never moved again.
+    pub fn junk_moved(&mut self, account: &str, msg_key: &str, at: DateTime<Utc>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE junk SET moved_at = ?3
+             WHERE account = ?1 AND msg_key = ?2 AND moved_at IS NULL",
+            params![account, msg_key, at.timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Drops a recorded move that was never sent (the account has no Junk folder or no MOVE),
+    /// so it is due again once the account can move.
+    pub fn junk_not_sent(&mut self, account: &str, msg_key: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM junk WHERE account = ?1 AND msg_key = ?2 AND moved_at IS NULL",
+            params![account, msg_key],
         )?;
         Ok(())
     }
@@ -1233,6 +1364,7 @@ fn migrate_v1(conn: &mut Connection) -> Result<()> {
     }
     tx.execute_batch(CLASSIFICATION)?;
     tx.execute_batch(LABEL)?;
+    tx.execute_batch(JUNK)?;
     tx.execute_batch(INDEX)?;
     let dangling = tx
         .prepare("PRAGMA foreign_key_check")?
@@ -1656,6 +1788,7 @@ mod tests {
         let loose = GroupRules {
             other_below: 0.2,
             follow_up_old_days: 365,
+            ..GroupRules::default()
         };
         assert_eq!(
             groups(&cache, GroupFilter::Any, &loose)
@@ -1732,6 +1865,11 @@ mod tests {
         ids[0]
     }
 
+    const BOTH: DueFor = DueFor {
+        labels: true,
+        junk: true,
+    };
+
     fn due(
         cache: &Cache,
         rules: &GroupRules,
@@ -1740,11 +1878,11 @@ mod tests {
         limit: usize,
     ) -> (Vec<(String, String, Option<String>)>, usize) {
         let (due, more) = cache
-            .labels_due(None, None, rules, prefix, day(now), limit)
+            .labels_due(None, None, rules, prefix, BOTH, day(now), limit)
             .unwrap();
         let due = due
             .into_iter()
-            .map(|d| (d.remote_id.as_str().to_owned(), d.want, d.last))
+            .map(|d| (d.item().to_owned(), d.want, d.last))
             .collect();
         (due, more)
     }
@@ -1752,7 +1890,9 @@ mod tests {
     fn written(cache: &mut Cache, subject: &str, name: &str) {
         let (account, _) = key_of(cache, subject);
         let id = RemoteId::new(format!("id-{subject}")).unwrap();
-        cache.store_label(&account, &id, name, day(1)).unwrap();
+        cache
+            .store_label(&account, id.as_str(), name, day(1))
+            .unwrap();
     }
 
     #[test]
@@ -1763,17 +1903,6 @@ mod tests {
         let b = outlook(&mut cache, "out", "b", 2, Some((Choice::Spam, 0.1)));
         outlook(&mut cache, "out", "c", 3, Some((Choice::Newsletters, 0.9)));
         outlook(&mut cache, "out", "d", 4, None);
-        // IMAP mail is slice 10d's, even when classified.
-        let mb = cache
-            .reset_mailbox("imap", "INBOX", UidValidity::new(1).unwrap())
-            .unwrap();
-        cache
-            .insert_messages(mb.id, &[msg(1, 5 * DAY, "e")])
-            .unwrap();
-        let (account, key) = key_of(&cache, "e");
-        cache
-            .store_classification(&account, &key, &result(Choice::Main, 0.9))
-            .unwrap();
 
         let entry = |id: &str, want: &str| (id.to_owned(), want.to_owned(), None);
         assert_eq!(
@@ -1801,19 +1930,9 @@ mod tests {
             [entry("id-b", "nm-spam"), entry("id-a", "nm-main")]
         );
         let (only, more) = cache
-            .labels_due(Some("out"), Some(&[b]), &rules, &prefix, day(10), 10)
+            .labels_due(Some("out"), Some(&[b]), &rules, &prefix, BOTH, day(10), 10)
             .unwrap();
-        assert_eq!(
-            (only.len(), only[0].remote_id.as_str(), more),
-            (1, "id-b", 0)
-        );
-        assert!(
-            cache
-                .labels_due(Some("imap"), None, &rules, &prefix, day(10), 10)
-                .unwrap()
-                .0
-                .is_empty()
-        );
+        assert_eq!((only.len(), only[0].item(), more), (1, "id-b", 0));
     }
 
     #[test]
@@ -1822,6 +1941,7 @@ mod tests {
         let rules = GroupRules {
             other_below: 0.4,
             follow_up_old_days: 30,
+            ..GroupRules::default()
         };
         let prefix = LabelPrefix::default();
         outlook(&mut cache, "out", "a", 1, Some((Choice::FollowUp, 0.6)));
@@ -1862,7 +1982,7 @@ mod tests {
         outlook(&mut cache, "out", "a", 1, None);
         assert_eq!(
             cache
-                .labels_due(None, None, &rules, &prefix, day(2), 10)
+                .labels_due(None, None, &rules, &prefix, BOTH, day(2), 10)
                 .unwrap(),
             (vec![], 0)
         );
@@ -1902,7 +2022,9 @@ mod tests {
         assert_eq!(ids(&cache), ["id-x", "id-y"]);
         // The write to id-y failed: only id-x is recorded, and id-y stays due.
         let x = RemoteId::new("id-x").unwrap();
-        cache.store_label("out", &x, "nm-main", day(2)).unwrap();
+        cache
+            .store_label("out", x.as_str(), "nm-main", day(2))
+            .unwrap();
         assert_eq!(ids(&cache), ["id-y"]);
     }
 
@@ -1915,14 +2037,14 @@ mod tests {
             outlook(&mut cache, "out", "a", 1, Some((Choice::Newsletters, 0.9)));
             outlook(&mut cache, "out", "b", 2, None);
         }
-        // Schema 5 is schema 6 without the label table.
+        // Schema 5 is schema 7 without the label and junk tables.
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("DROP TABLE label; PRAGMA user_version = 5;")
+        conn.execute_batch("DROP TABLE label; DROP TABLE junk; PRAGMA user_version = 5;")
             .unwrap();
         drop(conn);
 
         let mut cache = Cache::open(&path).unwrap();
-        assert_eq!(schema_version(&cache.conn).unwrap(), 6);
+        assert_eq!(schema_version(&cache.conn).unwrap(), 7);
         assert_eq!(cache.list(None, 10).unwrap().len(), 2);
         let (account, key) = key_of(&cache, "a");
         assert_eq!(
@@ -1937,5 +2059,167 @@ mod tests {
         );
         written(&mut cache, "a", "nm-newsletters");
         assert_eq!(due(&cache, &rules, &prefix, 3, 10).0, []);
+    }
+
+    /// The due messages as (item, label due, move due), asking for both.
+    fn due_for(cache: &Cache, rules: &GroupRules, for_: DueFor) -> Vec<(String, bool, bool)> {
+        let prefix = LabelPrefix::default();
+        let (due, _) = cache
+            .labels_due(None, None, rules, &prefix, for_, day(10), 10)
+            .unwrap();
+        due.into_iter()
+            .map(|d| (d.item().to_owned(), d.label, d.junk))
+            .collect()
+    }
+
+    #[test]
+    fn imap_mail_is_due_by_its_msg_key_and_a_rebuild_keeps_what_was_written() {
+        let mut cache = Cache::open_in_memory().unwrap();
+        let (rules, prefix) = (GroupRules::default(), LabelPrefix::default());
+        let mb = cache
+            .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
+            .unwrap();
+        cache
+            .insert_messages(mb.id, &[msg(1, 5 * DAY, "e")])
+            .unwrap();
+        let (account, key) = key_of(&cache, "e");
+        cache
+            .store_classification(&account, &key, &result(Choice::Main, 0.9))
+            .unwrap();
+        let (due, more) = cache
+            .labels_due(None, None, &rules, &prefix, BOTH, day(10), 10)
+            .unwrap();
+        assert_eq!((due.len(), more), (1, 0));
+        assert_eq!(
+            due[0].key,
+            MessageKey::Uid {
+                uid_validity: UidValidity::new(1).unwrap(),
+                uid: Uid::new(1).unwrap()
+            }
+        );
+        assert_eq!((due[0].item(), due[0].msg_key.as_str()), (&*key, &*key));
+        assert!(due[0].label && !due[0].junk);
+        cache
+            .store_label(&account, due[0].item(), "nm-main", day(10))
+            .unwrap();
+        // A rebuild gives the message a new UID: what was written still stands.
+        let mb = cache
+            .reset_mailbox("work", "INBOX", UidValidity::new(2).unwrap())
+            .unwrap();
+        cache
+            .insert_messages(mb.id, &[msg(7, 5 * DAY, "e")])
+            .unwrap();
+        assert_eq!(due_for(&cache, &rules, BOTH), []);
+    }
+
+    #[test]
+    fn confident_spam_is_due_a_move_apart_from_its_label_until_the_move_is_confirmed() {
+        let mut cache = Cache::open_in_memory().unwrap();
+        let rules = GroupRules::default();
+        let a = outlook(&mut cache, "out", "a", 1, Some((Choice::Spam, 0.95)));
+        outlook(&mut cache, "out", "b", 2, Some((Choice::Spam, 0.6)));
+        outlook(&mut cache, "out", "c", 3, Some((Choice::Main, 0.99)));
+        let entry = |id: &str, label, junk| (id.to_owned(), label, junk);
+        assert_eq!(
+            due_for(&cache, &rules, BOTH),
+            [
+                entry("id-c", true, false),
+                entry("id-b", true, false),
+                entry("id-a", true, true)
+            ],
+            "only spam at or above junk_at moves"
+        );
+        let off = GroupRules {
+            junk_at: None,
+            ..rules
+        };
+        assert!(
+            due_for(&cache, &off, BOTH).iter().all(|d| !d.2),
+            "junk = false"
+        );
+        // Its label written, the move is still due: one that failed is tried again.
+        for (subject, name) in [("a", "nm-spam"), ("b", "nm-spam"), ("c", "nm-main")] {
+            written(&mut cache, subject, name);
+        }
+        assert_eq!(due_for(&cache, &rules, BOTH), [entry("id-a", false, true)]);
+        let labels = DueFor {
+            labels: true,
+            junk: false,
+        };
+        assert_eq!(due_for(&cache, &rules, labels), [], "a server without Junk");
+        // Recorded before it is sent: still due until the server confirms it.
+        let (account, key) = key_of(&cache, "a");
+        cache.junk_attempt(&account, &key, a, day(3)).unwrap();
+        assert_eq!(due_for(&cache, &rules, BOTH), [entry("id-a", false, true)]);
+        cache.junk_moved(&account, &key, day(3)).unwrap();
+        assert_eq!(due_for(&cache, &rules, BOTH), []);
+        // A confirmed move stays confirmed.
+        cache.junk_attempt(&account, &key, a, day(4)).unwrap();
+        assert_eq!(due_for(&cache, &rules, BOTH), []);
+    }
+
+    #[test]
+    fn a_message_brought_back_is_never_moved_again_unless_its_move_was_never_sent() {
+        let mut cache = Cache::open_in_memory().unwrap();
+        let rules = GroupRules::default();
+        let mb = cache
+            .reset_mailbox("work", "INBOX", UidValidity::new(1).unwrap())
+            .unwrap();
+        cache.insert_messages(mb.id, &[msg(1, DAY, "s")]).unwrap();
+        let (account, key) = key_of(&cache, "s");
+        cache
+            .store_classification(&account, &key, &result(Choice::Spam, 0.99))
+            .unwrap();
+        cache
+            .store_label(&account, &key, "nm-spam", day(2))
+            .unwrap();
+        let (due, _) = cache
+            .labels_due(
+                None,
+                None,
+                &rules,
+                &LabelPrefix::default(),
+                BOTH,
+                day(2),
+                10,
+            )
+            .unwrap();
+        cache
+            .junk_attempt(&account, &key, due[0].id, day(2))
+            .unwrap();
+        // neomail stopped before the answer, and the move went through: the next sync drops the
+        // row. Then the user moves it back: a new row, never moved again.
+        cache.remove(&[due[0].id]).unwrap();
+        cache.insert_messages(mb.id, &[msg(2, DAY, "s")]).unwrap();
+        assert_eq!(due_for(&cache, &rules, BOTH), []);
+        // A move known never to have been sent is dropped, and due again.
+        cache.junk_not_sent(&account, &key).unwrap();
+        assert_eq!(due_for(&cache, &rules, BOTH), [(key.clone(), false, true)]);
+    }
+
+    #[test]
+    fn a_schema_6_cache_gains_the_junk_table_and_keeps_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        {
+            let mut cache = Cache::open(&path).unwrap();
+            outlook(&mut cache, "out", "a", 1, Some((Choice::Spam, 0.95)));
+            outlook(&mut cache, "out", "b", 2, None);
+            written(&mut cache, "a", "nm-spam");
+        }
+        // Schema 6 is schema 7 without the junk table.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE junk; PRAGMA user_version = 6;")
+            .unwrap();
+        drop(conn);
+
+        let cache = Cache::open(&path).unwrap();
+        assert_eq!(schema_version(&cache.conn).unwrap(), 7);
+        assert_eq!(cache.list(None, 10).unwrap().len(), 2);
+        assert_eq!(
+            due_for(&cache, &GroupRules::default(), BOTH),
+            [("id-a".to_owned(), false, true)],
+            "its label kept, and spam classified before 10d due a move once"
+        );
     }
 }

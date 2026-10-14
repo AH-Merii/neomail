@@ -121,6 +121,12 @@ message were still in the INBOX afterwards, it would report it as not confirmed 
 cache. `neomail move "[Gmail]/Spam" ID...` moves a message to Spam the same way: a live check on a
 test account moved one, and it was then in `[Gmail]/Spam` and no longer in the INBOX.
 
+## Groups as labels
+
+`neomail classify` gives each classified message its group as a Gmail label, such as
+`nm-receipts-invoices`, next to your own labels, and moves confident spam to Spam, the mailbox
+Gmail marks `\Junk`: see [labels.md](labels.md).
+
 ## Sending
 
 neomail sends through smtp.gmail.com on port 465 with TLS, signed in with the same OAuth scope

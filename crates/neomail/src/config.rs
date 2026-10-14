@@ -334,7 +334,9 @@ pub struct ClassifySettings {
     /// The prefix of a group's name on the server, `nm-` by default; never shown inside neomail
     /// (DEC-2026-10-13-labels).
     pub label_prefix: LabelPrefix,
-    /// Whether groups are written to the server: Outlook categories (DEC-2026-10-13-categories).
+    /// Whether groups are written to the server: Outlook categories, Gmail and Proton labels
+    /// (DEC-2026-10-13-categories, DEC-2026-10-14-labels-junk). Spam's move to Junk is
+    /// `rules.junk_at`'s, apart from this.
     pub labels: bool,
 }
 
@@ -376,6 +378,8 @@ struct RawClassify {
     daemon: Option<bool>,
     label_prefix: Option<String>,
     labels: Option<bool>,
+    junk: Option<bool>,
+    junk_at: Option<f64>,
 }
 
 /// Checks a `[classify]` table and fills in the defaults.
@@ -419,6 +423,15 @@ fn classify_settings(raw: Option<RawClassify>) -> Result<ClassifySettings> {
     }
     if let Some(labels) = raw.labels {
         settings.labels = labels;
+    }
+    if let Some(at) = raw.junk_at {
+        if !(at > 0.0 && at <= 1.0) {
+            bail!("classify.junk_at must be above 0 and at most 1");
+        }
+        settings.rules.junk_at = Some(at);
+    }
+    if raw.junk == Some(false) {
+        settings.rules.junk_at = None;
     }
     Ok(settings)
 }
@@ -1457,16 +1470,26 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
         );
         assert_eq!(c.classify.label_prefix.as_str(), "nm-");
         assert!(c.classify.labels, "groups are written unless told not to");
+        assert_eq!(
+            c.classify.rules.junk_at,
+            Some(0.9),
+            "the decisions' Spam rule"
+        );
 
         let c = Config::parse(&format!(
             "{accounts}[classify]\nurl = \"http://127.0.0.1:8080/\"\nmodel = \"jev-preview\"\n\
              other_below = 0.55\nfollow_up_old_days = 30\ndaemon = true\n\
-             label_prefix = \"neo/\"\nlabels = false\n"
+             label_prefix = \"neo.\"\nlabels = false\njunk_at = 0.97\n"
         ))
         .unwrap();
         assert!(c.classify.daemon);
-        assert_eq!(c.classify.label_prefix.as_str(), "neo/");
+        assert_eq!(c.classify.label_prefix.as_str(), "neo.");
         assert!(!c.classify.labels);
+        assert_eq!(c.classify.rules.junk_at, Some(0.97));
+        for junk_off in ["junk = false\n", "junk = false\njunk_at = 0.5\n"] {
+            let c = Config::parse(&format!("{accounts}[classify]\n{junk_off}")).unwrap();
+            assert_eq!(c.classify.rules.junk_at, None, "{junk_off}");
+        }
         assert_eq!(c.classify.url, "http://127.0.0.1:8080");
         assert_eq!(c.classify.model, "jev-preview");
         assert_eq!(
@@ -1504,6 +1527,13 @@ cert_sha256 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55
                 "must not hold control characters",
             ),
             ("labels = \"yes\"", "invalid type"),
+            (
+                "label_prefix = \"nm/\"",
+                "classify.label_prefix must not hold /",
+            ),
+            ("junk_at = 0", "above 0 and at most 1"),
+            ("junk_at = 1.2", "above 0 and at most 1"),
+            ("junk = 1", "invalid type"),
         ] {
             let e = format!(
                 "{:#}",

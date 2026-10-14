@@ -128,10 +128,11 @@ request to a host, neomail says what will be sent and asks once; --yes consents 
 `neomail daemon` classifies new mail in the background only once `daemon = true` under [classify]
 in the config switches it on; that consent then covers it too. A result is stored as soon as it
 arrives and is never asked for again unless --again: a stopped run resumes where it left off.
-Then each classified Outlook message gets its group as a category (classify.label_prefix, nm- by
-default; classify.labels = false turns it off), up to 1,000 per account, keeping your own
-categories. Exit 1 when a message failed, a category write or an account's sign-in for it
-failed, or the run stopped. What is sent and kept:
+Then each classified message gets its group on its server, up to 1,000 per account: an Outlook
+category or a Gmail or Proton label (classify.label_prefix, nm- by default; classify.labels =
+false turns it off), keeping your own. Spam at or above classify.junk_at (0.9) then moves to the
+account's Junk folder, once (classify.junk = false turns it off). Exit 1 when a message failed, a
+write, a move or an account's sign-in for them failed, or the run stopped. What is sent and kept:
 https://github.com/AH-Merii/neomail/blob/main/docs/privacy.md";
 
 const MARK_EXAMPLES: &str = "\
@@ -387,7 +388,8 @@ to the classifier and writes no groups. Once on, it classifies new mail as it ar
 `neomail classify` sends, once `neomail classify` has your consent for the backend and there is a key \
 (`neomail key set` or JEV_API_KEY); it never asks. It sends at most 100 messages each time it syncs (a \
 round, a push sync or an Outlook check); the rest wait for the next time it syncs. After classifying, it \
-writes each Outlook message's group as a category; `classify.labels = false` turns that off.\n\n\
+writes each message's group to its server as a category or label (`classify.labels = false` turns that \
+off) and moves confident spam to Junk (`classify.junk = false` turns that off).\n\n\
 Guide: https://github.com/AH-Merii/neomail/blob/main/docs/daemon.md"
     )]
     Daemon {

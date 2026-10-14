@@ -173,16 +173,19 @@ model = "jev-1.13.0"              # pinned, so stored confidences stay comparabl
 other_below = 0.4                 # below this confidence a message lists as `other`
 follow_up_old_days = 90           # a `follow-up` older than this lists as `follow-up-old`
 daemon = false                    # true: `neomail daemon` classifies new mail in the background
-label_prefix = "nm-"              # Outlook categories are named nm-newsletters and so on
+label_prefix = "nm-"              # groups on the server are named nm-newsletters and so on
 labels = true                     # false: write no group to the server
+junk = true                       # false: never move spam to Junk
+junk_at = 0.9                     # spam at or above this confidence moves to Junk
 ```
 
 - `url` must be `https://`, except for a backend on this machine: `http://127.0.0.1`,
   `http://[::1]` or `http://localhost`, with any port.
 - `other_below` (0 to 1) and `follow_up_old_days` (at least 1) apply when mail is listed, so
   changing them needs no new answers. `spam` stays `spam` whatever its confidence.
-- `label_prefix` must not be empty. neomail never shows it: `list --group` takes and prints the
-  bare group.
+- `label_prefix` must not be empty or hold `/`, which nests labels on Gmail and Proton. neomail
+  never shows it: `list --group` takes and prints the bare group.
+- `junk_at` must be above 0 and at most 1. `junk = false` moves nothing.
 
 ### Passwords
 
@@ -294,13 +297,14 @@ neomail forward 42 --to ada@example.com                          # forward its t
   stored results too. Stopping a run during a request, or running it while the daemon classifies,
   can pay for one message twice ([docs/daemon.md](docs/daemon.md#classifying)).
   `neomail classify 42 57` classifies those messages.
-  Then each classified Outlook message gets its group as an Outlook category (`nm-newsletters`),
-  up to 1,000 per account, keeping your own categories; a line such as `neomail: outlook: 37
-  categories written` says how many. It needs a sign-in that lets neomail change mail, writes
-  again only when a message's group changes, and exits 1 when a write or an account's sign-in
-  failed
-  ([docs/outlook.md](docs/outlook.md#groups-as-categories)). Gmail and Proton labels are not
-  written yet.
+  Then each classified message gets its group on its server, up to 1,000 per account: an
+  Outlook category or a Gmail or Proton label (`nm-newsletters`), keeping your own categories and
+  labels. Spam at or above `junk_at` then moves to the account's Junk folder, once: a message you
+  move back stays. Other IMAP servers get no labels, only the move to Junk. A line such as
+  `neomail: work: 37 labels written, 2 moved to Junk` says what was done. neomail writes again
+  only when a message's group changes, and exits 1 when a write, a move or an account's sign-in
+  failed ([docs/outlook.md](docs/outlook.md#groups-as-categories),
+  [docs/labels.md](docs/labels.md)).
 - `neomail list --group G` lists one group: `main`, `follow-up`, `follow-up-old`, `recruitment`,
   `receipts-invoices`, `orders-shipping`, `newsletters`, `promotions`, `notifications`, `spam`,
   `other`, or `unclassified`. On a terminal `list` shows each message's group once any is
@@ -409,10 +413,11 @@ the config ([docs/daemon.md](docs/daemon.md#classifying)). Once it is on, and yo
 classification through `neomail classify` and stored a key, it classifies new mail as it
 arrives, with the same request, at most 100 messages each time it syncs (a round, a push sync or
 an Outlook check), so `neomail list --group` stays current. It never asks for consent itself, and
-leaves an account's first sync to `neomail classify`. After classifying it writes Outlook
-accounts' groups as categories, at most 100 per account each time
-([docs/daemon.md](docs/daemon.md#groups-as-outlook-categories)); `classify.labels = false` turns
-that off. While the switch is off it writes no groups either.
+leaves an account's first sync to `neomail classify`. After classifying it writes each account's
+groups to its server as categories or labels and moves confident spam to Junk, at most 100 per
+account each time ([docs/daemon.md](docs/daemon.md#groups-on-the-server)); `classify.labels =
+false` and `classify.junk = false` turn those off. While the switch is off it writes and moves
+nothing either.
 
 How it fits together: [docs/architecture.md](docs/architecture.md).
 

@@ -17,7 +17,7 @@ actions, then `neomail archive` and `neomail delete` for IMAP and Outlook accoun
 | ----- | ------------- | ----------------- |
 | `crates/neomail` | The binary: CLI (clap), config, passwords (command or OS keyring), OAuth sign-in, the daemon and its locks, output, wiring. | The composition root. Nothing depends on it. |
 | `crates/nm-core` | Domain types, the `MailSource`, `IdSource` and `MailWriter` traits, the SQLite cache, the sync engines, the actions, mail parsing, and building outgoing mail (`compose`). | The seam: providers and front ends depend on it, and it never touches the network, so its tests run offline. |
-| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap); its two writes, `store_seen` and `move_to`, and `list_folders`, with modified UTF-7 names decoded; `append_sent`, and SMTP submission (`smtp`) over the same TLS and pinning. | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
+| `crates/nm-imap` | `ImapSource`: TCP, TLS or STARTTLS (rustls), certificate pinning, IMAP (async-imap); its writes, `store_seen`, `move_to` and the label pass (`labels`: Gmail's `X-GM-LABELS`, Proton's `Labels/` copies, spam moved to `\Junk`), and `list_folders`, with modified UTF-7 names decoded; `append_sent`, and SMTP submission (`smtp`) over the same TLS and pinning. | The first `MailSource`. It keeps the TLS and IMAP dependencies away from the core; `nm-graph` is its sibling. |
 | `crates/nm-graph` | `GraphSource`: the INBOX through Microsoft Graph's REST API, over a `Transport` port; its writes, `set_read`, `move_to` and `set_categories`, and `folders`, the read behind `folder list`; `send`, through sendMail. | The first `IdSource`. It holds Graph's URLs, JSON and error rules and no network code, so its tests run offline. |
 | `crates/nm-redact` | The PII redaction rules, how each placeholder is spelled, `Excerpt`, the text classification sends, and `Outgoing`, that text with the signals that go with it. Pure: no I/O, no network, no config; `regex` is its only dependency. | One owner for what may leave the machine: the classifier's request (slice 10) takes an `Outgoing` and nothing else, and the rules change without touching it. What MCP clients receive is decided when MCP lands, through the same rules. |
 
@@ -280,9 +280,14 @@ with looser modes (`neomail/src/main.rs`, `restrict_cache_files`). Tables:
   account and `msg_key`, not by `message.id`, because rebuilding a mailbox deletes its rows and
   gives them new ids, and an answer must outlive that so a rebuild pays for no message again;
 - `label (account, remote_id, name, written_at)`: the name neomail last wrote on a message on its
-  server, an Outlook category for now. It is keyed by the server's id, not `msg_key`, because two
-  copies of one mail are two items to write; Graph's immutable ids come back the same after a
-  rebuild, so it outlives one too.
+  server: an Outlook category, or a Gmail or Proton label. On Outlook it is keyed by the server's
+  id, not `msg_key`, because two copies of one mail are two items to write; Graph's immutable ids
+  come back the same after a rebuild, so it outlives one too. Over IMAP a UID changes with a move
+  or a rebuild, so the column holds the `msg_key` instead (`LabelDue::item`);
+- `junk (account, msg_key, message_id, recorded_at, moved_at)`: each move of confident spam to
+  Junk, recorded before it is sent, so a message is moved at most once. A row whose move was
+  never confirmed counts as made once its message has left the cache; keyed by `msg_key`, it
+  outlives the row, so a message the user moves back is never moved again.
 
 The group a message lists under is worked out when the cache is read, in one place:
 `GroupRules::effective` (`nm-core/src/group.rs`), which `Cache::list_grouped` applies to each row
@@ -291,17 +296,19 @@ lists as `other`; a `follow-up` older than `follow_up_old_days` lists as `follow
 a threshold needs no new answer. `Cache::pending` lists the messages with no stored answer, newest
 first, for `classify` to choose from.
 
-`Cache::labels_due` works out, the same way, which Outlook messages' categories are not yet what
-their effective group wants: classified rows with a `remote_id` (never IMAP's) whose wanted name,
-`LabelPrefix::name` of the effective group, differs from `label.name`. There is no queue: mail
-classified before categories existed, a failed write, a follow-up that grew old, a new threshold
+`Cache::labels_due` works out, the same way, which messages have something to write on their
+server (`DueFor` asks for labels, Junk moves or both): a label when the wanted name,
+`LabelPrefix::name` of the effective group, differs from `label.name`; a move for spam that
+`GroupRules::junk` moves and no `junk` row has taken. There is no queue: mail classified before
+categories or labels existed, a failed write or move, a follow-up that grew old, a new threshold
 and a new prefix all show up there. `LabelPrefix` (`nm-core/src/label.rs`) is the one owner of
-which names are neomail's (the prefix and one of the eleven group names, ignoring ASCII case) and
-of `merge`, which keeps every other name in its order; 10d's Gmail and Proton labels reuse both.
+which names are neomail's (the prefix and one of the eleven group names, ignoring ASCII case), of
+`merge`, which keeps every other name of an Outlook list in its order, and of `plan`, which
+picks the single names a Gmail or Proton label change adds and removes.
 
 Schema 2 added the by-id columns, schema 3 `mailbox.synced`, schema 4 `mailbox.cursor` and schema
-5 `message.msg_key` and the `classification` table, schema 6 the `label` table. The step to 5
-parses no row; the step to 6 only creates the table. Each
+5 `message.msg_key` and the `classification` table, schema 6 the `label` table and schema 7 the
+`junk` table. The step to 5 parses no row; the steps to 6 and 7 only create a table. Each
 step from 2 runs in one `BEGIN IMMEDIATE` transaction that reads the version again. A schema 2 cache
 gets `synced` with every existing mailbox counted as synced (a build without the column synced it);
 a schema 3 cache gets `cursor` empty, so its next sync lists and stores one. A schema 1 cache is
@@ -702,22 +709,28 @@ stops the daemon's requests without a restart. The tests run the
 `Classifier` against the fake jev (`neomail/tests/support/fake_jev.rs`, shared with
 `tests/classify.rs` by `#[path]`, as the crate has no library target) and a cache in memory.
 
-**Groups as categories** (`neomail/src/classify/labels.rs`) run after `neomail classify` stores
+**Groups on the server** (`neomail/src/classify/labels.rs`) run after `neomail classify` stores
 its results (`labels::cli_pass`, up to 1,000 per account, waiting for the account's lock) and
 after the daemon's classifier in the same wake (up to 100, skipping a locked account), but only
 while `classify.daemon` is on: `daemon.rs`'s `background_groups` skips the daemon's writes while
-the switch is off. Both go
-through `write_labels`, which owns the cap, the lock, the grant check and the per-account error
-rules, and returns outcomes rather than errors, so a failure never reaches classifying, the sync
-or the notifications. It writes in chunks of four and stores each confirmed name with
-`Cache::store_label`; a stop ends the pass after the chunk in flight, and the daemon's deadline
-(`classify::daemon::budget`, from when the writes start) ends it before the next chunk, with
-`GraphWriter` dropping a chunk still in flight at it. `CategoryWriter` is the seam: `GraphWriter`
-signs in through `sync::Logins` and calls `GraphSource::set_categories` (a GET of `categories`,
-`label::merge`, and a PATCH only when the list changed). 401, 403, a throttled answer after
-Graph's retries and an unreachable Graph end the account's pass, and the rest wait. The tests use
-a fake, so they reach no Graph and no keyring. The daemon's
-`labels::Reports` says why an account is off once per state.
+the switch is off. Both go through `write_labels`, which owns the cap, the lock, the grant check
+and the per-account error rules, and returns outcomes rather than errors, so a failure never
+reaches classifying, the sync or the notifications. On Outlook it writes categories in chunks of
+four, then moves each chunk's confident spam to `junkemail`; over IMAP it first asks the server
+what it takes (`nm_imap::labels::probe`: Gmail's `X-GM-EXT-1`, Bridge's `Labels/` and `Folders/`,
+a `\Junk` mailbox and MOVE), asks the cache again for only that, and writes batches of 50, one
+session each (`nm_imap::labels::write_labels`). Only an account on `imap.gmail.com` or with
+Bridge's shape is asked for labels (`may_take_labels`), so another server is signed in to only
+when spam is due a move. Each confirmed name is stored with `Cache::store_label`, and each move is
+recorded with `Cache::junk_attempt` before it is sent. A stop ends the pass after the chunk or
+batch in flight, and the daemon's deadline (`classify::daemon::budget`, from when the writes
+start) ends it before the next one, with the writer dropping a chunk still in flight at it.
+`LabelWriter` is the seam: `ServerWriter` signs in through `sync::Logins`, calls
+`GraphSource::set_categories` (a GET of `categories`, `label::merge`, and a PATCH only when the
+list changed) and `move_to`, and runs the IMAP sessions. 401, 403, a throttled answer after
+Graph's retries, an unreachable Graph and a failed IMAP session end the account's pass, and the
+rest wait. The tests use a fake, so they reach no server and no keyring. The daemon's
+`labels::Reports` says why an account is off, and each warning, once per state.
 
 `sync_inbox` (`nm-core/src/sync.rs`) runs once per account:
 

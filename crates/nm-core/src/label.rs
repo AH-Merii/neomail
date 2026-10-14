@@ -1,4 +1,4 @@
-//! The names groups get on the server: an Outlook category now, a Gmail or Proton label later.
+//! The names groups get on the server: an Outlook category, a Gmail label or a Proton label.
 //! [`LabelPrefix`] is the one owner of which names are neomail's (DEC-2026-10-13-labels,
 //! DEC-2026-10-13-categories): the prefix followed by one of the eleven group names, ignoring
 //! ASCII case. Every other name is the user's and is never changed. Inside neomail the prefix is
@@ -20,6 +20,10 @@ pub enum BadPrefix {
     Empty,
     #[error("must not hold control characters")]
     Control,
+    /// Gmail and Bridge both name nested labels with `/`: a prefix holding one would put
+    /// neomail's labels under a parent label.
+    #[error("must not hold /")]
+    Slash,
 }
 
 impl LabelPrefix {
@@ -29,6 +33,9 @@ impl LabelPrefix {
         }
         if prefix.chars().any(char::is_control) {
             return Err(BadPrefix::Control);
+        }
+        if prefix.contains('/') {
+            return Err(BadPrefix::Slash);
         }
         Ok(Self(prefix.to_owned()))
     }
@@ -89,6 +96,43 @@ pub fn merge(
     (merged != current).then_some(merged)
 }
 
+/// What a Gmail message's labels need, as single names to add and remove: Gmail's IMAP adds
+/// and removes names one by one, so no STORE ever replaces the message's whole set
+/// (DEC-2026-10-14-labels-junk). The names are [`merge`]'s: what neomail owns goes, apart from
+/// the first that is exactly `want`, and `want` is added when it is missing. Every other name,
+/// the system labels (`\Inbox`) included, is never named.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LabelPlan {
+    pub add: Option<String>,
+    pub remove: Vec<String>,
+}
+
+impl LabelPlan {
+    /// Whether the message already carries what it should.
+    pub fn is_empty(&self) -> bool {
+        self.add.is_none() && self.remove.is_empty()
+    }
+}
+
+/// The [`LabelPlan`] that turns `current` into what [`merge`] would give.
+pub fn plan(current: &[String], prefix: &LabelPrefix, last: Option<&str>, want: &str) -> LabelPlan {
+    let mut plan = LabelPlan::default();
+    let mut kept_want = false;
+    for name in current {
+        if name == want && !kept_want {
+            kept_want = true;
+        } else if (prefix.owns(name).is_some() || Some(name.as_str()) == last)
+            && !plan.remove.contains(name)
+        {
+            plan.remove.push(name.clone());
+        }
+    }
+    if !kept_want {
+        plan.add = Some(want.to_owned());
+    }
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,8 +150,8 @@ mod tests {
             assert_eq!(prefix.owns(&prefix.name(g)), Some(g));
             assert_eq!(prefix.owns(&prefix.name(g).to_uppercase()), Some(g));
         }
-        let custom = LabelPrefix::new("neo/").unwrap();
-        assert_eq!(custom.name(Group::Spam), "neo/spam");
+        let custom = LabelPrefix::new("neo.").unwrap();
+        assert_eq!(custom.name(Group::Spam), "neo.spam");
         assert_eq!(custom.owns("nm-spam"), None, "another prefix's name");
     }
 
@@ -132,6 +176,8 @@ mod tests {
         assert_eq!(LabelPrefix::new(""), Err(BadPrefix::Empty));
         assert_eq!(LabelPrefix::new("  "), Err(BadPrefix::Empty));
         assert_eq!(LabelPrefix::new("nm\n"), Err(BadPrefix::Control));
+        assert_eq!(LabelPrefix::new("nm/"), Err(BadPrefix::Slash));
+        assert_eq!(LabelPrefix::new("a/nm-"), Err(BadPrefix::Slash));
         assert_eq!(LabelPrefix::new("nm-").unwrap(), LabelPrefix::default());
     }
 
@@ -187,6 +233,46 @@ mod tests {
                 merge(&names(current), &prefix, last, want),
                 merged.map(names),
                 "{current:?} {last:?} {want}"
+            );
+        }
+    }
+    #[test]
+    fn a_plan_names_only_neomails_labels_and_gives_what_merging_gives() {
+        let prefix = LabelPrefix::default();
+        // (current, last, want)
+        let cases: [(&[&str], Option<&str>, &str); 6] = [
+            (&["\\Inbox", "\\Important"], None, "nm-main"),
+            (
+                &["\\Inbox", "Red", "nm-follow-up"],
+                Some("nm-follow-up"),
+                "nm-follow-up-old",
+            ),
+            (&["nm-main", "Red"], Some("nm-main"), "nm-main"),
+            (&["nm-main", "NM-SPAM", "nm-main"], None, "nm-spam"),
+            (&["old-main", "nm-project"], Some("old-main"), "nm-main"),
+            (&["nm-project"], None, "nm-spam"),
+        ];
+        for (current, last, want) in cases {
+            let current = names(current);
+            let plan = plan(&current, &prefix, last, want);
+            for name in plan.remove.iter().chain(&plan.add) {
+                let users = prefix.owns(name).is_none() && Some(name.as_str()) != last;
+                assert!(!users || name == want, "named the user's {name:?}");
+            }
+            let mut applied: Vec<String> = current
+                .iter()
+                .filter(|n| !plan.remove.contains(n))
+                .cloned()
+                .collect();
+            applied.extend(plan.add.clone());
+            applied.dedup();
+            let merged = merge(&current, &prefix, last, want).unwrap_or(current.clone());
+            let set = |v: &[String]| v.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(set(&applied), set(&merged), "{current:?} {last:?} {want}");
+            assert_eq!(
+                plan.is_empty(),
+                set(&merged) == set(&current),
+                "{current:?}"
             );
         }
     }

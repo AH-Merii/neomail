@@ -19,7 +19,8 @@ pub mod types;
 
 pub use action::{Action, Change, Destination, Folder, MailWriter, Moved, Written};
 pub use cache::{
-    Cache, CacheError, Classification, GroupFilter, Grouped, LabelDue, Located, MessageKey, Pending,
+    Cache, CacheError, Classification, DueFor, GroupFilter, Grouped, LabelDue, Located, MessageKey,
+    Pending,
 };
 pub use folder::{FolderName, ListedFolder, Role};
 pub use group::{Choice, Group, GroupRules};

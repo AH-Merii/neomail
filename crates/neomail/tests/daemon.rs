@@ -403,7 +403,7 @@ fn without_accounts_or_with_a_bad_interval_the_daemon_is_a_usage_error() {
 }
 
 #[test]
-fn the_help_names_the_switch_both_key_sources_the_cap_per_sync_and_the_categories() {
+fn the_help_names_the_switch_both_key_sources_the_cap_per_sync_and_the_server_writes() {
     let dir = tempfile::tempdir().unwrap();
     let o = command(dir.path(), &["daemon", "--help"]).output().unwrap();
     assert!(o.status.success());
@@ -414,8 +414,9 @@ fn the_help_names_the_switch_both_key_sources_the_cap_per_sync_and_the_categorie
          config switches it on",
         "While it is off, the daemon sends nothing to the classifier and writes no groups",
         "there is a key (`neomail key set` or JEV_API_KEY)",
-        "After classifying, it writes each Outlook message's group as a category; \
-         `classify.labels = false` turns that off",
+        "After classifying, it writes each message's group to its server as a category or label \
+         (`classify.labels = false` turns that off) and moves confident spam to Junk \
+         (`classify.junk = false` turns that off)",
         "at most 100 messages each time it syncs (a round, a push sync or an Outlook check); \
          the rest wait for the next time it syncs",
     ] {

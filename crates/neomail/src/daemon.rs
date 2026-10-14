@@ -722,10 +722,10 @@ pub fn after_sync<O: Write, E: Write, C>(
 }
 
 /// What a wake that synced does with groups in the background: `classify` new mail, then `write`
-/// groups to the server (Outlook categories). Only `classify` runs while `classify.daemon` is off:
-/// it then says so once, reads no key and sends nothing; nothing is written, as `neomail
-/// classify` writes groups in its own run (DEC-2026-10-14-classify-when-asked). `cx` is what
-/// both use (the cache).
+/// groups to the server (categories and labels) and move confident spam to Junk. Only `classify`
+/// runs while `classify.daemon` is off: it then says so once, reads no key and sends nothing;
+/// nothing is written or moved, as `neomail classify` does that in its own run
+/// (DEC-2026-10-14-classify-when-asked). `cx` is what both use (the cache).
 fn background_groups<C>(
     settings: &ClassifySettings,
     cx: &mut C,
@@ -785,7 +785,7 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
         data_dir: data_dir.clone(),
     };
     let mut classifier = Classifier::new(&config.classify, &mut access);
-    let mut label_writer = labels::GraphWriter::skipping(&runtime, &data_dir);
+    let mut label_writer = labels::ServerWriter::skipping(&runtime, &data_dir);
     let mut label_reports = labels::Reports::default();
     let count = config.accounts.len();
     eprintln!(
@@ -875,10 +875,11 @@ pub fn run(config_path: PathBuf, interval: Interval, no_notify: bool) -> Result<
                     now: chrono::Utc::now(),
                 };
                 // Outside `block_on` too: the key is read from the keyring. Then, while
-                // classify.daemon is on, the groups go to Outlook as categories, on every wake
-                // that synced: what is due changes with age too, and a failure there is only
-                // lines. The writes get a budget of their own, as classifying does, so a
-                // throttled Graph holds up the next round by little more than that budget.
+                // classify.daemon is on, the groups go to the servers as categories and labels,
+                // and confident spam to Junk, on every wake that synced: what is due changes with
+                // age too, and a failure there is only lines. The writes get a budget of their
+                // own, as classifying does, so a slow server holds up the next round by little
+                // more than that budget.
                 let classify = |new_mail: &[NewMail], cache: &mut Cache| {
                     background_groups(
                         &config.classify,
