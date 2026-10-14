@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroU32;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, bail};
 use nm_core::{Cache, SyncReport, sync_inbox_with_progress};
@@ -91,6 +91,12 @@ impl<'a> Syncer<'a> {
                 }
             }
         }
+    }
+
+    /// The logins the syncs use, for the daemon's writes of groups to the servers: one token
+    /// refresh per account for both, and the same unattended `password_command`.
+    pub fn logins(&mut self) -> &mut Logins {
+        &mut self.logins
     }
 
     /// Drops what is kept for accounts no longer in `accounts`.
@@ -204,6 +210,18 @@ impl Logins {
         account: &Account,
         warnings: &mut Vec<String>,
     ) -> Result<Credential<'_>> {
+        self.credential_until(runtime, account, warnings, None)
+    }
+
+    /// [`Self::credential`], with a token refresh cut off at `deadline` when there is one: the
+    /// error is then [`SignInCutOff`].
+    pub fn credential_until(
+        &mut self,
+        runtime: &Runtime,
+        account: &Account,
+        warnings: &mut Vec<String>,
+        deadline: Option<Instant>,
+    ) -> Result<Credential<'_>> {
         match &account.login {
             Login::Password(source) => {
                 if matches!(account.server, Server::Graph { .. }) {
@@ -219,7 +237,7 @@ impl Logins {
             Login::OAuth(settings) => {
                 let keyring = &mut self.keyring;
                 let token = self.tokens.get_or_refresh(account, SystemTime::now(), || {
-                    refresh(runtime, keyring, account, settings, warnings)
+                    refresh(runtime, keyring, account, settings, warnings, deadline)
                 })?;
                 Ok(Credential::AccessToken(token))
             }
@@ -234,6 +252,18 @@ impl Logins {
         self.keyring = None;
     }
 }
+
+/// A token refresh cut off at its deadline: nothing failed, the sign-in is tried again later.
+#[derive(Debug)]
+pub struct SignInCutOff;
+
+impl std::fmt::Display for SignInCutOff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the sign-in did not finish within the time budget")
+    }
+}
+
+impl std::error::Error for SignInCutOff {}
 
 /// One account's sync: its report or error, and the warnings that did not fail it, each
 /// without the `neomail: ACCOUNT: ` prefix. The caller prints them: `neomail sync` at once, the
@@ -258,9 +288,18 @@ fn refresh(
     account: &Account,
     settings: &OAuthSettings,
     warnings: &mut Vec<String>,
+    deadline: Option<Instant>,
 ) -> Result<Refreshed> {
     let saved = secret::oauth_secrets(&account.name, keyring)?;
-    let refreshed = runtime.block_on(account::refresh(account, settings, &saved))?;
+    let refreshed = runtime.block_on(async {
+        let refresh = account::refresh(account, settings, &saved);
+        match deadline {
+            Some(at) => tokio::time::timeout_at(at.into(), refresh)
+                .await
+                .map_err(|_| anyhow::Error::new(SignInCutOff))?,
+            None => refresh.await,
+        }
+    })?;
     if let Some(rotated) = refreshed.rotated(&saved.refresh_token)
         && let Err(e) = secret::save_refresh_token(&account.name, keyring, &saved, rotated)
     {

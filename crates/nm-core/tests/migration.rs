@@ -5,7 +5,8 @@ use std::path::Path;
 
 use nm_core::cache::{MailboxKind, SCHEMA_VERSION};
 use nm_core::{
-    Cache, DueFor, FetchedMessage, Flags, GroupRules, LabelPrefix, RemoteId, Uid, UidValidity,
+    Cache, DueFor, FetchedMessage, Flags, GroupRules, LabelPrefix, LabelsDue, RemoteId, Uid,
+    UidValidity,
 };
 use rusqlite::Connection;
 
@@ -132,7 +133,7 @@ fn rows_and_ids_are_kept_and_the_next_id_is_fresh() {
                 10
             )
             .unwrap(),
-        (vec![], 0)
+        LabelsDue::default()
     );
     let id = RemoteId::new("id-1").unwrap();
     cache
@@ -427,14 +428,15 @@ fn a_v4_cache_gains_msg_key_and_the_classification_table_without_parsing_its_row
     );
 }
 
-/// Schema 7's tables, from schema 8's: everything search added, gone. Pinned here as schema 7
-/// stood for caches on disk.
+/// Schema 7's tables, from this schema's: everything search and the retry table added, gone.
+/// Pinned here as schema 7 stood for caches on disk.
 const UNDO_SEARCH: &str = "
     DROP TRIGGER message_fts_delete;
     DROP TABLE message_fts;
     DROP INDEX message_thread;
     ALTER TABLE message DROP COLUMN thread;
     ALTER TABLE message DROP COLUMN indexed;
+    DROP TABLE label_retry;
     PRAGMA user_version = 7;
 ";
 

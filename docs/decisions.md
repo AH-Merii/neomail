@@ -1383,3 +1383,27 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
 - **Builds on:** [DEC-2026-10-13-send](#dec-2026-10-13-send), the "Drafting with files and
   images" bullets under [Images and attachments](#images-and-attachments) and
   [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux) for asking and exit codes.
+
+### <a id="dec-2026-10-14-label-retries"></a>DEC-2026-10-14-label-retries: a failed write or move waits before it is tried again
+
+- **Status:** proposed by Claude on 2026-10-14, for issue #71.
+- **Proposal:**
+  - A category or label write, or a move to Junk, that fails for one message alone waits before
+    it is tried again: 15 minutes after the first failure in a row, doubled after each next one,
+    at most a day. A success ends the wait.
+  - Whether a server ever refuses such a write for good is not known, so no failure is final:
+    the wait only grows.
+  - A message whose group or the label prefix changes is tried at once, with its count of
+    failures started afresh.
+  - A message its server no longer has (Graph's 404, an IMAP message gone from the INBOX) is not
+    asked about again while it stays in the cache. The wait and the gone mark go with the
+    message's row: a message the sync drops and brings back is tried at once.
+  - Failures of a whole account (a refused token or grant, throttling, no connection, a failed
+    session) do not count: they stop that account's pass as before, and everything waits for
+    the next run or wake.
+  - A message waiting after a failure is said: `neomail classify` counts it as held back and
+    does not exit 1 for it alone; the daemon counts it as failed, so a retry that fails again
+    says nothing new.
+  - The state is the cache's `label_retry` table, keyed by the message's id.
+- **Builds on:** [DEC-2026-10-13-categories](#dec-2026-10-13-categories) and
+  [DEC-2026-10-14-labels-junk](#dec-2026-10-14-labels-junk).

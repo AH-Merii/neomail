@@ -349,6 +349,13 @@ id would be handed out again), recreates the index, requires an empty `PRAGMA fo
 sets the version, straight to the newest schema with every mailbox synced. Foreign keys go back on
 afterwards. Any failure rolls back to the untouched schema 1 (`nm-core/tests/migration.rs`).
 
+Schema 9 adds the `label_retry` table, which holds back a message whose write or move failed or
+whose server no longer has it ([DEC-2026-10-14-label-retries](decisions.md#dec-2026-10-14-label-retries)).
+Its rows refer to `message.id` with `ON DELETE CASCADE`, so they go when the sync, a rebuild or a
+move to Junk deletes the message. `Cache::labels_due` skips a held-back message, counting the
+ones that wait after a failure (`LabelsDue::held`) for the lines, and `Cache::label_tried` records how each message's write or move ended. The step to 8 only creates
+the table.
+
 `PRAGMA user_version` holds the schema version. A new cache gets its schema and version in one
 `BEGIN IMMEDIATE` transaction that reads the version again, so two first syncs at once or a
 crash cannot leave half a schema. A newer version than the binary knows is refused rather than

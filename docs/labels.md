@@ -59,9 +59,13 @@ spam keeps its label and stays where it is.
 
 As for categories: up to 1,000 messages per account per `neomail classify` run and 100 per
 daemon wake, under the account's lock; over IMAP, 50 messages per session. What is still to write
-or move is worked out from the cache each time, so nothing is queued, and a write or move that
-failed is tried again next time. A line such as `neomail: work: 37 labels written, 2 moved to
-Junk` says what was done. A failed sign-in or session stops that account's writes, and says
+or move is worked out from the cache each time, so nothing is queued. A write or move that failed
+for one message waits before it is tried again: 15 minutes, doubled after each failure in a row,
+at most a day, or not at all once the message's group or the prefix changes
+([DEC-2026-10-14-label-retries](decisions.md#dec-2026-10-14-label-retries)). A message no longer
+in the INBOX is not asked about again until the sync drops it. A line such as `neomail: work: 37 labels written, 2 moved to
+Junk` says what was done, and `1 held back after a failure (tried again later)` counts the
+messages still waiting after a failure; those alone do not make `neomail classify` exit 1. A failed sign-in or session stops that account's writes, and says
 `neomail: work: labels not written: WHY` (`spam not moved to Junk` when only moves were due); the
 other accounts go on. `neomail classify` exits 1 when a write, a move or an account failed; a
 server without Junk and an earlier Proton label that stays are warnings. Classifying, syncing and

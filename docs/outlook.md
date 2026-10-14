@@ -191,17 +191,23 @@ get labels the same way ([labels.md](labels.md)).
   daemon wake, at most four requests at once, with the same throttling waits as reads; the rest
   is written next time. Writes take the account's lock, as `mark` does.
 - **When it fails.** What is still to write is worked out from the cache each time, so nothing is
-  queued: mail classified before neomail wrote categories, and writes that failed, are written on
-  the next run or wake. neomail records what it wrote on each message by the message's immutable
+  queued: mail classified before neomail wrote categories is written on the next run or wake.
+  neomail records what it wrote on each message by the message's immutable
   id, which stays the same when the message moves to another folder of the mailbox
   ([immutable ids](https://learn.microsoft.com/en-us/graph/outlook-immutable-id)), so two copies
-  of one mail are written, and retried, each on its own. A write that keeps failing is tried again
-  on every run or wake; the daemon says so only when its counts change. A message Graph no longer
-  has (404) is skipped. A refused token or grant (401 or 403), or Graph still throttling after its
+  of one mail are written, and retried, each on its own. A write that fails for one message waits
+  before it is tried again: 15 minutes, doubled after each failure in a row, at most a day, or not
+  at all once its group or the prefix changes
+  ([DEC-2026-10-14-label-retries](decisions.md#dec-2026-10-14-label-retries)). Until then
+  `neomail classify` counts it, as in `outlook: 1 held back after a failure (tried again later)`,
+  and exits 0 for it; the daemon says so only when its counts change, a held-back message counting
+  as a failed one, so a retry that fails again is not said again. A message Graph no longer has (404) is not asked about again until
+  the sync drops it. A refused token or grant (401 or 403), or Graph still throttling after its
   retries or out of reach, stops that account's writes, and the rest wait; the other accounts go
   on. In the daemon the writes also stop at a time budget (60 seconds, or the interval when that
-  is shorter), so they hold up the next sync by little more than that, and accounts not reached
-  by then wait for the next wake.
+  is shorter), the sign-in's token refresh included, so they hold up the next sync by little more
+  than that. Each account gets an equal share of what is left of the budget when its turn comes,
+  so a throttled or slow account cannot keep the others from theirs.
   `neomail classify` exits 1 when a category write, a move to Junk or an account's sign-in
   failed; classifying, syncing and notifying go on whatever happens. Lines about categories name
   the account only, never a subject, a sender or a category of yours.

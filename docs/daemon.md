@@ -420,7 +420,7 @@ account the daemon writes to prints one line on standard output when it wrote or
 when its failed or waiting counts changed:
 
 ```text
-14:05:00 outlook: 12 categories written, 1 failed (tried again next wake), 30 wait for the next wake
+14:05:00 outlook: 12 categories written, 1 failed (tried again later), 30 wait for the next wake
 14:05:02 work: 3 labels written, 1 moved to Junk
 ```
 
@@ -434,17 +434,22 @@ for the wake and says once `neomail: outlook: categories not written: WHY`; on G
 failed sign-in or session says `labels not written: WHY`, or `spam not moved to Junk: WHY` where
 only moves were due. The rest wait for the next wake. A refused token is fetched afresh at the
 next wake, with nothing to run. A server without a Junk folder, and Proton labels that stay
-beside the new ones, are warnings said once, and again only when they change. A warning
-from the sign-in, such as a new refresh token that could not be saved, is printed like the sync's
-and only when it differs from the account's last one. The writes stop starting when their
-budget is spent, as classifying does (60 seconds, or the interval when that is shorter, counted
-from when the writes start), and writes still in flight then are dropped and tried again next
-wake. So a wake's writes can delay the next sync by little more than that budget, and accounts
-not reached by then wait for the next wake. However a write fails, classifying, the sync and the
+beside the new ones, are warnings said once, and again only when they change. The writes sign in
+with the sync's sign-in, so an account's token is refreshed once for both, and a warning from it,
+such as a new refresh token that could not be saved, is printed once, whichever of them signed
+in, and again only when it differs from the account's last one. The writes stop starting when
+their budget is spent, as classifying does (60 seconds, or the interval when that is shorter,
+counted from when the writes start), and writes and token refreshes still in flight then are
+dropped and tried again next wake; an IMAP account's `password_command` keeps its own 60-second
+limit. Each account gets an equal share of what is left of the budget when its
+turn comes, and one that needs less leaves the rest to the accounts after it, so a throttled or
+slow account cannot use up their time. So a wake's writes can delay the next sync by little more
+than that budget. A write or move that failed for one message waits before it is tried again
+([labels.md](labels.md#how-much-at-once-and-when-it-fails)); while it waits it counts as failed,
+so a retry that fails again prints nothing new. However a write fails, classifying, the sync and the
 notifications go on as before. `[classify] labels = false` turns writing off and `junk = false`
-moving from the next round, and `label_prefix` sets the prefix. On Outlook the writes use their
-own copy of the account's access token, refreshed as the sync's is, and only while something is
-due; on Gmail and Proton each IMAP session signs in on its own, one per 50 messages, after one
+moving from the next round, and `label_prefix` sets the prefix. On Outlook the writes use the
+sync's access token; on Gmail and Proton each IMAP session signs in on its own, one per 50 messages, after one
 that asks the server what it takes, which the daemon remembers until a session fails. Ctrl-C or SIGTERM ends the writes after the four Outlook requests
 or the IMAP session in flight.
 

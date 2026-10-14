@@ -17,7 +17,7 @@ use crate::types::{
 
 /// The schema this build writes. A cache with a newer version is refused, not guessed at; an
 /// older one is migrated by [`Cache::open`].
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// The `mailbox` and `message` tables of schema 5, named `mailbox{suffix}` and `message{suffix}`: the migration from 1
 /// creates them under temporary names first. `message` refers to `mailbox` by its final name.
@@ -128,6 +128,41 @@ CREATE TABLE junk (
 );
 ";
 
+/// Writes and moves that failed for one message, and messages its server no longer has (schema
+/// 9; DEC-2026-10-14-label-retries), so neither costs a request on every pass. Keyed by
+/// `message.id`, never reused: the row goes with the message when a sync, a rebuild or a move
+/// to Junk deletes it, and a message brought back is a new row, tried at once. `want` is the
+/// name that was due when it failed: a message whose group or prefix changed is due at once.
+/// `retry_at` is when it is due again, NULL for a message the server no longer has.
+const LABEL_RETRY: &str = "
+CREATE TABLE label_retry (
+    message_id INTEGER PRIMARY KEY REFERENCES message (id) ON DELETE CASCADE,
+    want       TEXT    NOT NULL,
+    failures   INTEGER NOT NULL CHECK (failures >= 0),
+    retry_at   INTEGER
+);
+";
+
+/// The wait after a message's `failures`-th write or move in a row that failed: 15 minutes,
+/// doubled with each failure, at most a day (DEC-2026-10-14-label-retries).
+pub fn label_retry_wait(failures: u32) -> chrono::TimeDelta {
+    const FIRST_MINUTES: i64 = 15;
+    const CAP: chrono::TimeDelta = chrono::TimeDelta::days(1);
+    let doublings = failures.saturating_sub(1).min(16);
+    chrono::TimeDelta::minutes(FIRST_MINUTES << doublings).min(CAP)
+}
+
+/// How a message's write or move ended, for [`Cache::label_tried`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tried {
+    /// Everything due on it was done (or it waits only for a later pass): due as usual.
+    Done,
+    /// A write or move failed for this message alone: due again after [`label_retry_wait`].
+    Failed,
+    /// Its server no longer has it: not due again while its row stays.
+    Gone,
+}
+
 const INDEX: &str =
     "CREATE INDEX message_order ON message (COALESCE(received, date, 0) DESC, id DESC);";
 
@@ -196,6 +231,9 @@ END;
 /// Schema 7 to 8: [`SEARCH`]. No row is parsed here: every row starts unindexed, and
 /// [`Cache::index_pending`] indexes them.
 const MIGRATE_V7: &str = SEARCH;
+
+/// Schema 8 to 9: the [`LABEL_RETRY`] table. Every existing row stays; nothing has failed yet.
+const MIGRATE_V8: &str = LABEL_RETRY;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
@@ -328,6 +366,18 @@ pub struct DueFor {
     pub junk: bool,
 }
 
+/// What [`Cache::labels_due`] found for a pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LabelsDue {
+    /// The due messages, newest first: at most the limit.
+    pub due: Vec<LabelDue>,
+    /// How many more are due past the limit.
+    pub more: usize,
+    /// How many would be due but are held back after a failed write or move, until their
+    /// `retry_at` ([`Cache::label_tried`]). A message its server no longer has is not counted.
+    pub held: usize,
+}
+
 /// A classified message with something to write on its server: [`Cache::labels_due`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelDue {
@@ -402,6 +452,7 @@ impl Cache {
                 tx.execute_batch(CLASSIFICATION)?;
                 tx.execute_batch(LABEL)?;
                 tx.execute_batch(JUNK)?;
+                tx.execute_batch(LABEL_RETRY)?;
                 tx.execute_batch(INDEX)?;
                 tx.execute_batch(SEARCH)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -428,6 +479,9 @@ impl Cache {
         }
         if schema_version(&conn)? == 7 {
             migrate_step(&mut conn, 7, MIGRATE_V7)?;
+        }
+        if schema_version(&conn)? == 8 {
+            migrate_step(&mut conn, 8, MIGRATE_V8)?;
         }
         conn.pragma_update(None, "foreign_keys", true)?;
         match schema_version(&conn)? {
@@ -1260,7 +1314,7 @@ impl Cache {
     }
 
     /// The classified messages with something to write on their server, newest first: at most
-    /// `limit`, and how many more are due. From one account or all of them, and only the
+    /// `limit`, how many more are due, and how many are held back after a failure. From one account or all of them, and only the
     /// messages `ids` when given.
     ///
     /// A label is due (`for_.labels`) when the wanted name, `prefix` and the effective group
@@ -1270,6 +1324,10 @@ impl Cache {
     /// recorded for this very row and never confirmed ([`Self::junk_attempt`]). So a move that
     /// failed after its label was written is still due, and a message the user brought back is
     /// not.
+    ///
+    /// Neither is due while [`Self::label_tried`] holds it back: a message its server no longer
+    /// has, or one whose last write or move failed, until its `retry_at` passes or the name it
+    /// should carry changes.
     #[allow(clippy::too_many_arguments)] // The pass's scope, rules and cap, each used once.
     pub fn labels_due(
         &self,
@@ -1280,21 +1338,23 @@ impl Cache {
         for_: DueFor,
         now: DateTime<Utc>,
         limit: usize,
-    ) -> Result<(Vec<LabelDue>, usize)> {
+    ) -> Result<LabelsDue> {
         let mut stmt = self.conn.prepare(
             "SELECT m.id, b.account, m.remote_id, m.uid, b.uid_validity,
                     COALESCE(m.received, m.date), m.msg_key, c.choice, c.confidence, l.name,
-                    j.msg_key IS NOT NULL, j.moved_at IS NULL AND j.message_id = m.id
+                    j.msg_key IS NOT NULL, j.moved_at IS NULL AND j.message_id = m.id,
+                    r.message_id IS NOT NULL, r.want, r.retry_at
              FROM message m JOIN mailbox b ON b.id = m.mailbox_id
              JOIN classification c ON c.account = b.account AND c.msg_key = m.msg_key
              LEFT JOIN label l ON l.account = b.account
                  AND l.remote_id = COALESCE(m.remote_id, m.msg_key)
              LEFT JOIN junk j ON j.account = b.account AND j.msg_key = m.msg_key
+             LEFT JOIN label_retry r ON r.message_id = m.id
              WHERE ?1 IS NULL OR b.account = ?1
              ORDER BY COALESCE(m.received, m.date, 0) DESC, m.id DESC",
         )?;
         let mut rows = stmt.query(params![account])?;
-        let (mut due, mut more) = (Vec::new(), 0);
+        let mut found = LabelsDue::default();
         while let Some(r) = rows.next()? {
             let id = MessageId::new(r.get(0)?);
             if ids.is_some_and(|ids| !ids.contains(&id)) {
@@ -1320,8 +1380,21 @@ impl Cache {
             if !label && !junk {
                 continue;
             }
-            if due.len() == limit {
-                more += 1;
+            let (held, failed_want, retry_at): (bool, Option<String>, Option<i64>) =
+                (r.get(12)?, r.get(13)?, r.get(14)?);
+            match retry_at {
+                // Gone from its server.
+                None if held => continue,
+                Some(at)
+                    if failed_want.as_deref() == Some(want.as_str()) && at > now.timestamp() =>
+                {
+                    found.held += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            if found.due.len() == limit {
+                found.more += 1;
                 continue;
             }
             let key = match (r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?) {
@@ -1338,7 +1411,7 @@ impl Cache {
                 },
                 (None, None) => return Err(CacheError::Corrupt("a message without a key")),
             };
-            due.push(LabelDue {
+            found.due.push(LabelDue {
                 id,
                 account: r.get(1)?,
                 key,
@@ -1349,7 +1422,7 @@ impl Cache {
                 junk,
             });
         }
-        Ok((due, more))
+        Ok(found)
     }
 
     /// Records that `account`'s item `item` ([`LabelDue::item`]) carries `name` on its server,
@@ -1366,6 +1439,50 @@ impl Cache {
              VALUES (?1, ?2, ?3, ?4)",
             params![account, item, name, at.timestamp()],
         )?;
+        Ok(())
+    }
+
+    /// Records how a write or move for the message `id`, due to carry `want`, ended at `at`:
+    /// [`Tried::Done`] clears what held it back, [`Tried::Failed`] holds it back for
+    /// [`label_retry_wait`] of its failures in a row (counted afresh when `want` changed), and
+    /// [`Tried::Gone`] for as long as its row stays.
+    pub fn label_tried(
+        &mut self,
+        id: MessageId,
+        want: &str,
+        tried: Tried,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        match tried {
+            Tried::Done => {
+                self.conn
+                    .execute("DELETE FROM label_retry WHERE message_id = ?1", [id.get()])?;
+            }
+            Tried::Gone => {
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO label_retry (message_id, want, failures, retry_at)
+                     VALUES (?1, ?2, 0, NULL)",
+                    params![id.get(), want],
+                )?;
+            }
+            Tried::Failed => {
+                let before: Option<u32> = self
+                    .conn
+                    .query_row(
+                        "SELECT failures FROM label_retry WHERE message_id = ?1 AND want = ?2",
+                        params![id.get(), want],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let failures = before.unwrap_or(0).saturating_add(1);
+                let retry_at = at + label_retry_wait(failures);
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO label_retry (message_id, want, failures, retry_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![id.get(), want, failures, retry_at.timestamp()],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1461,6 +1578,7 @@ fn migrate_v1(conn: &mut Connection) -> Result<()> {
     tx.execute_batch(CLASSIFICATION)?;
     tx.execute_batch(LABEL)?;
     tx.execute_batch(JUNK)?;
+    tx.execute_batch(LABEL_RETRY)?;
     tx.execute_batch(INDEX)?;
     tx.execute_batch(SEARCH)?;
     let dangling = tx
@@ -1582,7 +1700,7 @@ fn uid_from_db(value: i64) -> Result<Uid> {
 mod tests {
     use super::*;
 
-    /// Turns a schema 8 cache back into schema 7's tables (the version is left to the caller).
+    /// Drops what search added (schema 8); the caller drops the rest and sets the version.
     const UNDO_SEARCH: &str = "
         DROP TRIGGER message_fts_delete;
         DROP TABLE message_fts;
@@ -2023,7 +2141,7 @@ mod tests {
         now: i64,
         limit: usize,
     ) -> (Vec<(String, String, Option<String>)>, usize) {
-        let (due, more) = cache
+        let LabelsDue { due, more, .. } = cache
             .labels_due(None, None, rules, prefix, BOTH, day(now), limit)
             .unwrap();
         let due = due
@@ -2075,7 +2193,9 @@ mod tests {
             due(&cache, &rules, &prefix, 10, 10).0,
             [entry("id-b", "nm-spam"), entry("id-a", "nm-main")]
         );
-        let (only, more) = cache
+        let LabelsDue {
+            due: only, more, ..
+        } = cache
             .labels_due(Some("out"), Some(&[b]), &rules, &prefix, BOTH, day(10), 10)
             .unwrap();
         assert_eq!((only.len(), only[0].item(), more), (1, "id-b", 0));
@@ -2130,7 +2250,7 @@ mod tests {
             cache
                 .labels_due(None, None, &rules, &prefix, BOTH, day(2), 10)
                 .unwrap(),
-            (vec![], 0)
+            LabelsDue::default()
         );
         assert_eq!(cache.list(None, 10).unwrap().len(), 1);
     }
@@ -2183,11 +2303,13 @@ mod tests {
             outlook(&mut cache, "out", "a", 1, Some((Choice::Newsletters, 0.9)));
             outlook(&mut cache, "out", "b", 2, None);
         }
-        // Schema 5 is schema 7 without the label and junk tables.
+        // Schema 5 is this schema without the label, junk and label_retry tables.
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(UNDO_SEARCH).unwrap();
-        conn.execute_batch("DROP TABLE label; DROP TABLE junk; PRAGMA user_version = 5;")
-            .unwrap();
+        conn.execute_batch(
+            "DROP TABLE label_retry; DROP TABLE label; DROP TABLE junk; PRAGMA user_version = 5;",
+        )
+        .unwrap();
         drop(conn);
 
         let mut cache = Cache::open(&path).unwrap();
@@ -2211,9 +2333,10 @@ mod tests {
     /// The due messages as (item, label due, move due), asking for both.
     fn due_for(cache: &Cache, rules: &GroupRules, for_: DueFor) -> Vec<(String, bool, bool)> {
         let prefix = LabelPrefix::default();
-        let (due, _) = cache
+        let due = cache
             .labels_due(None, None, rules, &prefix, for_, day(10), 10)
-            .unwrap();
+            .unwrap()
+            .due;
         due.into_iter()
             .map(|d| (d.item().to_owned(), d.label, d.junk))
             .collect()
@@ -2233,7 +2356,7 @@ mod tests {
         cache
             .store_classification(&account, &key, &result(Choice::Main, 0.9))
             .unwrap();
-        let (due, more) = cache
+        let LabelsDue { due, more, .. } = cache
             .labels_due(None, None, &rules, &prefix, BOTH, day(10), 10)
             .unwrap();
         assert_eq!((due.len(), more), (1, 0));
@@ -2320,7 +2443,7 @@ mod tests {
         cache
             .store_label(&account, &key, "nm-spam", day(2))
             .unwrap();
-        let (due, _) = cache
+        let LabelsDue { due, .. } = cache
             .labels_due(
                 None,
                 None,
@@ -2354,10 +2477,10 @@ mod tests {
             outlook(&mut cache, "out", "b", 2, None);
             written(&mut cache, "a", "nm-spam");
         }
-        // Schema 6 is schema 8 without search's index and the junk table.
+        // Schema 6 is this schema without search's index and the junk and label_retry tables.
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(UNDO_SEARCH).unwrap();
-        conn.execute_batch("DROP TABLE junk; PRAGMA user_version = 6;")
+        conn.execute_batch("DROP TABLE label_retry; DROP TABLE junk; PRAGMA user_version = 6;")
             .unwrap();
         drop(conn);
 
@@ -2369,5 +2492,106 @@ mod tests {
             [("id-a".to_owned(), false, true)],
             "its label kept, and spam classified before 10d due a move once"
         );
+    }
+    #[test]
+    fn a_failed_message_waits_longer_after_each_failure_and_at_once_for_a_new_group() {
+        let mut cache = Cache::open_in_memory().unwrap();
+        let rules = GroupRules::default();
+        let a = outlook(&mut cache, "out", "a", 1, Some((Choice::Main, 0.9)));
+        let at = day(10);
+        let due_at = |cache: &Cache, prefix: &LabelPrefix, now: DateTime<Utc>| {
+            let found = cache
+                .labels_due(None, None, &rules, prefix, BOTH, now, 10)
+                .unwrap();
+            (found.due.len(), found.more, found.held)
+        };
+        let prefix = LabelPrefix::default();
+        cache.label_tried(a, "nm-main", Tried::Failed, at).unwrap();
+        let minute = chrono::TimeDelta::minutes(1);
+        assert_eq!(
+            due_at(&cache, &prefix, at),
+            (0, 0, 1),
+            "not due, not counted as more, counted as held back"
+        );
+        assert_eq!(due_at(&cache, &prefix, at + minute * 14), (0, 0, 1));
+        assert_eq!(due_at(&cache, &prefix, at + minute * 15), (1, 0, 0));
+        // A second failure in a row waits 30 minutes, a third an hour.
+        cache.label_tried(a, "nm-main", Tried::Failed, at).unwrap();
+        assert_eq!(due_at(&cache, &prefix, at + minute * 29), (0, 0, 1));
+        assert_eq!(due_at(&cache, &prefix, at + minute * 30), (1, 0, 0));
+        cache.label_tried(a, "nm-main", Tried::Failed, at).unwrap();
+        assert_eq!(due_at(&cache, &prefix, at + minute * 59), (0, 0, 1));
+        // A new prefix is a new name to write: due at once.
+        let other = LabelPrefix::new("x-").unwrap();
+        assert_eq!(due_at(&cache, &other, at), (1, 0, 0));
+        // A success clears the waits.
+        cache.label_tried(a, "nm-main", Tried::Done, at).unwrap();
+        assert_eq!(due_at(&cache, &prefix, at), (1, 0, 0));
+    }
+
+    #[test]
+    fn the_wait_doubles_from_15_minutes_up_to_a_day() {
+        let waits: Vec<i64> = (1..=9).map(|n| label_retry_wait(n).num_minutes()).collect();
+        assert_eq!(waits, [15, 30, 60, 120, 240, 480, 960, 1440, 1440]);
+        assert_eq!(label_retry_wait(u32::MAX).num_minutes(), 1440);
+    }
+
+    #[test]
+    fn a_gone_message_is_never_due_while_its_row_stays_and_a_new_row_is_due_at_once() {
+        let mut cache = Cache::open_in_memory().unwrap();
+        let rules = GroupRules::default();
+        let a = outlook(&mut cache, "out", "a", 1, Some((Choice::Spam, 0.95)));
+        cache
+            .label_tried(a, "nm-spam", Tried::Gone, day(10))
+            .unwrap();
+        assert_eq!(due_for(&cache, &rules, BOTH), []);
+        // Not even for a new group, and it is not held back after a failure either.
+        let other = LabelPrefix::new("x-").unwrap();
+        assert_eq!(
+            cache
+                .labels_due(None, None, &rules, &other, BOTH, day(400), 10)
+                .unwrap(),
+            LabelsDue::default()
+        );
+        // The sync drops it; brought back, it is a new row, due at once.
+        cache.remove(&[a]).unwrap();
+        outlook(&mut cache, "out", "a", 1, None);
+        assert_eq!(
+            due_for(&cache, &rules, BOTH),
+            [("id-a".to_owned(), true, true)]
+        );
+    }
+
+    #[test]
+    fn a_schema_8_cache_gains_the_label_retry_table_and_keeps_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        {
+            let mut cache = Cache::open(&path).unwrap();
+            outlook(&mut cache, "out", "a", 1, Some((Choice::Main, 0.9)));
+            written(&mut cache, "a", "nm-main");
+            outlook(&mut cache, "out", "b", 2, Some((Choice::Main, 0.9)));
+        }
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE label_retry; PRAGMA user_version = 8;")
+            .unwrap();
+        drop(conn);
+
+        let mut cache = Cache::open(&path).unwrap();
+        assert_eq!(schema_version(&cache.conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(cache.list(None, 10).unwrap().len(), 2);
+        assert_eq!(
+            due_for(&cache, &GroupRules::default(), BOTH),
+            [("id-b".to_owned(), true, false)]
+        );
+        let prefix = LabelPrefix::default();
+        let rules = GroupRules::default();
+        let LabelsDue { due, .. } = cache
+            .labels_due(None, None, &rules, &prefix, BOTH, day(10), 10)
+            .unwrap();
+        cache
+            .label_tried(due[0].id, "nm-main", Tried::Gone, day(10))
+            .unwrap();
+        assert_eq!(due_for(&cache, &GroupRules::default(), BOTH), []);
     }
 }
