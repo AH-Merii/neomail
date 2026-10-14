@@ -575,6 +575,20 @@ Debug builds open a JSON file named by `NEOMAIL_TEST_KEYRING` instead of the OS 
 next; release builds have no such path. The CLI tests (`neomail/tests/classify.rs`) run a fake
 jev on 127.0.0.1; `tests/live_jev.rs` is the one live check, off by default.
 
+**The question after a first sync** (`neomail/src/first_sync.rs`,
+[DEC-2026-10-14-first-sync](decisions.md#dec-2026-10-14-first-sync)): `neomail sync` keeps each
+synced account's `SyncReport`, closes its cache, and then calls `first_sync::after_sync` with the
+accounts `first_sync::firsts` picks: those whose report is `initial` and not `reset`. That takes in
+the sync that finishes an interrupted first sync or rebuild, since `initial` stays set until a
+sync completes. `first_sync::can_ask` asks only when standard input and standard error are a
+terminal and `--no-input` is not given. `offer` is the rule: an answer in `classify-first-sync.json` in the data
+directory says nothing; off a terminal one line; without a key one line; else the question, built
+from `classify::preview` (what `--estimate` works out for `--account NAME`), and the answer kept
+before anything runs. A yes runs `classify::run_with` with `classify::Args` parsed from
+`classify --account NAME`; `run_with` is `run` with the terminal question as a parameter, so the
+consent question goes through the same `ask`. Its tests (`first_sync/tests.rs`) sync a fake IMAP
+INBOX into a cache in memory and script the answers.
+
 ## How sync works
 
 `neomail sync` and `neomail daemon` sync an account through one function, `sync::Syncer::sync`
