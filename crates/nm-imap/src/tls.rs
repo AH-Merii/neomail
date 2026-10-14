@@ -76,8 +76,9 @@ pub fn client_config(pin: Option<CertPin>) -> Result<Arc<ClientConfig>, rustls::
 }
 
 /// A config that accepts any certificate, only so that its SHA-256 can be read and shown to the
-/// user (`server_certificate`). Nothing is ever sent over such a connection.
-pub(crate) fn capture_config() -> Result<Arc<ClientConfig>, rustls::Error> {
+/// user (`server_certificate`, and the Proton setup's check of Bridge's IMAP and SMTP ports).
+/// Nothing is ever sent over such a connection.
+pub fn capture_config() -> Result<Arc<ClientConfig>, rustls::Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = PinVerifier {
         pin: None,

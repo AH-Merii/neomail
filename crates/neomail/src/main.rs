@@ -231,6 +231,8 @@ const ADD_EXAMPLES: &str = "\
 Examples:
   neomail account add
   neomail account add proton
+  neomail account add proton --no-input --username you@example.com --port 1144 \\
+      --bridge-cert ~/bridge-cert/cert.pem --password-command 'pass show bridge'
   neomail account add gmail-app-password --username you@example.com
   neomail account add imap --name work --username you@example.com --host imap.example.com
   pass show mail/work | neomail account add imap --no-input --name work \\
@@ -262,7 +264,16 @@ sign-in left in the keyring under that name with no account in the config: it is
 and deleted right before the new sign-in, since revoking it afterwards would end the new one too,
 and nothing replaces it if a later step fails. A failure names the step to change. Off a terminal or with --no-input they need --email and --client-id:
 https://github.com/AH-Merii/neomail/blob/main/docs/gmail.md
-https://github.com/AH-Merii/neomail/blob/main/docs/outlook.md";
+https://github.com/AH-Merii/neomail/blob/main/docs/outlook.md
+
+proton goes one step at a time on a terminal: a paid plan, installing Bridge, signing in to it,
+then the name and Bridge's mailbox details (username, IMAP and SMTP ports and security). It
+checks that Bridge answers on both ports as answered, shows the certificate's SHA-256 and pins it
+when you confirm it or give the cert.pem Bridge exported (a mismatch is refused), then checks the
+Bridge password with an IMAP login and an SMTP login that sends nothing before anything is
+written. Your Proton password is never asked for. Off a terminal or with --no-input it needs
+--username and --cert-sha256 or --bridge-cert:
+https://github.com/AH-Merii/neomail/blob/main/docs/proton.md";
 
 #[derive(Parser)]
 #[command(
@@ -674,10 +685,10 @@ struct AddCommand {
     /// imap: the IMAP server
     #[arg(long, value_name = "HOST")]
     host: Option<String>,
-    /// imap, proton: the port [default: 993 with tls, 143 with starttls; proton 1143]
+    /// imap, proton: the IMAP port [default: 993 with tls, 143 with starttls; proton 1143]
     #[arg(long, value_name = "PORT")]
     port: Option<u16>,
-    /// imap: how the connection is secured [default: tls]
+    /// imap, proton: how the IMAP connection is secured; Bridge's SSL is tls [default: tls; proton starttls]
     #[arg(long, value_name = "MODE")]
     security: Option<SecurityArg>,
     /// imap, proton, gmail-app-password: run this through `sh -c` for the password instead of storing it in the OS keyring
@@ -686,15 +697,18 @@ struct AddCommand {
     /// imap: the SMTP server to send through, with TLS [default: none, so the account cannot send until the config names one]
     #[arg(long, value_name = "HOST")]
     smtp_host: Option<String>,
-    /// imap: the SMTP port [default: 587 with starttls, else 465]
-    #[arg(long, value_name = "PORT", requires = "smtp_host")]
+    /// imap (with --smtp-host), proton: the SMTP port [default: 587 with starttls, else 465; proton 1025]
+    #[arg(long, value_name = "PORT")]
     smtp_port: Option<u16>,
-    /// imap: how the SMTP connection is secured [default: starttls on port 587, else tls]
-    #[arg(long, value_name = "MODE", requires = "smtp_host")]
+    /// imap (with --smtp-host), proton: how the SMTP connection is secured [default: starttls on port 587, else tls; proton starttls]
+    #[arg(long, value_name = "MODE")]
     smtp_security: Option<SecurityArg>,
     /// imap, proton: the server certificate's SHA-256 to pin (64 hex digits, colons allowed)
     #[arg(long, value_name = "HEX", value_parser = parse_pin)]
     cert_sha256: Option<CertPin>,
+    /// proton: the cert.pem Bridge exported, compared with the certificate Bridge presents and pinned if they match (delete the key.pem the export wrote next to it)
+    #[arg(long, value_name = "PATH", conflicts_with = "cert_sha256")]
+    bridge_cert: Option<PathBuf>,
     /// Skip the read-only login check before the config is written; gmail and outlook also skip the client check before the sign-in
     #[arg(long)]
     no_check: bool,
@@ -728,7 +742,7 @@ impl AddProvider {
             Self::Gmail => "gmail",
             Self::Outlook => oauth::MICROSOFT.setup.default_name,
             Self::GmailAppPassword => wizard::gmail::GMAIL_APP_PASSWORD.id,
-            Self::Proton => setup::PROTON.id,
+            Self::Proton => wizard::proton::PROTON.id,
             Self::Imap => setup::IMAP.id,
         }
     }
@@ -1599,34 +1613,66 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
     let outlook_only = [("--account-type", add.account_type.is_some())];
     let imap_only = [
         ("--host", add.host.is_some()),
-        ("--security", add.security.is_some()),
         ("--smtp-host", add.smtp_host.is_some()),
+    ];
+    let imap_proton = [
+        ("--security", add.security.is_some()),
         ("--smtp-port", add.smtp_port.is_some()),
         ("--smtp-security", add.smtp_security.is_some()),
     ];
+    let proton_only = [("--bridge-cert", add.bridge_cert.is_some())];
     let port_pin = [
         ("--port", add.port.is_some()),
         ("--cert-sha256", add.cert_sha256.is_some()),
     ];
     let refused: Vec<(&str, bool)> = match provider {
-        AddProvider::Gmail => [&password_only[..], &outlook_only, &imap_only, &port_pin].concat(),
-        AddProvider::Outlook => [&password_only[..], &gmail_only, &imap_only, &port_pin].concat(),
+        AddProvider::Gmail => [
+            &password_only[..],
+            &outlook_only,
+            &imap_only,
+            &imap_proton,
+            &port_pin,
+            &proton_only,
+        ]
+        .concat(),
+        AddProvider::Outlook => [
+            &password_only[..],
+            &gmail_only,
+            &imap_only,
+            &imap_proton,
+            &port_pin,
+            &proton_only,
+        ]
+        .concat(),
         AddProvider::GmailAppPassword => [
             &oauth_only[..],
             &gmail_only,
             &outlook_only,
             &imap_only,
+            &imap_proton,
             &port_pin,
+            &proton_only,
         ]
         .concat(),
         AddProvider::Proton => [&oauth_only[..], &gmail_only, &outlook_only, &imap_only].concat(),
-        AddProvider::Imap => [&oauth_only[..], &gmail_only, &outlook_only].concat(),
+        AddProvider::Imap => [&oauth_only[..], &gmail_only, &outlook_only, &proton_only].concat(),
     };
     if let Some((flag, _)) = refused.iter().find(|(_, given)| *given) {
         return Err(usage(format!(
             "{flag} does not apply to `neomail account add {}`",
             provider.id()
         )));
+    }
+    if matches!(provider, AddProvider::Imap) && add.smtp_host.is_none() {
+        let smtp_only = [
+            ("--smtp-port", add.smtp_port.is_some()),
+            ("--smtp-security", add.smtp_security.is_some()),
+        ];
+        if let Some((flag, _)) = smtp_only.iter().find(|(_, given)| *given) {
+            return Err(usage(format!(
+                "{flag} needs --smtp-host on `neomail account add imap`"
+            )));
+        }
     }
     let preset = match provider {
         AddProvider::Gmail | AddProvider::Outlook => {
@@ -1655,7 +1701,21 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
             };
             return wizard::gmail::add(path, args, input, out);
         }
-        AddProvider::Proton => &setup::PROTON,
+        AddProvider::Proton => {
+            let args = wizard::proton::Args {
+                name: add.name,
+                username: add.username,
+                port: add.port,
+                security: add.security.map(SecurityArg::security),
+                smtp_port: add.smtp_port,
+                smtp_security: add.smtp_security.map(SecurityArg::security),
+                cert_sha256: add.cert_sha256,
+                bridge_cert: add.bridge_cert,
+                password_command: add.password_command,
+                no_check: add.no_check,
+            };
+            return wizard::proton::add(path, args, input, out);
+        }
         AddProvider::Imap => &setup::IMAP,
     };
     let args = setup::Args {

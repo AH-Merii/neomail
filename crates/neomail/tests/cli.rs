@@ -823,6 +823,21 @@ fn no_input_and_missing_values_are_usage_errors_that_write_nothing() {
         "{}",
         stderr(&o)
     );
+    // --bridge-cert is Proton's; imap's SMTP port and security need its SMTP host.
+    for (args, says) in [
+        (
+            &["account", "add", "imap", "--bridge-cert", "cert.pem"][..],
+            "--bridge-cert does not apply to `neomail account add imap`",
+        ),
+        (
+            &["account", "add", "imap", "--smtp-port", "2525"][..],
+            "--smtp-port needs --smtp-host on `neomail account add imap`",
+        ),
+    ] {
+        let o = neomail_stdin(dir.path(), args, "");
+        assert_eq!(o.status.code(), Some(2));
+        assert!(stderr(&o).contains(says), "{}", stderr(&o));
+    }
     assert!(!dir.path().join("config.toml").exists());
 }
 

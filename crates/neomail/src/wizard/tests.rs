@@ -8,6 +8,7 @@ const ALL: &[&Wizard] = &[
     &GMAIL_APP_PASSWORD,
     &crate::oauth::steps::GMAIL,
     &crate::oauth::steps::OUTLOOK,
+    &super::proton::PROTON,
 ];
 
 /// The long flags of `neomail account add`.

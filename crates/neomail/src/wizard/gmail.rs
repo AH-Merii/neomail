@@ -200,11 +200,11 @@ use `neomail account add gmail`.",
     ],
 };
 
-const NAME_TAKEN: &str = "name-taken";
-const REFUSED: &str = "refused";
-const OTHER: &str = "other";
+pub(super) const NAME_TAKEN: &str = "name-taken";
+pub(super) const REFUSED: &str = "refused";
+pub(super) const OTHER: &str = "other";
 
-fn clean_name(typed: &str) -> Result<Cleaned, &'static str> {
+pub(super) fn clean_name(typed: &str) -> Result<Cleaned, &'static str> {
     let name = typed.trim();
     if name.is_empty() {
         return Err("The account name is empty.");
@@ -436,7 +436,7 @@ fn refused_from_flags(address_flag: bool, command: bool) -> String {
     text
 }
 
-fn other(e: anyhow::Error) -> CheckError {
+pub(super) fn other(e: anyhow::Error) -> CheckError {
     CheckError {
         kind: OTHER,
         detail: format!("{e:#}"),
@@ -445,13 +445,13 @@ fn other(e: anyhow::Error) -> CheckError {
 
 /// Whether the config at `path` parses and already has an account named `name`. A config that
 /// does not parse is [`config::check_append`]'s to report.
-fn name_taken(path: &Path, name: &str) -> bool {
+pub(super) fn name_taken(path: &Path, name: &str) -> bool {
     config::exists(path) && Config::load(path).is_ok_and(|c| c.find(name).is_some())
 }
 
 /// Logs in to IMAP (EXAMINE INBOX, read-only) and SMTP (AUTH, then QUIT): a refused login on
 /// either is [`REFUSED`].
-fn check_login(
+pub(super) fn check_login(
     imap: &ImapConfig,
     smtp: &SmtpSettings,
     password: &Password,

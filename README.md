@@ -74,19 +74,21 @@ error. Secrets are never flags: they are prompted for without echo, read as one 
 input, or come from `--password-command`. `--no-check` skips the login. `neomail account add
 --help` lists the flags with examples.
 
-- **Proton Mail**, through Proton Mail Bridge (paid Proton plans), on
-  127.0.0.1 port 1143 with STARTTLS:
+- **Proton Mail**, through Proton Mail Bridge (paid Proton plans):
 
   ```sh
   neomail account add proton
   ```
 
-  It asks for the username and the password Bridge shows, never your Proton password. It reads
-  Bridge's self-signed certificate, shows its SHA-256 and asks before pinning it. Off a terminal,
-  pass the SHA-256 you expect with `--cert-sha256`; a different certificate is refused. To get
-  it, run `neomail account add proton` on a terminal once, or, with Bridge running, read it with
-  `openssl s_client -connect 127.0.0.1:1143 -starttls imap </dev/null | openssl x509 -noout
-  -fingerprint -sha256 | cut -d= -f2`.
+  It takes you through it one step at a time, from a paid plan and no Bridge to a first sync:
+  installing Bridge, signing in to it, then Bridge's mailbox details (username, IMAP and SMTP
+  ports and security; defaults 1143 and 1025 with STARTTLS). It checks that Bridge answers on
+  both ports as you answered, telling "not running or wrong port" from "wrong security". It shows
+  Bridge's self-signed certificate's SHA-256 and pins it when you confirm it, or give the cert.pem
+  Bridge exports (`--bridge-cert PATH`; a different certificate is refused). It asks for the
+  password Bridge shows, never your Proton password, and checks it with an IMAP login and an SMTP
+  login that sends nothing before anything is written. Off a terminal, pass `--username` and
+  `--cert-sha256` or `--bridge-cert`. The steps: [docs/proton.md](docs/proton.md).
 
   Bridge's IMAP LIST shows your folders under `Folders/` and your labels under `Labels/`. Proton has
   you create folders under the Folders group and labels under the Labels group
@@ -156,10 +158,12 @@ cert_sha256 = "AB:CD:…"   # 64 hex digits
   Bridge need none: neomail sends through smtp.gmail.com (port 465, TLS) and through Bridge's
   127.0.0.1 port 1025 ([Proton's port list](https://proton.me/support/port-already-occupied-error)),
   and both keep the copy in Sent themselves, so neomail adds none. Proton does not say how
-  Bridge's SMTP is secured; neomail uses STARTTLS with the IMAP pin. The live check sent through
-  Bridge's SMTP that way, from a hand-written `smtp` table, as its Bridge listened on other ports
-  and the preset only matches IMAP on port 1143. `account add proton` and `gmail-app-password`
-  write this out. An `smtp` table naming smtp.gmail.com also defaults to `save_sent = false`.
+  Bridge's SMTP is secured; without an `smtp` table neomail uses STARTTLS with the IMAP pin. The
+  live check sent through Bridge's SMTP that way, from a hand-written `smtp` table, as its Bridge
+  listened on other ports and the preset only matches IMAP on port 1143. `gmail-app-password`
+  writes this out; `account add proton` writes Bridge's `smtp` table from the answered SMTP port
+  and security, pinned to the certificate that port presents. An `smtp` table naming
+  smtp.gmail.com also defaults to `save_sent = false`.
   Any other server needs its `smtp` before it can send: `account add imap --smtp-host HOST`
   writes it (`--smtp-port 587` uses STARTTLS, any other port TLS; `--smtp-security starttls|tls`
   says otherwise, on port 587 or 465 unless `--smtp-port` names one).
