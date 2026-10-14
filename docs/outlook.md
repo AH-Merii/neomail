@@ -320,6 +320,30 @@ Known limit: mail moved into the INBOX from another folder, with an arrival time
 oldest cached message, is never seen: the delta query and the listing both filter on arrival time
 and leave it out.
 
+## Large files
+
+A message with a file of 3 MB or more, or one whose sendMail request would pass 4 MB, goes the
+way Microsoft documents for large attachments
+([Attach large files to Outlook messages](https://learn.microsoft.com/en-us/graph/outlook-large-attachments)):
+
+1. The message without its files is saved as a draft from its MIME (`POST /me/messages`).
+2. Each file under 3 MB is added with one `POST /me/messages/{id}/attachments`. Each larger one
+   gets an upload session (`POST .../attachments/createUploadSession`), then its bytes in order,
+   3,276,800 bytes a `PUT`, to the session's URL. That URL is on outlook.office.com and carries
+   its own token, so neomail sends it no bearer token, and refuses a URL on any other host.
+3. The draft is sent (`POST /me/messages/{id}/send`); Outlook keeps it in Sent Items.
+
+Nothing is sent before step 3, so a failure of step 1 or 2 says nothing was sent. If step 1
+fails with a 5xx or its answer is lost, Exchange may still have saved the draft, which neomail
+cannot delete without its id: the error says a draft may be left in Drafts. If step 2 fails,
+neomail deletes the draft; if it cannot, the error says the draft is left in Drafts. Steps 1 and
+2 are retried only after a 429, never a 503, which may come after Graph did the work. If step 3
+is refused (a 4xx), nothing was sent and the draft stays in Drafts, which the error says. If
+step 3 fails with a 5xx or its answer is lost, the message may have been sent: neomail says so,
+does not retry, and keeps the draft. Every sign-in that can send (`Mail.Send`) also grants
+`Mail.ReadWrite`, which the draft and the sessions need. Outlook takes 25 MB of files a message,
+the Outlook.com limit; neomail refuses more before any request.
+
 ## When something goes wrong
 
 - **"access token refused":** during `neomail sync`, the token expired between the refresh and

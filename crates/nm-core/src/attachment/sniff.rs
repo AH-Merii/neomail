@@ -185,7 +185,8 @@ fn text_kind(data: &[u8]) -> Option<&'static str> {
     )
 }
 
-fn is_textual(t: &str) -> bool {
+/// Whether `t` names a kind of text: `text/*`, XML, JSON, scripts and the like.
+pub fn is_textual(t: &str) -> bool {
     t.starts_with("text/") || t.ends_with("+xml") || t.ends_with("+json") || TEXTUAL.contains(&t)
 }
 

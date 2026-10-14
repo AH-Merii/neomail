@@ -8,6 +8,10 @@
 //! session sends RSET and QUIT instead of DATA, so nobody gets the message: a script that retries
 //! after the error must not deliver it twice to the recipients that went through.
 //!
+//! A server that names its largest message with the SIZE extension (RFC 1870,
+//! <https://www.rfc-editor.org/rfc/rfc1870>) gets nothing larger: the message is refused before
+//! AUTH, and the size is declared on MAIL FROM, so the server can refuse it before DATA.
+//!
 //! The credential is used for AUTH only; no error or `Debug` output holds it.
 
 use std::fmt;
@@ -109,6 +113,9 @@ pub enum SmtpError {
     Rejected { step: &'static str, reply: Reply },
     #[error("{0:?} cannot be used in an SMTP command; nothing was sent")]
     BadAddress(String),
+    /// The server's SIZE extension names a smaller limit than the message.
+    #[error("the message is {size} bytes, and the server takes at most {limit}; nothing was sent")]
+    TooBig { size: u64, limit: u64 },
     #[error("the server sent a malformed reply during {0}")]
     Malformed(&'static str),
     #[error("timed out during {0}")]
@@ -242,6 +249,7 @@ async fn ehlo<S: AsyncRead + AsyncWrite + Unpin>(
     if reply.code != 250 {
         return Err(SmtpError::Rejected { step, reply });
     }
+    conn.size_limit = size_limit(&reply.lines);
     Ok(reply
         .lines
         .iter()
@@ -249,6 +257,19 @@ async fn ehlo<S: AsyncRead + AsyncWrite + Unpin>(
         .filter_map(|l| l.split_whitespace().next())
         .map(str::to_ascii_uppercase)
         .collect())
+}
+
+/// The largest message the EHLO reply's SIZE line allows, if it names one: `SIZE 0` or a bare
+/// `SIZE` names no fixed limit (RFC 1870 section 4).
+fn size_limit(lines: &[String]) -> Option<u64> {
+    lines.iter().skip(1).find_map(|line| {
+        let mut words = line.split_whitespace();
+        let keyword = words.next()?;
+        if !keyword.eq_ignore_ascii_case("SIZE") {
+            return None;
+        }
+        words.next()?.parse().ok().filter(|limit| *limit > 0)
+    })
 }
 
 /// AUTH, then the envelope and the message, on a greeted connection. Shared with the tests.
@@ -267,10 +288,19 @@ async fn send_on<S: AsyncRead + AsyncWrite + Unpin>(
             return Err(SmtpError::BadAddress(address.clone()));
         }
     }
+    let size = message.mime.len() as u64;
+    if let Some(limit) = conn.size_limit
+        && size > limit
+    {
+        return Err(SmtpError::TooBig { size, limit });
+    }
     authenticate(conn, user, login).await?;
 
     let step = "MAIL FROM";
-    let from = format!("MAIL FROM:<{}>", message.envelope_from);
+    let mut from = format!("MAIL FROM:<{}>", message.envelope_from);
+    if conn.size_limit.is_some() {
+        from.push_str(&format!(" SIZE={size}"));
+    }
     let reply = conn.command(&from, step).await?;
     if !reply.ok() {
         return Err(SmtpError::Rejected { step, reply });
@@ -370,6 +400,8 @@ fn dot_stuffed(mime: &[u8]) -> Vec<u8> {
 /// A connection: commands out, replies in.
 struct Conn<S> {
     stream: BufReader<S>,
+    /// The largest message the server takes, from its last EHLO reply.
+    size_limit: Option<u64>,
 }
 
 impl<S> fmt::Debug for Conn<S> {
@@ -382,6 +414,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     fn new(stream: S) -> Self {
         Self {
             stream: BufReader::new(stream),
+            size_limit: None,
         }
     }
 

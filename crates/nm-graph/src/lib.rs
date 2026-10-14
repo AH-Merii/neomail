@@ -70,6 +70,9 @@ use nm_core::{
 };
 use serde::Deserialize;
 
+mod upload;
+pub use upload::{MAX_SENDMAIL_REQUEST, RANGE_SIZE, UPLOAD_SESSION_FROM, fits_send_mail};
+
 /// Where every request goes, and the only place a next page link may point.
 pub const GRAPH_ORIGIN: &str = "https://graph.microsoft.com/";
 const API: &str = "https://graph.microsoft.com/v1.0";
@@ -156,6 +159,24 @@ pub trait Transport {
         body: &[u8],
         max_body: usize,
     ) -> impl Future<Output = Result<Reply, TransportError>>;
+
+    /// A PUT of `body`, sent as `Content-Type: application/octet-stream`, as for
+    /// [`Self::patch_json`]: one range of a file in an upload session.
+    fn put_bytes(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> impl Future<Output = Result<Reply, TransportError>>;
+
+    /// A DELETE.
+    fn delete(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        max_body: usize,
+    ) -> impl Future<Output = Result<Reply, TransportError>>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -218,6 +239,44 @@ pub enum GraphError {
          so use Outlook on the web to move to it"
     )]
     SharedPath(FolderName),
+    /// 403 on saving the draft that large files need: the sign-in may lack Mail.ReadWrite.
+    #[error(
+        "Microsoft Graph refused to save the message as a draft (HTTP 403), which large files \
+         need: the sign-in may not include Mail.ReadWrite; nothing was sent"
+    )]
+    CannotDraft,
+    /// An upload session's URL is not on Outlook's upload host.
+    #[error("Microsoft Graph's upload URL points outside {}; refused", upload::UPLOAD_ORIGINS.join(" or "))]
+    ForeignUpload,
+    /// Sending with files failed before anything was sent: saving the draft, giving it its
+    /// files, or a refused send of the draft.
+    #[error(
+        "{source}; nothing was sent{}",
+        draft_note(*.draft_left)
+    )]
+    Unsent {
+        #[source]
+        source: Box<GraphError>,
+        draft_left: DraftLeft,
+    },
+}
+
+/// Whether an unsent message's draft is still in Drafts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftLeft {
+    /// None was saved, or it was deleted.
+    No,
+    Yes,
+    /// Saving it failed in a way that does not say whether Exchange saved it.
+    Maybe,
+}
+
+fn draft_note(left: DraftLeft) -> &'static str {
+    match left {
+        DraftLeft::No => "",
+        DraftLeft::Yes => ", and the unsent draft is left in Drafts",
+        DraftLeft::Maybe => ", but a draft of it may be left in Drafts",
+    }
 }
 
 fn code_suffix(code: &Option<String>) -> String {

@@ -9,7 +9,7 @@ use std::num::NonZeroU32;
 
 use anyhow::{Result, anyhow};
 use nm_core::LabelPrefix;
-use nm_core::compose::Outgoing;
+use nm_core::compose::{AttachedFile, Outgoing};
 use nm_core::{
     Cache, Destination, ListedFolder, Moved, RemoteId, SyncError, SyncReport, Written,
     sync_inbox_by_id_with_progress,
@@ -76,6 +76,35 @@ impl Transport for Https {
         max_body: usize,
     ) -> Result<Reply, TransportError> {
         let r = Https::post_text(self, url, headers, body, max_body).await?;
+        Ok(Reply {
+            status: r.status,
+            retry_after: r.retry_after,
+            body: r.body,
+        })
+    }
+
+    async fn put_bytes(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        max_body: usize,
+    ) -> Result<Reply, TransportError> {
+        let r = Https::put_bytes(self, url, headers, body, max_body).await?;
+        Ok(Reply {
+            status: r.status,
+            retry_after: r.retry_after,
+            body: r.body,
+        })
+    }
+
+    async fn delete(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        max_body: usize,
+    ) -> Result<Reply, TransportError> {
+        let r = Https::delete(self, url, headers, max_body).await?;
         Ok(Reply {
             status: r.status,
             retry_after: r.retry_after,
@@ -197,26 +226,41 @@ pub async fn folders(account: &str, token: &AccessToken) -> Result<Vec<ListedFol
 /// Sends `message` from a Graph account with sendMail; Graph keeps the copy in Sent Items. The
 /// grant is checked first: a sign-in from before neomail asked for Mail.Send is told to sign in
 /// again, and nothing is sent.
-pub async fn send(account: &str, token: &AccessToken, message: &Outgoing) -> Result<()> {
+///
+/// With `large`, the message without its files and the files, it goes through a draft and
+/// upload sessions instead ([`GraphSource::send_with_files`]). They need Mail.ReadWrite, which
+/// every sign-in that grants Mail.Send also asks for.
+pub async fn send(
+    account: &str,
+    token: &AccessToken,
+    message: &Outgoing,
+    large: Option<(&Outgoing, &[AttachedFile])>,
+) -> Result<()> {
     if !token.grant.can_send() {
         return Err(anyhow!(
             "this account's sign-in does not let neomail send mail; nothing was sent; run \
              `neomail account login {account}` once to let neomail send"
         ));
     }
-    GraphSource::new(Https::new()?, token.expose())
-        .send(message)
-        .await
-        .map_err(|e| match e {
-            GraphError::Unauthorized => {
-                anyhow!("access token refused; nothing was sent; run the command again")
-            }
-            GraphError::CannotSend => anyhow!(
-                "{e}; run `neomail account login {account}` and accept the permission to send \
+    let source = GraphSource::new(Https::new()?, token.expose());
+    let sent = match large {
+        Some((bare, files)) => source.send_with_files(bare, files).await,
+        None => source.send(message).await,
+    };
+    sent.map_err(|e| match e {
+        GraphError::Unauthorized => {
+            anyhow!("access token refused; nothing was sent; run the command again")
+        }
+        GraphError::CannotSend => anyhow!(
+            "{e}; run `neomail account login {account}` and accept the permission to send \
                  mail as you; if it persists, a policy of the account's organisation may block it"
-            ),
-            e => anyhow::Error::new(e),
-        })
+        ),
+        GraphError::CannotDraft => anyhow!(
+            "{e}; run `neomail account login {account}` and accept the permission to read and \
+                 change your email"
+        ),
+        e => anyhow::Error::new(e),
+    })
 }
 
 /// Fails when `token`'s sign-in grants only Mail.Read: changing or moving mail needs
@@ -344,7 +388,7 @@ mod tests {
                 secret: Secret::new("not-a-real-token".into()),
                 grant,
             };
-            let e = send("outlook", &token, &message).await.unwrap_err();
+            let e = send("outlook", &token, &message, None).await.unwrap_err();
             assert_eq!(
                 e.to_string(),
                 "this account's sign-in does not let neomail send mail; nothing was sent; run \

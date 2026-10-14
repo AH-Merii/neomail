@@ -9,6 +9,13 @@
 //!   when the server never answered the whole message (or Graph failed with a 5xx): that error
 //!   says it may have been sent.
 //! - One identity per account: its `address` (else its login) and `display_name`.
+//! - `--attach` files ([`files`]) are read once, before anything else can fail late, and checked
+//!   against the provider's limit before any connection. Words that say a file is attached, with
+//!   none attached, are asked about on a terminal and refused off one
+//!   ([`nm_core::compose::files::mentions_attachment`]). Outlook takes large files through a
+//!   draft and upload sessions ([`nm_graph::GraphSource::send_with_files`]).
+
+mod files;
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,7 +24,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use nm_core::MessageId;
-use nm_core::compose::{self, ComposeError, Draft, Mailbox, Outgoing};
+use nm_core::compose::files::mentions_attachment;
+use nm_core::compose::{self, AttachedFile, ComposeError, Draft, Mailbox, Outgoing};
 use nm_core::parse::ParsedMessage;
 use serde::Serialize;
 
@@ -36,6 +44,8 @@ Examples:
       --body - --yes --json         From a script: the body on standard input, no question
   neomail send --to ada@example.com --subject Hi --body note.md --dry-run
                                     Print the message that would be sent; send nothing
+  neomail send --to ada@example.com --subject Report --body note.md --attach report.pdf \\
+      --attach chart.png            Send two files with it
 
 The body is Markdown: it is sent as HTML rendered from it, with the Markdown itself as the plain
 text part (--text-only sends the plain text alone). HTML typed into the Markdown is sent as text,
@@ -47,8 +57,15 @@ message or a recipient, or the login failed: nothing was sent to anyone then. Ex
 connection was lost or timed out after the whole message went out, or Microsoft Graph failed with
 a 5xx: then the error says it may have been sent, so check Sent before sending it again. Exit 0
 means the server accepted it; a copy in Sent that could not be stored is a warning. An Outlook
-account added before neomail could send needs `neomail account login NAME` once. Attachments are
-not supported yet.";
+account added before neomail could send needs `neomail account login NAME` once.
+
+--attach sends a file with the message, under its own name without its folder; its type comes
+from its content. Every file is read before anything is sent, and one that cannot be read stops
+the command. Gmail, Proton Mail and Outlook take 25 MB of files a message: more is refused before
+anything is sent, naming both sizes. Outlook takes a file of 3 MB or more through an upload
+session. When your subject or text says attach, attached or attachment and no file is attached,
+neomail asks on a terminal; without one, or with --yes, it sends nothing and exits 2 unless
+--no-attachment-check is given.";
 
 pub const REPLY_EXAMPLES: &str = "\
 Examples:
@@ -142,6 +159,12 @@ pub struct Common {
     /// separate them with commas
     #[arg(long, value_name = "ADDR")]
     bcc: Vec<String>,
+    /// A file to send with the message; repeat the flag for more
+    #[arg(long, value_name = "PATH")]
+    attach: Vec<PathBuf>,
+    /// Send even though your text says something is attached and no file is
+    #[arg(long)]
+    no_attachment_check: bool,
     /// Send the Markdown as plain text only, without the HTML part
     #[arg(long)]
     text_only: bool,
@@ -186,6 +209,7 @@ pub fn send(args: SendArgs, cx: Env<'_>) -> Result<ExitCode> {
         return Err(usage("--to: no address given"));
     }
     let markdown = read_body(&args.body)?;
+    let own_text = format!("{}\n{markdown}", args.subject);
     let draft = Draft {
         from: me,
         to,
@@ -196,8 +220,9 @@ pub fn send(args: SendArgs, cx: Env<'_>) -> Result<ExitCode> {
         text_only: false,
         in_reply_to: None,
         references: Vec::new(),
+        files: Vec::new(),
     };
-    deliver(account, draft, &args.common, cx)
+    deliver(account, draft, &own_text, &args.common, cx)
 }
 
 /// `neomail reply ID [--all]`.
@@ -222,7 +247,8 @@ pub fn reply(args: ReplyArgs, cx: Env<'_>) -> Result<ExitCode> {
             ),
             e => anyhow!("message {} cannot be answered: {e}", args.id),
         })?;
-    deliver(account, draft, &args.common, cx)
+    // The quoted original and its `Re:` subject are not the writer's words.
+    deliver(account, draft, &markdown, &args.common, cx)
 }
 
 /// `neomail forward ID --to ADDR`.
@@ -253,7 +279,7 @@ pub fn forward(args: ForwardArgs, cx: Env<'_>) -> Result<ExitCode> {
         );
     }
     let draft = compose::forward(&original, &me, to, &markdown);
-    deliver(account, draft, &args.common, cx)
+    deliver(account, draft, &markdown, &args.common, cx)
 }
 
 /// The cached message `id`: its account's name and the message, parsed.
@@ -408,12 +434,38 @@ struct Sent<'a> {
     subject: &'a str,
     message_id: &'a str,
     in_reply_to: Option<&'a str>,
+    attachments: Vec<Attachment<'a>>,
     sent_copy: SentCopy,
 }
 
-/// Adds `--cc` and `--bcc` to the draft, builds it, then prints it (`--dry-run`) or confirms and
-/// sends it.
-fn deliver(account: &Account, mut draft: Draft, common: &Common, cx: Env<'_>) -> Result<ExitCode> {
+/// A file sent with the message, as `--json` prints it (docs/json.md).
+#[derive(Serialize)]
+struct Attachment<'a> {
+    name: &'a str,
+    content_type: &'a str,
+    size: u64,
+}
+
+impl<'a> From<&'a AttachedFile> for Attachment<'a> {
+    fn from(f: &'a AttachedFile) -> Self {
+        Self {
+            name: f.name(),
+            content_type: f.media_type(),
+            size: f.size(),
+        }
+    }
+}
+
+/// Adds `--cc`, `--bcc` and `--attach` to the draft, builds it, checks its files, then prints it
+/// (`--dry-run`) or confirms and sends it. `own_text` is what the writer wrote (the subject of a
+/// new message and the body), which the forgotten-attachment check reads.
+fn deliver(
+    account: &Account,
+    mut draft: Draft,
+    own_text: &str,
+    common: &Common,
+    cx: Env<'_>,
+) -> Result<ExitCode> {
     for (flag, values) in [("--cc", &common.cc), ("--bcc", &common.bcc)] {
         for m in mailboxes(flag, values)? {
             let listed = draft
@@ -431,11 +483,14 @@ fn deliver(account: &Account, mut draft: Draft, common: &Common, cx: Env<'_>) ->
         }
     }
     draft.text_only = common.text_only;
+    draft.files = files::read(&common.attach)?;
+    let now = Utc::now();
     let outgoing = draft
-        .build(Utc::now())
+        .build(now)
         .map_err(|e| anyhow!("the message cannot be built: {e}"))?;
-    // Both read the config alone, so a dry run refuses what the real send would refuse.
+    // These read the config alone, so a dry run refuses what the real send would refuse.
     let outbound = account.outbound()?;
+    files::check_size(files::limit(&outbound), &draft.files)?;
     if outbound == Outbound::Graph && !outgoing.bcc.is_empty() {
         bail!(
             "account {} sends through Microsoft Graph, which neomail cannot give Bcc recipients \
@@ -443,7 +498,12 @@ fn deliver(account: &Account, mut draft: Draft, common: &Common, cx: Env<'_>) ->
             account.name
         );
     }
+    let forgotten =
+        draft.files.is_empty() && !common.no_attachment_check && mentions_attachment(own_text);
     if common.dry_run {
+        if forgotten {
+            eprintln!("neomail: warning: {FORGOTTEN}");
+        }
         // The summary goes to standard error: it is the only place Bcc shows, as no header
         // names it.
         eprint!("{}", summary(account, &draft));
@@ -454,11 +514,29 @@ fn deliver(account: &Account, mut draft: Draft, common: &Common, cx: Env<'_>) ->
     if outbound == Outbound::Graph {
         refuse_a_grant_without_send(account)?;
     }
+    if forgotten && !send_without_a_file(common.yes, cx.input)? {
+        eprintln!("neomail: nothing was sent");
+        return Ok(ExitCode::from(crate::EXIT_FAILURE));
+    }
     if !confirm(account, &draft, common.yes, cx.input)? {
         eprintln!("neomail: nothing was sent");
         return Ok(ExitCode::from(crate::EXIT_FAILURE));
     }
-    let sent_copy = transmit(account, &outbound, &outgoing)?;
+    // Outlook takes large files apart from the message: built now, so a failure sends nothing.
+    let bare = match outbound {
+        Outbound::Graph
+            if !draft.files.is_empty() && !nm_graph::fits_send_mail(&outgoing, &draft.files) =>
+        {
+            Some(
+                draft
+                    .build_without_files(now, &outgoing)
+                    .map_err(|e| anyhow!("the message cannot be built: {e}"))?,
+            )
+        }
+        _ => None,
+    };
+    let large = bare.as_ref().map(|b| (b, draft.files.as_slice()));
+    let sent_copy = transmit(account, &outbound, &outgoing, large)?;
     let sent = Sent {
         account: &account.name,
         from: Address::from(&draft.from),
@@ -468,6 +546,7 @@ fn deliver(account: &Account, mut draft: Draft, common: &Common, cx: Env<'_>) ->
         subject: &draft.subject,
         message_id: &outgoing.message_id,
         in_reply_to: draft.in_reply_to.as_deref(),
+        attachments: draft.files.iter().map(Attachment::from).collect(),
         sent_copy,
     };
     let mode = Mode::choose(common.plain, common.json, common.jsonl, cx.terminal);
@@ -514,6 +593,30 @@ fn refuse_a_grant_without_send(account: &Account) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// What the forgotten-attachment check says.
+const FORGOTTEN: &str = "your text says something is attached, but no file is (--attach PATH)";
+
+/// A yes to send a message whose text says something is attached when no file is: asked on a
+/// terminal unless `--yes` says not to ask; otherwise a usage error that names
+/// `--no-attachment-check`, so a script never sends it without saying so.
+fn send_without_a_file(yes: bool, input: Input) -> Result<bool> {
+    if yes || !input.can_prompt() {
+        let why = if yes {
+            "--yes answers only the question to send"
+        } else {
+            input.why_not()
+        };
+        return Err(usage(format!(
+            "nothing was sent: {FORGOTTEN}; {why}, so pass --no-attachment-check to send it \
+             without a file"
+        )));
+    }
+    eprintln!("neomail: {FORGOTTEN}");
+    let answer =
+        secret::prompt_line("Send it without a file? [y/N] ").context("nothing was sent")?;
+    Ok(said_yes(&answer))
 }
 
 /// A yes to send: `--yes`, or asked on a terminal. Without either, a usage error.
@@ -579,11 +682,32 @@ fn summary(account: &Account, draft: &Draft) -> String {
     text.push_str(&format!(
         "Body:     {lines} line{s} of Markdown, sent {how}\n"
     ));
+    if !draft.files.is_empty() {
+        let list: Vec<String> = draft
+            .files
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} ({}, {})",
+                    f.name(),
+                    f.media_type(),
+                    files::size(f.size())
+                )
+            })
+            .collect();
+        text.push_str(&format!("Files:    {}\n", list.join(", ")));
+    }
     text
 }
 
 /// Sends `outgoing` from `account`, then stores the copy in Sent when the server keeps none.
-fn transmit(account: &Account, outbound: &Outbound, outgoing: &Outgoing) -> Result<SentCopy> {
+/// `large` is the message without its files and the files, for Outlook's upload sessions.
+fn transmit(
+    account: &Account,
+    outbound: &Outbound,
+    outgoing: &Outgoing,
+    large: Option<(&Outgoing, &[AttachedFile])>,
+) -> Result<SentCopy> {
     let name = &account.name;
     let runtime = crate::account::runtime()?;
     let mut logins = Logins::default();
@@ -597,7 +721,7 @@ fn transmit(account: &Account, outbound: &Outbound, outgoing: &Outgoing) -> Resu
     match (outbound, &credential) {
         (Outbound::Graph, Credential::AccessToken(token)) => {
             runtime
-                .block_on(crate::graph::send(name, token, outgoing))
+                .block_on(crate::graph::send(name, token, outgoing, large))
                 .with_context(|| Sending(format!("sending from {name}")))?;
             Ok(SentCopy::Server)
         }
@@ -695,6 +819,7 @@ mod tests {
             text_only: false,
             in_reply_to: Some("three@example.com".to_owned()),
             references: Vec::new(),
+            files: Vec::new(),
         };
         assert_eq!(
             summary(&config.accounts[0], &draft),

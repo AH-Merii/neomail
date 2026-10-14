@@ -21,6 +21,7 @@ fn draft(markdown: &str) -> Draft {
         text_only: false,
         in_reply_to: None,
         references: Vec::new(),
+        files: Vec::new(),
     }
 }
 
@@ -513,4 +514,194 @@ fn reply_all_never_lists_the_accounts_other_addresses() {
         (addresses(&d.to), addresses(&d.cc)),
         (vec!["bob@example.org"], vec![])
     );
+}
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01";
+
+fn with_files(markdown: &str, files: Vec<AttachedFile>) -> Draft {
+    Draft {
+        files,
+        ..draft(markdown)
+    }
+}
+
+/// The parsed parts that are attachments: each name, content type and decoded bytes.
+fn attachments(mime: &[u8]) -> Vec<(String, String, Vec<u8>)> {
+    let msg = MessageParser::default().parse(mime).unwrap();
+    msg.attachments()
+        .map(|a| {
+            let ct = a.content_type().unwrap();
+            let ct = format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or_default());
+            (
+                a.attachment_name().unwrap().to_owned(),
+                ct,
+                a.contents().to_vec(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn files_follow_the_body_inside_multipart_mixed_with_their_names_and_exact_bytes() {
+    // A text file with bare line feeds and a trailing space must arrive byte for byte.
+    let text = b"line one \nline two\n\nno newline at the end".to_vec();
+    let draft = with_files(
+        MARKDOWN,
+        vec![
+            AttachedFile::new("/srv/shared/Plans/chart.png", PNG.to_vec()),
+            AttachedFile::new("notes.txt", text.clone()),
+        ],
+    );
+    let out = draft.build(now()).unwrap();
+    let msg = MessageParser::default().parse(&out.mime).unwrap();
+    let ct = msg.content_type().unwrap();
+    assert_eq!((ct.ctype(), ct.subtype()), ("multipart", Some("mixed")));
+    // The body keeps its two parts: the Markdown and the HTML rendered from it.
+    assert_eq!(part(&out.mime, "plain").unwrap(), canonical(MARKDOWN));
+    assert!(
+        part(&out.mime, "html")
+            .unwrap()
+            .contains("<strong>bold</strong>")
+    );
+    assert!(msg.parts.iter().any(|p| {
+        p.content_type()
+            .is_some_and(|c| c.ctype() == "multipart" && c.subtype() == Some("alternative"))
+    }));
+    assert_eq!(
+        attachments(&out.mime),
+        vec![
+            ("chart.png".to_owned(), "image/png".to_owned(), PNG.to_vec()),
+            ("notes.txt".to_owned(), "text/plain".to_owned(), text),
+        ]
+    );
+    let raw = String::from_utf8(out.mime).unwrap();
+    assert_eq!(
+        raw.matches("Content-Transfer-Encoding: base64").count(),
+        2,
+        "every file, text included, is base64"
+    );
+    assert!(!raw.contains("Plans"), "no folder of the sender's");
+}
+
+#[test]
+fn a_text_only_message_with_a_file_is_its_plain_part_then_the_file() {
+    let draft = Draft {
+        text_only: true,
+        ..with_files(
+            "See the chart.\n",
+            vec![AttachedFile::new("chart.png", PNG.to_vec())],
+        )
+    };
+    let out = draft.build(now()).unwrap();
+    assert_eq!(
+        part(&out.mime, "plain").unwrap(),
+        canonical("See the chart.\n")
+    );
+    assert_eq!(part(&out.mime, "html"), None);
+    assert_eq!(attachments(&out.mime).len(), 1);
+}
+
+#[test]
+fn a_name_that_is_not_ascii_round_trips_and_its_header_line_stays_ascii() {
+    let name = "Jahresabschluß – €5 года.pdf";
+    let out = with_files("x\n", vec![AttachedFile::new(name, b"%PDF-1.7\n".to_vec())])
+        .build(now())
+        .unwrap();
+    assert_eq!(attachments(&out.mime)[0].0, name);
+    assert!(out.mime.is_ascii(), "the name is encoded, never raw UTF-8");
+}
+
+#[test]
+fn without_files_the_same_message_keeps_its_id_and_body_but_no_file() {
+    let draft = with_files(MARKDOWN, vec![AttachedFile::new("chart.png", PNG.to_vec())]);
+    let full = draft.build(now()).unwrap();
+    let bare = draft.build_without_files(now(), &full).unwrap();
+    assert_eq!(bare.message_id, full.message_id);
+    assert_eq!(bare.envelope_to, full.envelope_to);
+    assert!(attachments(&bare.mime).is_empty());
+    assert_eq!(part(&bare.mime, "plain").unwrap(), canonical(MARKDOWN));
+}
+
+#[test]
+fn a_files_name_keeps_only_its_last_part_and_no_control_or_bidi_character() {
+    for (given, sent) in [
+        ("/srv/shared/Documents/report.pdf", "report.pdf"),
+        ("C:\\Users\\me\\report.pdf", "report.pdf"),
+        ("../../etc/passwd", "passwd"),
+        ("invoice\u{202E}fdp.exe", "invoicefdp.exe"),
+        ("two\u{2066}words\u{2069}.txt", "twowords.txt"),
+        ("bad\r\nname\t.txt", "badname.txt"),
+        ("  spaced.txt  ", "spaced.txt"),
+        ("Résumé.pdf", "Résumé.pdf"),
+    ] {
+        assert_eq!(files::safe_name(given), sent, "{given:?}");
+    }
+    for nothing in ["", "/", "dir/", "..", ".", "\u{202E}", "a/.."] {
+        assert_eq!(
+            files::safe_name(nothing),
+            files::FALLBACK_NAME,
+            "{nothing:?}"
+        );
+    }
+}
+
+#[test]
+fn a_files_type_comes_from_its_content_and_the_extension_only_fills_gaps() {
+    const ZIP: &[u8] = b"PK\x03\x04\x14\0\0\0";
+    const OLE: &[u8] = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0\0";
+    for (bytes, name, expected) in [
+        // The content wins over a wrong or missing extension.
+        (PNG, "photo.jpg", "image/png"),
+        (b"%PDF-1.4\n".as_slice(), "scan", "application/pdf"),
+        (b"\xFF\xD8\xFF\xE0".as_slice(), "image.PNG", "image/jpeg"),
+        (ZIP, "letter.pdf", "application/zip"),
+        // A container's extension names what is inside it.
+        (
+            ZIP,
+            "letter.DOCX",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (ZIP, "book.epub", "application/epub+zip"),
+        (OLE, "old.xls", "application/vnd.ms-excel"),
+        (OLE, "old.bin", "application/octet-stream"),
+        // Content with no magic number: the extension, then text or not.
+        (b"a,b\n1,2\n".as_slice(), "table.csv", "text/csv"),
+        (b"just words\n".as_slice(), "README", "text/plain"),
+        (
+            b"\x00\x01\x02\x03".as_slice(),
+            "blob",
+            "application/octet-stream",
+        ),
+        (
+            b"\xC3\x28 not utf-8".as_slice(),
+            "blob",
+            "application/octet-stream",
+        ),
+    ] {
+        assert_eq!(files::media_type(bytes, name), expected, "{name:?}");
+    }
+}
+
+#[test]
+fn the_attachment_words_are_found_as_whole_words_outside_quotes() {
+    for says in [
+        "I've attached the report.",
+        "See the ATTACHMENT",
+        "Attachments: two",
+        "Let me attach it tomorrow",
+        "Subject line\n\nThe slides are attached, thanks",
+        "attaching the draft",
+    ] {
+        assert!(files::mentions_attachment(says), "{says:?}");
+    }
+    for silent in [
+        "",
+        "Nothing to see here",
+        "We are detached from it",
+        "reattached", // a different word
+        "> I've attached the report\n> as promised",
+        "Thanks!\n\n  > see the attachment",
+    ] {
+        assert!(!files::mentions_attachment(silent), "{silent:?}");
+    }
 }

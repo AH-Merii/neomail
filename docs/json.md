@@ -437,6 +437,7 @@ same object on one line:
   "subject": "Re: Plans",
   "message_id": "5f0c3a1e9b2d4c7a8e6f1d2c3b4a5968.neomail@example.com",
   "in_reply_to": "three@example.com",
+  "attachments": [{"name": "report.pdf", "content_type": "application/pdf", "size": 48213}],
   "sent_copy": "server"
 }
 ```
@@ -445,6 +446,9 @@ same object on one line:
 - `bcc` lists who got a blind copy; no header of the message names them.
 - `message_id` is the new message's Message-ID, and `in_reply_to` the one it answers (`null` for
   `send` and `forward`), both without angle brackets.
+- `attachments` lists the files sent with `--attach`, in order: the name the recipient sees,
+  the type neomail found from the content, and the size in bytes before encoding. It is `[]`
+  without files.
 - `sent_copy` says where the copy in Sent is: `"server"` when the server keeps it (Gmail, Proton
   Mail Bridge, Outlook), `"appended"` when neomail stored it in the mailbox marked `\Sent`, or
   `"failed"` when that append failed. The message was sent in every case: a `"failed"` copy
@@ -549,6 +553,8 @@ not a terminal, or `--no-input`): nothing is opened.
 | 0 | `search` with no match, printing `[]` with `--json`. |
 | 1 | `search --account NAME` with no cached mail for NAME, or `search --thread ID` with an id that is not cached. |
 | 2 | `search` without a query or `--thread`, with no letter or digit in its query, or with `subject:`, `from:` or `to:` and no word after it. |
+| 1 | With `--attach`, nothing was sent either when a file cannot be read or is not a regular file, when the files pass the provider's limit (25 MB for Gmail, Proton Mail and Outlook) or the server's SIZE, or when Outlook's draft, upload session or the draft's send failed in a way that says it was not sent; the error says when a draft is, or may be, left in Drafts. |
+| 2 | `send`, `reply` or `forward` whose own subject or text says attach, attached or attachment with no `--attach`, when nothing can be asked or with `--yes`, and without `--no-attachment-check` (nothing is sent). |
 
 Errors go to standard error, in these forms:
 

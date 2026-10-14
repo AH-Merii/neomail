@@ -7,6 +7,9 @@
 //!   (RFC 2046 section 4.1.1), and the HTML pulldown-cmark renders from it. A text-only draft
 //!   has the text/plain part alone. Raw HTML in the Markdown is escaped as text, never passed
 //!   through, so the HTML part holds only what the Markdown means.
+//! - Files (`--attach`, [`files`]) make the message multipart/mixed: the body as above first, then
+//!   one part per file, base64-encoded whatever its type, so its bytes arrive exactly as they were
+//!   (RFC 2045 section 6.8), with its name in `Content-Disposition: attachment`.
 //! - Bcc recipients are in the envelope only, never in a header.
 //! - A reply threads as RFC 5322 section 3.6.4 says
 //!   (<https://www.rfc-editor.org/rfc/rfc5322#section-3.6.4>), and quotes the original as a
@@ -14,18 +17,25 @@
 //! - Addresses are ASCII: an internationalised address needs SMTPUTF8 (RFC 6531), which the
 //!   SMTP client does not speak yet. Names may be any text and are RFC 2047 encoded.
 
+pub mod files;
+
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
 use mail_builder::MessageBuilder;
 use mail_builder::headers::address::Address;
+use mail_builder::headers::content_type::ContentType;
 use mail_builder::headers::date::Date;
 use mail_builder::headers::message_id::MessageId;
+use mail_builder::mime::{BodyPart, MimePart};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use sha2::{Digest, Sha256};
 
 use crate::parse::{EmailAddress, ParsedMessage};
+pub use files::AttachedFile;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ComposeError {
@@ -156,6 +166,8 @@ pub struct Draft {
     pub text_only: bool,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
+    /// Files sent with it, in this order, after the body.
+    pub files: Vec<AttachedFile>,
 }
 
 /// A built message: its bytes and the SMTP envelope. `envelope_to` holds every recipient, Bcc
@@ -187,6 +199,26 @@ impl fmt::Debug for Outgoing {
 impl Draft {
     /// Builds the message, dated `now`, with a new Message-ID on the sender's domain.
     pub fn build(&self, now: DateTime<Utc>) -> Result<Outgoing, ComposeError> {
+        self.build_as(now, new_message_id(now, &self.from), &self.files)
+    }
+
+    /// The message [`Self::build`] made as `sent`, dated `now`, with the same Message-ID but none
+    /// of its files: for a sender that takes the files apart from the message (Microsoft
+    /// Graph's draft and upload sessions).
+    pub fn build_without_files(
+        &self,
+        now: DateTime<Utc>,
+        sent: &Outgoing,
+    ) -> Result<Outgoing, ComposeError> {
+        self.build_as(now, sent.message_id.clone(), &[])
+    }
+
+    fn build_as(
+        &self,
+        now: DateTime<Utc>,
+        message_id: String,
+        files: &[AttachedFile],
+    ) -> Result<Outgoing, ComposeError> {
         if self.subject.chars().any(char::is_control) {
             return Err(ComposeError::LineBreak("subject"));
         }
@@ -199,7 +231,6 @@ impl Draft {
         if envelope_to.is_empty() {
             return Err(ComposeError::NoRecipients);
         }
-        let message_id = new_message_id(now, &self.from);
         let mut builder = MessageBuilder::new()
             .from(address(&self.from))
             .subject(self.subject.as_str())
@@ -223,9 +254,25 @@ impl Draft {
         if !references.is_empty() {
             builder = builder.references(MessageId::new_list(references.into_iter()));
         }
-        builder = builder.text_body(self.markdown.as_str());
-        if !self.text_only {
-            builder = builder.html_body(render_html(&self.markdown));
+        if files.is_empty() {
+            builder = builder.text_body(self.markdown.as_str());
+            if !self.text_only {
+                builder = builder.html_body(render_html(&self.markdown));
+            }
+        } else {
+            let text = MimePart::new("text/plain", BodyPart::Text(self.markdown.as_str().into()));
+            let body = if self.text_only {
+                text
+            } else {
+                let html = MimePart::new(
+                    "text/html",
+                    BodyPart::Text(render_html(&self.markdown).into()),
+                );
+                MimePart::new("multipart/alternative", vec![text, html])
+            };
+            let mut parts = vec![body];
+            parts.extend(files.iter().map(file_part));
+            builder = builder.body(MimePart::new("multipart/mixed", parts));
         }
         let mime = builder
             .write_to_vec()
@@ -238,6 +285,24 @@ impl Draft {
             message_id,
         })
     }
+}
+
+/// One file's part: its type, its name as an attachment, and its bytes in base64 whatever the
+/// type, in lines of 76 characters (RFC 2045 section 6.8). mail-builder would pick quoted-printable
+/// or 7bit for a text file, which can change its line breaks.
+fn file_part(file: &AttachedFile) -> MimePart<'_> {
+    let encoded = BASE64.encode(file.bytes());
+    let mut wrapped = Vec::with_capacity(encoded.len() + encoded.len() / 76 * 2 + 2);
+    for line in encoded.as_bytes().chunks(76) {
+        wrapped.extend_from_slice(line);
+        wrapped.extend_from_slice(b"\r\n");
+    }
+    MimePart::new(
+        ContentType::new(file.media_type()),
+        BodyPart::Binary(wrapped.into()),
+    )
+    .attachment(file.name())
+    .transfer_encoding("base64")
 }
 
 fn address(m: &Mailbox) -> Address<'_> {
@@ -385,6 +450,7 @@ pub fn reply(
         text_only: false,
         in_reply_to: t.message_id.clone(),
         references,
+        files: Vec::new(),
     })
 }
 
@@ -427,6 +493,7 @@ pub fn forward(original: &ParsedMessage, me: &Mailbox, to: Vec<Mailbox>, markdow
         text_only: false,
         in_reply_to: None,
         references: Vec::new(),
+        files: Vec::new(),
     }
 }
 
