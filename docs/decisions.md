@@ -103,6 +103,11 @@ the new entry.
   `neomail classify` takes cached mail from the last 365 days, newest first, at most 1,000
   messages (`--days` and `--limit` change both), and estimates what the rest would cost (count,
   requests, time, money); `--all` does the rest.
+- **The question after a first sync**
+  ([DEC-2026-10-14-first-sync](#dec-2026-10-14-first-sync), proposed): after an account's first
+  `neomail sync`, on a terminal and with a key stored, neomail asks once whether to classify the
+  last year, with `--estimate`'s figures for it and for the rest. A yes runs `neomail classify
+  --account NAME`; the answer is kept per account.
 - **Redaction uses our own rules** ([DEC-2026-10-11-pii-rules](#dec-2026-10-11-pii-rules)): the PII
   redaction that runs before text goes to jev is neomail's own rule redactor. No model is part of
   the default.
@@ -1261,3 +1266,42 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   and unread filters, and attachment names.
 - **Builds on:** [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux) and
   [DEC-2026-10-11-build-first](#dec-2026-10-11-build-first).
+
+### <a id="dec-2026-10-14-first-sync"></a>DEC-2026-10-14-first-sync: the question after an account's first sync
+
+- **Status:** proposed by Claude on 2026-10-14, as roadmap slice 11, under
+  [DEC-2026-10-14-classify-when-asked](#dec-2026-10-14-classify-when-asked).
+- **Proposal:**
+  - After `neomail sync` printed its lines, it asks about each account whose sync was a first
+    one: one that starts, or finishes, an INBOX synced from empty. A rebuild after a UIDVALIDITY
+    change is not one, since its results survive the rebuild, unless it was interrupted: the sync
+    that finishes it is reported as initial and not reset, as `SyncReport::initial` stays set until
+    a sync completes. Asking then is harmless, since nothing is sent without a yes. `account add`
+    runs no sync, so it asks nothing.
+  - It asks only when standard input and standard error are a terminal and `--no-input` is not
+    given, and only when a jev key is stored for the backend host (or `JEV_API_KEY` is set).
+    Without a key, one line says to run `neomail key set`, then `neomail classify --account NAME`;
+    off a terminal, one line names `neomail classify --account NAME`. The daemon syncs without
+    asking, as before; `neomail sync` has no JSON output.
+  - The question shows `--estimate`'s figures for `neomail classify --account NAME`: messages,
+    requests, input tokens and, for TypeSafe's host, dollars; and the same for the rest, with
+    the `--all` command that sends it. It names the group rules from 10a: spam is grouped as spam,
+    any other answer below `classify.other_below` lists as `other`, and a `follow-up` older than
+    `classify.follow_up_old_days` as `follow-up-old`. An account with nothing from the last year is
+    not asked.
+  - A yes runs `neomail classify --account NAME` with its defaults, parsed from that command line,
+    so its consent question comes first when the host has no consent yet, and `neomail sync` exits
+    1 when that run does, consent refused at the prompt included, as `neomail classify` does. A
+    question that cannot be set up (an unreadable answers file, a cache error) is one line naming
+    the account, and `neomail sync` exits 1 too. A no, an empty line or a closed standard input classifies nothing and
+    names the command for later.
+  - Either answer is kept per account in `classify-first-sync.json` in the data directory, which
+    the question names, and the question is not asked again for that account. Off a terminal or
+    without a key nothing is kept. Once the first sync has completed, the next sync is not a first
+    one, so it does not ask either; until then (a body still owed) each sync is a first one and
+    says its line or asks again.
+  - No estimate of the time a run takes: `--estimate` has none, and the question shows what it
+    shows.
+- **Builds on:** [DEC-2026-10-13-classify](#dec-2026-10-13-classify),
+  [DEC-2026-10-13-classify-send](#dec-2026-10-13-classify-send) and
+  [DEC-2026-10-12-cli-ux](#dec-2026-10-12-cli-ux).

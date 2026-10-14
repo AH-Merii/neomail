@@ -561,7 +561,7 @@ fn take_all_command(args: &Args) -> String {
 }
 
 /// `word` as one shell word: as it is when it holds only safe characters, else in single quotes.
-fn shell_quote(word: &str) -> String {
+pub(crate) fn shell_quote(word: &str) -> String {
     let safe = |c: char| c.is_ascii_alphanumeric() || "@%+=:,./_-".contains(c);
     if !word.is_empty() && word.chars().all(safe) {
         word.to_owned()
@@ -589,7 +589,7 @@ fn describe(e: &Estimate) -> String {
     text
 }
 
-fn thousands(n: u64) -> String {
+pub(crate) fn thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
@@ -610,6 +610,31 @@ pub fn run(
     terminal: bool,
     colors: Colors,
     out: &mut dyn Write,
+) -> Result<ExitCode> {
+    run_with(
+        args,
+        ids,
+        config,
+        input,
+        terminal,
+        colors,
+        out,
+        &mut ask_terminal,
+    )
+}
+
+/// [`run`], with `ask` in place of the terminal for the consent question: the first-sync
+/// question (first_sync.rs) asks it through the same seam.
+#[allow(clippy::too_many_arguments, reason = "run's arguments and the seam")]
+pub(crate) fn run_with(
+    args: &Args,
+    ids: Vec<i64>,
+    config: Option<PathBuf>,
+    input: Input,
+    terminal: bool,
+    colors: Colors,
+    out: &mut dyn Write,
+    ask: &mut dyn FnMut(&str, &str) -> Result<String>,
 ) -> Result<ExitCode> {
     let mode = args.format.mode(terminal);
     // The owner's addresses are masked whole: a config the user named must load.
@@ -669,14 +694,7 @@ pub fn run(
             bail!("{}", keyring::NO_JEV_KEY);
         };
         let data_dir = config::data_dir()?;
-        let asked = ensure_consent(
-            &data_dir,
-            &host,
-            args.yes,
-            input,
-            plan.jobs.len(),
-            &mut ask_terminal,
-        )?;
+        let asked = ensure_consent(&data_dir, &host, args.yes, input, plan.jobs.len(), ask)?;
         if !asked {
             printer.finish()?;
             eprintln!("neomail: nothing was sent");
@@ -802,6 +820,47 @@ fn per_request_of(
         plan.jobs.iter().map(|j| j.request.as_slice()).collect()
     };
     Ok(per_request(measured, &views))
+}
+
+/// What a run of `args` would send and what it would leave, in `--estimate`'s words: the
+/// first-sync question shows it (first_sync.rs).
+pub(crate) struct Preview {
+    /// The messages the run would send.
+    pub(crate) messages: usize,
+    /// `--estimate`'s "would send" line, without the label.
+    pub(crate) send: String,
+    /// What is left outside the window or the cap, and the command that sends it; `None` when
+    /// nothing is.
+    pub(crate) rest: Option<(String, String)>,
+    /// `--estimate`'s "tokens from" line, without the label.
+    pub(crate) tokens_from: Option<&'static str>,
+}
+
+/// [`Preview`] of `args` (no ids) over `cache`, as `--estimate` works it out.
+pub(crate) fn preview(
+    cache: &mut Cache,
+    args: &Args,
+    settings: &ClassifySettings,
+    owners: &[&str],
+    now: DateTime<Utc>,
+) -> Result<Preview> {
+    let priced = settings.host()? == TYPESAFE_HOST;
+    let reader = Reader {
+        owners,
+        model: &settings.model,
+    };
+    let plan = plan(cache, args, &[], &reader, now)?;
+    let per = per_request_of(cache, &plan, &reader)?;
+    let rest = (!plan.left.is_empty()).then(|| {
+        let left = estimate(plan.left.len(), per, priced);
+        (describe(&left), take_all_command(args))
+    });
+    Ok(Preview {
+        messages: plan.jobs.len(),
+        send: describe(&estimate(plan.jobs.len(), per, priced)),
+        rest,
+        tokens_from: per.map(PerRequest::basis),
+    })
 }
 
 /// `--estimate`'s output: lines for people and pipes, one object for scripts.

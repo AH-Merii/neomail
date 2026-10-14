@@ -9,6 +9,7 @@ mod classify;
 mod config;
 #[cfg(unix)]
 mod daemon;
+mod first_sync;
 mod folders;
 mod graph;
 mod help;
@@ -400,6 +401,7 @@ fn parse_id_arg(s: &str) -> Result<IdArg, String> {
 #[derive(Subcommand)]
 enum Command {
     /// Fetch new mail into the local cache, read-only: nothing changes on the server
+    #[command(after_help = first_sync::SYNC_HELP)]
     Sync {
         /// Sync only this account
         #[arg(long, value_name = "NAME")]
@@ -974,7 +976,7 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
     let mut out = BufWriter::new(stdout.lock());
     let code = match command {
         Command::Sync { account, limit } => {
-            let config = Config::load(&config::config_path(cli.config)?)?;
+            let config = Config::load(&config::config_path(cli.config.clone())?)?;
             let accounts = config.select(account.as_deref())?;
             let data_dir = config::data_dir()?;
             let mut cache = open_cache(true)?.context("the cache could not be created")?;
@@ -983,6 +985,8 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
             let progress = output::ProgressLine::new(stderr.is_terminal());
             let mut syncer = sync::Syncer::new(&runtime, limit.get(), progress);
             let mut failed = false;
+            // The accounts that synced and their reports, for the question after the syncs.
+            let mut synced = Vec::new();
             for account in accounts {
                 // One sync per account: the daemon may be syncing this one.
                 let result = lock::wait_for_account(&data_dir, &account.name, || {
@@ -999,12 +1003,13 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
                     }
                     synced.report
                 })
-                .map(|report| sync::report_line(&account.name, &report));
+                .map(|report| (sync::report_line(&account.name, &report), report));
                 syncer.progress.clear(&mut io::stderr());
                 match result {
-                    Ok(line) => {
+                    Ok((line, report)) => {
                         writeln!(out, "{line}")?;
                         out.flush()?;
+                        synced.push((account.name.clone(), report));
                     }
                     Err(e) => {
                         out.flush()?;
@@ -1013,6 +1018,18 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
                     }
                 }
             }
+            // classify opens the cache itself.
+            drop(cache);
+            let config_path = cli.config;
+            failed |= first_sync::after_sync(
+                &config,
+                config_path,
+                &first_sync::firsts(&synced),
+                input,
+                terminal,
+                colors,
+                &mut out,
+            )?;
             if failed {
                 ExitCode::from(EXIT_FAILURE)
             } else {

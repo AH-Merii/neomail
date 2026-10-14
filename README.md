@@ -275,6 +275,14 @@ neomail forward 42 --to ada@example.com                          # forward its t
 - `neomail sync --account work --limit 100`: the first sync takes the 500 messages that arrived
   last unless `--limit` says otherwise. Later syncs fetch all mail that is new since, however
   much, refresh flags and drop deleted mail. Messages are fetched without marking them read.
+- After an account's first sync, on a terminal and once a jev key is stored, `neomail sync` asks
+  once whether to classify that account's last year: it shows what `neomail classify --account
+  NAME --estimate` would send and cost, and what the rest would. Nothing is sent without a yes; a
+  yes runs `neomail classify --account NAME`, which asks first for consent to the backend if you
+  have not given it. The answer is kept in `classify-first-sync.json` in the data directory, so
+  the question never comes back for that account. Off a terminal or with `--no-input` nothing is
+  asked or classified, and one line names the command; without a key, one line says how to store
+  one.
 - `neomail list --account work --limit all` lists every cached message; `--limit` takes a number
   or `all` on `list` and `sync`.
 - `neomail search WORD...` searches the cache, offline: the INBOX mail synced so far, not the
