@@ -12,43 +12,7 @@ use nm_imap::CertPin;
 use sha2::{Digest, Sha256};
 
 use super::*;
-
-/// Scripted input: `lines` for typed answers, `secrets` for hidden ones.
-#[derive(Default)]
-struct Script {
-    interactive: bool,
-    lines: VecDeque<&'static str>,
-    secrets: VecDeque<&'static str>,
-    secrets_asked: usize,
-    said: String,
-    /// Each prompt, in order.
-    prompts: Vec<String>,
-}
-
-impl Term for Script {
-    fn interactive(&self) -> bool {
-        self.interactive
-    }
-    fn say(&mut self, text: &str) {
-        self.said.push_str(text);
-        self.said.push('\n');
-    }
-    fn line(&mut self, prompt: &str) -> Result<String> {
-        self.prompts.push(prompt.to_owned());
-        let line = self.lines.pop_front();
-        Ok(line
-            .unwrap_or_else(|| panic!("no answer for {prompt:?}:\n{}", self.said))
-            .to_owned())
-    }
-    fn secret(&mut self, prompt: &str) -> Result<String> {
-        self.secrets_asked += 1;
-        self.prompts.push(prompt.to_owned());
-        let secret = self.secrets.pop_front();
-        Ok(secret
-            .unwrap_or_else(|| panic!("no secret for {prompt:?}:\n{}", self.said))
-            .to_owned())
-    }
-}
+use crate::wizard::script::{self, Script};
 
 /// A TLS server on 127.0.0.1 that runs `serve` on each connection; what it logs is in `seen`.
 struct Fake {
@@ -255,7 +219,14 @@ impl World {
             servers,
         };
         let mut out = Vec::new();
-        run(&self.config(), args, OFF_TERMINAL, term, &deps, &mut out)?;
+        run(
+            &self.config(),
+            args,
+            OFF_TERMINAL,
+            &mut script::ui(term),
+            &deps,
+            &mut out,
+        )?;
         Ok(String::from_utf8(out).unwrap())
     }
 
@@ -392,14 +363,14 @@ fn a_work_or_school_account_goes_on_and_learns_at_step_3_what_to_do_if_none_is_o
     };
     world.run(Args::default(), &mut term).unwrap();
     assert_eq!(world.stored("gmail").as_deref(), Some(APP_PASSWORD));
-    // Step 2 names step 3 as next, so step 3 starts at the title's last mention.
-    let (_, from_step_3) = term
-        .said
-        .rsplit_once("Create an app password")
+    let step_3 = term
+        .frames
+        .iter()
+        .map(|f| f.lines.join("\n"))
+        .find(|screen| screen.starts_with("▸ Step 3/6 · Create an app password"))
         .expect("step 3 is shown");
-    let step_3 = from_step_3.split("Next:").next().unwrap();
     for advice in [
-        "If the page has no option to add one",
+        "the page has no option to add one",
         "administrator",
         "neomail account add gmail`",
     ] {
@@ -605,31 +576,30 @@ fn gmails_servers_are_written_as_google_lists_them() {
 }
 
 #[test]
-fn on_a_terminal_a_number_not_listed_is_refused_and_less_than_goes_back() {
+fn on_a_terminal_esc_goes_back_and_every_later_screen_names_it() {
     let world = World::new(imap(APP_PASSWORD), smtp(false));
     let mut term = Script {
         interactive: true,
-        lines: ["0", "9", "1", "", "<", "", "", "", "you@example.com"].into(),
+        lines: ["1", "", "<", "", "", "", "you@example.com"].into(),
         secrets: [APP_PASSWORD].into(),
         ..Script::default()
     };
     world.run(Args::default(), &mut term).unwrap();
+    // Step 2, then back to it from step 3.
+    let headers = |h: &str| term.said.matches(h).count();
     assert_eq!(
-        term.said.matches("is not one of the numbers above").count(),
+        headers("Step 2/6 · Turn on 2-Step Verification\n"),
         2,
         "{}",
         term.said
     );
-    assert_eq!(
-        term.said.matches("Step 2 of 10").count(),
-        2,
-        "{}",
-        term.said
-    );
-    // Every prompt after the first step says how to go back, questions included.
-    for want in ["Gmail address", "App password"] {
-        let prompt = term.prompts.iter().find(|p| p.starts_with(want)).unwrap();
-        assert!(prompt.contains("< to go back"), "{prompt}");
+    // Every screen after the first step names the way back, questions included.
+    let screens: Vec<_> = term.frames.iter().map(|f| f.lines.join("\n")).collect();
+    let later = screens
+        .iter()
+        .filter(|s| (s.contains("Step 4/6") || s.contains("Step 6/6")) && s.contains("Enter"));
+    for screen in later {
+        assert!(screen.contains("Esc back"), "{screen}");
     }
     assert_eq!(world.stored("gmail").as_deref(), Some(APP_PASSWORD));
 }

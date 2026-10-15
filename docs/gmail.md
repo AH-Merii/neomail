@@ -15,7 +15,7 @@ neomail sync --account gmail
 
 On a terminal, `account add gmail` takes you through the setup one step at a time, from no
 Google Cloud project to a signed-in Desktop client. Each step says what to do, why it exists and
-which console page to open; `<` goes back a step. Give your project's ID when asked (or
+which console page to open; Esc goes back a step. Give your project's ID when asked (or
 `--project ID`) and the links open that project. The steps are:
 
 1. Create a Google Cloud project, then give its ID (optional).

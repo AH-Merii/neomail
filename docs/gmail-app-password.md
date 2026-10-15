@@ -48,8 +48,11 @@ neomail account add gmail-app-password
    nothing). `--no-check` skips this step; the name, the config and the keyring are still checked.
 10. The app password goes to the OS keyring and the account to the config file.
 
-Type `<` to go back a step. A failed check says which step to change, and nothing is written
-until step 10. On a terminal, a taken name asks for another name, and a refused login asks for
+This list numbers neomail's checks and the save too. The screen numbers only the steps you see,
+so with no flags the app password is step 6 of 6 there.
+
+Press Esc to go back a step. A failed check says which step to change, and nothing is written
+until the save. On a terminal, a taken name asks for another name, and a refused login asks for
 the app password again and repeats the cases with no app password. Any other failure, or one on a
 value given as a flag, ends the run.
 

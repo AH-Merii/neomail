@@ -23,6 +23,7 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
+crossterm.workspace = true
 keyring-core.workspace = true
 ring.workspace = true
 rpassword.workspace = true

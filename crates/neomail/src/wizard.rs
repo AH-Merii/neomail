@@ -5,7 +5,13 @@
 
 pub mod cli;
 pub mod gmail;
+pub mod imap;
 pub mod proton;
+pub mod remember;
+pub mod screen;
+#[cfg(test)]
+pub mod script;
+pub mod term;
 #[cfg(test)]
 mod tests;
 
@@ -15,6 +21,8 @@ use crate::secret::Password;
 #[derive(Debug)]
 pub struct Wizard {
     pub id: &'static str,
+    /// What it sets up, for the welcome screen: "a Gmail account, with an app password".
+    pub title: &'static str,
     pub steps: &'static [Step],
     /// What a failed check means, and which step to change.
     pub mistakes: &'static [Mistake],
@@ -25,10 +33,15 @@ pub struct Step {
     /// Names the step in [`Kind::Check`] reads and in [`Mistake`]s.
     pub id: &'static str,
     pub title: &'static str,
-    /// Why the step exists, or what to do there.
+    /// Why the step exists, or what to do there: paragraphs, hand-wrapped. A line that starts
+    /// with `- ` is an action the user takes (its own lines after it are indented), one with
+    /// `Why: ` or `Note: ` a side note, and one with `Warning: ` a warning; the lines after it,
+    /// up to the next such line or a blank one, belong to it ([`Step::lines`]).
     pub why: &'static str,
     /// Always printed; a provider's page or the help page a fact comes from.
     pub links: &'static [&'static str],
+    /// The one page of `links` the step sends the user to, opened for them where it can be.
+    pub page: Option<&'static str>,
     pub kind: Kind,
 }
 
@@ -70,8 +83,91 @@ pub struct Question {
     /// Read without echo on a terminal, else one line of standard input.
     pub secret: bool,
     pub default: Option<&'static str>,
+    /// The fixed answers, picked from a list on a terminal; empty for free text. `clean` still
+    /// takes each one's value, so the flag accepts the same.
+    pub choices: &'static [Choice],
     /// Tidies an answer, or says what to change.
     pub clean: fn(&str) -> Result<Cleaned, &'static str>,
+}
+
+/// One fixed answer of a [`Question`].
+#[derive(Debug)]
+pub struct Choice {
+    pub value: &'static str,
+    pub label: &'static str,
+}
+
+/// What a line of a step's text is, so each looks different.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Line {
+    /// An instruction or an explanation.
+    Say,
+    /// Something the user does.
+    Action,
+    /// A side note.
+    Note,
+    Warning,
+}
+
+/// `text` with its first letter capitalised, as the start of a line it now is.
+pub(crate) fn capitalised(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// A side note opens with `Note: `, or with `Why` and up to three words before a colon
+/// (`Why: `, `Why External: `).
+fn is_note(line: &str) -> bool {
+    if line.starts_with("Note: ") {
+        return true;
+    }
+    let Some(rest) = line.strip_prefix("Why") else {
+        return false;
+    };
+    rest.split_once(": ")
+        .is_some_and(|(words, _)| words.split_whitespace().count() <= 3 && !words.contains('.'))
+}
+
+impl Step {
+    /// The step's text as paragraphs, each with its kind and its lines joined: the markers of
+    /// [`Step::why`] decide the kind, and `Warning: ` and `- ` are dropped, since the screen
+    /// shows a sign for them.
+    pub fn lines(&self) -> Vec<(Line, String)> {
+        let mut out: Vec<(Line, String)> = Vec::new();
+        let mut open = false;
+        for raw in self.why.lines() {
+            let line = raw.trim();
+            if line.is_empty() {
+                open = false;
+                continue;
+            }
+            let marked = if let Some(rest) = line.strip_prefix("- ") {
+                Some((Line::Action, rest))
+            } else if let Some(rest) = line.strip_prefix("Warning: ") {
+                Some((Line::Warning, rest))
+            } else if is_note(line) {
+                Some((Line::Note, line))
+            } else {
+                None
+            };
+            match (marked, out.last_mut()) {
+                (Some((kind, text)), _) => out.push((kind, capitalised(text))),
+                // An action goes on only on indented lines, as a list item would.
+                (None, Some((kind, text)))
+                    if open && (*kind != Line::Action || raw.starts_with("  ")) =>
+                {
+                    text.push(' ');
+                    text.push_str(line);
+                }
+                (None, _) => out.push((Line::Say, line.to_owned())),
+            }
+            open = true;
+        }
+        out
+    }
 }
 
 /// An answer as it will be used, with a warning that does not stop it.
@@ -157,6 +253,21 @@ pub struct View<'s> {
     /// About the answer just given, which still goes on.
     pub warning: Option<&'static str>,
     pub can_go_back: bool,
+    /// [`Step::page`] with its placeholder filled, as in `links`.
+    pub page: Option<String>,
+    /// Where the step is among those the user sees (1-based), never counting checks.
+    pub seen: usize,
+    pub seen_total: usize,
+    /// The steps the user sees, in order, and how far each is.
+    pub outline: Vec<(&'static str, Place)>,
+}
+
+/// How far a step of the outline is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    Done,
+    Now,
+    Left,
 }
 
 /// An answer, kept as given.
@@ -352,9 +463,74 @@ impl Session {
         self.settle();
     }
 
+    /// Whether step `i` is one the user sees: asked or shown, not answered by a flag, and, for a
+    /// [`Kind::ConsoleIf`], one whose earlier answer applies.
+    fn seen(&self, i: usize) -> bool {
+        match self.wizard.steps[i].kind {
+            Kind::Console | Kind::Gate(_) => self.interactive,
+            Kind::ConsoleIf { step, is } => self.interactive && self.answered(step, is),
+            Kind::Ask(_) => !self.given[i],
+            Kind::Check { .. } | Kind::Commit => false,
+        }
+    }
+
+    /// The steps the user sees and how far each is, from step `at`.
+    fn outline(&self, at: usize) -> Vec<(&'static str, Place)> {
+        (0..self.wizard.steps.len())
+            .filter(|&i| self.seen(i))
+            .map(|i| {
+                let place = match i.cmp(&at) {
+                    std::cmp::Ordering::Less => Place::Done,
+                    std::cmp::Ordering::Equal => Place::Now,
+                    std::cmp::Ordering::Greater => Place::Left,
+                };
+                (self.wizard.steps[i].title, place)
+            })
+            .collect()
+    }
+
+    /// Whether the count of steps the user sees may still grow: a [`Kind::ConsoleIf`] waits on
+    /// an answer not given yet.
+    pub fn may_grow(&self) -> bool {
+        self.interactive
+            && self.wizard.steps.iter().any(|s| match s.kind {
+                Kind::ConsoleIf { step, .. } => self.text(step).is_none(),
+                _ => false,
+            })
+    }
+
+    /// The answers typed so far that are no secret and came from no flag, by step id: what a
+    /// second run offers again.
+    pub fn typed(&self) -> Vec<(&'static str, &str)> {
+        self.wizard
+            .steps
+            .iter()
+            .zip(&self.answers)
+            .zip(&self.given)
+            .filter_map(|((step, answer), given)| match answer {
+                Some(Answer::Text(t)) if !given => Some((step.id, t.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn wizard(&self) -> &'static Wizard {
+        self.wizard
+    }
+
     fn view(&self, at: usize) -> View<'_> {
         let steps = self.wizard.steps;
+        let outline = self.outline(at);
+        let seen_total = outline.len();
+        let seen = (0..=at.min(steps.len() - 1))
+            .filter(|&i| self.seen(i))
+            .count()
+            .max(1);
         View {
+            page: steps[at].page.map(|p| self.link(p)),
+            seen,
+            seen_total,
+            outline,
             number: at + 1,
             total: steps.len(),
             step: &steps[at],

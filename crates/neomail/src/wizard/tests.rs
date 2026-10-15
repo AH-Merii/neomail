@@ -9,6 +9,7 @@ const ALL: &[&Wizard] = &[
     &crate::oauth::steps::GMAIL,
     &crate::oauth::steps::OUTLOOK,
     &super::proton::PROTON,
+    &super::imap::IMAP,
 ];
 
 /// The long flags of `neomail account add`.
@@ -209,4 +210,85 @@ fn a_check_reads_only_the_answers_it_declares() {
         s.next(event);
     }
     panic!("never reached the login check");
+}
+
+#[test]
+fn a_page_is_one_of_its_steps_links_and_fixed_answers_pass_their_own_check() {
+    let mut pages = 0;
+    let mut choices = 0;
+    for wizard in ALL {
+        for step in wizard.steps {
+            if let Some(page) = step.page {
+                pages += 1;
+                assert!(step.links.contains(&page), "{}: {page}", step.id);
+            }
+            if let Kind::Ask(q) = &step.kind {
+                for c in q.choices {
+                    choices += 1;
+                    assert_eq!((q.clean)(c.value).map(|c| c.value), Ok(c.value.to_owned()));
+                }
+                if let (Some(d), false) = (q.default, q.choices.is_empty()) {
+                    assert!(q.choices.iter().any(|c| c.value == d), "{}", step.id);
+                }
+            }
+        }
+    }
+    assert!(pages >= 5 && choices >= 6, "{pages} {choices}");
+}
+
+#[test]
+fn a_steps_text_marks_its_actions_notes_and_warnings() {
+    let step = Step {
+        id: "x",
+        title: "X",
+        why: "\
+Some explanation that goes
+on here.
+- Click Enable, then
+  Save.
+This line explains, after the action.
+Why External: a note
+that continues.
+Warning: mind the key.pem.",
+        links: &[],
+        page: None,
+        kind: Kind::Console,
+    };
+    assert_eq!(
+        step.lines(),
+        [
+            (Line::Say, "Some explanation that goes on here.".to_owned()),
+            (Line::Action, "Click Enable, then Save.".to_owned()),
+            (
+                Line::Say,
+                "This line explains, after the action.".to_owned()
+            ),
+            (
+                Line::Note,
+                "Why External: a note that continues.".to_owned()
+            ),
+            (Line::Warning, "Mind the key.pem.".to_owned()),
+        ]
+    );
+}
+
+/// The welcome's step count may grow only where it says so: while a step shown only for some
+/// answers waits on an answer not given yet.
+#[test]
+fn the_step_count_grows_only_while_an_answer_it_depends_on_is_missing() {
+    use crate::oauth::steps::{DEVICE_CODE, OUTLOOK, WORK};
+    let open = Session::new(&OUTLOOK, true, |_| None).unwrap();
+    assert!(open.may_grow());
+    let flags = |f: &str| match f {
+        "--account-type" => Some(WORK.to_owned()),
+        "--device-code" => Some(DEVICE_CODE.to_owned()),
+        _ => None,
+    };
+    let decided = Session::new(&OUTLOOK, true, flags).unwrap();
+    assert!(!decided.may_grow());
+    assert!(
+        !Session::new(&GMAIL_APP_PASSWORD, true, |_| None)
+            .unwrap()
+            .may_grow()
+    );
 }

@@ -84,9 +84,9 @@ pub fn add(
     config_path: &Path,
     args: Args,
     input: Input,
+    paint: crate::style::Paint,
     out: &mut impl Write,
 ) -> Result<()> {
-    let plan = gather(preset, config_path, args, input)?;
     let prompt = preset.password_prompt;
     let deps = Deps {
         open_keyring: &Keyring::open,
@@ -100,6 +100,13 @@ pub fn add(
             Ok(crate::account::runtime()?.block_on(nm_imap::check_login(imap, login))?)
         },
     };
+    // On a terminal the wizard asks; off one, and with --no-input, the flags answer as before.
+    let mut tty = crate::wizard::term::Tty::new(input, "password");
+    if crate::wizard::term::Term::interactive(&tty) {
+        let mut ui = crate::wizard::cli::Ui::real(&mut tty, paint, false, preset.id);
+        return crate::wizard::imap::run(preset, config_path, args, &mut ui, &deps, out);
+    }
+    let plan = gather(preset, config_path, args, input)?;
     execute(plan, config_path, &deps, out)
 }
 
@@ -229,17 +236,6 @@ pub fn execute(
     out: &mut impl Write,
 ) -> Result<()> {
     let name = plan.name.clone();
-    let block = |plan: &Plan| {
-        config::password_account_toml(
-            &name,
-            &plan.imap,
-            plan.password_command.as_deref(),
-            plan.smtp
-                .clone()
-                .or_else(|| config::preset_smtp(&plan.imap))
-                .as_ref(),
-        )
-    };
     config::check_append(config_path, &name, &block(&plan))?;
 
     let (keyring, password) = match &plan.password_command {
@@ -259,18 +255,49 @@ pub fn execute(
             plan.imap.host, plan.imap.port, plan.imap.username
         );
     }
-    let stored = match (&keyring, &password) {
+    save(&plan, keyring.as_ref(), password.as_ref(), config_path, out)?;
+    Ok(())
+}
+
+/// The account's config block.
+pub fn block(plan: &Plan) -> String {
+    config::password_account_toml(
+        &plan.name,
+        &plan.imap,
+        plan.password_command.as_deref(),
+        plan.smtp
+            .clone()
+            .or_else(|| config::preset_smtp(&plan.imap))
+            .as_ref(),
+    )
+}
+
+/// Stores the password in `keyring`, if given, and appends the account; says so on `out`.
+/// Returns where the password went, if to the keyring.
+pub fn save(
+    plan: &Plan,
+    keyring: Option<&Keyring>,
+    password: Option<&Password>,
+    config_path: &Path,
+    out: &mut impl Write,
+) -> Result<Option<String>> {
+    let name = &plan.name;
+    let (stored, place) = match (keyring, password) {
         (Some(keyring), Some(password)) => {
-            keyring.set(&name, password)?;
-            format!(
-                "Its password is in {} (service {:?}, username {name:?}).",
+            keyring.set(name, password)?;
+            let place = format!(
+                "{} (service {:?}, username {name:?})",
                 keyring.name(),
                 keyring::SERVICE
-            )
+            );
+            (format!("Its password is in {place}."), Some(place))
         }
-        _ => "It runs its password_command for the password.".to_owned(),
+        _ => (
+            "It runs its password_command for the password.".to_owned(),
+            None,
+        ),
     };
-    config::append_account(config_path, &name, &block(&plan)).with_context(|| {
+    config::append_account(config_path, name, &block(plan)).with_context(|| {
         if keyring.is_some() {
             "the password is stored in the keyring, but the config file could not be updated"
         } else {
@@ -283,7 +310,8 @@ pub fn execute(
         plan.imap.username,
         config_path.display(),
     )?;
-    Ok(())
+    out.flush()?;
+    Ok(place)
 }
 
 #[cfg(test)]

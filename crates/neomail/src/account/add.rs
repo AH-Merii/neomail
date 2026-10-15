@@ -25,8 +25,9 @@ use crate::oauth::check::{self, Verdict};
 use crate::oauth::steps::{self, *};
 use crate::oauth::{self, ClientKind, EndpointError, Provider, Secret, SignInError, SignedIn};
 use crate::secret::{self, Input};
-use crate::wizard::cli::{self, Term};
+use crate::wizard::cli::{self, Saved, Ui};
 use crate::wizard::gmail::Servers;
+use crate::wizard::term::Tty;
 use crate::wizard::{Answers, CheckError, Session, StartError, Wizard};
 
 /// The flags of `neomail account add gmail|outlook`.
@@ -68,30 +69,13 @@ pub fn wizard(provider: &Provider) -> &'static Wizard {
     }
 }
 
-/// The standard streams, with the secret called a client secret in its messages.
-struct Stdio(Input);
-
-impl Term for Stdio {
-    fn interactive(&self) -> bool {
-        self.0.can_prompt()
-    }
-    fn say(&mut self, text: &str) {
-        eprintln!("{text}");
-    }
-    fn line(&mut self, prompt: &str) -> Result<String> {
-        secret::prompt_line(prompt)
-    }
-    fn secret(&mut self, prompt: &str) -> Result<String> {
-        secret::read_secret(prompt, "client secret", self.0)
-    }
-}
-
 /// `neomail account add gmail|outlook` with the real keyring, endpoints and servers.
 pub fn add(
     provider: &'static Provider,
     config_path: &Path,
     args: AddArgs,
     input: Input,
+    paint: crate::style::Paint,
     out: &mut impl Write,
 ) -> Result<()> {
     let flow = super::flow_here(provider, args.device_code)?;
@@ -108,13 +92,15 @@ pub fn add(
         gmail: Servers::gmail(),
         graph_count: &graph_count,
     };
+    let mut tty = Tty::new(input, "client secret");
+    let mut ui = Ui::real(&mut tty, paint, no_browser, wizard(provider).id);
     run(
         provider,
         flow,
         config_path,
         args,
         input,
-        &mut Stdio(input),
+        &mut ui,
         &deps,
         out,
     )
@@ -128,7 +114,7 @@ type Opened = (Keyring, Option<(String, OAuthEntry)>);
 /// is asked; the write uses the real one.
 const SOME_CLIENT_ID: &str = "client-id";
 
-/// The wizard for `provider`, with `term` for the user and `deps` for the outside. `flow` is
+/// The wizard for `provider`, with `ui` for the user and `deps` for the outside. `flow` is
 /// the sign-in [`super::flow_here`] chose from `--device-code` and the environment.
 #[allow(clippy::too_many_arguments)]
 pub fn run<H: Http>(
@@ -137,7 +123,7 @@ pub fn run<H: Http>(
     config_path: &Path,
     args: AddArgs,
     input: Input,
-    term: &mut dyn Term,
+    ui: &mut Ui<'_>,
     deps: &Deps<'_, H>,
     out: &mut impl Write,
 ) -> Result<()> {
@@ -152,7 +138,7 @@ pub fn run<H: Http>(
         "--device-code" => device_code.then(|| DEVICE_CODE.to_owned()),
         _ => None,
     };
-    let mut session = match Session::new(wizard, term.interactive(), flag) {
+    let mut session = match Session::new(wizard, ui.interactive(), flag) {
         Ok(session) => session,
         Err(StartError::Missing(flags)) => {
             let secret_note = match provider.client {
@@ -178,7 +164,10 @@ pub fn run<H: Http>(
             .secret("secret")
             .map(|s| Secret::new(s.expose().to_owned())),
     };
-    let check = |id: &str, answers: &Answers<'_>| -> Result<String, CheckError> {
+    let check = |id: &str,
+                 answers: &Answers<'_>,
+                 ask: &mut cli::Ask<'_, '_>|
+     -> Result<String, CheckError> {
         match id {
             "ready" => {
                 let name = answers.text("name").unwrap_or_default();
@@ -205,7 +194,7 @@ pub fn run<H: Http>(
                 *keyring.borrow_mut() = Some((store, leftover.map(|l| (name.to_owned(), l))));
                 Ok(String::new())
             }
-            "client-check" if args.no_check => Ok(String::new()),
+            "client-check" | "mail-check" if args.no_check => Ok(cli::SKIPPED.to_owned()),
             "client-check" => client_check(deps.http, provider, &client(answers)),
             "sign-in" => {
                 let email = answers.text("email").unwrap_or_default();
@@ -222,6 +211,29 @@ pub fn run<H: Http>(
                 if let (Some((name, leftover)), Some((store, _))) =
                     (leftover, keyring.borrow().as_ref())
                 {
+                    let what = format!(
+                        "{} holds a sign-in named {name:?} that no account in the config uses, \
+                         left by an earlier setup. Signing in again replaces it: neomail revokes it \
+                         with {} where it can and deletes it.",
+                        store.name(),
+                        provider.name
+                    );
+                    match ask.confirm("Replace the old sign-in", &what, "Revoke and delete it?") {
+                        Ok(Some(true)) => {}
+                        Ok(None) => {
+                            return Err(CheckError {
+                                kind: cli::QUIT,
+                                detail: "quit".into(),
+                            });
+                        }
+                        Ok(Some(false)) => {
+                            return Err(CheckError {
+                                kind: KEPT_LEFTOVER,
+                                detail: format!("The old sign-in named {name:?} was kept."),
+                            });
+                        }
+                        Err(e) => return Err(other(e)),
+                    }
                     said = revoke_leftover(deps.http, provider, store, &name, &leftover)?;
                     said.push('\n');
                 }
@@ -241,7 +253,6 @@ pub fn run<H: Http>(
                 *signed_in.borrow_mut() = Some(done);
                 Ok(said)
             }
-            "mail-check" if args.no_check => Ok(String::new()),
             "mail-check" => {
                 let signed = signed_in.borrow();
                 let signed = signed
@@ -266,7 +277,7 @@ pub fn run<H: Http>(
             _ => Ok(String::new()),
         }
     };
-    let write = |answers: &Answers<'_>| -> Result<String> {
+    let write = |answers: &Answers<'_>| -> Result<Saved> {
         let name = answers.text("name").unwrap_or_default();
         let guard = keyring.borrow();
         let (store, _) = guard.as_ref().context("the keyring was not opened")?;
@@ -287,9 +298,22 @@ pub fn run<H: Http>(
             store.name(),
             keyring::OAUTH_SERVICE,
         )?;
-        Ok(String::new())
+        out.flush()?;
+        Ok(Saved {
+            saved: vec![
+                format!(
+                    "the sign-in in {} (service {:?}, username {name:?})",
+                    store.name(),
+                    keyring::OAUTH_SERVICE
+                ),
+                format!("the account {name:?} in {}", config_path.display()),
+            ],
+            next: Some(format!("neomail sync --account {name}")),
+            said: String::new(),
+            todo: Vec::new(),
+        })
     };
-    cli::drive(&mut session, term, check, write)
+    cli::drive(&mut session, ui, check, write)
 }
 
 fn other(e: anyhow::Error) -> CheckError {
@@ -305,10 +329,11 @@ fn name_taken(path: &Path, name: &str) -> bool {
     config::exists(path) && Config::load(path).is_ok_and(|c| c.find(name).is_some())
 }
 
-/// "step 6 (Add yourself as a test user)": a step of `wizard` as the user sees it.
+/// "the step Add yourself as a test user": a step of `wizard` as the user sees it, by its
+/// title, since its number depends on the steps the flags answered.
 fn step_ref(wizard: &Wizard, id: &str) -> String {
     match wizard.position(id) {
-        Some(i) => format!("step {} ({})", i + 1, wizard.steps[i].title),
+        Some(i) => format!("the step {:?}", wizard.steps[i].title),
         None => id.to_owned(),
     }
 }

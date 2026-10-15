@@ -1,6 +1,6 @@
 //! Colour: one decision per stream, made once in main.rs from `--color`, NO_COLOR,
 //! CLICOLOR_FORCE, CLICOLOR, TERM and whether the stream is a terminal, then passed down as a
-//! [`Paint`]. Only the 16 ANSI colours plus bold, so the terminal's theme picks the shades.
+//! [`Paint`]. Only the 16 ANSI colours plus bold, dim and underline, so the terminal's theme picks the shades.
 //! Colour never carries meaning alone: the text says the same without it.
 
 use anstyle::{AnsiColor, Style};
@@ -147,6 +147,137 @@ impl Paint {
             text,
         )
     }
+
+    // The palette's roles, shared by help (crate::help) and the setup wizards
+    // (DEC-2026-10-15-wizard-ui). A symbol or a word next to the text always says the same.
+
+    /// A heading, and where you are: bold yellow, as help's `Usage:`.
+    pub fn heading(self, text: &str) -> String {
+        self.paint(
+            Style::new().bold().fg_color(Some(AnsiColor::Yellow.into())),
+            text,
+        )
+    }
+
+    /// What you type or press: commands, flags, values, keys, the item a list points at. Bold
+    /// green, as help's command and flag names.
+    pub fn literal(self, text: &str) -> String {
+        self.paint(
+            Style::new().bold().fg_color(Some(AnsiColor::Green.into())),
+            text,
+        )
+    }
+
+    /// A placeholder for a value of yours, such as `NAME`: magenta, as in help.
+    pub fn placeholder(self, text: &str) -> String {
+        self.fg(AnsiColor::Magenta, text)
+    }
+
+    /// A page to open: underlined cyan.
+    pub fn link(self, text: &str) -> String {
+        self.paint(
+            Style::new()
+                .underline()
+                .fg_color(Some(AnsiColor::Cyan.into())),
+            text,
+        )
+    }
+
+    /// Something you do: bold, after an action bullet.
+    pub fn action(self, text: &str) -> String {
+        self.strong(text)
+    }
+
+    /// A side note: dim.
+    pub fn note(self, text: &str) -> String {
+        self.paint(Style::new().dimmed(), text)
+    }
+
+    /// A warning: yellow, after a warning sign.
+    pub fn warning(self, text: &str) -> String {
+        self.fg(AnsiColor::Yellow, text)
+    }
+
+    /// Something that worked: green, after a check mark.
+    pub fn success(self, text: &str) -> String {
+        self.fg(AnsiColor::Green, text)
+    }
+
+    /// Something that failed: red, after a cross. [`Paint::error`] is its bold form.
+    pub fn failure(self, text: &str) -> String {
+        self.fg(AnsiColor::Red, text)
+    }
+}
+
+/// The symbols that carry the meaning colour only underlines: Unicode when the locale is UTF-8,
+/// else ASCII.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Symbols {
+    /// Done, saved, passed.
+    pub check: &'static str,
+    /// Failed, wrong.
+    pub cross: &'static str,
+    /// The current step, the header.
+    pub arrow: &'static str,
+    /// An action to take.
+    pub bullet: &'static str,
+    pub warning: &'static str,
+    /// A page being opened.
+    pub open: &'static str,
+    /// A step left, and the separator in a header.
+    pub dot: &'static str,
+    /// The item a list points at.
+    pub pointer: &'static str,
+    /// A check that is running.
+    pub running: &'static str,
+    /// More above or below.
+    pub up: &'static str,
+    pub down: &'static str,
+}
+
+impl Symbols {
+    pub const UNICODE: Self = Self {
+        check: "✓",
+        cross: "✗",
+        arrow: "▸",
+        bullet: "•",
+        warning: "⚠",
+        open: "↗",
+        dot: "·",
+        pointer: "❯",
+        running: "…",
+        up: "↑",
+        down: "↓",
+    };
+
+    pub const ASCII: Self = Self {
+        check: "+",
+        cross: "x",
+        arrow: ">",
+        bullet: "*",
+        warning: "!",
+        open: "->",
+        dot: "-",
+        pointer: ">",
+        running: "...",
+        up: "^",
+        down: "v",
+    };
+
+    /// Unicode when the locale's character set is UTF-8: the first of LC_ALL, LC_CTYPE and LANG
+    /// that is set and not empty names it. `var` reads the environment.
+    pub fn for_locale(var: impl Fn(&str) -> Option<String>) -> Self {
+        let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+            .into_iter()
+            .find_map(|name| var(name).filter(|v| !v.is_empty()))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if locale.contains("utf-8") || locale.contains("utf8") {
+            Self::UNICODE
+        } else {
+            Self::ASCII
+        }
+    }
 }
 
 #[cfg(test)]
@@ -213,5 +344,38 @@ mod tests {
         assert_eq!(p.error("neomail"), "\x1b[1m\x1b[31mneomail\x1b[0m");
         assert_eq!(Paint::OFF.strong("x"), "x");
         assert_eq!(p.id(""), "");
+        assert_eq!(p.heading("h"), "\x1b[1m\x1b[33mh\x1b[0m");
+        assert_eq!(p.literal("v"), "\x1b[1m\x1b[32mv\x1b[0m");
+        assert_eq!(p.note("n"), "\x1b[2mn\x1b[0m");
+        assert_eq!(
+            Paint::OFF.link("https://example.com"),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn symbols_are_ascii_unless_the_locale_is_utf_8() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| (*v).to_owned())
+            }
+        };
+        assert_eq!(
+            Symbols::for_locale(env(&[("LANG", "en_GB.UTF-8")])),
+            Symbols::UNICODE
+        );
+        assert_eq!(
+            Symbols::for_locale(env(&[("LC_ALL", "C.utf8")])),
+            Symbols::UNICODE
+        );
+        assert_eq!(Symbols::for_locale(env(&[])), Symbols::ASCII);
+        // LC_ALL wins over LANG, and an empty one is skipped.
+        let c = env(&[("LC_ALL", "C"), ("LANG", "en_GB.UTF-8")]);
+        assert_eq!(Symbols::for_locale(c), Symbols::ASCII);
+        let empty = env(&[("LC_ALL", ""), ("LANG", "en_GB.UTF-8")]);
+        assert_eq!(Symbols::for_locale(empty), Symbols::UNICODE);
     }
 }

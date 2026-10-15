@@ -14,7 +14,7 @@ neomail sync --account outlook
 ```
 
 On a terminal, `account add outlook` takes you through the setup one step at a time. Each step
-says what to do, why it exists and which page to open; `<` goes back a step. It first asks
+says what to do, why it exists and which page to open; Esc goes back a step. It first asks
 whether the account is personal (Outlook.com, Hotmail) or work or school (`--account-type`), and
 how you will sign in (`--device-code`), and shows only the steps that apply:
 

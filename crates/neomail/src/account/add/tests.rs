@@ -21,6 +21,8 @@ use super::*;
 use crate::config::SmtpSettings;
 use crate::http::Response;
 use crate::oauth::{GOOGLE, MICROSOFT, MailGrant};
+use crate::wizard::script::{self, Script};
+use crate::wizard::term::Key;
 use crate::wizard::{Event, Kind, Prompt};
 
 const GMAIL_ID: &str = "1234-abc.apps.googleusercontent.com";
@@ -35,57 +37,6 @@ const MICROSOFT_KNOWN: (u16, &str) = (
     200,
     r#"{"device_code":"dc","user_code":"UC","verification_uri":"https://example.com","expires_in":900,"interval":5,"message":"m"}"#,
 );
-
-/// Scripted input: `lines` for typed answers, `secrets` for hidden ones.
-#[derive(Default)]
-struct Script {
-    interactive: bool,
-    lines: VecDeque<&'static str>,
-    secrets: VecDeque<&'static str>,
-    secrets_asked: usize,
-    said: String,
-}
-
-impl Script {
-    fn off_terminal(secrets: &[&'static str]) -> Self {
-        Self {
-            secrets: secrets.iter().copied().collect(),
-            ..Self::default()
-        }
-    }
-
-    fn terminal(lines: &[&'static str], secrets: &[&'static str]) -> Self {
-        Self {
-            interactive: true,
-            lines: lines.iter().copied().collect(),
-            secrets: secrets.iter().copied().collect(),
-            ..Self::default()
-        }
-    }
-}
-
-impl Term for Script {
-    fn interactive(&self) -> bool {
-        self.interactive
-    }
-    fn say(&mut self, text: &str) {
-        self.said.push_str(text);
-        self.said.push('\n');
-    }
-    fn line(&mut self, prompt: &str) -> Result<String> {
-        let line = self.lines.pop_front();
-        Ok(line
-            .unwrap_or_else(|| panic!("no answer for {prompt:?}:\n{}", self.said))
-            .to_owned())
-    }
-    fn secret(&mut self, prompt: &str) -> Result<String> {
-        self.secrets_asked += 1;
-        let secret = self.secrets.pop_front();
-        Ok(secret
-            .unwrap_or_else(|| panic!("no secret for {prompt:?}:\n{}", self.said))
-            .to_owned())
-    }
-}
 
 /// Google's and Microsoft's endpoints: plays the scripted answers in order and records each
 /// request. A request with no answer left fails the test.
@@ -382,7 +333,7 @@ impl World {
             &self.config(),
             args,
             input,
-            term,
+            &mut script::ui(term),
             &deps,
             &mut out,
         )?;
@@ -655,9 +606,9 @@ fn a_gmail_sign_in_that_times_out_names_the_steps_google_shows_mistakes_for() {
         .unwrap_err()
         .to_string();
     for step in [
-        "step 6 (Add yourself as a test user)",
-        "step 11 (Create a Desktop app client)",
-        "step 7 (Data Access: add the mail scope)",
+        "the step \"Add yourself as a test user\"",
+        "the step \"Create a Desktop app client\"",
+        "the step \"Data Access: add the mail scope\"",
     ] {
         assert!(e.contains(step), "{step}: {e}");
     }
@@ -761,12 +712,12 @@ fn on_a_terminal_the_steps_link_the_project_and_explain_the_choices_when_made() 
         assert!(said.contains(link), "{link}\n{said}");
         let at = |text: &str| said.find(text).unwrap_or_else(|| panic!("{text}\n{said}"));
         // The publishing choice, with its effects, comes before the client is created.
-        let publishing = at("Step 8 of 17: Testing or published");
-        assert!(publishing < at("Step 11 of 17: Create a Desktop app client"));
+        let publishing = at("Step 8/12 · Testing or published");
+        assert!(publishing < at("Step 10/12 · Create a Desktop app client"));
         for effect in ["after 7 days", "100 users", "Advanced Protection"] {
             assert!(at(effect) > publishing, "{effect}");
         }
-        assert!(at("only this once") > at("Step 11 of 17"));
+        assert!(at("only this once") > at("Step 10/12"));
     }
 }
 
@@ -796,6 +747,50 @@ fn a_leftover_sign_in_is_revoked_before_the_new_one() {
         "{}",
         term.said
     );
+}
+
+/// On a terminal the leftover is replaced only after a yes, and the sign-in after it runs in
+/// cooked mode, so Ctrl-C stops it and its lines print below the question. Esc at the question
+/// quits: nothing is revoked, signed in or written.
+#[test]
+fn on_a_terminal_a_leftover_is_replaced_after_a_yes_and_esc_quits() {
+    let leftover = OAuthEntry {
+        client_secret: Some(CLIENT_SECRET.into()),
+        refresh_token: Some("1//old".into()),
+        mail_grant: None,
+    };
+    for (key, replaced) in [(Key::Char('y'), true), (Key::Esc, false)] {
+        let w = World::new(&[GOOGLE_KNOWN, (200, "")]);
+        w.keyring().set_oauth("gmail", &leftover).unwrap();
+        let mut term = Script::terminal(&[""; 20], &[CLIENT_SECRET]);
+        term.confirms.push_back(key);
+        let can_print = term.can_print.clone();
+        let out = w.run(&GOOGLE, Flow::Browser, gmail_args(), &mut term, |e| {
+            assert!(
+                can_print.get(),
+                "the sign-in runs in raw mode, or over the screen"
+            );
+            Ok(signed(e))
+        });
+        assert!(term.said.contains("Revoke and delete it?"), "{}", term.said);
+        let revoked = w
+            .http
+            .seen()
+            .iter()
+            .any(|(url, _)| url.ends_with("/revoke"));
+        assert_eq!(revoked, replaced, "{}", term.said);
+        if replaced {
+            out.unwrap();
+        } else {
+            let e = out.unwrap_err().to_string();
+            assert!(e.starts_with("stopped at \"Sign in"), "{e}");
+            assert!(e.contains("nothing was written"), "{e}");
+            assert!(w.sign_ins.borrow().is_empty());
+            let kept = w.keyring().get_oauth("gmail").unwrap().unwrap();
+            assert_eq!(kept.refresh_token.as_deref(), Some("1//old"));
+        }
+        assert!(!term.raw);
+    }
 }
 
 #[test]
@@ -1069,11 +1064,11 @@ fn an_outlook_sign_in_that_times_out_names_the_steps_microsoft_shows_mistakes_fo
         "{e}"
     );
     assert!(
-        e.contains("(step 5 (Add the redirect URI), AADSTS50011)"),
+        e.contains("(the step \"Add the redirect URI\", AADSTS50011)"),
         "{e}"
     );
     assert!(
-        e.contains("(step 3 (Register the app), AADSTS50194)"),
+        e.contains("(the step \"Register the app\", AADSTS50194)"),
         "{e}"
     );
 }

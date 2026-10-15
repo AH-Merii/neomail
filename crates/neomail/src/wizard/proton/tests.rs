@@ -3,7 +3,6 @@
 //! byte and self-signed certificates.
 
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -13,57 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::config::Config;
-
-/// Scripted input: `lines` for typed answers, `secrets` for hidden ones.
-#[derive(Default)]
-struct Script {
-    interactive: bool,
-    lines: VecDeque<&'static str>,
-    secrets: VecDeque<&'static str>,
-    secrets_asked: usize,
-    said: String,
-}
-
-impl Script {
-    fn terminal(lines: &[&'static str], secrets: &[&'static str]) -> Self {
-        Self {
-            interactive: true,
-            lines: lines.iter().copied().collect(),
-            secrets: secrets.iter().copied().collect(),
-            ..Self::default()
-        }
-    }
-
-    fn off_terminal(secrets: &[&'static str]) -> Self {
-        Self {
-            secrets: secrets.iter().copied().collect(),
-            ..Self::default()
-        }
-    }
-}
-
-impl Term for Script {
-    fn interactive(&self) -> bool {
-        self.interactive
-    }
-    fn say(&mut self, text: &str) {
-        self.said.push_str(text);
-        self.said.push('\n');
-    }
-    fn line(&mut self, prompt: &str) -> Result<String> {
-        let line = self.lines.pop_front();
-        Ok(line
-            .unwrap_or_else(|| panic!("no answer for {prompt:?}:\n{}", self.said))
-            .to_owned())
-    }
-    fn secret(&mut self, prompt: &str) -> Result<String> {
-        self.secrets_asked += 1;
-        let secret = self.secrets.pop_front();
-        Ok(secret
-            .unwrap_or_else(|| panic!("no secret for {prompt:?}:\n{}", self.said))
-            .to_owned())
-    }
-}
+use crate::wizard::script::{self, Script};
 
 /// A self-signed certificate for 127.0.0.1, as Bridge makes one.
 struct Cert {
@@ -371,7 +320,14 @@ impl World {
             find_bridge: &find,
         };
         let mut out = Vec::new();
-        run(&self.config(), args, OFF_TERMINAL, term, &deps, &mut out)?;
+        run(
+            &self.config(),
+            args,
+            OFF_TERMINAL,
+            &mut script::ui(term),
+            &deps,
+            &mut out,
+        )?;
         Ok(String::from_utf8(out).unwrap())
     }
 
@@ -486,9 +442,9 @@ fn on_a_terminal_each_step_is_shown_and_the_ports_typed_are_checked() {
     let mut term = Script::terminal(&lines, &[PASSWORD]);
     w.run(Args::default(), &mut term).unwrap();
     for shown in [
-        "Step 1 of 17: A paid Proton plan",
+        "Step 1/11 · A paid Proton plan",
         "https://proton.me/mail/bridge",
-        "Step 6 of 17: Mailbox details: the username",
+        "Step 5/11 · Mailbox details: the username",
         "never into neomail",
         &w.cert.fingerprint(),
     ] {
@@ -743,11 +699,13 @@ fn off_a_terminal_the_pin_comes_from_a_flag_and_the_password_never_does() {
             open_keyring: &keyring,
             find_bridge: &|| None,
         };
+        let mut tty = crate::wizard::term::Tty::new(input, "password");
+        let mut ui = cli::Ui::real(&mut tty, crate::style::Paint::OFF, true, "proton");
         let e = run(
             &w.config(),
             w.args(),
             input,
-            &mut cli::Stdio(input),
+            &mut ui,
             &deps,
             &mut Vec::new(),
         )
