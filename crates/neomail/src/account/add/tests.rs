@@ -470,21 +470,21 @@ fn google_answers_to_the_client_check_name_the_step_to_change() {
                 401,
                 r#"{"error":"invalid_client","error_description":"The OAuth client was not found."}"#,
             ),
-            "step 12 of 17 (Paste the client ID): Google answered: invalid_client: The OAuth client was not found.",
+            "step 14 of 19 (Paste the client ID): Google answered: invalid_client: The OAuth client was not found.",
         ),
         (
             (
                 401,
                 r#"{"error":"invalid_client","error_description":"The provided client secret is invalid."}"#,
             ),
-            "step 13 of 17 (Paste the client secret): Google answered:",
+            "step 15 of 19 (Paste the client secret): Google answered:",
         ),
         (
             (
                 400,
                 r#"{"error":"invalid_request","error_description":"client_secret is missing."}"#,
             ),
-            "step 13 of 17 (Paste the client secret):",
+            "step 15 of 19 (Paste the client secret):",
         ),
     ];
     for (answer, want) in cases {
@@ -534,8 +534,8 @@ fn on_a_terminal_a_wrong_client_id_is_asked_again_and_the_secret_kept() {
         name: Some("mine".into()),
         ..AddArgs::default()
     };
-    // Enter at the console steps, then a wrong ID, then the right one.
-    let enter = [""; 7];
+    // Enter at the route and the console steps, then a wrong ID, then the right one.
+    let enter = [""; 8];
     let lines: Vec<&str> = [&enter[..], &["wrong.apps.googleusercontent.com", GMAIL_ID]].concat();
     let mut term = Script::terminal(&lines, &[CLIENT_SECRET]);
     w.run(&GOOGLE, Flow::Browser, args, &mut term, |e| Ok(signed(e)))
@@ -572,7 +572,7 @@ fn a_refused_mail_login_writes_nothing() {
             .unwrap_err();
         assert!(
             e.to_string()
-                .starts_with("step 16 of 17 (Check the mail login): "),
+                .starts_with("step 18 of 19 (Check the mail login): "),
             "{refusing}: {e}"
         );
         w.assert_nothing_written("gmail");
@@ -613,7 +613,7 @@ fn a_gmail_sign_in_that_times_out_names_the_steps_google_shows_mistakes_for() {
         assert!(e.contains(step), "{step}: {e}");
     }
     assert!(
-        e.starts_with("step 6 of 17 (Add yourself as a test user): no sign-in came back"),
+        e.starts_with("step 8 of 19 (Add yourself as a test user): no sign-in came back"),
         "{e}"
     );
     w.assert_nothing_written("gmail");
@@ -628,11 +628,11 @@ fn gmail_sign_in_errors_name_their_step() {
     let cases: [(anyhow::Error, &str); 4] = [
         (
             exchange_error(&GOOGLE, (200, &no_mail_scope)),
-            "step 7 of 17 (Data Access: add the mail scope)",
+            "step 9 of 19 (Data Access: add the mail scope)",
         ),
         (
             exchange_error(&GOOGLE, (401, r#"{"error":"invalid_client"}"#)),
-            "step 13 of 17 (Paste the client secret)",
+            "step 15 of 19 (Paste the client secret)",
         ),
         (
             SignInError::Declined {
@@ -640,7 +640,7 @@ fn gmail_sign_in_errors_name_their_step() {
                 description: None,
             }
             .into(),
-            "step 8 of 17 (Testing or published: choose now)",
+            "step 10 of 19 (Testing or published: choose now)",
         ),
         (
             SignInError::Redirected {
@@ -648,7 +648,7 @@ fn gmail_sign_in_errors_name_their_step() {
                 description: None,
             }
             .into(),
-            "step 11 of 17 (Create a Desktop app client)",
+            "step 13 of 19 (Create a Desktop app client)",
         ),
     ];
     for (error, want) in cases {
@@ -673,7 +673,7 @@ fn gmail_sign_in_errors_name_their_step() {
         .unwrap_err();
     assert!(
         e.to_string()
-            .starts_with("step 5 of 17 (Your Gmail address): You signed in as other@example.com"),
+            .starts_with("step 7 of 19 (Your Gmail address): You signed in as other@example.com"),
         "{e}"
     );
 }
@@ -688,9 +688,10 @@ fn on_a_terminal_the_steps_link_the_project_and_explain_the_choices_when_made() 
         ("", "https://console.developers.google.com/auth/clients\n"),
     ] {
         let w = World::new(&[GOOGLE_KNOWN]);
-        // project, the ID, API, branding, address, test user, scope, publishing, name, client,
-        // client ID.
+        // route, project, the ID, API, branding, address, test user, scope, publishing, name,
+        // client, client ID.
         let lines = [
+            "",
             "",
             project,
             "",
@@ -712,12 +713,12 @@ fn on_a_terminal_the_steps_link_the_project_and_explain_the_choices_when_made() 
         assert!(said.contains(link), "{link}\n{said}");
         let at = |text: &str| said.find(text).unwrap_or_else(|| panic!("{text}\n{said}"));
         // The publishing choice, with its effects, comes before the client is created.
-        let publishing = at("Step 8/12 · Testing or published");
-        assert!(publishing < at("Step 10/12 · Create a Desktop app client"));
+        let publishing = at("Step 9/13 · Testing or published");
+        assert!(publishing < at("Step 11/13 · Create a Desktop app client"));
         for effect in ["after 7 days", "100 users", "Advanced Protection"] {
             assert!(at(effect) > publishing, "{effect}");
         }
-        assert!(at("only this once") > at("Step 10/12"));
+        assert!(at("only this once") > at("Step 11/13"));
     }
 }
 

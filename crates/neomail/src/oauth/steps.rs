@@ -4,7 +4,7 @@
 //!
 //! Console labels drift, so each step quotes its provider briefly and links the page.
 
-use crate::wizard::{Choice, Cleaned, Kind, Mistake, Question, Run, Step, When, Wizard};
+use crate::wizard::{Choice, Cleaned, Download, Kind, Mistake, Question, Run, Step, When, Wizard};
 
 // What a failed check can mean: the `kind` of a `CheckError`, matched in the tables' mistakes.
 pub const NAME_TAKEN: &str = "name-taken";
@@ -36,6 +36,9 @@ pub const PORTAL: &str = "portal";
 pub const COMMANDS: &str = "commands";
 /// The display name the commands set up or pick up.
 pub const COMMANDS_APP: &str = "neomail";
+/// Gmail's browser route: the steps in the Google Cloud console (#110). Its commands route is
+/// [`COMMANDS`].
+pub const CONSOLE: &str = "console";
 
 const NAME_STEP_WHY: &str = "What neomail calls the account, as in `neomail sync --account NAME`.";
 const READY_WHY: &str = "The name is free, the config file can take the account and the keyring \
@@ -57,6 +60,35 @@ pub static GMAIL: Wizard = Wizard {
     title: "a Gmail account, through your own Google OAuth app",
     steps: &[
         Step {
+            id: "route",
+            title: "Browser steps or Google Cloud CLI commands?",
+            why: "\
+console: follow the steps in the Google Cloud console. commands: paste one line into a terminal
+with the Google Cloud CLI (gcloud) installed; it makes or picks up the project, enables the
+Gmail API in it and hands the project ID back here.
+Note: only those steps have a command. The Google Auth Platform pages and the client stay
+browser steps on both routes: Google offers no command for them.",
+            links: &["https://cloud.google.com/sdk/docs/install"],
+            page: None,
+            kind: Kind::Ask(Question {
+                flag: None,
+                prompt: "console or commands? ",
+                secret: false,
+                default: Some(CONSOLE),
+                choices: &[
+                    Choice {
+                        value: CONSOLE,
+                        label: "the steps in the Google Cloud console",
+                    },
+                    Choice {
+                        value: COMMANDS,
+                        label: "one line to paste, with the Google Cloud CLI",
+                    },
+                ],
+                clean: clean_gmail_route,
+            }),
+        },
+        Step {
             id: "project",
             title: "Create a Google Cloud project",
             why: "\
@@ -65,7 +97,39 @@ neomail ships no OAuth client, so you create your own, and every client belongs 
 Note: no billing is needed. Its project ID can be changed only while you create it.",
             links: &["https://console.cloud.google.com/projectcreate"],
             page: Some("https://console.cloud.google.com/projectcreate"),
-            kind: Kind::Console,
+            kind: Kind::ConsoleIf(&[When {
+                step: "route",
+                is: &[CONSOLE],
+            }]),
+        },
+        Step {
+            id: "commands",
+            title: "Run the Google Cloud CLI commands",
+            why: "\
+- Paste the line below into a terminal and run it. It runs a script neomail wrote, which
+  signs in to the Google Cloud CLI in your browser, makes or picks up your neomail project,
+  enables the Gmail API in it, and hands the project ID back.
+Note: the project ID is neomail- and 10 letters and digits made from your Google address, so
+every run finds the same project. To use a project of your own, add its ID after the line.
+Note: it signs in with a folder of its own and revokes that sign-in when it ends, so your own
+gcloud account and active project stay as they were.
+Note: no browser here (over SSH)? The sign-in prints a link and asks for a code instead. Or
+run the script on another machine and type the project ID it prints.",
+            links: &[],
+            page: None,
+            kind: Kind::Run(Run {
+                when: &[When {
+                    step: "route",
+                    is: &[COMMANDS],
+                }],
+                fills: "project-id",
+                script: super::gcloud::script,
+                prompt: "Or type the project ID: ",
+                wrong: "That is not a project ID: 6 to 30 lowercase letters, digits and hyphens, \
+                        starting with a letter. The script prints it after ok.",
+                failure: super::gcloud::failure,
+                with_given: true,
+            }),
         },
         Step {
             id: "project-id",
@@ -98,7 +162,10 @@ Gmail's scope is the one neomail reads your mail with.",
             page: Some(
                 "https://console.cloud.google.com/apis/library/gmail.googleapis.com?project={project-id}",
             ),
-            kind: Kind::Console,
+            kind: Kind::ConsoleIf(&[When {
+                step: "route",
+                is: &[CONSOLE],
+            }]),
         },
         Step {
             id: "branding",
@@ -202,8 +269,10 @@ account's data.",
             title: "Create a Desktop app client",
             why: "\
 - Clients > Create client > Application type: Desktop app, any name, Create.
-- Copy the client ID and the client secret now: Google shows the secret in full only this once.
-Lost it? Open the client and click Add secret.
+- In the box that shows the new client, click Download JSON: neomail reads the client ID and
+  the secret from your download folder by itself. Google offers the file only in this box.
+Note: no download? Copy the client ID and the client secret now, press Enter and paste them:
+Google shows the secret in full only this once. Lost it? Open the client and click Add secret.
 Why Desktop app: it may send the sign-in back to http://127.0.0.1 on any port, where neomail
 waits for it.",
             links: &[
@@ -211,7 +280,16 @@ waits for it.",
                 "https://support.google.com/cloud/answer/15549257",
             ],
             page: Some("https://console.developers.google.com/auth/clients?project={project-id}"),
-            kind: Kind::Console,
+            kind: Kind::Download(Download {
+                prefix: "client_secret_",
+                suffix: ".json",
+                fills: &["client-id", "secret"],
+                read: super::gcloud::client_file,
+                picked: super::gcloud::picked,
+                again: "The client ID and secret came from the downloaded file. Google offers \
+                        the file only when it makes a client: create another Desktop app client \
+                        and download its JSON, or press Enter and paste the ID and secret.",
+            }),
         },
         Step {
             id: "client-id",
@@ -564,6 +642,7 @@ sh, and type the client ID it prints.",
                 wrong: "That is not an Application (client) ID, which looks like \
                         00000000-0000-0000-0000-000000000000. The script prints it after ok.",
                 failure: super::azure::failure,
+                with_given: false,
             }),
         },
         Step {
@@ -957,6 +1036,14 @@ fn clean_sign_in_method(typed: &str) -> Result<Cleaned, &'static str> {
         "browser" | "b" => Ok(Cleaned::ok(BROWSER)),
         "device-code" | "device" | "code" | "d" => Ok(Cleaned::ok(DEVICE_CODE)),
         _ => Err("Type browser or device-code."),
+    }
+}
+
+fn clean_gmail_route(typed: &str) -> Result<Cleaned, &'static str> {
+    match typed.trim().to_ascii_lowercase().as_str() {
+        "console" | "browser" | "b" => Ok(Cleaned::ok(CONSOLE)),
+        "commands" | "command" | "c" | "cli" | "gcloud" => Ok(Cleaned::ok(COMMANDS)),
+        _ => Err("Type console or commands."),
     }
 }
 

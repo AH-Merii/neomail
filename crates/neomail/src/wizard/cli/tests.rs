@@ -913,3 +913,167 @@ fn a_failed_run_shows_what_to_do_and_the_next_run_is_picked_up() {
     );
     assert_eq!(got.as_deref(), Some(CLIENT_ID), "{}", script.said);
 }
+
+/// What the Gmail wizard's client check got: the client ID and the secret.
+#[derive(Debug, Default, PartialEq)]
+struct GmailGot {
+    client_id: Option<String>,
+    secret: Option<String>,
+}
+
+/// The Gmail OAuth wizard (#110) to the end, with every check passing and a save that writes
+/// nothing: `before` runs on the download folder before the walk, and `on_wait` each time a
+/// step waits with no key, with the commands step's directory (`None` while there is none)
+/// and the download folder. Returns the screens, what the client check got, and the folders.
+fn gmail_walk(
+    lines: &[&'static str],
+    secrets: &[&'static str],
+    waits: usize,
+    before: impl FnOnce(&std::path::Path),
+    mut on_wait: impl FnMut(Option<&std::path::Path>, &std::path::Path) + 'static,
+) -> (Script, GmailGot, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let downloads = tmp.path().join("Downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    before(&downloads);
+    let runs = data_dir.join("runs");
+    let mut script = Script::terminal(lines, secrets);
+    script.size = (115, 62);
+    script.waits = waits;
+    let watched = downloads.clone();
+    script.on_wait = Some(Box::new(move || {
+        let dir = std::fs::read_dir(&runs)
+            .ok()
+            .and_then(|mut d| d.next())
+            .map(|e| e.unwrap().path());
+        on_wait(dir.as_deref(), &watched);
+    }));
+    let got = RefCell::new(GmailGot::default());
+    {
+        let mut ui = Ui::new(&mut script, plain(), &no_opener, false, Memory::none());
+        ui.runs = Some(data_dir);
+        ui.downloads = Some(downloads);
+        let mut session = Session::new(&crate::oauth::steps::GMAIL, true, |_| None).unwrap();
+        let check = |id: &str, answers: &Answers<'_>, _: &mut Ask<'_, '_>| {
+            if id == "client-check" {
+                *got.borrow_mut() = GmailGot {
+                    client_id: answers.text("client-id").map(str::to_owned),
+                    secret: answers.secret("secret").map(|s| s.expose().to_owned()),
+                };
+            }
+            Ok(String::new())
+        };
+        let _ = drive(&mut session, &mut ui, check, |_| Ok(Saved::default()));
+    }
+    (script, got.into_inner(), tmp)
+}
+
+const GOOGLE_ID: &str = "1234-abc.apps.googleusercontent.com";
+const MADE_UP_SECRET: &str = "made-up-secret-not-real";
+
+/// The console's client file for `project`, as a browser saves it.
+fn drop_client(dir: &std::path::Path, name: &str, project: &str) {
+    let text = format!(
+        r#"{{"installed":{{"client_id":"{GOOGLE_ID}","project_id":"{project}","client_secret":"{MADE_UP_SECRET}","redirect_uris":["http://localhost"]}}}}"#
+    );
+    std::fs::write(dir.join(name), text).unwrap();
+}
+
+/// The route, then the commands step, then branding, the address, test user, scope,
+/// publishing and the name (Enter keeps gmail): then the client step.
+const GMAIL_COMMANDS: [&str; 7] = ["commands", "", "you@example.com", "", "", "", ""];
+
+/// The commands route: the project ID and the client file are both picked up while their
+/// steps wait, with no key pressed, and shown; the secret never is. After the save, the file
+/// is deleted on yes, as it holds the secret.
+#[test]
+fn the_gmail_commands_route_picks_up_the_project_and_the_client_file_without_a_key() {
+    let file = std::rc::Rc::new(RefCell::new(None));
+    let seen = file.clone();
+    let (script, got, _tmp) = gmail_walk(
+        &GMAIL_COMMANDS,
+        &[],
+        4,
+        |_| {},
+        move |run, downloads| match run {
+            Some(dir) => write_result(dir, "ok\nmy-project-123\n"),
+            None => {
+                let name = "client_secret_1234-abc.apps.googleusercontent.com.json";
+                if seen.borrow().is_none() {
+                    drop_client(downloads, name, "my-project-123");
+                    *seen.borrow_mut() = Some(downloads.join(name));
+                }
+            }
+        },
+    );
+    let want = GmailGot {
+        client_id: Some(GOOGLE_ID.into()),
+        secret: Some(MADE_UP_SECRET.into()),
+    };
+    assert_eq!(got, want, "{}", script.said);
+    assert!(
+        script
+            .said
+            .contains("Picked up from the commands: my-project-123.")
+    );
+    assert!(
+        script.said.contains("its secret (not shown)"),
+        "{}",
+        script.said
+    );
+    assert!(!script.said.contains(MADE_UP_SECRET), "{}", script.said);
+    // Every later browser step opens in that project.
+    assert!(
+        script.said.contains("auth/clients?project=my-project-123"),
+        "{}",
+        script.said
+    );
+    let path = file.borrow().clone().expect("no client file dropped");
+    assert!(!path.exists(), "the client file was not deleted");
+}
+
+/// The browser route: a client file that was in the download folder before the step showed, and
+/// one of another project, are not taken; the one of another project says why. Enter goes on
+/// to paste both, which are taken, and no file is offered for deletion.
+#[test]
+fn the_client_step_ignores_an_older_file_and_another_projects_and_takes_pasted_values() {
+    let lines = [
+        "console",
+        "",
+        "my-project-123",
+        "",
+        "",
+        "you@example.com",
+        "",
+        "",
+        "",
+        "",
+        "",
+        GOOGLE_ID,
+    ];
+    let (script, got, _tmp) = gmail_walk(
+        &lines,
+        &["typed-secret-here"],
+        3,
+        |downloads| drop_client(downloads, "client_secret_old.json", "my-project-123"),
+        |_, downloads| {
+            if !downloads.join("client_secret_other.json").exists() {
+                drop_client(downloads, "client_secret_other.json", "their-project");
+            }
+        },
+    );
+    let want = GmailGot {
+        client_id: Some(GOOGLE_ID.into()),
+        secret: Some("typed-secret-here".into()),
+    };
+    assert_eq!(got, want, "{}", script.said);
+    assert!(
+        script.said.contains("their-project, not my-project-123"),
+        "{}",
+        script.said
+    );
+    assert!(!script.said.contains("Picked up from"), "{}", script.said);
+    assert!(!script.said.contains("Delete it now?"), "{}", script.said);
+    assert!(!script.said.contains(MADE_UP_SECRET), "{}", script.said);
+}

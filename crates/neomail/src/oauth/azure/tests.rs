@@ -80,10 +80,10 @@ case "$1 $2 $3" in
 esac
 "#;
 
-type Shell = (&'static str, PathBuf, &'static [&'static str]);
+pub(crate) type Shell = (&'static str, PathBuf, &'static [&'static str]);
 
 /// The shells found on PATH, and how to run a line in each without the user's own config.
-fn shells() -> Vec<Shell> {
+pub(crate) fn shells() -> Vec<Shell> {
     let found = |name: &str| {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
             .map(|dir| dir.join(name))
@@ -278,7 +278,7 @@ impl World {
 }
 
 /// Every file under `dir`, by its path relative to it.
-fn files(dir: &Path) -> BTreeMap<String, String> {
+pub(crate) fn files(dir: &Path) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -318,7 +318,7 @@ const OLD: &str = "bbbbbbbb-0000-0000-0000-000000000002";
 const OTHER: &str = "cccccccc-0000-0000-0000-000000000003";
 const ANY: &str = "AzureADandPersonalMicrosoftAccount\n";
 
-fn said(out: &std::process::Output) -> String {
+pub(crate) fn said(out: &std::process::Output) -> String {
     format!(
         "status {:?}\nstdout {}\nstderr {}",
         out.status.code(),

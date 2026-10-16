@@ -1524,3 +1524,55 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   at once would read each other's result).
 - **Builds on:** [DEC-2026-10-13-wizard-steps](#dec-2026-10-13-wizard-steps) and
   [DEC-2026-10-15-wizard-ui](#dec-2026-10-15-wizard-ui).
+
+### <a id="dec-2026-10-16-gcloud-route"></a>DEC-2026-10-16-gcloud-route: Gmail's Google Cloud CLI commands, and the client file picked up from the download folder
+
+- **Status:** proposed by Claude on 2026-10-16, for issue #110.
+- **Proposal:**
+  - **A route question first.** The Gmail wizard asks `console` (the browser steps) or
+    `commands`. It has no flag: off a terminal and with `--no-input` its default, `console`,
+    answers it, and the flags work as before.
+  - **Three steps become one paste.** On the commands route, the project, its ID and the Gmail
+    API are one `Kind::Run` step that fills `project-id`, with the paste, script file and result
+    of [DEC-2026-10-16-commands-route](#dec-2026-10-16-commands-route); the script and its
+    failure advice are `crates/neomail/src/oauth/gcloud.rs`. The Google Auth Platform pages and
+    the Desktop client stay browser steps on both routes: the IAP OAuth Admin API, the only
+    command for the consent screen, was shut down on 2026-03-19, and `gcloud iam oauth-clients`
+    makes Workforce Identity clients. With a project ID known, every page opens in it
+    (`?project=ID`).
+  - **One project per account, found by ID.** Without a project ID the script derives
+    `neomail-` and 10 hex digits of the SHA-256 of `neomail-gmail:` and the signed-in address,
+    and looks it up with `gcloud projects describe` (projects.get), creating it only when it is
+    not there: projects.list "is eventually consistent", so a second run reading it right after a
+    create could make a second project
+    ([projects.list](https://docs.cloud.google.com/resource-manager/reference/rest/v1/projects/list)).
+    A project ID the wizard holds (`--project`, or an earlier result) or one given after the line
+    is used as it is, never created. `Run::with_given` keeps the step shown when `--project`
+    answered `project-id`, since the Gmail API still has to be enabled there.
+  - **Isolated, and nothing waits or outlives it.** The script unsets every `CLOUDSDK_*`
+    variable except where Python is, the proxy and certificates, signs in with a throwaway
+    `CLOUDSDK_CONFIG` and revokes that sign-in before it removes the folder. It sets
+    `CLOUDSDK_CORE_DISABLE_PROMPTS=1`: gcloud's `PromptContinue` then returns its default
+    (googlecloudsdk `core/console/console_io.py`), so the "Do you want to continue" of
+    `auth login` on a Compute Engine machine or Cloud Shell does not wait for a key, while the
+    sign-in code without a browser is read with `input()` (`core/credentials/flow.py`) and still
+    works. It sets `CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true`: gcloud sends usage statistics
+    from a `subprocess.Popen` it does not wait for (`ReportMetrics` in `core/metrics.py`), and
+    with reporting off no collector exists (`GetCollector`). The update check is off too.
+  - **The client file is picked up.** A new step kind, `Kind::Download`, is a console step that
+    also watches the user's download folder (`XDG_DOWNLOAD_DIR` from the environment or
+    `user-dirs.dirs`, else `~/Downloads`; `capture::download_dir`) every 250 ms for a
+    `client_secret_*.json` made or changed after the step showed (`capture::Watch`). It reads
+    `installed.client_id` and `installed.client_secret`, refuses a file whose
+    `installed.project_id` is not the project the wizard holds or that has no `installed` part,
+    and sends both values as `Event::Fill`, which answers the client ID and secret questions.
+    The screen shows the client ID, never the secret. Enter goes on to paste them, and clears
+    what a file filled before. After the save the wizard offers to delete the file, since it
+    holds the secret in plain text.
+- **Rejected:** a command for the consent screen or the client (none exists, above); listing
+  projects by name or label to find an earlier one (eventually consistent, and it could pick a
+  colleague's project named `neomail`); a `NEOMAIL_` variable for the download folder
+  (`XDG_DOWNLOAD_DIR` already names it); reading the client file without the project check (a
+  client of another project lacks this project's test user and scope, which only the sign-in
+  would show).
+- **Builds on:** [DEC-2026-10-16-commands-route](#dec-2026-10-16-commands-route).
