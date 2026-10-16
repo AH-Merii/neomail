@@ -420,16 +420,18 @@ fn a_refused_request_is_told_in_googles_words_and_a_quota_says_to_wait() {
     assert!(!advice.contains("Wait a minute"), "{advice}");
 }
 
-/// Without gcloud on PATH the run says to install it, and leaves nothing behind.
+/// Without gcloud on PATH the run says to install it, and leaves nothing behind. The PATH is
+/// this machine's with no gcloud in it: CI runners come with the Google Cloud CLI installed.
 #[test]
 fn without_gcloud_the_run_says_to_install_it() {
     let shell = shells().into_iter().find(|s| s.0 == "sh").unwrap();
     let w = World::new();
     let paste = w.inbox.paste(&script_for(None)).unwrap();
-    std::fs::remove_file(w.bin.join("gcloud")).unwrap();
+    let path = tempfile::tempdir().unwrap();
+    link_path_but_gcloud(path.path());
     let out = w
         .command(&shell, &paste)
-        .env("PATH", format!("{}:/usr/bin:/bin", w.bin.display()))
+        .env("PATH", path.path())
         .output()
         .unwrap();
     assert!(!out.status.success(), "{}", said(&out));
@@ -439,6 +441,18 @@ fn without_gcloud_the_run_says_to_install_it() {
     assert!(failure(&stage, &said).contains("not installed"), "{stage}");
     let left: Vec<_> = std::fs::read_dir(&w.tmp).unwrap().collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// Links in `dir` to every program on this machine's PATH but gcloud, so that `dir` alone is
+/// the PATH of the same machine without the Google Cloud CLI.
+fn link_path_but_gcloud(dir: &Path) {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    for entries in std::env::split_paths(&inherited).filter_map(|d| std::fs::read_dir(d).ok()) {
+        for entry in entries.flatten().filter(|e| e.file_name() != "gcloud") {
+            // A program of the same name from an earlier directory stays, as PATH finds it first.
+            let _ = std::os::unix::fs::symlink(entry.path(), dir.join(entry.file_name()));
+        }
+    }
 }
 
 /// Anything but a project ID after the line is refused before gcloud runs.
