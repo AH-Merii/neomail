@@ -7,11 +7,11 @@
 
 use anyhow::{Result, bail};
 
-use super::capture::{Inbox, Outcome};
+use super::capture::{self, Inbox, Outcome, Watch};
 use super::remember::Memory;
 use super::screen::{self, Look};
 use super::term::{Frame, Key, Term, Tty};
-use super::{Answers, CheckError, Event, Kind, Line, Place, Prompt, Run, Session, View};
+use super::{Answers, CheckError, Download, Event, Kind, Line, Place, Prompt, Run, Session, View};
 use crate::style::{self, Paint, Symbols};
 
 /// What the save leaves to the user: shown in the closing summary on a terminal. What was
@@ -54,8 +54,14 @@ pub struct Ui<'a> {
     /// Where a [`Kind::Run`] step makes the directory its command writes the result to: the
     /// data directory. `None` leaves the value to be typed.
     pub runs: Option<std::path::PathBuf>,
-    /// What a [`Kind::Run`] step picked up, said on the next screen so it can be corrected.
+    /// What a [`Kind::Run`] or [`Kind::Download`] step picked up, said on the next screen so it
+    /// can be corrected.
     picked: Option<String>,
+    /// The folder a [`Kind::Download`] step watches: the user's download folder. `None` leaves
+    /// the values to be pasted.
+    pub downloads: Option<std::path::PathBuf>,
+    /// The file a [`Kind::Download`] step read, offered for deletion after the save.
+    downloaded: Option<std::path::PathBuf>,
 }
 
 /// Opens nothing: for a [`Ui`] that may not open pages.
@@ -96,6 +102,8 @@ impl<'a> Ui<'a> {
             menu_header: None,
             runs: None,
             picked: None,
+            downloads: None,
+            downloaded: None,
         }
     }
 
@@ -116,6 +124,7 @@ impl<'a> Ui<'a> {
             None => Memory::none(),
         };
         let mut ui = Self::new(tty, look, &crate::browser::open, open, memory);
+        ui.downloads = capture::download_dir(style::env_var).filter(|_| interactive);
         ui.runs = data_dir;
         ui
     }
@@ -257,6 +266,8 @@ fn as_is(_: Paint, text: &str) -> String {
 enum Input<'i> {
     /// Enter, at a step that shows a page or advice.
     Keys,
+    /// Enter, at a step that also watches for a download: what it watches.
+    Watch(&'i str),
     /// A list: the items (label, and what narrowing also matches), the one pointed at (an index
     /// into the narrowed list) and the text typed to narrow it.
     Pick(&'i [(String, String)], usize, &'i str),
@@ -419,6 +430,13 @@ impl Ui<'_> {
         let p = self.paint();
         match input {
             Input::Keys => (Vec::new(), None),
+            Input::Watch(status) => {
+                let lead = format!("  {} ", p.note(s.running));
+                (
+                    self.paragraph(&lead, status, cols, |_, l| l.to_owned()),
+                    None,
+                )
+            }
             Input::Run {
                 paste,
                 prompt,
@@ -783,6 +801,7 @@ impl Ui<'_> {
                 }
             }
             Kind::Run(run) => self.run(view, run, &error, &page, back)?,
+            Kind::Download(d) => self.download(session, view, d, &error, &page, back)?,
             Kind::Ask(q) | Kind::AskIf(_, q) if !q.choices.is_empty() => {
                 let w = q
                     .choices
@@ -838,8 +857,7 @@ impl Ui<'_> {
         if let Some(value) = self.picked.take() {
             let (cols, _) = self.term.size();
             let sign = format!("  {} ", self.paint().success(self.sym().check));
-            let text = format!("Picked up from the commands: {value}. Esc goes back to change it.");
-            let lines = self.paragraph(&sign, &text, usize::from(cols), Paint::success);
+            let lines = self.paragraph(&sign, &value, usize::from(cols), Paint::success);
             self.recent.extend(lines);
         }
         Ok(did)
@@ -1047,7 +1065,9 @@ impl Ui<'_> {
             let Some(key) = self.term.key_within(POLL)? else {
                 match inbox.as_ref().and_then(Inbox::take) {
                     Some(Outcome::Value(value)) => {
-                        self.picked = Some(value.clone());
+                        self.picked = Some(format!(
+                            "Picked up from the commands: {value}. Esc goes back to change it."
+                        ));
                         return Ok(Did::Event(Event::Answer(value)));
                     }
                     Some(Outcome::Failed { stage, said }) => {
@@ -1073,6 +1093,109 @@ impl Ui<'_> {
                 key => edit(&mut text, &mut cursor, key, keeps),
             }
         }
+    }
+
+    /// A [`Kind::Download`] step: its page and text, and the folder it watches. While it waits
+    /// for keys it looks for a new file there every [`POLL`]: one whose values `read` takes goes
+    /// on by itself, one it refuses says why and the watch goes on. Enter goes on without it.
+    fn download(
+        &mut self,
+        session: &Session,
+        view: &View<'_>,
+        d: &Download,
+        error: &[String],
+        page: &[String],
+        back: bool,
+    ) -> Result<Did> {
+        let mut watch = self
+            .downloads
+            .as_deref()
+            .map(|dir| Watch::new(dir, d.prefix, d.suffix));
+        let status = match &watch {
+            Some(w) => format!(
+                "Watching {} for {}*{}: this step goes on by itself when the file arrives.",
+                w.dir().display(),
+                d.prefix,
+                d.suffix
+            ),
+            None => {
+                "No download folder is watched here: press Enter and paste the values.".to_owned()
+            }
+        };
+        let mut error = error.to_vec();
+        let mut keys = vec![("Enter", "paste them instead")];
+        if back {
+            keys.push(("Esc", "back"));
+        }
+        keys.push(("q", "quit"));
+        let mut drawn: Option<Frame> = None;
+        loop {
+            let frame = self.step_frame(view, &Input::Watch(&status), &error, page, &keys);
+            if drawn.as_ref() != Some(&frame) {
+                self.term.raw(true)?;
+                self.term.draw(&frame);
+                drawn = Some(frame);
+            }
+            let Some(key) = self.term.key_within(POLL)? else {
+                let Some(w) = watch.as_mut() else { continue };
+                for (path, text) in w.arrived() {
+                    let answer = |id: &str| session.text(id).map(str::to_owned);
+                    let Some(read) = (d.read)(&text, &answer) else {
+                        continue;
+                    };
+                    w.read(&path);
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    match read {
+                        Ok(values) => {
+                            self.picked =
+                                Some(format!("Picked up from {name}: {}.", (d.picked)(&values)));
+                            self.downloaded = Some(path.clone());
+                            return Ok(Did::Event(Event::Fill(values)));
+                        }
+                        Err(why) => {
+                            let (cols, _) = self.term.size();
+                            let fix = format!("{name}: {why}");
+                            error = self.error_lines(Some(&fix), usize::from(cols));
+                        }
+                    }
+                }
+                continue;
+            };
+            match key {
+                Key::Enter | Key::Char('s' | 'S') => return Ok(Did::Event(Event::Continue)),
+                Key::Esc | Key::Char('b') if back => return Ok(Did::Event(Event::Back)),
+                Key::Char('q' | 'Q') | Key::Interrupt => return Ok(Did::Quit),
+                _ => {}
+            }
+        }
+    }
+
+    /// After the save, the file a [`Kind::Download`] step read, which holds the secret in plain
+    /// text: deleted if the user agrees, else left as a thing to do.
+    fn offer_delete(&mut self, saved: &mut Saved) -> Result<()> {
+        let Some(path) = self.downloaded.take().filter(|p| p.is_file()) else {
+            return Ok(());
+        };
+        let (cols, _) = self.term.size();
+        let what = format!(
+            "{} holds the client secret in plain text, readable by any program you run. The \
+             secret is in the keyring now, so neomail no longer needs the file.",
+            path.display()
+        );
+        let sign = format!("  {} ", self.paint().warning(self.sym().warning));
+        let lines = self.paragraph(&sign, &what, usize::from(cols), Paint::warning);
+        let delete = self.yes_no("The downloaded client file", &lines, "Delete it now?", true)?;
+        let _ = self.term.raw(false);
+        match delete == Some(true) && std::fs::remove_file(&path).is_ok() {
+            true => self
+                .ran
+                .push(("Deleted the downloaded client file".to_owned(), false)),
+            false => saved.todo.push(format!(
+                "Delete {} when you no longer need it: it holds the client secret.",
+                path.display()
+            )),
+        }
+        Ok(())
     }
 
     /// A screen that asks yes or no: `Some(answer)`, or `None` to quit. Enter takes `yes`.
@@ -1263,8 +1386,11 @@ pub fn drive(
                     // summary said after them follows them instead of being drawn over them.
                     let _ = ui.term.raw(false);
                 }
-                let saved = write(&answers)?;
+                let mut saved = write(&answers)?;
                 ui.memory.forget();
+                if interactive {
+                    ui.offer_delete(&mut saved)?;
+                }
                 ui.summary(session.wizard().title, &saved);
                 Event::Written
             }

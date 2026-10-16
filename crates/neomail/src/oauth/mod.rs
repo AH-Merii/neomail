@@ -9,6 +9,7 @@
 pub mod azure;
 pub mod check;
 pub mod device;
+pub mod gcloud;
 pub mod loopback;
 mod provider;
 pub mod steps;

@@ -186,4 +186,4 @@ pub fn failure(stage: &str, said: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

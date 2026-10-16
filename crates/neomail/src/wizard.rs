@@ -66,6 +66,9 @@ pub enum Kind {
     /// The user runs a command the step shows, and its result answers a later question: see
     /// [`Run`]. Shown only on a terminal, when every [`When`] holds and no flag answered it.
     Run(Run),
+    /// A [`Kind::Console`] step whose page offers a file that answers later questions: see
+    /// [`Download`]. Shown only on a terminal; Enter goes on to the questions themselves.
+    Download(Download),
     /// The driver checks the answers of the steps named in `reads`, which all come before it.
     Check { reads: &'static [&'static str] },
     /// The driver writes. Nothing is written before it, and there is no going back after it.
@@ -103,6 +106,32 @@ pub struct Run {
     pub wrong: &'static str,
     /// What a failed run means, from the stage it failed at and what it said: what to do next.
     pub failure: fn(&str, &str) -> String,
+    /// Shown even when a flag answered `fills`: the script still has work to do with that
+    /// value, as Gmail's enables the Gmail API in the project `--project` names.
+    pub with_given: bool,
+}
+
+/// What a [`Download`] file holds: its values, or why it is not the one.
+pub type FileValues = Result<Vec<String>, String>;
+
+/// A step whose page offers a file to download that answers later questions, so the user
+/// never copies them (DEC-2026-10-16-gcloud-route). While it shows, the driver watches the
+/// user's download folder for a file whose name starts with `prefix` and ends with `suffix`
+/// and that arrived after the step showed ([`capture::Watch`]), and sends what [`Download::read`]
+/// finds in it as [`Event::Fill`].
+#[derive(Debug)]
+pub struct Download {
+    pub prefix: &'static str,
+    pub suffix: &'static str,
+    /// The questions the file answers, in the order `read` returns their values.
+    pub fills: &'static [&'static str],
+    /// Reads a file's text, with the answers so far by step id: the values, or why the file is
+    /// not the one (shown, and the step keeps watching); `None` while it is not whole yet.
+    pub read: fn(&str, &AnswerOf<'_>) -> Option<FileValues>,
+    /// What the step says it picked up, from the values `read` returned: never a secret.
+    pub picked: fn(&[String]) -> String,
+    /// What to do when a check refuses values the file gave, shown back at this step.
+    pub again: &'static str,
 }
 
 /// What Next names at a [`Case`] the setup stops at.
@@ -262,6 +291,8 @@ pub enum Event {
     Choose(usize),
     /// The text typed (or read) at a [`Kind::Ask`].
     Answer(String),
+    /// What the file of a [`Kind::Download`] holds, in the order of its `fills`.
+    Fill(Vec<String>),
     /// Back to the step shown before this one.
     Back,
     /// The result of the check the session asked for.
@@ -506,7 +537,7 @@ impl Session {
     /// applies. Checks are never seen.
     fn shows(&self, i: usize, pending: Option<&str>) -> bool {
         match self.wizard.steps[i].kind {
-            Kind::Console | Kind::Gate(_) => self.interactive,
+            Kind::Console | Kind::Gate(_) | Kind::Download(_) => self.interactive,
             Kind::ConsoleIf(when) => self.holds(when, pending),
             Kind::Ask(_) => !self.given[i] && self.filler(i, pending).is_none(),
             Kind::AskIf(when, _) => !self.given[i] && self.holds(when, pending),
@@ -515,7 +546,7 @@ impl Session {
                     && self
                         .wizard
                         .position(run.fills)
-                        .is_some_and(|f| !self.given[f])
+                        .is_some_and(|f| run.with_given || !self.given[f])
             }
             Kind::Check { .. } | Kind::Commit => false,
         }
@@ -592,7 +623,8 @@ impl Session {
             .map(str::to_owned)
     }
 
-    fn text(&self, id: &str) -> Option<&str> {
+    /// The answer question `id` has, unless it is a secret.
+    pub fn text(&self, id: &str) -> Option<&str> {
         match self.answers.get(self.wizard.position(id)?)? {
             Some(Answer::Text(t)) => Some(t),
             _ => None,
@@ -800,6 +832,43 @@ impl Session {
                 }
             }
             (Kind::Console | Kind::ConsoleIf(_), Event::Continue) => self.advance(),
+            // Going on without the file: its questions are asked, even when a file answered them
+            // before the user came back here.
+            (Kind::Download(d), Event::Continue) => {
+                for id in d.fills {
+                    if let Some(i) = self.wizard.position(id).filter(|&i| !self.given[i]) {
+                        self.answers[i] = None;
+                    }
+                }
+                self.advance();
+            }
+            (Kind::Download(d), Event::Fill(values)) => {
+                let mut filled = Vec::new();
+                for (id, value) in d.fills.iter().zip(&values) {
+                    let Some(i) = self.wizard.position(id) else {
+                        return;
+                    };
+                    let Some(q) = self.wizard.steps[i].kind.question() else {
+                        return;
+                    };
+                    match (q.clean)(value) {
+                        Ok(c) if q.secret => {
+                            filled.push((i, Answer::Secret(Password::new(c.value))))
+                        }
+                        Ok(c) => filled.push((i, Answer::Text(c.value))),
+                        Err(fix) => {
+                            self.fix = Some(fix.to_owned());
+                            return;
+                        }
+                    }
+                }
+                for (i, answer) in filled {
+                    if !self.given[i] {
+                        self.answers[i] = Some(answer);
+                    }
+                }
+                self.advance();
+            }
             (Kind::Gate(cases), Event::Choose(i)) => match cases.get(i).map(|c| c.stop) {
                 Some(None) => self.advance(),
                 Some(Some(advice)) => self.end = Some(End::Stopped(advice)),
@@ -861,7 +930,29 @@ impl Session {
             .or_else(|| mistakes().next());
         let (target, fix) = match found {
             Some((target, m)) => (target, format!("{}\n{}", e.detail, m.fix)),
-            None => (self.at, e.detail),
+            None => (self.at, e.detail.clone()),
+        };
+        // A value a downloaded file gave, not typed: back to the step that watches for the
+        // file, where a new download or Enter (to paste the values) mends it.
+        let id = self.wizard.steps[target].id;
+        let from_file = self
+            .wizard
+            .steps
+            .iter()
+            .enumerate()
+            .find_map(|(d, s)| match s.kind {
+                Kind::Download(ref dl)
+                    if dl.fills.contains(&id)
+                        && self.shown.contains(&d)
+                        && !self.shown.contains(&target) =>
+                {
+                    Some((d, dl.again))
+                }
+                _ => None,
+            });
+        let (target, fix) = match from_file {
+            Some((d, again)) => (d, format!("{}\n{again}", e.detail)),
+            None => (target, fix),
         };
         let can_ask_again = self.interactive && target < self.at && !self.given[target];
         if can_ask_again {

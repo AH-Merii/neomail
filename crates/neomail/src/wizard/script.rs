@@ -106,13 +106,13 @@ impl Script {
     fn answer(&mut self) -> Result<()> {
         let shown = self.screen();
         let has = |s: &str| shown.contains(s);
-        if has("[y/N]")
+        if (has("[y/N]") || has("Delete it now?"))
             && let Some(key) = self.confirms.pop_front()
         {
             self.pending.push_back(key);
             return Ok(());
         }
-        if has("Ready to start?") || has("Save it now?") || has("[y/N]") {
+        if has("Ready to start?") || has("Save it now?") || has("Delete it now?") || has("[y/N]") {
             self.pending.push_back(Key::Char('y'));
             return Ok(());
         }

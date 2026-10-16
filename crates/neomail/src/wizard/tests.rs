@@ -533,3 +533,144 @@ fn on_the_commands_route_a_failed_check_goes_back_to_the_commands() {
         );
     }
 }
+
+/// Gmail's route decides its steps: the commands route shows the command in place of the
+/// project's three browser steps, and the count follows it. A project ID given by flag still
+/// goes to the commands, which enable the Gmail API in it.
+#[test]
+fn the_gmail_route_decides_its_steps_and_a_given_project_reaches_the_commands() {
+    let titles = |route: &str| {
+        let mut s = Session::new(&crate::oauth::steps::GMAIL, true, |_| None).unwrap();
+        s.next(Event::Answer(route.to_owned()));
+        let path = s.path(0, None);
+        path.iter()
+            .map(|(i, _)| s.wizard().steps[*i].id)
+            .collect::<Vec<_>>()
+    };
+    let console = titles("console");
+    let commands = titles("commands");
+    assert_eq!(
+        &console[..4],
+        ["route", "project", "project-id", "gmail-api"]
+    );
+    assert_eq!(&commands[..2], ["route", "commands"]);
+    assert_eq!(console.len(), commands.len() + 2);
+    assert!(console.contains(&"client") && commands.contains(&"client"));
+    let flag = |f: &str| (f == "--project").then(|| "my-project-123".to_owned());
+    let mut s = Session::new(&crate::oauth::steps::GMAIL, true, flag).unwrap();
+    let Prompt::Show(view) = s.next(Event::Answer("commands".to_owned())) else {
+        panic!("no step after the route")
+    };
+    assert_eq!(view.step.id, "commands");
+    assert!(view.script.unwrap().contains("'my-project-123'"));
+}
+
+/// The download folder: the environment's XDG_DOWNLOAD_DIR first, then the one user-dirs.dirs
+/// names (as "$HOME/..." or an absolute path), else ~/Downloads, also when the file names the
+/// home itself or is missing.
+#[test]
+fn the_download_folder_follows_xdg_user_dirs_then_falls_back_to_downloads() {
+    let home = "/home/you";
+    let cases: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+        // (case, XDG_DOWNLOAD_DIR in the environment, user-dirs.dirs, expected)
+        (
+            "the environment wins",
+            Some("/data/dl"),
+            Some("XDG_DOWNLOAD_DIR=\"$HOME/Téléchargements\"\n"),
+            "/data/dl",
+        ),
+        (
+            "$HOME in the file",
+            None,
+            Some(
+                "# written by xdg-user-dirs-update\nXDG_DESKTOP_DIR=\"$HOME/Bureau\"\nXDG_DOWNLOAD_DIR=\"$HOME/Téléchargements\"\n",
+            ),
+            "/home/you/Téléchargements",
+        ),
+        (
+            "an absolute path in the file",
+            None,
+            Some("XDG_DOWNLOAD_DIR=\"/mnt/files/dl\"\n"),
+            "/mnt/files/dl",
+        ),
+        (
+            "the home itself",
+            None,
+            Some("XDG_DOWNLOAD_DIR=\"$HOME/\"\n"),
+            "/home/you/Downloads",
+        ),
+        ("no file", None, None, "/home/you/Downloads"),
+    ];
+    for &(case, from_env, file, expected) in cases {
+        let config = tempfile::tempdir().unwrap();
+        if let Some(text) = file {
+            std::fs::write(config.path().join("user-dirs.dirs"), text).unwrap();
+        }
+        let config_home = config.path().to_str().unwrap().to_owned();
+        let env = |name: &str| match name {
+            "HOME" => Some(home.to_owned()),
+            "XDG_CONFIG_HOME" => Some(config_home.clone()),
+            "XDG_DOWNLOAD_DIR" => from_env.map(str::to_owned),
+            _ => None,
+        };
+        assert_eq!(
+            capture::download_dir(env),
+            Some(std::path::PathBuf::from(expected)),
+            "{case}"
+        );
+    }
+}
+
+/// A client the check refuses goes back to where its values came from: to the step that
+/// watches for the downloaded file when the file gave them, with what to do there, and to the
+/// question when the user typed them.
+#[test]
+fn a_refused_client_from_the_downloaded_file_goes_back_to_the_download() {
+    use crate::oauth::steps::{BAD_CLIENT, GMAIL, UNKNOWN_ID, WRONG_SECRET};
+    let id = "1234-abc.apps.googleusercontent.com".to_owned();
+    let secret = "GOCSPX-made-up".to_owned();
+    for (kind, typed_step) in [
+        (UNKNOWN_ID, "client-id"),
+        (WRONG_SECRET, "secret"),
+        (BAD_CLIENT, "client-id"),
+    ] {
+        for from_file in [true, false] {
+            let mut s = Session::new(&GMAIL, true, |_| None).unwrap();
+            let mut steps = 0;
+            while !matches!(s.prompt(), Prompt::Check(ref v, _) if v.step.id == "client-check") {
+                let event = match s.prompt() {
+                    Prompt::Check(..) => Event::Checked(Ok(())),
+                    Prompt::Show(v) => match v.step.id {
+                        "route" => Event::Answer("console".into()),
+                        "project-id" => Event::Answer("my-project-123".into()),
+                        "email" => Event::Answer("you@example.com".into()),
+                        "name" => Event::Answer("gmail".into()),
+                        "client" if from_file => Event::Fill(vec![id.clone(), secret.clone()]),
+                        "client-id" => Event::Answer(id.clone()),
+                        "secret" => Event::Answer(secret.clone()),
+                        _ => Event::Continue,
+                    },
+                    other => panic!("{other:?}"),
+                };
+                s.next(event);
+                steps += 1;
+                assert!(steps < 30, "{kind}");
+            }
+            let error = CheckError {
+                kind,
+                detail: "Google said no".into(),
+            };
+            let Prompt::Show(again) = s.next(Event::Checked(Err(error))) else {
+                panic!("{kind}")
+            };
+            let fix = again.fix.unwrap_or_default();
+            let (want, says) = match from_file {
+                true => ("client", "came from the downloaded file"),
+                false => (typed_step, "Google"),
+            };
+            assert_eq!(again.step.id, want, "{kind}, from the file: {from_file}");
+            assert!(fix.contains(says), "{kind}: {fix}");
+            assert!(fix.contains("Google said no"), "{kind}: {fix}");
+        }
+    }
+}
