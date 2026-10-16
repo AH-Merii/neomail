@@ -110,6 +110,60 @@ attack" and recommends that organizations block it wherever possible
 A work or school tenant may therefore refuse it; use the browser sign-in then. Only enter a code
 that neomail itself just printed.
 
+### Set up the app with Azure CLI commands
+
+Once you have a directory (personal accounts) or from the start (work or school), the wizard
+asks how to set up the app: **portal**, the browser steps above, or **commands**, a script you
+run in a terminal with the [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
+(`az`) installed. The commands route asks how you will sign in first, since that decides what
+the script sets, then:
+
+- **Your directory:** the script passes it to `az login --tenant`, so the app goes there. For a
+  work or school account, the domain of your work address (`contoso.com`) is enough. For a
+  personal account, its Primary domain (`NAME.onmicrosoft.com`) or Tenant ID, both under Entra
+  ID > Overview at <https://entra.microsoft.com>: without `--tenant`, `az login` signs in to work
+  and school accounts only. A work account needs it too: without it, az signs in to every
+  directory the account can reach and acts on the first one with a subscription, which may be
+  another organisation's where you are a guest.
+- **Which app:** Enter sets up the app named exactly `neomail`, or type the Application (client)
+  ID of an app you already have.
+- **The paste:** one short line, such as `sh '/home/you/.local/share/neomail/runs/12345/setup.sh'`,
+  the same in fish, zsh, bash and sh ([the decision](https://github.com/AH-Merii/neomail/issues/105#issuecomment-6214831846)).
+  It runs `setup.sh`, which the wizard writes into a folder of its own in the data directory,
+  readable only by you, and removes with the folder when the step ends. The script is plain sh
+  with a comment for each part, and holds no secret: open it and read it first if you like.
+- **The script:**
+  - signs in with `az login --tenant DIRECTORY --allow-no-subscriptions` in a browser;
+  - runs `az ad app create --display-name neomail`, which sets up the one app with that name,
+    made in the browser or by an earlier run, or makes it, with Any Entra ID Tenant + Personal
+    Microsoft accounts and version 2 access tokens (personal accounts need them). For the
+    browser sign-in it adds `http://localhost` to the Mobile and desktop redirect URIs and keeps
+    the others; for the device code sign-in it allows public client flows. With a client ID it
+    runs `az ad app update --id` with the same settings instead;
+  - prints `ok` and the client ID, or `failed` and what az said, and hands the same to the
+    wizard. The step moves on by itself and shows the client ID it got; Esc goes back to change
+    it. No browser here (over SSH)? Copy the script to a machine with one, run it there with
+    `sh setup.sh`, and type the client ID it prints.
+
+A second run changes nothing and makes no second app.
+
+**Why a throwaway sign-in.** The Azure CLI keeps its signed-in accounts, default subscription and
+token cache in `~/.azure` or `AZURE_CONFIG_DIR`. The script signs in with an `AZURE_CONFIG_DIR` of
+its own from `mktemp -d` and removes it when it ends, also after a failure or Ctrl-C. So an
+earlier az sign-in never decides where the app goes, your own az setup is the same before and
+after, and no sign-in is left behind. For its own az runs it also turns off two settings,
+through az's environment variables (`AZURE_<SECTION>_<OPTION>`, [Azure CLI
+configuration](https://learn.microsoft.com/en-us/cli/azure/azure-cli-configuration)):
+`AZURE_CORE_LOGIN_EXPERIENCE_V2=off`, so `az login` on a terminal does not stop at "Select a
+subscription and tenant" waiting for Enter, and `AZURE_CORE_COLLECT_TELEMETRY=no`, so az's
+detached telemetry uploader does not make the removed folder again. The live check of #105 hit
+both.
+
+**Limits of the name match.** `az ad app create` matches the display name exactly, case
+included: an app named `Neomail` or anything else is not picked up, and a new `neomail` app is
+made beside it. With two or more apps named `neomail` it changes nothing and fails; the wizard
+then lists their client IDs, so you can give one under Which app, or delete the others.
+
 ## Where things are kept
 
 - The config file holds the account's name, address and client ID, which are not secret:
