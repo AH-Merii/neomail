@@ -559,7 +559,9 @@ fn on_another_machine_the_client_id_is_printed() {
 }
 
 /// Ctrl-C at the sign-in, which reaches every process of the terminal's foreground group:
-/// the script still hands back that it stopped and removes its sign-in folder.
+/// the script still hands back that it stopped and removes its sign-in folder. Linux only: it
+/// needs GNU env's --default-signal, which macOS's env does not have.
+#[cfg(target_os = "linux")]
 #[test]
 fn ctrl_c_at_the_sign_in_still_cleans_up_and_hands_back_a_stop() {
     use std::os::unix::process::CommandExt;
