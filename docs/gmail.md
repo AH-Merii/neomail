@@ -18,6 +18,9 @@ Google Cloud project to a signed-in Desktop client. Each step says what to do, w
 which console page to open; Esc goes back a step. Give your project's ID when asked (or
 `--project ID`) and the links open that project. The steps are:
 
+First, choose the route: the console steps below, or
+[commands](#set-up-the-project-with-google-cloud-cli-commands) for steps 1 and 2.
+
 1. Create a Google Cloud project, then give its ID (optional).
 2. Enable the Gmail API, so its scope is offered under Data Access.
 3. Set up the Google Auth Platform with Audience **External**, so a personal `@gmail.com`
@@ -29,12 +32,14 @@ which console page to open; Esc goes back a step. Give your project's ID when as
 6. Choose Testing or published ([below](#testing-mode-sign-ins-that-last-7-days)).
 7. Name the account. neomail checks that the name is free, that the config file can take it and
    that the keyring opens, before it asks for anything secret.
-8. Create a **Desktop app** client and paste its ID and secret. Google shows the secret in full
+8. Create a **Desktop app** client and download its JSON. Google shows the secret in full
    only once, when the client is created
    ([manage OAuth clients](https://support.google.com/cloud/answer/15549257)); if you lost it,
    open the client and click **Add secret**. A Desktop app client may send the sign-in back to
    `http://127.0.0.1` on any port, where neomail waits
    ([OAuth for desktop apps](https://developers.google.com/identity/protocols/oauth2/native-app)).
+   The wizard reads the ID and secret from the JSON
+   ([below](#the-client-id-and-secret-are-picked-up)), or you paste them.
 
 neomail then checks the client ID and secret with Google before you sign in: it sends a token
 request with a made-up code, which Google refuses differently for an unknown client, a wrong
@@ -54,6 +59,69 @@ Off a terminal, or with `--no-input`, the console steps are skipped: pass `--ema
 secret-tool lookup service my-google-client | \
   neomail account add gmail --email you@example.com --client-id 1234-abc.apps.googleusercontent.com
 ```
+
+### Set up the project with Google Cloud CLI commands
+
+The wizard's first question is how to set up the project: **console**, the browser steps above,
+or **commands**, a script you run in a terminal with the
+[Google Cloud CLI](https://cloud.google.com/sdk/docs/install) (`gcloud`) installed. Off a
+terminal and with `--no-input`, console answers it and the flags work as before.
+
+- **The paste:** one short line, such as `sh '/home/you/.local/share/neomail/runs/12345/setup.sh'`,
+  the same in fish, zsh, bash and sh. The wizard writes `setup.sh` into a folder of its own in
+  the data directory, readable only by you, and removes it when the step ends. The script is
+  plain sh with a comment for each part and holds no secret: open it and read it first if you
+  like. This is the same paste and pick-up as Outlook's
+  ([the decision](decisions.md#dec-2026-10-16-commands-route)).
+- **The script** signs in with `gcloud auth login` in your browser (or with a code when there is
+  none), finds or makes the project, runs `gcloud services enable gmail.googleapis.com` in it,
+  prints `ok` and the project ID, and hands the same to the wizard. The step moves on by itself
+  and shows the project ID it got; Esc goes back to change it. No browser here (over SSH)? The
+  sign-in prints a link to open in any browser and asks for the code it shows. Or run the
+  script on another machine with `sh setup.sh` and type the project ID it prints.
+- **The project ID** is `neomail-` and the first 10 hex digits of the SHA-256 of
+  `neomail-gmail:` and the address you signed in with, so every run finds the same project and
+  the address itself never shows in the ID. The script looks it up with
+  `gcloud projects describe` and makes it only when it is not there. To use a project of your
+  own, made in the browser or by hand, give its ID: `--project ID`, or after the line
+  (`sh '.../setup.sh' my-project-123`). The script then only enables the Gmail API in it, and
+  stops if it cannot open it.
+- **Every later step opens in that project:** each page link carries `?project=ID`.
+
+A second run changes nothing and makes no second project. A project pending deletion is not
+replaced: the script stops and names `gcloud projects undelete ID`.
+
+**Only three steps are commands.** The project, its ID and the Gmail API have commands. The Google
+Auth Platform pages (branding, the test user, the mail scope, publishing) and the Desktop client
+have none: Google shut down the IAP OAuth Admin API (`gcloud iap oauth-brands`) on 2026-03-19,
+and it only ever made Internal brands; `gcloud iam oauth-clients` makes Workforce Identity
+clients, not Desktop app clients. So they stay browser steps on both routes, each opened in your
+project.
+
+**Why a throwaway sign-in.** The Google Cloud CLI keeps its signed-in accounts and active project in
+`~/.config/gcloud` or `CLOUDSDK_CONFIG`, and reads any setting from a `CLOUDSDK_<SECTION>_<NAME>`
+variable. The script clears those variables (keeping only where Python is, the proxy and
+certificates), signs in with a `CLOUDSDK_CONFIG` of its own from `mktemp -d`, and at the end
+revokes that sign-in (`gcloud auth revoke --all`) and removes the folder, also after a failure
+or Ctrl-C. So an earlier gcloud session never decides the result, and your own account and
+active project are the same before and after. For its own runs it also sets
+`CLOUDSDK_CORE_DISABLE_PROMPTS=1`, so no question waits for a key (gcloud takes each one's
+default; the code at a sign-in without a browser is still asked),
+`CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true`, so no reporting process gcloud leaves running
+outlives the script, and `CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true`.
+
+### The client ID and secret are picked up
+
+At **Create a Desktop app client**, click **Download JSON** in the box that shows the new client:
+Google offers the file only there. While the step shows, the wizard watches your download folder
+(`XDG_DOWNLOAD_DIR`, from the environment or `user-dirs.dirs`, else `~/Downloads`) for a
+`client_secret_*.json` that arrives after the step showed. It reads the client ID and secret from
+it, checks that the file names your project, and moves on by itself, showing the client ID, never
+the secret. A file of another project or of another kind of client is ignored, and the step says
+why. No download? Press Enter and paste the client ID and secret, as before.
+
+The file holds the secret in plain text. Once the account is saved and the secret is in the
+keyring, the wizard offers to delete it.
 
 ## Testing mode: sign-ins that last 7 days
 
