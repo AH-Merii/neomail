@@ -13,13 +13,10 @@ use super::term::{Frame, Key, Term, Tty};
 use super::{Answers, CheckError, Event, Kind, Line, Place, Prompt, Session, View};
 use crate::style::{self, Paint, Symbols};
 
-/// What the save did: shown in the closing summary on a terminal.
+/// What the save leaves to the user: shown in the closing summary on a terminal. What was
+/// saved where, and the command to run next, the save says itself, so the summary does not.
 #[derive(Debug, Default)]
 pub struct Saved {
-    /// What went where: "the app password: GNOME Keyring (service \"neomail\", ...)".
-    pub saved: Vec<String>,
-    /// The command to run next, such as `neomail sync --account work`.
-    pub next: Option<String>,
     /// What is left to do or know; said off a terminal too.
     pub said: String,
     /// What is left to do by hand, in the summary on a terminal only.
@@ -45,8 +42,8 @@ pub struct Ui<'a> {
     pub memory: Memory,
     /// What the checks said since the last screen, shown on the next one.
     recent: Vec<String>,
-    /// Every check passed, for the summary.
-    passed: Vec<String>,
+    /// Every check that passed, and those a flag skipped (`true`), in order, for the summary.
+    ran: Vec<(String, bool)>,
     /// The steps whose page was opened or offered.
     opened: Vec<&'static str>,
     /// The last text typed at each step, kept for editing when it is asked again.
@@ -87,7 +84,7 @@ impl<'a> Ui<'a> {
             open_pages,
             memory,
             recent: Vec::new(),
-            passed: Vec::new(),
+            ran: Vec::new(),
             opened: Vec::new(),
             kept: Vec::new(),
             menu_header: None,
@@ -163,7 +160,8 @@ impl<'a> Ui<'a> {
 
 impl Ui<'_> {
     /// A list item after `lead`: a label with a name column ("gmail   Gmail, through ...")
-    /// keeps the column, and its description wraps under itself.
+    /// keeps the column, and its description wraps under itself; a numbered label ("2. A work
+    /// account ...") wraps under its text, not under its number.
     fn item(
         &self,
         lead: &str,
@@ -172,7 +170,16 @@ impl Ui<'_> {
         role: fn(Paint, &str) -> String,
     ) -> Vec<String> {
         let Some((name, rest)) = label.split_once("  ") else {
-            return self.paragraph(lead, label, cols, role);
+            let number = label
+                .split_once(". ")
+                .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+            return match number {
+                Some((n, text)) => {
+                    let first = format!("{lead}{} ", role(self.paint(), &format!("{n}.")));
+                    self.paragraph(&first, text, cols, role)
+                }
+                None => self.paragraph(lead, label, cols, role),
+            };
         };
         let about = rest.trim_start();
         let pad = 2 + rest.len() - about.len();
@@ -272,7 +279,7 @@ impl Ui<'_> {
             return Vec::new();
         }
         if roomy {
-            return view
+            let mut lines: Vec<String> = view
                 .outline
                 .iter()
                 .map(|(title, place)| match place {
@@ -281,6 +288,11 @@ impl Ui<'_> {
                     Place::Left => format!("  {} {title}", s.dot),
                 })
                 .collect();
+            // A case the setup stops at: no step follows, so the outline says where it ends.
+            if view.next == Some(super::STOPS_HERE) {
+                lines.push(p.note(&format!("  {} {}", s.dot, super::STOPS_HERE)));
+            }
+            return lines;
         }
         let done = view
             .outline
@@ -613,7 +625,7 @@ impl Ui<'_> {
     }
 
     /// Shows a Console, Gate or Ask step and waits for what the user does there.
-    fn show(&mut self, view: &View<'_>) -> Result<Did> {
+    fn show(&mut self, session: &Session, view: &View<'_>) -> Result<Did> {
         if !self.interactive() {
             // Off a terminal only a secret is left to read: Console and Gate steps are skipped.
             return match &view.step.kind {
@@ -647,7 +659,9 @@ impl Ui<'_> {
                     .enumerate()
                     .map(|(i, c)| (format!("{}. {}", i + 1, c.label), String::new()))
                     .collect();
-                match self.pick(view, &items, 0, &error, &page, back)? {
+                // Pointing at a case the setup stops at shows that no step follows it.
+                let preview = |i: usize| session.preview(&i.to_string());
+                match self.pick(view, Some(&preview), &items, 0, &error, &page, back)? {
                     Some(Ok(i)) => Did::Event(Event::Choose(i)),
                     Some(Err(())) => Did::Event(Event::Back),
                     None => Did::Quit,
@@ -673,7 +687,9 @@ impl Ui<'_> {
                 let start = preferred
                     .and_then(|v| q.choices.iter().position(|c| c.value == v))
                     .unwrap_or(0);
-                match self.pick(view, &items, start, &error, &page, back)? {
+                // Moving the pointer redraws the outline, the count and Next for that answer.
+                let preview = |i: usize| session.preview(q.choices[i].value);
+                match self.pick(view, Some(&preview), &items, start, &error, &page, back)? {
                     Some(Ok(i)) => Did::Event(Event::Answer(q.choices[i].value.to_owned())),
                     Some(Err(())) => Did::Event(Event::Back),
                     None => Did::Quit,
@@ -690,6 +706,7 @@ impl Ui<'_> {
                 };
                 self.line(
                     view,
+                    &|text: &str| session.preview(text),
                     q.prompt,
                     q.secret,
                     keeps.as_deref(),
@@ -731,9 +748,10 @@ impl Ui<'_> {
     /// before anything is typed points at that item; other text narrows the list; Enter picks.
     /// `Some(Ok(index))` is the item of `items` picked, `Some(Err(()))` back, `None` quit.
     #[allow(clippy::too_many_arguments)]
-    fn pick(
+    fn pick<'s>(
         &mut self,
-        view: &View<'_>,
+        view: &View<'s>,
+        preview: Option<&dyn Fn(usize) -> View<'s>>,
         items: &[(String, String)],
         start: usize,
         error: &[String],
@@ -755,6 +773,8 @@ impl Ui<'_> {
         loop {
             let matches = narrow(items, &filter);
             at = at.min(matches.len().saturating_sub(1));
+            let pointed = preview.zip(matches.get(at)).map(|(f, &i)| f(i));
+            let view = pointed.as_ref().unwrap_or(view);
             let frame = self.step_frame(view, &Input::Pick(items, at, &filter), error, page, &keys);
             match self.key(&frame)? {
                 Key::Enter => {
@@ -799,9 +819,10 @@ impl Ui<'_> {
     /// A line of text: typed in place, hidden for a secret. Enter with nothing typed takes
     /// `keeps`; Tab fills it in to edit. `kept` is the text typed before a wrong answer.
     #[allow(clippy::too_many_arguments)]
-    fn line(
+    fn line<'s>(
         &mut self,
-        view: &View<'_>,
+        view: &View<'s>,
+        preview: &dyn Fn(&str) -> View<'s>,
         prompt: &str,
         hidden: bool,
         keeps: Option<&str>,
@@ -828,7 +849,16 @@ impl Ui<'_> {
                 hidden,
                 keeps,
             };
-            let frame = self.step_frame(view, &input, error, page, &keys);
+            // The outline follows the answer as typed, or the one Enter keeps.
+            let typed: String = text.iter().collect();
+            let pending = match keeps {
+                Some(k) if typed.trim().is_empty() && !hidden => k.to_owned(),
+                _ if hidden => String::new(),
+                _ => typed,
+            };
+            let previewed = (!hidden).then(|| preview(&pending));
+            let shown = previewed.as_ref().unwrap_or(view);
+            let frame = self.step_frame(shown, &input, error, page, &keys);
             match self.key(&frame)? {
                 Key::Enter => {
                     let typed: String = text.iter().collect();
@@ -926,8 +956,8 @@ impl Ui<'_> {
                  check has passed.",
                 wizard.title,
                 view.seen_total,
-                match session.may_grow() {
-                    true => " or a few more, depending on your answers",
+                match session.depends_on_answers() {
+                    true => " for the suggested answers (an answer may change them)",
                     false => "",
                 }
             ),
@@ -999,6 +1029,14 @@ pub fn drive(
     mut write: impl FnMut(&Answers<'_>) -> Result<Saved>,
 ) -> Result<()> {
     let interactive = ui.interactive();
+    if interactive {
+        // The path is predicted with the answers the screens will offer again.
+        for step in session.wizard().steps {
+            if let Some(value) = ui.memory.get(step.id) {
+                session.offer(step.id, value);
+            }
+        }
+    }
     if interactive && let Prompt::Show(view) = session.prompt() {
         let ready = ui.welcome(session, &view)?;
         if !ready {
@@ -1061,7 +1099,7 @@ pub fn drive(
             }
             Prompt::Show(view) => {
                 last_seen = Some((view.seen, view.seen_total, view.step.title));
-                match ui.show(&view)? {
+                match ui.show(session, &view)? {
                     Did::Event(e) => e,
                     Did::Quit => {
                         let at = format!("step {} ({})", view.seen, view.step.title);
@@ -1158,11 +1196,12 @@ impl Ui<'_> {
             Ok(_) if skipped => {
                 let line = format!("  {} {title}: skipped (--no-check)", s.dot);
                 self.recent.push(p.note(&line));
+                self.ran.push((title.to_owned(), true));
             }
             Ok(_) => {
                 self.recent
                     .push(format!("  {} {}", p.success(s.check), p.success(title)));
-                self.passed.push(title.to_owned());
+                self.ran.push((title.to_owned(), false));
                 for line in said.lines().filter(|l| !l.trim().is_empty()) {
                     self.recent
                         .extend(self.paragraph("    ", line, cols, Paint::note));
@@ -1192,25 +1231,15 @@ impl Ui<'_> {
             String::new(),
             p.heading(&format!("{} Set up {title}", s.check)),
         ];
-        for check in &self.passed {
-            lines.push(format!("  {} {}", p.success(s.check), check));
+        for (check, skipped) in &self.ran {
+            lines.push(match skipped {
+                true => p.note(&format!("  {} {check}: skipped (--no-check)", s.dot)),
+                false => format!("  {} {}", p.success(s.check), check),
+            });
         }
-        for item in &saved.saved {
-            let sign = format!("  {} ", p.success(s.check));
-            lines.extend(self.paragraph(&sign, &format!("Saved {item}"), cols, as_is));
-        }
-        if saved.next.is_some() || !saved.said.is_empty() || !saved.todo.is_empty() {
+        if !saved.said.is_empty() || !saved.todo.is_empty() {
             lines.push(String::new());
             lines.push(p.heading("Left for you"));
-        }
-        if let Some(next) = &saved.next {
-            let bullet = format!("  {} ", p.literal(s.bullet));
-            lines.extend(self.paragraph(
-                &bullet,
-                &format!("Run `{next}` to fetch your mail."),
-                cols,
-                as_is,
-            ));
         }
         let said = saved.said.lines().map(str::to_owned);
         for said in saved
@@ -1268,7 +1297,7 @@ pub fn choose(
     };
     let header = ui.paint().heading(&format!("{} {title}", ui.sym().arrow));
     ui.menu_header = Some(header);
-    let picked = ui.pick(&view, &list, start, &[], &[], false);
+    let picked = ui.pick(&view, None, &list, start, &[], &[], false);
     ui.menu_header = None;
     Ok(picked?.and_then(Result::ok))
 }

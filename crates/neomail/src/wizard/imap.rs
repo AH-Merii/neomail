@@ -329,25 +329,14 @@ pub fn run(
     let write = |_: &Answers<'_>| -> Result<Saved> {
         let guard = plan.borrow();
         let made = guard.as_ref().ok_or_else(|| anyhow::anyhow!("no plan"))?;
-        let place = setup::save(
+        setup::save(
             made,
             keyring.borrow().as_ref(),
             password.borrow().as_ref(),
             config_path,
             out,
         )?;
-        let mut saved: Vec<String> = place
-            .map(|p| format!("the password in {p}"))
-            .into_iter()
-            .collect();
-        saved.push(format!(
-            "the account {:?} in {}",
-            made.name,
-            config_path.display()
-        ));
         Ok(Saved {
-            saved,
-            next: Some(format!("neomail sync --account {}", made.name)),
             said: String::new(),
             todo: Vec::new(),
         })

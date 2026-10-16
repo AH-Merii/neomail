@@ -140,7 +140,17 @@ pub fn run<H: Http>(
     };
     let mut session = match Session::new(wizard, ui.interactive(), flag) {
         Ok(session) => session,
-        Err(StartError::Missing(flags)) => {
+        Err(StartError::Missing(mut flags)) => {
+            // Named in the order of the options, not of the steps: moving a step to where its
+            // value shows does not change the message.
+            let order = [
+                "--name",
+                "--email",
+                "--client-id",
+                "--project",
+                "--account-type",
+            ];
+            flags.sort_by_key(|f| order.iter().position(|o| o == f));
             let secret_note = match provider.client {
                 ClientKind::Confidential => {
                     " (the client secret is then read as one line of standard input)"
@@ -300,15 +310,6 @@ pub fn run<H: Http>(
         )?;
         out.flush()?;
         Ok(Saved {
-            saved: vec![
-                format!(
-                    "the sign-in in {} (service {:?}, username {name:?})",
-                    store.name(),
-                    keyring::OAUTH_SERVICE
-                ),
-                format!("the account {name:?} in {}", config_path.display()),
-            ],
-            next: Some(format!("neomail sync --account {name}")),
             said: String::new(),
             todo: Vec::new(),
         })

@@ -425,6 +425,24 @@ Why: neomail signs in through Microsoft's common endpoint, which needs that type
             kind: Kind::Console,
         },
         Step {
+            id: "client-id",
+            title: "Paste the Application (client) ID",
+            why: "\
+Register opens the app's Overview page: copy its Application (client) ID, not the Directory
+(tenant) ID or the Object ID. There is no secret: neomail runs on your machine, so it cannot
+keep one.",
+            links: &[],
+            page: None,
+            kind: Kind::Ask(Question {
+                flag: Some("--client-id"),
+                prompt: "Application (client) ID: ",
+                secret: false,
+                default: None,
+                choices: &[],
+                clean: clean_guid,
+            }),
+        },
+        Step {
             id: "sign-in-method",
             title: "How you will sign in",
             why: "\
@@ -541,23 +559,6 @@ sign in again.",
             kind: Kind::Check {
                 reads: &["name", "email"],
             },
-        },
-        Step {
-            id: "client-id",
-            title: "Paste the Application (client) ID",
-            why: "\
-From the app's Overview page: the Application (client) ID, not the Directory (tenant) ID or
-the Object ID. There is no secret: neomail runs on your machine, so it cannot keep one.",
-            links: &[],
-            page: None,
-            kind: Kind::Ask(Question {
-                flag: Some("--client-id"),
-                prompt: "Application (client) ID: ",
-                secret: false,
-                default: None,
-                choices: &[],
-                clean: clean_guid,
-            }),
         },
         Step {
             id: "client-check",

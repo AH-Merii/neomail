@@ -27,9 +27,18 @@ fn typed(text: &str) -> Vec<Key> {
 }
 
 /// The keys from the welcome screen to the address step: start, the first case, step 2 done,
-/// step 3 skipped, the name's default kept.
+/// the name's default kept.
 fn to_address() -> Vec<Key> {
-    vec![Enter, Enter, Enter, Char('s'), Enter]
+    vec![Enter, Enter, Enter, Enter]
+}
+
+/// The keys from the welcome screen to the password step: `address` typed, then the step that
+/// creates the app password skipped.
+fn to_password(address: &str) -> Vec<Key> {
+    let mut keys = to_address();
+    keys.extend(typed(address));
+    keys.push(Char('s'));
+    keys
 }
 
 /// What the checks and the write saw, in order.
@@ -127,7 +136,7 @@ fn a_list_is_picked_with_the_arrows_j_and_k_a_digit_or_by_typing_to_narrow() {
 
 #[test]
 fn going_back_skipping_and_quitting_are_keys_each_screen_names() {
-    let mut keys = vec![Enter, Enter, Esc, Enter, Char('s'), Char('q')];
+    let mut keys = vec![Enter, Enter, Esc, Enter, Char('q')];
     let mut script = Script::keys(&keys);
     let seen = Seen::default();
     let e = run(
@@ -140,14 +149,14 @@ fn going_back_skipping_and_quitting_are_keys_each_screen_names() {
         &[],
     )
     .unwrap_err();
-    assert!(format!("{e}").contains("stopped at step 3"), "{e}");
+    assert!(format!("{e}").contains("stopped at step 2"), "{e}");
     assert!(format!("{e}").contains("nothing was written"), "{e}");
     assert!(!seen.has("write you@example.com") && seen.events.borrow().is_empty());
     let steps: Vec<String> = headers(&script)
         .into_iter()
         .filter(|h| h.contains("Step"))
         .collect();
-    let want = ["Step 1/6", "Step 2/6", "Step 1/6", "Step 2/6", "Step 3/6"];
+    let want = ["Step 1/6", "Step 2/6", "Step 1/6", "Step 2/6"];
     assert_eq!(steps.len(), want.len(), "{steps:?}");
     for (h, w) in steps.iter().zip(want) {
         assert!(h.starts_with(&format!("▸ {w} · ")), "{h}");
@@ -182,7 +191,7 @@ fn going_back_skipping_and_quitting_are_keys_each_screen_names() {
         &[],
     )
     .unwrap_err();
-    assert!(format!("{e}").contains("stopped at step 5"), "{e}");
+    assert!(format!("{e}").contains("stopped at step 4"), "{e}");
 }
 
 #[test]
@@ -190,7 +199,7 @@ fn a_wrong_answer_is_shown_under_it_and_fixed_without_starting_over() {
     let mut keys = to_address();
     keys.extend(typed("you"));
     keys.extend(typed("@example.com"));
-    keys.push(Interrupt);
+    keys.extend([Char('s'), Interrupt]);
     let mut script = Script::keys(&keys);
     let seen = Seen::default();
     run(
@@ -239,8 +248,7 @@ fn a_secret_is_never_shown_nor_kept_and_a_second_run_offers_the_rest() {
     let id = GMAIL_APP_PASSWORD.id;
     let seen = Seen::default();
     // The first run gets to the save and says no.
-    let mut keys = to_address();
-    keys.extend(typed("you@example.com"));
+    let mut keys = to_password("you@example.com");
     keys.extend(typed(SECRET));
     keys.push(Char('n'));
     let mut script = Script::keys(&keys);
@@ -268,7 +276,7 @@ fn a_secret_is_never_shown_nor_kept_and_a_second_run_offers_the_rest() {
     }
     // The second run offers the address again: Enter keeps it; the save removes the file.
     let mut keys = to_address();
-    keys.push(Enter);
+    keys.extend([Enter, Char('s')]);
     keys.extend(typed(SECRET));
     keys.push(Char('y'));
     let mut script = Script::keys(&keys);
@@ -333,7 +341,9 @@ fn pages_open_only_on_a_terminal_without_no_browser_nor_ssh_without_a_display() 
     assert!(!may_open_pages(true, false, env(ssh)));
     assert!(!may_open_pages(false, false, env(&[])));
 
-    let keys = [Enter, Enter, Enter, Esc, Enter, Enter, Interrupt];
+    let mut keys = vec![Enter, Enter, Esc, Enter, Enter, Enter];
+    keys.extend(typed("you@example.com"));
+    keys.push(Interrupt);
     let opened = RefCell::new(Vec::new());
     let opener = |url: &str| {
         opened.borrow_mut().push(url.to_owned());
@@ -421,8 +431,7 @@ fn raw_mode_is_left_after_a_quit_an_error_and_a_panic() {
 #[test]
 fn nothing_is_written_until_every_check_has_passed() {
     let seen = Seen::default();
-    let mut keys = to_address();
-    keys.extend(typed("you@example.com"));
+    let mut keys = to_password("you@example.com");
     keys.extend(typed(SECRET));
     // The login is refused: the password is asked again, and the user gives up.
     keys.extend(typed(SECRET));
@@ -448,8 +457,7 @@ fn nothing_is_written_until_every_check_has_passed() {
     assert!(everything(&script).contains("✗ the server said no"));
     // When they all pass, the write comes after the last one, and only after a yes.
     let seen = Seen::default();
-    let mut keys = to_address();
-    keys.extend(typed("you@example.com"));
+    let mut keys = to_password("you@example.com");
     keys.extend(typed(SECRET));
     keys.push(Enter);
     let mut script = Script::keys(&keys);
@@ -478,8 +486,7 @@ fn nothing_is_written_until_every_check_has_passed() {
 /// the cursor off that screen, so the summary said after it is not drawn over it.
 #[test]
 fn checks_a_confirm_and_the_save_run_in_cooked_mode_below_the_screen() {
-    let mut keys = to_address();
-    keys.extend(typed("you@example.com"));
+    let mut keys = to_password("you@example.com");
     keys.extend(typed(SECRET));
     keys.extend([Char('y'), Enter]);
     let mut script = Script::keys(&keys);
@@ -519,4 +526,185 @@ fn checks_a_confirm_and_the_save_run_in_cooked_mode_below_the_screen() {
         "write true",
     ];
     assert_eq!(events, want);
+}
+
+/// Runs the Outlook wizard on `keys` at `size` up to its first check, where it quits.
+fn outlook_screens(keys: &[Key], size: (u16, u16)) -> Script {
+    let mut script = Script::keys(keys);
+    script.size = size;
+    let mut ui = Ui::new(&mut script, plain(), &no_opener, false, Memory::none());
+    let mut session = Session::new(&crate::oauth::steps::OUTLOOK, true, |_| None).unwrap();
+    let check = |_: &str, _: &Answers<'_>, _: &mut Ask<'_, '_>| {
+        Err(CheckError {
+            kind: QUIT,
+            detail: String::new(),
+        })
+    };
+    let _ = drive(&mut session, &mut ui, check, |_| Ok(Saved::default()));
+    drop(ui);
+    script
+}
+
+/// Each step screen's header title, and the step its outline names as next: the line after
+/// the current one, or the one-line outline's "next, ...".
+fn titles_and_next(script: &Script) -> Vec<(String, String, Option<String>)> {
+    let mut out: Vec<(String, String, Option<String>)> = Vec::new();
+    for frame in &script.frames {
+        let lines: Vec<String> = frame.lines.iter().map(|l| screen::plain(l)).collect();
+        let Some(head) = lines[0].strip_prefix("▸ Step ") else {
+            continue;
+        };
+        let (count, title) = head.split_once(" · ").unwrap();
+        let outline: Vec<&String> = lines[1..].iter().take_while(|l| !l.is_empty()).collect();
+        // A check's screen keeps the step's header but has no outline.
+        if outline.is_empty() {
+            continue;
+        }
+        let next = match outline.iter().position(|l| l.starts_with("  ▸ ")) {
+            Some(now) => outline
+                .get(now + 1)
+                .and_then(|l| l.strip_prefix("  · "))
+                .map(str::to_owned),
+            None => outline
+                .first()
+                .and_then(|l| l.split_once(": next, "))
+                .map(|(_, n)| n.to_owned()),
+        };
+        let entry = (count.to_owned(), title.to_owned(), next);
+        if out.last() != Some(&entry) {
+            out.push(entry);
+        }
+    }
+    out
+}
+
+/// The owner's walk of 2026-10-15 (#106): personal and browser. The steps count 1/8 to 8/8
+/// with no gap, each screen names as next the step that comes next, and the client ID is asked
+/// right after Register, while its Overview page is open.
+#[test]
+fn an_outlook_walk_counts_only_its_steps_and_each_names_the_one_that_follows() {
+    let mut keys = vec![Enter, Enter, Enter, Enter];
+    keys.extend(typed("00000000-0000-0000-0000-000000000000"));
+    keys.extend([Enter, Enter]);
+    keys.extend(typed("you@example.com"));
+    keys.push(Enter);
+    let want = [
+        "Personal, or work or school?",
+        "Get a directory: a free Azure account",
+        "Register the app",
+        "Paste the Application (client) ID",
+        "How you will sign in",
+        "Add the redirect URI",
+        "Your Outlook address",
+        "Name the account",
+    ];
+    // Roomy, and short enough that the outline goes on one line.
+    for size in [(100, 60), (80, 14)] {
+        let script = outlook_screens(&keys, size);
+        let seen = titles_and_next(&script);
+        let counts: Vec<&str> = seen.iter().map(|(c, _, _)| c.as_str()).collect();
+        let titles: Vec<&str> = seen.iter().map(|(_, t, _)| t.as_str()).collect();
+        let numbers: Vec<String> = (1..=8).map(|n| format!("{n}/8")).collect();
+        assert_eq!(counts, numbers, "{size:?}");
+        assert_eq!(titles, want, "{size:?}");
+        for (i, (_, title, next)) in seen.iter().enumerate().take(7) {
+            assert_eq!(next.as_deref(), Some(want[i + 1]), "{size:?} at {title}");
+        }
+    }
+}
+
+/// Moving the pointer at a list redraws the outline and Next for that answer before Enter.
+#[test]
+fn moving_the_pointer_shows_the_steps_that_answer_brings() {
+    // At "Personal, or work or school?": personal, then work.
+    let script = outlook_screens(&[Enter, Down, Interrupt], (100, 60));
+    let first: Vec<String> = script
+        .frames
+        .iter()
+        .map(|f| {
+            f.lines
+                .iter()
+                .map(|l| screen::plain(l))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|s| s.starts_with("▸ Step 1/"))
+        .collect();
+    assert_eq!(first.len(), 2, "{first:#?}");
+    assert!(first[0].contains("· Get a directory") && !first[0].contains("· Your organisation"));
+    assert!(first[1].contains("· Your organisation") && !first[1].contains("· Get a directory"));
+    // At "How you will sign in": browser, then device-code.
+    let mut keys = vec![Enter, Enter, Enter, Enter];
+    keys.extend(typed("00000000-0000-0000-0000-000000000000"));
+    keys.extend([Char('j'), Interrupt]);
+    let script = outlook_screens(&keys, (100, 60));
+    let at_method: Vec<(String, String, Option<String>)> = titles_and_next(&script)
+        .into_iter()
+        .filter(|(_, t, _)| t == "How you will sign in")
+        .collect();
+    let next: Vec<Option<&str>> = at_method.iter().map(|(_, _, n)| n.as_deref()).collect();
+    assert_eq!(
+        next,
+        [
+            Some("Add the redirect URI"),
+            Some("Allow public client flows")
+        ]
+    );
+}
+
+/// A numbered item that wraps goes on under its text, not under its number, so it does not
+/// read as a new item.
+#[test]
+fn a_wrapped_numbered_item_goes_on_under_its_text() {
+    let mut script = Script::keys(&[]);
+    let ui = Ui::new(&mut script, plain(), &no_opener, false, Memory::none());
+    let label = "3. A work, school or other organisation account: its administrator may not allow \
+                 app passwords";
+    let lines = ui.item("    ", label, 40, as_is);
+    assert!(lines.len() > 1, "{lines:?}");
+    assert!(lines[0].starts_with("    3. A work"), "{lines:?}");
+    for line in &lines[1..] {
+        assert!(
+            line.starts_with("       ") && !line.starts_with("        "),
+            "{lines:?}"
+        );
+    }
+}
+
+/// Pointing at a case the app-password setup stops at shows no step to come, and Next says it
+/// ends there; pointing back at one that goes on shows its steps again.
+#[test]
+fn pointing_at_a_case_that_stops_the_setup_shows_no_step_to_come() {
+    // Roomy, and short enough that the outline goes on one line.
+    for size in [(100, 60), (100, 14)] {
+        let mut script = Script::keys(&[Enter, Down, Up, Interrupt]);
+        script.size = size;
+        let seen = Seen::default();
+        let _ = run(
+            &mut script,
+            plain(),
+            false,
+            &no_opener,
+            Memory::none(),
+            &seen,
+            &[],
+        );
+        let gate: Vec<(String, String, Option<String>)> = titles_and_next(&script)
+            .into_iter()
+            .filter(|(_, t, _)| t == "Can this account have an app password?")
+            .collect();
+        let shown: Vec<(&str, Option<&str>)> = gate
+            .iter()
+            .map(|(c, _, n)| (c.as_str(), n.as_deref()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("1/6", Some("Turn on 2-Step Verification")),
+                ("1/1", Some(crate::wizard::STOPS_HERE)),
+                ("1/6", Some("Turn on 2-Step Verification")),
+            ],
+            "{size:?}"
+        );
+    }
 }

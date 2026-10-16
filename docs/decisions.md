@@ -1444,6 +1444,11 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
     what is left to do. Paragraphs wrap to the terminal, at most 100 columns wide; at 80x24 the
     outline goes on one line, then notes go, then the text is cut, so the header, the action, the
     prompt and the footer stay on screen.
+  - **The steps follow the answer about to be given** (#106): the count, the outline, Next and the
+    welcome screen come from one prediction (`Session::path`), made with the item pointed at or
+    the text typed, else the answer given, the one offered from the last run, or the default. A
+    value is asked right after the step whose page shows it. The end lists the checks passed and
+    those `--no-check` skipped, and what is left to do; what was saved where, the save says once.
   - **Pages open for you.** The first time a step with a page shows, neomail opens it through
     `browser.rs` and says `↗ opening URL`, except with `--no-browser`, over SSH without a display
     or off a terminal, where it says `Open it yourself:` with the URL. Links are always printed,

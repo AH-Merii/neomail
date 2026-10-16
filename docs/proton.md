@@ -18,21 +18,24 @@ The wizard carries the steps, each with why it exists and where to go:
    it goes on.
 3. Sign in to Bridge, and keep it running (its window, its systemd --user unit, or
    `protonmail-bridge --noninteractive`).
-4. The account's name in neomail (`--name`, default `proton`).
-5. Bridge's mailbox details: the username (`--username`), the IMAP port (`--port`, default
+4. Export Bridge's certificate (Settings > Advanced settings > Export TLS certificates, or
+   `cert export` in `protonmail-bridge --cli`), before the mailbox details are open, so they
+   stay open from the username to the Bridge password. The export also writes key.pem,
+   Bridge's private key: delete it once the certificate is pinned.
+5. The account's name in neomail (`--name`, default `proton`).
+6. Bridge's mailbox details: the username (`--username`), the IMAP port (`--port`, default
    1143) and security (`--security`, default `starttls`; Bridge's SSL is `tls`), and the SMTP
    port (`--smtp-port`, default 1025) and security (`--smtp-security`). With split addresses
    mode, add one neomail account per address.
-6. Is Bridge ready? neomail connects to both ports as answered. Nothing listening points to
+7. Is Bridge ready? neomail connects to both ports as answered. Nothing listening points to
    starting Bridge or the port; a server that speaks the other security points to the security
    answer.
-7. The certificate. Bridge made its own, which no authority vouches for, so neomail pins its
-   SHA-256. To check it against Bridge itself, export it (Settings > Advanced settings > Export
-   TLS certificates, or `cert export` in `protonmail-bridge --cli`) and give the cert.pem path
+8. The certificate. Bridge made its own, which no authority vouches for, so neomail pins its
+   SHA-256. To check it against Bridge itself, give the path of the cert.pem exported in step 4
    (`--bridge-cert PATH`), or pass the SHA-256 (`--cert-sha256`). A mismatch is refused and
-   nothing is written. The export also writes key.pem, Bridge's private key: delete it. If the
-   SMTP port presents another certificate, it is shown and pinned on its own.
-8. The Bridge password, from the mailbox details (prompted, standard input, or
+   nothing is written. If the SMTP port presents another certificate, it is shown and pinned on
+   its own.
+9. The Bridge password, from the mailbox details (prompted, standard input, or
    `--password-command`). neomail logs in to IMAP (read-only) and SMTP (sending nothing) before
    it writes the keyring and the config. A refused login means the Bridge password, not the
    Proton one, or no account signed in to Bridge.

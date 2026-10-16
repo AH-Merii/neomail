@@ -431,6 +431,7 @@ fn on_a_terminal_each_step_is_shown_and_the_ports_typed_are_checked() {
         "", // a paid plan
         "", // install
         "", // sign in
+        "", // export the certificate
         "", // name: proton
         USERNAME,
         imap.leak(),
@@ -442,9 +443,10 @@ fn on_a_terminal_each_step_is_shown_and_the_ports_typed_are_checked() {
     let mut term = Script::terminal(&lines, &[PASSWORD]);
     w.run(Args::default(), &mut term).unwrap();
     for shown in [
-        "Step 1/11 · A paid Proton plan",
+        "Step 1/12 · A paid Proton plan",
         "https://proton.me/mail/bridge",
-        "Step 5/11 · Mailbox details: the username",
+        "Step 4/12 · Export Bridge's certificate",
+        "Step 6/12 · Mailbox details: the username",
         "never into neomail",
         &w.cert.fingerprint(),
     ] {
@@ -469,10 +471,10 @@ fn a_port_where_nothing_listens_names_its_step_and_starting_bridge() {
             };
             let step = if smtp_closed {
                 args.smtp_port = Some(closed_port());
-                "step 9 of 17 (Mailbox details: the SMTP port)"
+                "step 10 of 18 (Mailbox details: the SMTP port)"
             } else {
                 args.port = Some(closed_port());
-                "step 7 of 17 (Mailbox details: the IMAP port)"
+                "step 8 of 18 (Mailbox details: the IMAP port)"
             };
             let mut term = Script::off_terminal(&[PASSWORD]);
             let e = w.fails(args, &mut term);
@@ -498,7 +500,7 @@ fn on_a_terminal_a_refused_port_is_asked_again() {
         smtp_port: Some(w.smtp.port),
         ..Args::default()
     };
-    let lines = ["", "", "", "", closed.leak(), "", "", open.leak(), "y"];
+    let lines = ["", "", "", "", "", closed.leak(), "", "", open.leak(), "y"];
     let mut term = Script::terminal(&lines, &[PASSWORD]);
     w.run(args, &mut term).unwrap();
     assert!(term.said.contains("Start Bridge"), "{}", term.said);
@@ -515,7 +517,7 @@ fn a_security_answer_bridge_does_not_speak_names_the_security_step() {
             StartTls,
             None,
             None,
-            "step 8 of 17 (Mailbox details: the IMAP security)",
+            "step 9 of 18 (Mailbox details: the IMAP security)",
             "speaks TLS from the first byte",
         ),
         (
@@ -523,7 +525,7 @@ fn a_security_answer_bridge_does_not_speak_names_the_security_step() {
             StartTls,
             Some(Tls),
             None,
-            "step 8 of 17 (Mailbox details: the IMAP security)",
+            "step 9 of 18 (Mailbox details: the IMAP security)",
             "greets in plain text",
         ),
         (
@@ -531,7 +533,7 @@ fn a_security_answer_bridge_does_not_speak_names_the_security_step() {
             Tls,
             None,
             None,
-            "step 10 of 17 (Mailbox details: the SMTP security)",
+            "step 11 of 18 (Mailbox details: the SMTP security)",
             "speaks TLS from the first byte",
         ),
         (
@@ -539,7 +541,7 @@ fn a_security_answer_bridge_does_not_speak_names_the_security_step() {
             StartTls,
             None,
             Some(Tls),
-            "step 10 of 17 (Mailbox details: the SMTP security)",
+            "step 11 of 18 (Mailbox details: the SMTP security)",
             "greets in plain text",
         ),
     ] {
@@ -573,7 +575,7 @@ fn a_certificate_that_is_not_the_one_bridge_presents_is_refused_before_the_passw
         let mut term = Script::off_terminal(&[PASSWORD]);
         let e = w.fails(args, &mut term);
         assert!(
-            e.starts_with("step 12 of 17 (Pin Bridge's certificate)"),
+            e.starts_with("step 13 of 18 (Pin Bridge's certificate)"),
             "{e}"
         );
         assert!(
@@ -600,8 +602,8 @@ fn on_a_terminal_the_cert_pem_is_compared_and_a_no_writes_nothing() {
     let good = dir.path().join("cert.pem");
     std::fs::write(&good, &w.cert.pem).unwrap();
     let good = good.to_string_lossy().into_owned();
-    // Steps 1 to 3, then the certificate: a wrong cert.pem is asked again.
-    let lines = ["", "", "", other.leak(), good.leak()];
+    // Steps 1 to 4, then the certificate: a wrong cert.pem is asked again.
+    let lines = ["", "", "", "", other.leak(), good.leak()];
     let mut term = Script::terminal(&lines, &[PASSWORD]);
     w.run(all_flags_for(&w), &mut term).unwrap();
     assert!(
@@ -617,7 +619,7 @@ fn on_a_terminal_the_cert_pem_is_compared_and_a_no_writes_nothing() {
     assert_eq!(w.account().imap().unwrap().cert_pin, Some(w.cert.pin()));
 
     let w = World::new();
-    let mut term = Script::terminal(&["", "", "", "n"], &[]);
+    let mut term = Script::terminal(&["", "", "", "", "n"], &[]);
     let e = w.fails(all_flags_for(&w), &mut term);
     assert!(e.contains("not pinned"), "{e}");
     assert!(w.logins().is_empty());
@@ -670,15 +672,22 @@ fn the_bridge_password_is_checked_on_both_ports_before_anything_is_written() {
         };
         let e = w.fails(args, &mut Script::off_terminal(&[password]));
         assert!(
-            e.starts_with("step 15 of 17 (Paste the Bridge password)"),
+            e.starts_with("step 16 of 18 (Paste the Bridge password)"),
             "{e}"
         );
         assert!(e.contains("not\nyour Proton password"), "{e}");
-        assert!(e.contains("sign in to\nBridge first (step 3)"), "{e}");
+        // It names the steps it points back to by what they are: their numbers differ between
+        // this message and a terminal's header.
+        assert!(
+            e.contains("check the username (on a terminal, Esc goes back to it)"),
+            "{e}"
+        );
+        assert!(e.contains("sign in to Bridge first."), "{e}");
+        assert!(!e.contains("(step "), "{e}");
     }
     // On a terminal the password is asked again.
     let w = World::new();
-    let mut term = Script::terminal(&["", "", "", "y"], &["my-proton-password", PASSWORD]);
+    let mut term = Script::terminal(&["", "", "", "", "y"], &["my-proton-password", PASSWORD]);
     w.run(all_flags_for(&w), &mut term).unwrap();
     assert_eq!(w.stored(), PASSWORD);
     assert_eq!(term.secrets_asked, 2);
@@ -748,4 +757,23 @@ fn no_check_pins_the_given_certificate_without_connecting() {
     );
     assert!(format!("{:#}", e.unwrap_err()).contains("pass --cert-sha256 or --bridge-cert too"));
     w.assert_nothing_written();
+}
+
+/// The certificate is exported before the mailbox details are opened, so no step from the
+/// username to the Bridge password sends the user to another Bridge page while they are asked
+/// for what the details show (#106).
+#[test]
+fn the_mailbox_details_stay_open_from_the_username_to_the_password() {
+    let at = |id: &str| PROTON.position(id).unwrap();
+    let exports =
+        |s: &Step| s.why.contains("Export TLS certificates") || s.why.contains("cert export");
+    let first_export = PROTON.steps.iter().position(exports).unwrap();
+    assert!(
+        first_export < at("username"),
+        "export at step {}",
+        first_export + 1
+    );
+    for step in &PROTON.steps[at("username")..=at("password")] {
+        assert!(!exports(step), "{} sends the user away", step.id);
+    }
 }

@@ -109,7 +109,7 @@ fn on_a_terminal_every_question_is_asked_before_the_check_that_reads_it() {
     // A name default "gmail" must be offered to the user before the name is checked.
     let session = Session::new(&GMAIL_APP_PASSWORD, true, |_| None).unwrap();
     let (shown, check) = shown_before_first_check(session);
-    assert_eq!(shown, ["eligible", "two-step", "create", "name"]);
+    assert_eq!(shown, ["eligible", "two-step", "name"]);
     assert_eq!(check, Some("name-free"));
 }
 
@@ -142,7 +142,7 @@ fn back_returns_to_the_step_shown_before_and_is_not_offered_first() {
     };
     assert_eq!(
         (view.step.id, view.number, view.next),
-        ("two-step", 2, Some("Create an app password"))
+        ("two-step", 2, Some("Name the account"))
     );
 }
 
@@ -278,17 +278,200 @@ Warning: mind the key.pem.",
 fn the_step_count_grows_only_while_an_answer_it_depends_on_is_missing() {
     use crate::oauth::steps::{DEVICE_CODE, OUTLOOK, WORK};
     let open = Session::new(&OUTLOOK, true, |_| None).unwrap();
-    assert!(open.may_grow());
+    assert!(open.depends_on_answers());
     let flags = |f: &str| match f {
         "--account-type" => Some(WORK.to_owned()),
         "--device-code" => Some(DEVICE_CODE.to_owned()),
         _ => None,
     };
     let decided = Session::new(&OUTLOOK, true, flags).unwrap();
-    assert!(!decided.may_grow());
+    assert!(!decided.depends_on_answers());
     assert!(
         !Session::new(&GMAIL_APP_PASSWORD, true, |_| None)
             .unwrap()
-            .may_grow()
+            .depends_on_answers()
+    );
+}
+
+fn yes_no(t: &str) -> Result<Cleaned, &'static str> {
+    Ok(Cleaned::ok(t.trim()))
+}
+
+/// A wizard where answering "yes" brings one more step: the count the user sees follows it.
+static GROWS: Wizard = Wizard {
+    id: "grows",
+    title: "a test",
+    steps: &[
+        Step {
+            id: "more",
+            title: "More?",
+            why: "",
+            links: &[],
+            page: None,
+            kind: Kind::Ask(Question {
+                flag: None,
+                prompt: "more? ",
+                secret: false,
+                default: Some("no"),
+                choices: &[
+                    Choice {
+                        value: "no",
+                        label: "no",
+                    },
+                    Choice {
+                        value: "yes",
+                        label: "yes",
+                    },
+                ],
+                clean: yes_no,
+            }),
+        },
+        Step {
+            id: "extra",
+            title: "The extra step",
+            why: "",
+            links: &[],
+            page: None,
+            kind: Kind::ConsoleIf {
+                step: "more",
+                is: &["yes"],
+            },
+        },
+        Step {
+            id: "last",
+            title: "The last step",
+            why: "",
+            links: &[],
+            page: None,
+            kind: Kind::Console,
+        },
+        Step {
+            id: "write",
+            title: "Save it",
+            why: "",
+            links: &[],
+            page: None,
+            kind: Kind::Commit,
+        },
+    ],
+    mistakes: &[],
+};
+
+/// The count, the outline and Next follow the answer about to be given, before it is given;
+/// with none pending they follow the default, and an offered answer of the last run beats it.
+#[test]
+fn the_path_follows_the_answer_about_to_be_given() {
+    let mut s = Session::new(&GROWS, true, |_| None).unwrap();
+    let titles = |v: &View<'_>| v.outline.iter().map(|(t, _)| *t).collect::<Vec<_>>();
+    let Prompt::Show(now) = s.prompt() else {
+        panic!()
+    };
+    assert_eq!(
+        (now.seen, now.seen_total, now.next),
+        (1, 2, Some("The last step"))
+    );
+    let yes = s.preview("yes");
+    assert_eq!(
+        (yes.seen, yes.seen_total, yes.next),
+        (1, 3, Some("The extra step"))
+    );
+    assert_eq!(titles(&yes), ["More?", "The extra step", "The last step"]);
+    let no = s.preview("no");
+    assert_eq!(titles(&no), ["More?", "The last step"]);
+    s.offer("more", "yes");
+    let Prompt::Show(offered) = s.prompt() else {
+        panic!()
+    };
+    assert_eq!(offered.seen_total, 3);
+    // Given, it holds: the extra step is step 2 of 3, and the last one names the save as next.
+    let Prompt::Show(extra) = s.next(Event::Answer("yes".into())) else {
+        panic!()
+    };
+    assert_eq!(
+        (extra.step.id, extra.seen, extra.seen_total),
+        ("extra", 2, 3)
+    );
+    let Prompt::Show(last) = s.next(Event::Continue) else {
+        panic!()
+    };
+    assert_eq!(
+        (last.seen, last.seen_total, last.next),
+        (3, 3, Some("Save it"))
+    );
+}
+
+/// Pointing at a case the setup stops at shows that no step follows it; pointing at one that
+/// goes on shows the steps it leads to.
+#[test]
+fn at_a_gate_the_path_follows_the_case_pointed_at() {
+    let s = Session::new(&GMAIL_APP_PASSWORD, true, |_| None).unwrap();
+    let Kind::Gate(cases) = &s.wizard().steps[0].kind else {
+        panic!("the first step is the gate")
+    };
+    let Prompt::Show(now) = s.prompt() else {
+        panic!()
+    };
+    for (i, case) in cases.iter().enumerate() {
+        let v = s.preview(&i.to_string());
+        if case.stop.is_some() {
+            assert_eq!((v.seen_total, v.next), (1, Some(STOPS_HERE)), "case {i}");
+            assert!(v.outline.iter().all(|(_, p)| *p != Place::Left), "case {i}");
+        } else {
+            assert_eq!(
+                (v.seen_total, v.next),
+                (now.seen_total, now.next),
+                "case {i}"
+            );
+            assert!(v.seen_total > 1 && v.next != Some(STOPS_HERE), "case {i}");
+        }
+    }
+    assert!(cases.iter().any(|c| c.stop.is_some()) && cases.iter().any(|c| c.stop.is_none()));
+}
+
+/// After a failed check asks an earlier step again, the advice steps already passed between it
+/// and the check are not shown again, and the outline counts them as done.
+#[test]
+fn a_step_asked_again_after_a_check_leads_back_to_the_check_without_repeating_advice() {
+    use crate::oauth::steps::{OUTLOOK, UNKNOWN_ID};
+    let mut s = Session::new(&OUTLOOK, true, |_| None).unwrap();
+    let mut steps = 0;
+    while !matches!(s.prompt(), Prompt::Check(ref v, _) if v.step.id == "client-check") {
+        let event = match s.prompt() {
+            Prompt::Check(..) => Event::Checked(Ok(())),
+            Prompt::Show(v) if v.step.id == "client-id" => {
+                Event::Answer("00000000-0000-0000-0000-000000000000".into())
+            }
+            Prompt::Show(v) if v.step.id == "email" => Event::Answer("you@example.com".into()),
+            Prompt::Show(v) if v.step.id == "account-type" => Event::Answer("personal".into()),
+            Prompt::Show(v) if v.step.id == "sign-in-method" => Event::Answer("browser".into()),
+            Prompt::Show(v) if v.step.id == "name" => Event::Answer("outlook".into()),
+            _ => Event::Continue,
+        };
+        s.next(event);
+        steps += 1;
+        assert!(steps < 30);
+    }
+    let unknown = CheckError {
+        kind: UNKNOWN_ID,
+        detail: "Microsoft does not know it".into(),
+    };
+    let Prompt::Show(again) = s.next(Event::Checked(Err(unknown))) else {
+        panic!()
+    };
+    assert_eq!(
+        (again.step.id, again.seen, again.seen_total),
+        ("client-id", 4, 8)
+    );
+    assert!(
+        again.outline[4..]
+            .iter()
+            .all(|(_, place)| *place == Place::Done),
+        "{:?}",
+        again.outline
+    );
+    let after = s.next(Event::Answer("11111111-1111-1111-1111-111111111111".into()));
+    assert!(
+        matches!(&after, Prompt::Check(v, _) if v.step.id == "ready"),
+        "{after:?}"
     );
 }

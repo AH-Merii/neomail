@@ -867,11 +867,11 @@ fn microsoft_answers_to_the_app_check_name_the_step_to_change() {
     let cases = [
         (
             r#"{"error":"invalid_request","error_codes":[50059],"error_description":"AADSTS50059: No tenant-identifying information found."}"#,
-            "step 11 of 15 (Paste the Application (client) ID): Microsoft answered:",
+            "step 4 of 15 (Paste the Application (client) ID): Microsoft answered:",
         ),
         (
             r#"{"error":"unauthorized_client","error_codes":[700016],"error_description":"AADSTS700016: Application not found."}"#,
-            "step 11 of 15 (Paste the Application (client) ID):",
+            "step 4 of 15 (Paste the Application (client) ID):",
         ),
         (
             r#"{"error":"invalid_request","error_codes":[50194],"error_description":"AADSTS50194: not multitenant."}"#,
@@ -896,23 +896,26 @@ fn microsoft_answers_to_the_app_check_name_the_step_to_change() {
 }
 
 /// The titles shown on a terminal up to the first check, answering each question from
-/// `answers` (by step id) and each console step with Enter; and each shown step's "next".
+/// `answers` (by step id) and each console step with Enter; and each shown step's "next", as
+/// its screen shows it with the answer about to be given.
 fn outlook_steps_shown(answers: &[(&str, &str)]) -> Vec<(&'static str, Option<&'static str>)> {
     let mut session = Session::new(&steps::OUTLOOK, true, |_| None).unwrap();
     let mut shown = Vec::new();
     let mut prompt = session.prompt();
     loop {
         let event = match prompt {
-            Prompt::Show(view) => {
-                shown.push((view.step.title, view.next));
-                match view.step.kind {
-                    Kind::Ask(_) => {
-                        let answer = answers.iter().find(|(id, _)| *id == view.step.id);
-                        Event::Answer(answer.map_or("x@example.com", |(_, a)| a).to_owned())
-                    }
-                    _ => Event::Continue,
+            Prompt::Show(view) => match view.step.kind {
+                Kind::Ask(_) => {
+                    let answer = answers.iter().find(|(id, _)| *id == view.step.id);
+                    let answer = answer.map_or("x@example.com", |(_, a)| a);
+                    shown.push((view.step.title, session.preview(answer).next));
+                    Event::Answer(answer.to_owned())
                 }
-            }
+                _ => {
+                    shown.push((view.step.title, view.next));
+                    Event::Continue
+                }
+            },
             _ => return shown,
         };
         prompt = session.next(event);
@@ -949,7 +952,11 @@ fn each_account_type_and_sign_in_method_sees_only_its_steps() {
         ),
     ];
     for (kind, method, shown, hidden) in cases {
-        let steps = outlook_steps_shown(&[("account-type", kind), ("sign-in-method", method)]);
+        let steps = outlook_steps_shown(&[
+            ("account-type", kind),
+            ("sign-in-method", method),
+            ("client-id", OUTLOOK_ID),
+        ]);
         let titles: Vec<&str> = steps.iter().map(|(t, _)| *t).collect();
         assert!(titles.contains(&"Register the app"), "{titles:?}");
         for title in shown {
@@ -991,13 +998,13 @@ fn outlook_sign_in_errors_name_their_step() {
             "personal",
             Flow::DeviceCode,
             exchange_error(&MICROSOFT, confidential),
-            "step 6 of 15 (Allow public client flows)",
+            "step 7 of 15 (Allow public client flows)",
         ),
         (
             "personal",
             Flow::Browser,
             exchange_error(&MICROSOFT, confidential),
-            "step 5 of 15 (Add the redirect URI)",
+            "step 6 of 15 (Add the redirect URI)",
         ),
         (
             "personal",
@@ -1015,7 +1022,7 @@ fn outlook_sign_in_errors_name_their_step() {
             "work",
             Flow::Browser,
             declined(),
-            "step 7 of 15 (Your organisation may need to approve the app)",
+            "step 8 of 15 (Your organisation may need to approve the app)",
         ),
         // A personal account has no admin to ask: the run ends at the sign-in.
         (
@@ -1077,15 +1084,16 @@ fn an_outlook_sign_in_that_times_out_names_the_steps_microsoft_shows_mistakes_fo
 fn device_code_is_the_sign_in_method_without_asking_when_chosen_or_over_ssh() {
     for flow in [Flow::DeviceCode, Flow::AutoDeviceCode] {
         let w = World::new(&[MICROSOFT_KNOWN]);
-        // Account type, the console steps, address and name: no question about the method.
+        // Account type, the console steps, the client ID after Register, address and name: no
+        // question about the method.
         let lines = [
             "personal",
             "",
             "",
+            OUTLOOK_ID,
             "",
             "you@outlook.example",
             "",
-            OUTLOOK_ID,
         ];
         let mut term = Script::terminal(&lines, &[]);
         w.run(&MICROSOFT, flow, AddArgs::default(), &mut term, |e| {

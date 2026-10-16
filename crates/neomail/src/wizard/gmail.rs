@@ -28,8 +28,8 @@ const TWO_STEP_PAGE: &str = "https://myaccount.google.com/signinoptions/two-step
 /// What a refused login can mean. Repeated at the password step, since the eligibility step is
 /// skipped when nothing can be asked.
 const REFUSED_FIX: &str = "\
-Gmail refused this address and app password. Paste the app password from step 3, not your Google
-Account password, and check the address (step 5; on a terminal, press Esc to go back to it). Google
+Gmail refused this address and app password. Paste the app password you created, not your Google
+Account password, and check the address (on a terminal, Esc goes back to it). Google
 revokes app passwords when the Google Account password changes. App passwords need 2-Step
 Verification, and Google may offer none when it is set up only for security keys,
 for a work, school or other organisation account (its administrator may not allow them),
@@ -66,7 +66,7 @@ none in the cases 2 to 4 below. Pick the one that fits.",
                 // Google Workspace users can sign in to legacy apps with an app password, but
                 // not where the administrator requires security keys
                 // (https://knowledge.workspace.google.com/admin/security/how-2-step-verification-works-with-legacy-apps),
-                // so this case goes on and step 3 says what to do if the option is missing.
+                // so this case goes on and the create step says what to do if the option is missing.
                 Case {
                     label: "A work, school or other organisation account: its administrator may \
                             not allow app passwords. If \
@@ -97,23 +97,6 @@ Note: skip this if it is on. Google: \"App passwords can only be used with accou
                 "https://support.google.com/accounts/answer/185839",
             ],
             page: Some(TWO_STEP_PAGE),
-            kind: Kind::Console,
-        },
-        Step {
-            id: "create",
-            title: "Create an app password",
-            why: "\
-- Name it (\"neomail\", say), create it and copy it.
-It is what neomail logs in with, so your Google Account password never reaches neomail.
-Warning: if the page has no option to add one, Google may
-offer none for this account: with security keys only, add another second step; for a work,
-school or other organisation account, its administrator may not allow app passwords, so ask them or
-use `neomail account add gmail`.",
-            links: &[
-                "https://myaccount.google.com/apppasswords",
-                APP_PASSWORDS_HELP,
-            ],
-            page: Some("https://myaccount.google.com/apppasswords"),
             kind: Kind::Console,
         },
         Step {
@@ -166,10 +149,27 @@ use `neomail account add gmail`.",
             },
         },
         Step {
+            id: "create",
+            title: "Create an app password",
+            why: "\
+- Name it (\"neomail\", say), create it and copy it.
+It is what neomail logs in with, so your Google Account password never reaches neomail.
+Warning: if the page has no option to add one, Google may
+offer none for this account: with security keys only, add another second step; for a work,
+school or other organisation account, its administrator may not allow app passwords, so ask them or
+use `neomail account add gmail`.",
+            links: &[
+                "https://myaccount.google.com/apppasswords",
+                APP_PASSWORDS_HELP,
+            ],
+            page: Some("https://myaccount.google.com/apppasswords"),
+            kind: Kind::Console,
+        },
+        Step {
             id: "password",
             title: "Paste the app password",
-            why: "The app password from step 3, not your Google Account password. Spaces are \
-                  removed.",
+            why: "The app password you just created, not your Google Account password. Spaces \
+                  are removed.",
             links: &[],
             page: None,
             kind: Kind::Ask(Question {
@@ -417,15 +417,9 @@ pub fn run(
     };
     let write = |answers: &Answers<'_>| -> Result<Saved> {
         let name = answers.text("name").unwrap_or_default();
-        let mut saved = Vec::new();
         let stored = match (keyring.borrow().as_ref(), answers.secret("password")) {
             (Some(keyring), Some(password)) => {
                 keyring.set(name, password)?;
-                saved.push(format!(
-                    "the app password in {} (service {:?}, username {name:?})",
-                    keyring.name(),
-                    keyring::SERVICE
-                ));
                 format!(
                     "Its app password is in {} (service {:?}, username {name:?}).",
                     keyring.name(),
@@ -448,10 +442,7 @@ pub fn run(
             config_path.display(),
         )?;
         out.flush()?;
-        saved.push(format!("the account {name:?} in {}", config_path.display()));
         Ok(Saved {
-            saved,
-            next: Some(format!("neomail sync --account {name}")),
             said: format!(
                 "Google revokes app passwords when the Google Account password changes ({APP_PASSWORDS_HELP}): \
                  then create a new one and run `neomail account set-password {name}`."

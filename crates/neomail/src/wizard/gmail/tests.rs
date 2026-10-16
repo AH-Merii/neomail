@@ -320,10 +320,10 @@ fn a_refused_imap_or_smtp_login_names_the_password_step_and_writes_nothing() {
     }
 }
 
-/// The answers of a terminal run up to the password: the first case, Enter twice, the default
-/// name and an address.
+/// The answers of a terminal run up to the password: the first case, Enter, the default name,
+/// an address, and Enter at the step that creates the app password.
 fn typed(extra: &[&'static str]) -> Script {
-    let mut lines: VecDeque<_> = ["1", "", "", "", "you@example.com"].into();
+    let mut lines: VecDeque<_> = ["1", "", "", "you@example.com", ""].into();
     lines.extend(extra);
     Script {
         interactive: true,
@@ -351,7 +351,7 @@ fn on_a_terminal_a_refused_login_asks_for_the_app_password_again() {
 }
 
 #[test]
-fn a_work_or_school_account_goes_on_and_learns_at_step_3_what_to_do_if_none_is_offered() {
+fn a_work_or_school_account_goes_on_and_learns_at_the_create_step_what_to_do_if_none_is_offered() {
     let world = World::new(imap(APP_PASSWORD), smtp(false));
     let mut lines = typed(&[]).lines;
     lines[0] = "3";
@@ -367,8 +367,8 @@ fn a_work_or_school_account_goes_on_and_learns_at_step_3_what_to_do_if_none_is_o
         .frames
         .iter()
         .map(|f| f.lines.join("\n"))
-        .find(|screen| screen.starts_with("▸ Step 3/6 · Create an app password"))
-        .expect("step 3 is shown");
+        .find(|screen| screen.starts_with("▸ Step 5/6 · Create an app password"))
+        .expect("the create step is shown");
     for advice in [
         "the page has no option to add one",
         "administrator",
@@ -435,14 +435,14 @@ fn a_taken_name_is_asked_again_on_a_terminal_and_fails_off_one_before_the_passwo
     .unwrap();
     let mut term = piped(APP_PASSWORD);
     let e = format!("{:#}", world.run(address(), &mut term).unwrap_err());
-    assert!(e.starts_with("step 4 of 10 (Name the account): "), "{e}");
+    assert!(e.starts_with("step 3 of 10 (Name the account): "), "{e}");
     assert_eq!(term.secrets_asked, 0);
     assert!(world.imap.seen().is_empty());
 
     // The name is asked again right after it, before the address.
     let mut term = Script {
         interactive: true,
-        lines: ["1", "", "", "", "work", "you@example.com"].into(),
+        lines: ["1", "", "", "work", "you@example.com", ""].into(),
         secrets: [APP_PASSWORD].into(),
         ..Script::default()
     };
@@ -527,7 +527,7 @@ fn no_check_skips_the_login_but_not_the_name_check() {
         "{:#}",
         world.run(args(), &mut piped(APP_PASSWORD)).unwrap_err()
     );
-    assert!(e.starts_with("step 4 of 10 (Name the account): "), "{e}");
+    assert!(e.starts_with("step 3 of 10 (Name the account): "), "{e}");
 }
 
 #[test]
@@ -580,12 +580,12 @@ fn on_a_terminal_esc_goes_back_and_every_later_screen_names_it() {
     let world = World::new(imap(APP_PASSWORD), smtp(false));
     let mut term = Script {
         interactive: true,
-        lines: ["1", "", "<", "", "", "", "you@example.com"].into(),
+        lines: ["1", "", "<", "", "", "you@example.com", ""].into(),
         secrets: [APP_PASSWORD].into(),
         ..Script::default()
     };
     world.run(Args::default(), &mut term).unwrap();
-    // Step 2, then back to it from step 3.
+    // Step 2, then back to it from step 3, the name.
     let headers = |h: &str| term.said.matches(h).count();
     assert_eq!(
         headers("Step 2/6 · Turn on 2-Step Verification\n"),
@@ -619,4 +619,41 @@ fn on_a_terminal_an_empty_app_password_is_asked_again() {
         term.said
     );
     assert_eq!(world.stored("gmail").as_deref(), Some(APP_PASSWORD));
+}
+
+/// The closing summary says each fact once: the save already said where the account and the
+/// app password went and what to run next. A check `--no-check` skipped is listed as skipped.
+#[test]
+fn the_summary_says_each_fact_once_and_lists_a_skipped_check() {
+    for no_check in [false, true] {
+        let world = World::new(imap(APP_PASSWORD), smtp(false));
+        let mut term = Script {
+            secrets: [APP_PASSWORD].into(),
+            ..typed(&[])
+        };
+        let args = Args {
+            no_check,
+            ..Args::default()
+        };
+        // What the save printed, then the summary said after it.
+        let out = world.run(args, &mut term).unwrap();
+        let said = &format!("{out}{}", term.said);
+        assert_eq!(
+            said.matches("neomail sync --account gmail").count(),
+            1,
+            "{said}"
+        );
+        assert_eq!(said.matches("username \"gmail\"").count(), 1, "{said}");
+        let summary = &said[said.rfind("Set up a Gmail account").expect(said)..];
+        assert_eq!(
+            summary.contains("Check the login: skipped (--no-check)"),
+            no_check,
+            "{summary}"
+        );
+        assert_eq!(
+            summary.contains("✓ Check the login"),
+            !no_check,
+            "{summary}"
+        );
+    }
 }

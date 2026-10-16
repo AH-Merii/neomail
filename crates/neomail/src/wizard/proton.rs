@@ -73,6 +73,21 @@ Your Proton password goes only into Bridge, never into neomail.
             kind: Kind::Console,
         },
         Step {
+            id: "export",
+            title: "Export Bridge's certificate",
+            why: "\
+Bridge secures the connection with a certificate it made itself, which no authority vouches for.
+neomail pins it, and checks it against a copy you export from Bridge now, before the mailbox
+details are open.
+- In Bridge, open Settings > Advanced settings > Export TLS certificates and pick a folder, or run
+  `cert export` in `protonmail-bridge --cli`.
+Warning: the export also writes key.pem, Bridge's private key, next to cert.pem: delete it once
+the certificate is pinned.",
+            links: &[SETTINGS_GUIDE, "https://proton.me/support/bridge-cli-guide"],
+            page: None,
+            kind: Kind::Console,
+        },
+        Step {
             id: "name",
             title: "Name the account",
             why: "What neomail calls it, as in `neomail sync --account NAME`.",
@@ -210,13 +225,11 @@ under Settings > Advanced settings > Connection mode.",
             id: "certificate",
             title: "Pin Bridge's certificate",
             why: "\
-Bridge secures the connection with a certificate it made itself, which no authority vouches for.
-neomail pins its SHA-256, shown above: it then talks only to the server holding that
-certificate. To check that it is Bridge's own, rather than read over the same connection, export
-it from Bridge (Settings > Advanced settings > Export TLS certificates, or `cert export` in
-`protonmail-bridge --cli`) and give the path of its cert.pem here: neomail compares the two.
-Warning: the export also writes key.pem, Bridge's private key, next to it: delete that
-afterwards.",
+neomail pins the SHA-256 of the certificate Bridge presented, shown above: it then talks only to
+the server holding that certificate. Give the path of the cert.pem you exported and neomail
+compares the two, so the pin is Bridge's own certificate rather than one read over the same
+connection.
+Note: then delete the key.pem the export wrote next to it.",
             links: &[SETTINGS_GUIDE],
             page: None,
             kind: Kind::Ask(Question {
@@ -386,8 +399,8 @@ Advanced settings > Connection mode.";
 
 const REFUSED_FIX: &str = "\
 Bridge refused this username and password. Paste the password Bridge's mailbox details show, not
-your Proton password, and check the username (step 6). If Bridge lists no account, sign in to
-Bridge first (step 3).";
+your Proton password, and check the username (on a terminal, Esc goes back to it). If Bridge
+lists no account, sign in to Bridge first.";
 
 /// The username Bridge shows: usually an address. Bridge checks it; here it only has to be one
 /// word.
@@ -650,15 +663,9 @@ pub fn run(
         };
     let write = |answers: &Answers<'_>| -> Result<Saved> {
         let name = answers.text("name").unwrap_or_default();
-        let mut saved = Vec::new();
         let stored = match (keyring.borrow().as_ref(), answers.secret("password")) {
             (Some(keyring), Some(password)) => {
                 keyring.set(name, password)?;
-                saved.push(format!(
-                    "the Bridge password in {} (service {:?}, username {name:?})",
-                    keyring.name(),
-                    keyring::SERVICE
-                ));
                 format!(
                     "Its Bridge password is in {} (service {:?}, username {name:?}).",
                     keyring.name(),
@@ -682,10 +689,7 @@ pub fn run(
             config_path.display(),
         )?;
         out.flush()?;
-        saved.push(format!("the account {name:?} in {}", config_path.display()));
         Ok(Saved {
-            saved,
-            next: Some(format!("neomail sync --account {name}")),
             said: String::new(),
             todo: vec!["Keep Bridge running: neomail syncs and sends through it.".to_owned()],
         })

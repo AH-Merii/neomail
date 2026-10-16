@@ -34,13 +34,15 @@ neomail account add gmail-app-password
 1. Whether the account can have an app password, as above.
 2. Turn on 2-Step Verification at
    <https://myaccount.google.com/signinoptions/two-step-verification>, if it is off.
-3. Create an app password at <https://myaccount.google.com/apppasswords> and copy it. If the
-   page has no option to add one, see the cases above.
-4. The account's name in neomail (`--name`, default `gmail`).
-5. neomail checks that no account has that name yet.
-6. Your Gmail address (`--username`).
-7. neomail checks that the config file can take the account and the OS keyring opens, before it
+3. The account's name in neomail (`--name`, default `gmail`).
+4. neomail checks that no account has that name yet.
+5. Your Gmail address (`--username`).
+6. neomail checks that the config file can take the account and the OS keyring opens, before it
    asks for the app password.
+7. Create an app password at <https://myaccount.google.com/apppasswords> and copy it. If the
+   page has no option to add one, see the cases above.
+   This step comes right before the one that asks for it, since Google says "Every app password
+   can only be checked once" ([Google's help](https://support.google.com/accounts/answer/185833)).
 8. Paste the app password. It is not shown, and spaces and no-break spaces are removed. A value
    that is not 16 letters or digits gets a warning but is still checked: Google calls it "a
    16-digit passcode" ([Google's help](https://support.google.com/accounts/answer/185833)).
@@ -58,7 +60,7 @@ value given as a flag, ends the run.
 
 ## In scripts
 
-Off a terminal, or with `--no-input`, steps 1 to 3 are skipped and `--username` is needed. The
+Off a terminal, or with `--no-input`, steps 1, 2 and 7 are skipped and `--username` is needed. The
 app password is read as one line of standard input, or comes from `--password-command`, which
 must print it without spaces: they are removed only from a pasted or piped app password.
 
