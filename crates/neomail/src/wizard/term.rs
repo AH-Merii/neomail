@@ -53,6 +53,9 @@ pub trait Term {
     fn raw(&mut self, on: bool) -> Result<()>;
     /// The next key, in raw mode.
     fn key(&mut self) -> Result<Key>;
+    /// The next key if one comes within `wait`, in raw mode: a screen that also watches for
+    /// something else, such as a command's result, reads keys this way.
+    fn key_within(&mut self, wait: std::time::Duration) -> Result<Option<Key>>;
     /// Replaces what is on the screen with `frame`.
     fn draw(&mut self, frame: &Frame);
     /// Text below what is on the screen, outside raw mode: progress, results, the summary, and
@@ -133,36 +136,24 @@ impl Term for Tty {
     }
 
     fn key(&mut self) -> Result<Key> {
-        use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
         loop {
-            match event::read().context("cannot read a key")? {
-                Event::Resize(..) => return Ok(Key::Resize),
-                Event::Key(k) if k.kind != KeyEventKind::Release => {
-                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                    return Ok(match k.code {
-                        KeyCode::Char('c' | 'd') if ctrl => Key::Interrupt,
-                        KeyCode::Char('u') if ctrl => Key::ClearLine,
-                        KeyCode::Char('n') if ctrl => Key::Down,
-                        KeyCode::Char('p') if ctrl => Key::Up,
-                        KeyCode::Char(_) if ctrl => Key::Other,
-                        KeyCode::Char(c) => Key::Char(c),
-                        KeyCode::Enter => Key::Enter,
-                        KeyCode::Esc => Key::Esc,
-                        KeyCode::Backspace => Key::Backspace,
-                        KeyCode::Delete => Key::Delete,
-                        KeyCode::Left => Key::Left,
-                        KeyCode::Right => Key::Right,
-                        KeyCode::Up => Key::Up,
-                        KeyCode::Down => Key::Down,
-                        KeyCode::Home => Key::Home,
-                        KeyCode::End => Key::End,
-                        KeyCode::Tab => Key::Tab,
-                        KeyCode::PageUp => Key::PageUp,
-                        KeyCode::PageDown => Key::PageDown,
-                        _ => Key::Other,
-                    });
-                }
-                _ => {}
+            let event = crossterm::event::read().context("cannot read a key")?;
+            if let Some(key) = key_of(event) {
+                return Ok(key);
+            }
+        }
+    }
+
+    fn key_within(&mut self, wait: std::time::Duration) -> Result<Option<Key>> {
+        let until = std::time::Instant::now() + wait;
+        loop {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if !crossterm::event::poll(left).context("cannot read a key")? {
+                return Ok(None);
+            }
+            let event = crossterm::event::read().context("cannot read a key")?;
+            if let Some(key) = key_of(event) {
+                return Ok(Some(key));
             }
         }
     }
@@ -185,6 +176,40 @@ impl Term for Tty {
 
     fn secret_line(&mut self, prompt: &str) -> Result<String> {
         secret::read_secret(prompt, self.what, self.input)
+    }
+}
+
+/// The key a terminal event is, if the wizard reads it: a press or repeat, or a resize.
+fn key_of(event: crossterm::event::Event) -> Option<Key> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+    match event {
+        Event::Resize(..) => Some(Key::Resize),
+        Event::Key(k) if k.kind != KeyEventKind::Release => {
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            Some(match k.code {
+                KeyCode::Char('c' | 'd') if ctrl => Key::Interrupt,
+                KeyCode::Char('u') if ctrl => Key::ClearLine,
+                KeyCode::Char('n') if ctrl => Key::Down,
+                KeyCode::Char('p') if ctrl => Key::Up,
+                KeyCode::Char(_) if ctrl => Key::Other,
+                KeyCode::Char(c) => Key::Char(c),
+                KeyCode::Enter => Key::Enter,
+                KeyCode::Esc => Key::Esc,
+                KeyCode::Backspace => Key::Backspace,
+                KeyCode::Delete => Key::Delete,
+                KeyCode::Left => Key::Left,
+                KeyCode::Right => Key::Right,
+                KeyCode::Up => Key::Up,
+                KeyCode::Down => Key::Down,
+                KeyCode::Home => Key::Home,
+                KeyCode::End => Key::End,
+                KeyCode::Tab => Key::Tab,
+                KeyCode::PageUp => Key::PageUp,
+                KeyCode::PageDown => Key::PageDown,
+                _ => Key::Other,
+            })
+        }
+        _ => None,
     }
 }
 

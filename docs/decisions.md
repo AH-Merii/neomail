@@ -1469,3 +1469,58 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   sees.
 - **Builds on:** [DEC-2026-10-13-wizard-steps](#dec-2026-10-13-wizard-steps) and
   [DEC-2026-10-14-help-logo](#dec-2026-10-14-help-logo).
+
+### <a id="dec-2026-10-16-commands-route"></a>DEC-2026-10-16-commands-route: commands to paste, and how the wizard picks up their result
+
+- **Status:** proposed by Claude on 2026-10-16, for issue #105.
+- **Proposal:**
+  - **A route question.** The Outlook wizard asks, once the user has a directory (personal) or
+    from the start (work or school), `portal` (the browser steps) or `commands`. It has no flag:
+    off a terminal and with `--no-input` its default, `portal`, answers it, and the flags work as
+    before. The sign-in method is asked right after it on both routes, since the commands need it.
+  - **A short paste that runs a script file**, as the owner decided
+    ([#105 comment](https://github.com/AH-Merii/neomail/issues/105#issuecomment-6214831846)):
+    `sh '/home/you/.local/share/neomail/runs/12345/setup.sh'`, the same in fish, zsh, bash and
+    sh. `Kind::Run` writes the step's script as `setup.sh` (mode 0600) into the step's result
+    directory and shows the paste (`Inbox::paste`, `wizard/capture.rs`); a path holding `'`, `\`
+    or a control character gets no paste, and the step says so. The Azure script
+    (`crates/neomail/src/oauth/azure.rs`) is commented POSIX sh. It signs in with a throwaway
+    `AZURE_CONFIG_DIR` from `mktemp -d`, set up in a subshell; the script traps INT, HUP and TERM
+    with `:`, so after a failure or Ctrl-C it still writes the result and removes the directory.
+    The subshell also exports `AZURE_CORE_LOGIN_EXPERIENCE_V2=off`, or `az login` on a terminal
+    waits at its subscription selector for Enter (azure-cli's profile `login`), and
+    `AZURE_CORE_COLLECT_TELEMETRY=no`, or az's detached telemetry uploader makes the removed
+    directory again (azure-cli's `telemetry.py`); knack reads any option from
+    `AZURE_<SECTION>_<OPTION>`
+    ([Azure CLI configuration](https://learn.microsoft.com/en-us/cli/azure/azure-cli-configuration)).
+    The live check of #105 found both. The user's own az setup is never read or changed. The
+    commands route asks the directory on both account types and passes it to `az login --tenant`:
+    without it az signs in to every tenant the account reaches and acts on the first with a
+    subscription.
+  - **The result is picked up, not copied.** A step of the new kind `Kind::Run` names the
+    question it answers (`fills`); its script holds `{result}`, which the driver replaces with a
+    directory it makes for the step under the data directory (`runs/PID`, mode 0700,
+    `wizard/capture.rs`), quoted for sh, and removes with the script when the step ends. The
+    script writes `ok` and the value, or `failed`, the stage and what the command said, to a
+    temporary name and renames it to `result`. The screen polls for it every 250 ms while it waits
+    for keys
+    (`Term::key_within`): a value goes on by itself and is shown on the next screen to correct
+    (Esc goes back), a failure shows the step's own advice and keeps watching. A value can be
+    typed instead, for a script run on another machine, which prints it; `Run::wrong` says what
+    to fix in a typed one, as the question's own advice may point to a page the route skips.
+  - **Conditions on more than one answer.** `When` names an answer a step needs; `ConsoleIf`,
+    the new `AskIf` (a question asked only on a terminal) and `Run` take a list of them, all of
+    which must hold. A question a shown `Run` fills is not shown. A failed check sends the user to
+    the first mistake whose step is on the route taken, or to the `Run` that fills it, so the
+    commands route has its own mistakes before those of the browser steps.
+  - **For #110:** the Google Cloud CLI route reuses `Kind::Run`, `capture.rs` and the result
+    format; only the script and its failure advice are its own.
+- **Rejected:** one `sh -c '...'` line holding the whole script (1,126 characters, with no `'` or
+  `\` so no comments or layout, and too long to copy whole at small window sizes); reading the
+  client ID from the clipboard or from the terminal's scrollback (neither is reachable from
+  neomail's process); a pipe or socket the script writes to (a file needs nothing but `cp` and `mv`
+  from sh, and survives the wizard redrawing); running az from neomail itself (it would sign in as
+  the user inside neomail's process and need az on the same machine); a fixed result path (two runs
+  at once would read each other's result).
+- **Builds on:** [DEC-2026-10-13-wizard-steps](#dec-2026-10-13-wizard-steps) and
+  [DEC-2026-10-15-wizard-ui](#dec-2026-10-15-wizard-ui).

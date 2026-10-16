@@ -6,6 +6,7 @@
 //! Tokens and the client secret are [`Secret`]s, whose `Debug` is redacted; errors never quote
 //! them, nor a token endpoint's response body.
 
+pub mod azure;
 pub mod check;
 pub mod device;
 pub mod loopback;

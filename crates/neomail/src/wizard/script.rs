@@ -46,6 +46,11 @@ pub struct Script {
     pub can_print: Rc<Cell<bool>>,
     /// A screen was drawn and the cursor is still on it.
     pub on_screen: bool,
+    /// At a screen that waits for a command's result ([`Term::key_within`]) with no key
+    /// scripted: how many waits pass with no key, each calling `on_wait` first (it may write the
+    /// result), before the screen is answered from `lines`.
+    pub waits: usize,
+    pub on_wait: Option<Box<dyn FnMut()>>,
 }
 
 impl Script {
@@ -180,6 +185,18 @@ impl Term for Script {
             self.answer()?;
         }
         Ok(self.pending.pop_front().unwrap_or(Key::Enter))
+    }
+
+    fn key_within(&mut self, _wait: std::time::Duration) -> Result<Option<Key>> {
+        assert!(self.raw, "a key read outside raw mode");
+        if self.keys.is_empty() && self.pending.is_empty() && self.waits > 0 {
+            self.waits -= 1;
+            if let Some(on_wait) = self.on_wait.as_mut() {
+                on_wait();
+            }
+            return Ok(None);
+        }
+        self.key().map(Some)
     }
 
     fn draw(&mut self, frame: &Frame) {

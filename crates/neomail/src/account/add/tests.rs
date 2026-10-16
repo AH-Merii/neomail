@@ -867,15 +867,15 @@ fn microsoft_answers_to_the_app_check_name_the_step_to_change() {
     let cases = [
         (
             r#"{"error":"invalid_request","error_codes":[50059],"error_description":"AADSTS50059: No tenant-identifying information found."}"#,
-            "step 4 of 15 (Paste the Application (client) ID): Microsoft answered:",
+            "step 9 of 19 (Paste the Application (client) ID): Microsoft answered:",
         ),
         (
             r#"{"error":"unauthorized_client","error_codes":[700016],"error_description":"AADSTS700016: Application not found."}"#,
-            "step 4 of 15 (Paste the Application (client) ID):",
+            "step 9 of 19 (Paste the Application (client) ID):",
         ),
         (
             r#"{"error":"invalid_request","error_codes":[50194],"error_description":"AADSTS50194: not multitenant."}"#,
-            "step 3 of 15 (Register the app):",
+            "step 7 of 19 (Register the app):",
         ),
     ];
     for (answer, want) in cases {
@@ -905,7 +905,11 @@ fn outlook_steps_shown(answers: &[(&str, &str)]) -> Vec<(&'static str, Option<&'
     loop {
         let event = match prompt {
             Prompt::Show(view) => match view.step.kind {
-                Kind::Ask(_) => {
+                Kind::Run(_) => {
+                    shown.push((view.step.title, view.next));
+                    Event::Answer(OUTLOOK_ID.to_owned())
+                }
+                Kind::Ask(_) | Kind::AskIf(..) => {
                     let answer = answers.iter().find(|(id, _)| *id == view.step.id);
                     let answer = answer.map_or("x@example.com", |(_, a)| a);
                     shown.push((view.step.title, session.preview(answer).next));
@@ -924,55 +928,71 @@ fn outlook_steps_shown(answers: &[(&str, &str)]) -> Vec<(&'static str, Option<&'
 
 #[test]
 fn each_account_type_and_sign_in_method_sees_only_its_steps() {
-    // (account type, sign-in method, shown, not shown)
-    let cases = [
+    const DIRECTORY: &str = "Get a directory: a free Azure account";
+    const REGISTER: &str = "Register the app";
+    const PASTE: &str = "Paste the Application (client) ID";
+    const REDIRECT: &str = "Add the redirect URI";
+    const PUBLIC: &str = "Allow public client flows";
+    const CONSENT: &str = "Your organisation may need to approve the app";
+    const NAME_IT: &str = "Your directory";
+    const WHICH: &str = "Which app";
+    const RUN: &str = "Run the Azure CLI commands";
+    // (account type, route, sign-in method, shown, not shown)
+    type Case<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], &'a [&'a str]);
+    let cases: [Case<'_>; 4] = [
         (
             "personal",
+            "portal",
             "browser",
-            [
-                "Get a directory: a free Azure account",
-                "Add the redirect URI",
-            ],
-            [
-                "Your organisation may need to approve the app",
-                "Allow public client flows",
-            ],
+            &[DIRECTORY, REGISTER, PASTE, REDIRECT],
+            &[CONSENT, PUBLIC, NAME_IT, WHICH, RUN],
         ),
         (
             "work",
+            "portal",
             "device-code",
-            [
-                "Your organisation may need to approve the app",
-                "Allow public client flows",
-            ],
-            [
-                "Get a directory: a free Azure account",
-                "Add the redirect URI",
-            ],
+            &[CONSENT, REGISTER, PASTE, PUBLIC],
+            &[DIRECTORY, REDIRECT, NAME_IT, WHICH, RUN],
+        ),
+        (
+            "personal",
+            "commands",
+            "browser",
+            &[DIRECTORY, NAME_IT, WHICH, RUN],
+            &[REGISTER, PASTE, REDIRECT, PUBLIC, CONSENT],
+        ),
+        (
+            "work",
+            "commands",
+            "device-code",
+            &[NAME_IT, WHICH, RUN, CONSENT],
+            &[DIRECTORY, REGISTER, PASTE, REDIRECT, PUBLIC],
         ),
     ];
-    for (kind, method, shown, hidden) in cases {
+    for (kind, route, method, shown, hidden) in cases {
         let steps = outlook_steps_shown(&[
             ("account-type", kind),
+            ("route", route),
             ("sign-in-method", method),
+            ("directory", "contoso.onmicrosoft.com"),
+            ("app", ""),
             ("client-id", OUTLOOK_ID),
         ]);
         let titles: Vec<&str> = steps.iter().map(|(t, _)| *t).collect();
-        assert!(titles.contains(&"Register the app"), "{titles:?}");
         for title in shown {
             assert!(
-                titles.contains(&title),
-                "{kind} {method}: {title} in {titles:?}"
+                titles.contains(title),
+                "{kind} {route} {method}: {title} in {titles:?}"
             );
         }
         for title in hidden {
             assert!(
-                !titles.contains(&title),
-                "{kind} {method}: {title} in {titles:?}"
+                !titles.contains(title),
+                "{kind} {route} {method}: {title} in {titles:?}"
             );
             // Nor is it announced as the next step.
             assert!(
-                steps.iter().all(|(_, next)| *next != Some(title)),
+                steps.iter().all(|(_, next)| next != &Some(*title)),
                 "{title}: {steps:?}"
             );
         }
@@ -998,13 +1018,13 @@ fn outlook_sign_in_errors_name_their_step() {
             "personal",
             Flow::DeviceCode,
             exchange_error(&MICROSOFT, confidential),
-            "step 7 of 15 (Allow public client flows)",
+            "step 11 of 19 (Allow public client flows)",
         ),
         (
             "personal",
             Flow::Browser,
             exchange_error(&MICROSOFT, confidential),
-            "step 6 of 15 (Add the redirect URI)",
+            "step 10 of 19 (Add the redirect URI)",
         ),
         (
             "personal",
@@ -1016,20 +1036,20 @@ fn outlook_sign_in_errors_name_their_step() {
                     r#"{"error":"invalid_request","error_codes":[9002332]}"#,
                 ),
             ),
-            "step 3 of 15 (Register the app)",
+            "step 7 of 19 (Register the app)",
         ),
         (
             "work",
             Flow::Browser,
             declined(),
-            "step 8 of 15 (Your organisation may need to approve the app)",
+            "step 12 of 19 (Your organisation may need to approve the app)",
         ),
         // A personal account has no admin to ask: the run ends at the sign-in.
         (
             "personal",
             Flow::Browser,
             declined(),
-            "step 13 of 15 (Sign in): access was declined",
+            "step 17 of 19 (Sign in): access was declined",
         ),
     ];
     for (kind, flow, error, want) in cases {
@@ -1067,7 +1087,7 @@ fn an_outlook_sign_in_that_times_out_names_the_steps_microsoft_shows_mistakes_fo
         .unwrap_err()
         .to_string();
     assert!(
-        e.starts_with("step 3 of 15 (Register the app): no sign-in came back"),
+        e.starts_with("step 7 of 19 (Register the app): no sign-in came back"),
         "{e}"
     );
     assert!(
@@ -1084,11 +1104,12 @@ fn an_outlook_sign_in_that_times_out_names_the_steps_microsoft_shows_mistakes_fo
 fn device_code_is_the_sign_in_method_without_asking_when_chosen_or_over_ssh() {
     for flow in [Flow::DeviceCode, Flow::AutoDeviceCode] {
         let w = World::new(&[MICROSOFT_KNOWN]);
-        // Account type, the console steps, the client ID after Register, address and name: no
-        // question about the method.
+        // Account type, the console steps, the route, the client ID after Register, address
+        // and name: no question about the method.
         let lines = [
             "personal",
             "",
+            "portal",
             "",
             OUTLOOK_ID,
             "",
