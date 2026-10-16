@@ -32,14 +32,23 @@ fn every_question_but_a_secret_has_a_flag_of_account_add() {
     let mut questions = 0;
     for wizard in ALL {
         for step in wizard.steps {
-            let Kind::Ask(q) = &step.kind else { continue };
+            let Some(q) = step.kind.question() else {
+                continue;
+            };
             questions += 1;
             match q.flag {
                 Some(flag) => {
                     assert!(!q.secret, "{}: a secret is never a flag", step.id);
                     assert!(flags.iter().any(|f| f == flag), "{}: no {flag}", step.id);
                 }
-                None => assert!(q.secret, "{}/{} has no flag", wizard.id, step.id),
+                // Read from standard input, answered by its default, or asked only on a
+                // terminal: a script never needs it.
+                None => assert!(
+                    q.secret || q.default.is_some() || matches!(step.kind, Kind::AskIf(..)),
+                    "{}/{} has no flag",
+                    wizard.id,
+                    step.id
+                ),
             }
         }
     }
@@ -276,7 +285,7 @@ Warning: mind the key.pem.",
 /// answers waits on an answer not given yet.
 #[test]
 fn the_step_count_grows_only_while_an_answer_it_depends_on_is_missing() {
-    use crate::oauth::steps::{DEVICE_CODE, OUTLOOK, WORK};
+    use crate::oauth::steps::{DEVICE_CODE, OUTLOOK, PORTAL, WORK};
     let open = Session::new(&OUTLOOK, true, |_| None).unwrap();
     assert!(open.depends_on_answers());
     let flags = |f: &str| match f {
@@ -284,7 +293,10 @@ fn the_step_count_grows_only_while_an_answer_it_depends_on_is_missing() {
         "--device-code" => Some(DEVICE_CODE.to_owned()),
         _ => None,
     };
-    let decided = Session::new(&OUTLOOK, true, flags).unwrap();
+    let mut decided = Session::new(&OUTLOOK, true, flags).unwrap();
+    // The route has no flag: it is the first question left.
+    assert!(decided.depends_on_answers());
+    decided.next(Event::Answer(PORTAL.to_owned()));
     assert!(!decided.depends_on_answers());
     assert!(
         !Session::new(&GMAIL_APP_PASSWORD, true, |_| None)
@@ -332,10 +344,10 @@ static GROWS: Wizard = Wizard {
             why: "",
             links: &[],
             page: None,
-            kind: Kind::ConsoleIf {
+            kind: Kind::ConsoleIf(&[When {
                 step: "more",
                 is: &["yes"],
-            },
+            }]),
         },
         Step {
             id: "last",
@@ -443,6 +455,7 @@ fn a_step_asked_again_after_a_check_leads_back_to_the_check_without_repeating_ad
             }
             Prompt::Show(v) if v.step.id == "email" => Event::Answer("you@example.com".into()),
             Prompt::Show(v) if v.step.id == "account-type" => Event::Answer("personal".into()),
+            Prompt::Show(v) if v.step.id == "route" => Event::Answer("portal".into()),
             Prompt::Show(v) if v.step.id == "sign-in-method" => Event::Answer("browser".into()),
             Prompt::Show(v) if v.step.id == "name" => Event::Answer("outlook".into()),
             _ => Event::Continue,
@@ -460,10 +473,10 @@ fn a_step_asked_again_after_a_check_leads_back_to_the_check_without_repeating_ad
     };
     assert_eq!(
         (again.step.id, again.seen, again.seen_total),
-        ("client-id", 4, 8)
+        ("client-id", 6, 9)
     );
     assert!(
-        again.outline[4..]
+        again.outline[6..]
             .iter()
             .all(|(_, place)| *place == Place::Done),
         "{:?}",
@@ -474,4 +487,49 @@ fn a_step_asked_again_after_a_check_leads_back_to_the_check_without_repeating_ad
         matches!(&after, Prompt::Check(v, _) if v.step.id == "ready"),
         "{after:?}"
     );
+}
+
+/// On the commands route, a client ID Microsoft does not know, or an app set up wrong, sends
+/// the user back to the commands step, which the route shows, not to the browser steps.
+#[test]
+fn on_the_commands_route_a_failed_check_goes_back_to_the_commands() {
+    use crate::oauth::steps::{NOT_MULTITENANT, OUTLOOK, UNKNOWN_ID};
+    for kind in [UNKNOWN_ID, NOT_MULTITENANT] {
+        let mut s = Session::new(&OUTLOOK, true, |_| None).unwrap();
+        let mut steps = 0;
+        while !matches!(s.prompt(), Prompt::Check(ref v, _) if v.step.id == "client-check") {
+            let event = match s.prompt() {
+                Prompt::Check(..) => Event::Checked(Ok(())),
+                Prompt::Show(v) => match v.step.id {
+                    "account-type" => Event::Answer("work".into()),
+                    "route" => Event::Answer("commands".into()),
+                    "sign-in-method" => Event::Answer("browser".into()),
+                    "directory" => Event::Answer("contoso.com".into()),
+                    "app" => Event::Answer(String::new()),
+                    "commands" => Event::Answer("00000000-0000-0000-0000-000000000000".into()),
+                    "email" => Event::Answer("you@example.com".into()),
+                    "name" => Event::Answer("outlook".into()),
+                    _ => Event::Continue,
+                },
+                other => panic!("{other:?}"),
+            };
+            s.next(event);
+            steps += 1;
+            assert!(steps < 30);
+        }
+        let error = CheckError {
+            kind,
+            detail: "Microsoft said no".into(),
+        };
+        let Prompt::Show(again) = s.next(Event::Checked(Err(error))) else {
+            panic!()
+        };
+        assert_eq!(again.step.id, "commands", "{kind}");
+        assert!(
+            again
+                .fix
+                .is_some_and(|f| f.contains("Run the commands again")),
+            "{kind}"
+        );
+    }
 }

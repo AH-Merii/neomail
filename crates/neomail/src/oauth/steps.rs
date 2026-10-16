@@ -4,7 +4,7 @@
 //!
 //! Console labels drift, so each step quotes its provider briefly and links the page.
 
-use crate::wizard::{Choice, Cleaned, Kind, Mistake, Question, Step, Wizard};
+use crate::wizard::{Choice, Cleaned, Kind, Mistake, Question, Run, Step, When, Wizard};
 
 // What a failed check can mean: the `kind` of a `CheckError`, matched in the tables' mistakes.
 pub const NAME_TAKEN: &str = "name-taken";
@@ -30,6 +30,12 @@ pub const PERSONAL: &str = "personal";
 pub const WORK: &str = "work";
 pub const BROWSER: &str = "browser";
 pub const DEVICE_CODE: &str = "device-code";
+/// The routes to the Entra app: the browser steps in the admin center, or the Azure CLI
+/// commands (#105).
+pub const PORTAL: &str = "portal";
+pub const COMMANDS: &str = "commands";
+/// The display name the commands set up or pick up.
+pub const COMMANDS_APP: &str = "neomail";
 
 const NAME_STEP_WHY: &str = "What neomail calls the account, as in `neomail sync --account NAME`.";
 const READY_WHY: &str = "The name is free, the config file can take the account and the keyring \
@@ -404,42 +410,36 @@ says you can't register apps until you have one.
                 "https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-create-new-tenant",
             ],
             page: Some("https://azure.microsoft.com/pricing/purchase-options/azure-account"),
-            kind: Kind::ConsoleIf {
+            kind: Kind::ConsoleIf(&[When {
                 step: "account-type",
                 is: &[PERSONAL],
-            },
+            }]),
         },
         Step {
-            id: "register",
-            title: "Register the app",
+            id: "route",
+            title: "Browser steps or Azure CLI commands?",
             why: "\
-- At entra.microsoft.com: Entra ID > App registrations > New registration, any name. Under
-  Supported account types choose Any Entra ID Tenant + Personal Microsoft accounts (not the
-  suggested Single tenant), then Register.
-Why: neomail signs in through Microsoft's common endpoint, which needs that type.",
-            links: &[
-                "https://entra.microsoft.com",
-                "https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app",
-            ],
-            page: Some("https://entra.microsoft.com"),
-            kind: Kind::Console,
-        },
-        Step {
-            id: "client-id",
-            title: "Paste the Application (client) ID",
-            why: "\
-Register opens the app's Overview page: copy its Application (client) ID, not the Directory
-(tenant) ID or the Object ID. There is no secret: neomail runs on your machine, so it cannot
-keep one.",
-            links: &[],
+portal: follow the steps in the Microsoft Entra admin center. commands: paste one line into a
+terminal with the Azure CLI (az) installed; it sets up the same app and hands its client ID
+back here.",
+            links: &["https://learn.microsoft.com/en-us/cli/azure/install-azure-cli"],
             page: None,
             kind: Kind::Ask(Question {
-                flag: Some("--client-id"),
-                prompt: "Application (client) ID: ",
+                flag: None,
+                prompt: "portal or commands? ",
                 secret: false,
-                default: None,
-                choices: &[],
-                clean: clean_guid,
+                default: Some(PORTAL),
+                choices: &[
+                    Choice {
+                        value: PORTAL,
+                        label: "the steps in the Microsoft Entra admin center",
+                    },
+                    Choice {
+                        value: COMMANDS,
+                        label: "one line to paste, with the Azure CLI",
+                    },
+                ],
+                clean: clean_route,
             }),
         },
         Step {
@@ -447,7 +447,8 @@ keep one.",
             title: "How you will sign in",
             why: "\
 browser: in a browser on this machine. device-code: with a code, on another device (chosen
-for you over SSH without a display). It decides the next step.",
+for you over SSH without a display). It decides what the app needs: a redirect URI, or public
+client flows.",
             links: &[],
             page: None,
             kind: Kind::Ask(Question {
@@ -469,6 +470,121 @@ for you over SSH without a display). It decides the next step.",
             }),
         },
         Step {
+            id: "directory",
+            title: "Your directory",
+            why: "\
+The commands sign in to the Azure CLI in this directory, so the app goes there whatever az
+was signed in to before.
+- Work or school: type the domain of your work address, such as contoso.com.
+- Personal: at entra.microsoft.com, Entra ID > Overview shows it: copy the Primary domain
+  (NAME.onmicrosoft.com) or the Tenant ID.",
+            links: &["https://entra.microsoft.com"],
+            page: None,
+            kind: Kind::AskIf(
+                &[When {
+                    step: "route",
+                    is: &[COMMANDS],
+                }],
+                Question {
+                    flag: None,
+                    prompt: "Directory (a domain such as contoso.com, or tenant ID): ",
+                    secret: false,
+                    default: None,
+                    choices: &[],
+                    clean: clean_directory,
+                },
+            ),
+        },
+        Step {
+            id: "app",
+            title: "Which app",
+            why: "\
+- Enter: the commands set up the app named exactly neomail, made in the browser or by an
+  earlier run, or make it if there is none.
+- An app with another name, or two named neomail? Type the Application (client) ID of the one
+  to use: the commands set up that one.
+Note: the name must match exactly, case too: an app named Neomail is not picked up, and the
+commands make a new one beside it.",
+            links: &[],
+            page: None,
+            kind: Kind::AskIf(
+                &[When {
+                    step: "route",
+                    is: &[COMMANDS],
+                }],
+                Question {
+                    flag: None,
+                    prompt: "App (Enter for neomail, or a client ID): ",
+                    secret: false,
+                    default: Some(COMMANDS_APP),
+                    choices: &[],
+                    clean: clean_app,
+                },
+            ),
+        },
+        Step {
+            id: "register",
+            title: "Register the app",
+            why: "\
+- At entra.microsoft.com: Entra ID > App registrations > New registration, any name. Under
+  Supported account types choose Any Entra ID Tenant + Personal Microsoft accounts (not the
+  suggested Single tenant), then Register.
+Why: neomail signs in through Microsoft's common endpoint, which needs that type.",
+            links: &[
+                "https://entra.microsoft.com",
+                "https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app",
+            ],
+            page: Some("https://entra.microsoft.com"),
+            kind: Kind::ConsoleIf(&[When {
+                step: "route",
+                is: &[PORTAL],
+            }]),
+        },
+        Step {
+            id: "commands",
+            title: "Run the Azure CLI commands",
+            why: "\
+- Paste the line below into a terminal and run it. It runs a script neomail wrote, which
+  signs in to the Azure CLI in your browser, sets up the app for the sign-in method you
+  chose, and hands its client ID back.
+Note: it signs in with a folder of its own and removes it when it ends, so your own az
+sign-ins and default subscription stay as they were and no sign-in is left behind.
+Note: no browser here (over SSH)? Copy the script to a machine with one, run it there with
+sh, and type the client ID it prints.",
+            links: &[],
+            page: None,
+            kind: Kind::Run(Run {
+                when: &[When {
+                    step: "route",
+                    is: &[COMMANDS],
+                }],
+                fills: "client-id",
+                script: super::azure::script,
+                prompt: "Or type the client ID: ",
+                wrong: "That is not an Application (client) ID, which looks like \
+                        00000000-0000-0000-0000-000000000000. The script prints it after ok.",
+                failure: super::azure::failure,
+            }),
+        },
+        Step {
+            id: "client-id",
+            title: "Paste the Application (client) ID",
+            why: "\
+Register opens the app's Overview page: copy its Application (client) ID, not the Directory
+(tenant) ID or the Object ID. There is no secret: neomail runs on your machine, so it cannot
+keep one.",
+            links: &[],
+            page: None,
+            kind: Kind::Ask(Question {
+                flag: Some("--client-id"),
+                prompt: "Application (client) ID: ",
+                secret: false,
+                default: None,
+                choices: &[],
+                clean: clean_guid,
+            }),
+        },
+        Step {
             id: "redirect",
             title: "Add the redirect URI",
             why: "\
@@ -480,10 +596,16 @@ Note: under Web instead, Microsoft would take the app for a confidential client 
                 "https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-redirect-uri",
             ],
             page: None,
-            kind: Kind::ConsoleIf {
-                step: "sign-in-method",
-                is: &[BROWSER],
-            },
+            kind: Kind::ConsoleIf(&[
+                When {
+                    step: "route",
+                    is: &[PORTAL],
+                },
+                When {
+                    step: "sign-in-method",
+                    is: &[BROWSER],
+                },
+            ]),
         },
         Step {
             id: "public-client",
@@ -496,10 +618,16 @@ app is a public client, which has no secret.",
                 "https://learn.microsoft.com/en-us/troubleshoot/entra/entra-id/app-integration/confidential-client-application-authentication-error-aadsts7000218",
             ],
             page: None,
-            kind: Kind::ConsoleIf {
-                step: "sign-in-method",
-                is: &[DEVICE_CODE],
-            },
+            kind: Kind::ConsoleIf(&[
+                When {
+                    step: "route",
+                    is: &[PORTAL],
+                },
+                When {
+                    step: "sign-in-method",
+                    is: &[DEVICE_CODE],
+                },
+            ]),
         },
         Step {
             id: "consent",
@@ -515,10 +643,10 @@ sign in again.",
                 "https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/manage-app-consent-policies",
             ],
             page: None,
-            kind: Kind::ConsoleIf {
+            kind: Kind::ConsoleIf(&[When {
                 step: "account-type",
                 is: &[WORK],
-            },
+            }]),
         },
         Step {
             id: "email",
@@ -609,6 +737,62 @@ sign in again.",
             kind: NAME_TAKEN,
             step: "name",
             fix: "Choose another name (--name).",
+        },
+        // The commands route: the first mistake on the user's path is used, so these come
+        // before those of the browser steps, whose steps that route does not show.
+        Mistake {
+            check: "client-check",
+            kind: UNKNOWN_ID,
+            step: "commands",
+            fix: "Microsoft knows no app with this client ID. Run the commands again, or type the \
+                  client ID they printed.",
+        },
+        Mistake {
+            check: "client-check",
+            kind: NOT_MULTITENANT,
+            step: "commands",
+            fix: "The app does not take personal accounts yet. Run the commands again: they set \
+                  it to.",
+        },
+        Mistake {
+            check: "sign-in",
+            kind: TIMED_OUT,
+            step: "commands",
+            fix: "Microsoft shows these mistakes on its own page and never sends them back. Run \
+                  the commands again: they set the app up for the sign-in method you chose.",
+        },
+        Mistake {
+            check: "sign-in",
+            kind: NOT_MULTITENANT,
+            step: "commands",
+            fix: "The app does not take personal accounts yet. Run the commands again: they set \
+                  it to.",
+        },
+        Mistake {
+            check: "sign-in",
+            kind: WORK_ONLY,
+            step: "commands",
+            fix: "The app admits work or school accounts only. Run the commands again: they set \
+                  it to take personal accounts too.",
+        },
+        Mistake {
+            check: "sign-in",
+            kind: UNKNOWN_ID,
+            step: "commands",
+            fix: "Run the commands again, or type the client ID they printed.",
+        },
+        Mistake {
+            check: "sign-in",
+            kind: CONFIDENTIAL_DEVICE,
+            step: "commands",
+            fix: "Run the commands again for this sign-in method: they allow public client \
+                  flows.",
+        },
+        Mistake {
+            check: "sign-in",
+            kind: CONFIDENTIAL_BROWSER,
+            step: "commands",
+            fix: "Run the commands again for this sign-in method: they add the redirect URI.",
         },
         Mistake {
             check: "client-check",
@@ -773,5 +957,49 @@ fn clean_sign_in_method(typed: &str) -> Result<Cleaned, &'static str> {
         "browser" | "b" => Ok(Cleaned::ok(BROWSER)),
         "device-code" | "device" | "code" | "d" => Ok(Cleaned::ok(DEVICE_CODE)),
         _ => Err("Type browser or device-code."),
+    }
+}
+
+fn clean_route(typed: &str) -> Result<Cleaned, &'static str> {
+    match typed.trim().to_ascii_lowercase().as_str() {
+        "portal" | "p" | "browser" => Ok(Cleaned::ok(PORTAL)),
+        "commands" | "command" | "c" | "cli" | "az" => Ok(Cleaned::ok(COMMANDS)),
+        _ => Err("Type portal or commands."),
+    }
+}
+
+/// A directory as `az login --tenant` takes it: a tenant ID or a domain such as contoso.com or
+/// NAME.onmicrosoft.com. Letters, digits, dots and hyphens only, so the command needs no quotes.
+pub fn clean_directory(typed: &str) -> Result<Cleaned, &'static str> {
+    let dir = typed.trim();
+    if dir.contains('@') {
+        return Err(
+            "That is an address. Give the directory: for a work address, its domain \
+             (contoso.com); for a personal account, the Primary domain (NAME.onmicrosoft.com) or \
+             Tenant ID from Entra ID > Overview.",
+        );
+    }
+    let chars_ok = dir
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    if !dir.is_empty() && chars_ok && (dir.contains('.') || clean_guid(dir).is_ok()) {
+        Ok(Cleaned::ok(dir))
+    } else {
+        Err(
+            "That is not a directory: give a domain (contoso.com, NAME.onmicrosoft.com) or a \
+             Tenant ID, from Entra ID > Overview.",
+        )
+    }
+}
+
+/// The app the commands set up: [`COMMANDS_APP`] (Enter), or a client ID.
+pub fn clean_app(typed: &str) -> Result<Cleaned, &'static str> {
+    match typed.trim() {
+        "" | COMMANDS_APP => Ok(Cleaned::ok(COMMANDS_APP)),
+        id if clean_guid(id).is_ok() => Ok(Cleaned::ok(id)),
+        _ => Err(
+            "Press Enter for the app named neomail, or type an Application (client) ID, \
+                  which looks like 00000000-0000-0000-0000-000000000000.",
+        ),
     }
 }

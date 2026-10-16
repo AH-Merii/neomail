@@ -3,6 +3,7 @@
 //! ([`cli`]) and, later, the TUI's add-account screen show the same steps. Checks and the write
 //! are the driver's, through the answers the session hands it (DEC-2026-10-13-wizard-steps).
 
+pub mod capture;
 pub mod cli;
 pub mod gmail;
 pub mod imap;
@@ -50,22 +51,58 @@ pub enum Kind {
     /// The user acts on a provider's page or reads advice. Sets nothing, so it has no flag and
     /// is skipped when nothing can be asked.
     Console,
-    /// A [`Kind::Console`] step shown only when the earlier question `step` was answered with
-    /// one of `is`: a step that applies to some setups only, such as a personal account's.
-    ConsoleIf {
-        step: &'static str,
-        is: &'static [&'static str],
-    },
+    /// A [`Kind::Console`] step shown only when every [`When`] holds: a step that applies to
+    /// some setups only, such as a personal account's.
+    ConsoleIf(&'static [When]),
     /// The user picks the case that fits: a case without advice goes on, the others stop with it.
     /// Sets nothing, so it has no flag and is skipped when nothing can be asked; a later check
     /// catches the same cases and its [`Mistake`] repeats the advice.
     Gate(&'static [Case]),
     /// A value the result depends on.
     Ask(Question),
+    /// A [`Kind::Ask`] asked only on a terminal and when every [`When`] holds; otherwise passed
+    /// unanswered, so never a missing flag.
+    AskIf(&'static [When], Question),
+    /// The user runs a command the step shows, and its result answers a later question: see
+    /// [`Run`]. Shown only on a terminal, when every [`When`] holds and no flag answered it.
+    Run(Run),
     /// The driver checks the answers of the steps named in `reads`, which all come before it.
     Check { reads: &'static [&'static str] },
     /// The driver writes. Nothing is written before it, and there is no going back after it.
     Commit,
+}
+
+/// A condition on an earlier question: its answer (or the one expected) is one of `is`.
+#[derive(Debug)]
+pub struct When {
+    pub step: &'static str,
+    pub is: &'static [&'static str],
+}
+
+/// Reads an answer given so far, by step id.
+pub type AnswerOf<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
+/// A step that hands the user a script to run and picks up its result itself
+/// (DEC-2026-10-16-commands-route). The driver writes the script into a directory of its own
+/// ([`capture::Inbox`]), puts on screen one short line that runs it, and sends the value the
+/// script hands back there as [`Event::Answer`]; the user may type the value instead, for a
+/// script run on another machine.
+#[derive(Debug)]
+pub struct Run {
+    pub when: &'static [When],
+    /// The question whose answer the result gives. It is not shown while this step is: this
+    /// step asks it, and its `clean` checks the value.
+    pub fills: &'static str,
+    /// The script to run, in POSIX sh, from the answers so far (by step id). `{result}` stands
+    /// for the directory the result goes to, quoted for sh: see [`capture`] for what to write.
+    pub script: fn(&AnswerOf<'_>) -> String,
+    /// The prompt of the line where the value can be typed instead.
+    pub prompt: &'static str,
+    /// What to say when the value typed there is not one `fills` takes: where the command
+    /// shows it, as the question's own advice may point elsewhere.
+    pub wrong: &'static str,
+    /// What a failed run means, from the stage it failed at and what it said: what to do next.
+    pub failure: fn(&str, &str) -> String,
 }
 
 /// What Next names at a [`Case`] the setup stops at.
@@ -132,6 +169,16 @@ fn is_note(line: &str) -> bool {
     };
     rest.split_once(": ")
         .is_some_and(|(words, _)| words.split_whitespace().count() <= 3 && !words.contains('.'))
+}
+
+impl Kind {
+    /// The question a [`Kind::Ask`] or [`Kind::AskIf`] asks.
+    pub fn question(&self) -> Option<&Question> {
+        match self {
+            Kind::Ask(q) | Kind::AskIf(_, q) => Some(q),
+            _ => None,
+        }
+    }
 }
 
 impl Step {
@@ -263,6 +310,10 @@ pub struct View<'s> {
     pub seen_total: usize,
     /// The steps the user sees, in order, and how far each is.
     pub outline: Vec<(&'static str, Place)>,
+    /// At a [`Kind::Run`]: the script to write, with `{result}` still in it.
+    pub script: Option<String>,
+    /// At a [`Kind::Run`]: the answer its question has now, from an earlier result or typing.
+    pub filled: Option<String>,
 }
 
 /// How far a step of the outline is.
@@ -372,8 +423,18 @@ impl Session {
         let mut given = vec![false; n];
         let mut missing = Vec::new();
         for (i, step) in wizard.steps.iter().enumerate() {
-            let Kind::Ask(q) = &step.kind else { continue };
-            let Some(name) = q.flag else { continue };
+            let Some(q) = step.kind.question() else {
+                continue;
+            };
+            let Some(name) = q.flag else {
+                // A question only a terminal asks, such as a choice of route: nothing can be
+                // asked, so its default answers it, as when a flag is left out.
+                if let (false, false, Some(d)) = (interactive, q.secret, q.default) {
+                    answers[i] = Some(Answer::Text(d.to_owned()));
+                    given[i] = true;
+                }
+                continue;
+            };
             let value = flag(name).filter(|v| !v.trim().is_empty());
             let value = match (value, q.default) {
                 (Some(v), _) => v,
@@ -433,6 +494,8 @@ impl Session {
             // An answer kept from earlier: after a failed check asks an earlier step
             // again, the steps between keep theirs. Back still shows them.
             Kind::Ask(_) => self.given[i] || self.answers[i].is_some(),
+            Kind::AskIf(..) => self.given[i] || self.answers[i].is_some() || !self.shows(i, None),
+            Kind::Run(_) => !self.shows(i, None),
             Kind::Check { .. } | Kind::Commit => false,
             _ => !self.shows(i, None) || self.passed[i],
         }
@@ -444,15 +507,68 @@ impl Session {
     fn shows(&self, i: usize, pending: Option<&str>) -> bool {
         match self.wizard.steps[i].kind {
             Kind::Console | Kind::Gate(_) => self.interactive,
-            Kind::ConsoleIf { step, is } => {
-                self.interactive
+            Kind::ConsoleIf(when) => self.holds(when, pending),
+            Kind::Ask(_) => !self.given[i] && self.filler(i, pending).is_none(),
+            Kind::AskIf(when, _) => !self.given[i] && self.holds(when, pending),
+            Kind::Run(ref run) => {
+                self.holds(run.when, pending)
                     && self
-                        .expected(step, pending)
-                        .is_some_and(|v| is.contains(&v.as_str()))
+                        .wizard
+                        .position(run.fills)
+                        .is_some_and(|f| !self.given[f])
             }
-            Kind::Ask(_) => !self.given[i],
             Kind::Check { .. } | Kind::Commit => false,
         }
+    }
+
+    /// Whether every condition in `when` holds, on a terminal: each question's answer, or the
+    /// one expected with `pending` at the current step, is one it names.
+    fn holds(&self, when: &[When], pending: Option<&str>) -> bool {
+        self.interactive && self.matches(when, pending)
+    }
+
+    /// Whether the answers given or expected meet every condition in `when`.
+    fn matches(&self, when: &[When], pending: Option<&str>) -> bool {
+        when.iter().all(|w| {
+            self.expected(w.step, pending)
+                .is_some_and(|v| w.is.contains(&v.as_str()))
+        })
+    }
+
+    /// Where a mistake naming step `i` sends the user on the route their answers take, on a
+    /// terminal or not: the step, the [`Kind::Run`] that answers it, or `None` when it is not
+    /// on that route.
+    fn on_route(&self, i: usize) -> Option<usize> {
+        let id = self.wizard.steps[i].id;
+        let when = |kind: &Kind| match kind {
+            Kind::ConsoleIf(when) | Kind::AskIf(when, _) | Kind::Run(Run { when, .. }) => {
+                Some(*when)
+            }
+            _ => None,
+        };
+        let applies =
+            |j: usize| when(&self.wizard.steps[j].kind).is_none_or(|w| self.matches(w, None));
+        let filler = self.wizard.steps.iter().position(|s| match s.kind {
+            Kind::Run(ref run) => run.fills == id,
+            _ => false,
+        });
+        match filler {
+            Some(r) if !self.given[i] && applies(r) => Some(r),
+            _ => applies(i).then_some(i),
+        }
+    }
+
+    /// The [`Kind::Run`] step the user sees that answers question `i`, if any.
+    fn filler(&self, i: usize, pending: Option<&str>) -> Option<usize> {
+        let id = self.wizard.steps[i].id;
+        self.wizard
+            .steps
+            .iter()
+            .position(|s| match s.kind {
+                Kind::Run(ref run) => run.fills == id,
+                _ => false,
+            })
+            .filter(|&r| self.shows(r, pending))
     }
 
     /// The answer question `id` has or is expected to get: `pending` at the current step, else
@@ -460,9 +576,7 @@ impl Session {
     /// item, which is what its screen starts with.
     fn expected(&self, id: &str, pending: Option<&str>) -> Option<String> {
         let i = self.wizard.position(id)?;
-        let Kind::Ask(q) = &self.wizard.steps[i].kind else {
-            return None;
-        };
+        let q = self.wizard.steps[i].kind.question()?;
         if i == self.at
             && let Some(p) = pending
         {
@@ -546,7 +660,9 @@ impl Session {
     pub fn depends_on_answers(&self) -> bool {
         self.interactive
             && self.wizard.steps.iter().any(|s| match s.kind {
-                Kind::ConsoleIf { step, .. } => self.text(step).is_none(),
+                Kind::ConsoleIf(when) | Kind::AskIf(when, _) | Kind::Run(Run { when, .. }) => {
+                    when.iter().any(|w| self.text(w.step).is_none())
+                }
                 _ => false,
             })
     }
@@ -605,7 +721,16 @@ impl Session {
                     .find(|s| matches!(s.kind, Kind::Commit))
                     .map(|s| s.title),
             });
+        let (script, filled) = match steps[at].kind {
+            Kind::Run(ref run) => (
+                Some((run.script)(&|id| self.text(id).map(str::to_owned))),
+                self.text(run.fills).map(str::to_owned),
+            ),
+            _ => (None, None),
+        };
         View {
+            script,
+            filled,
             page: steps[at].page.map(|p| self.link(p)),
             seen,
             seen_total,
@@ -674,13 +799,29 @@ impl Session {
                     self.warning = None;
                 }
             }
-            (Kind::Console | Kind::ConsoleIf { .. }, Event::Continue) => self.advance(),
+            (Kind::Console | Kind::ConsoleIf(_), Event::Continue) => self.advance(),
             (Kind::Gate(cases), Event::Choose(i)) => match cases.get(i).map(|c| c.stop) {
                 Some(None) => self.advance(),
                 Some(Some(advice)) => self.end = Some(End::Stopped(advice)),
                 None => {}
             },
-            (Kind::Ask(q), Event::Answer(text)) => match (q.clean)(&text) {
+            (Kind::Run(run), Event::Answer(text)) => {
+                let Some(f) = self.wizard.position(run.fills) else {
+                    return;
+                };
+                let Some(q) = self.wizard.steps[f].kind.question() else {
+                    return;
+                };
+                match (q.clean)(&text) {
+                    Ok(cleaned) => {
+                        self.answers[f] = Some(Answer::Text(cleaned.value));
+                        self.warning = cleaned.warning;
+                        self.advance();
+                    }
+                    Err(_) => self.fix = Some(run.wrong.to_owned()),
+                }
+            }
+            (Kind::Ask(q) | Kind::AskIf(_, q), Event::Answer(text)) => match (q.clean)(&text) {
                 Ok(cleaned) => {
                     self.answers[self.at] = Some(if q.secret {
                         Answer::Secret(Password::new(cleaned.value))
@@ -706,22 +847,35 @@ impl Session {
     /// A check failed: on a terminal, the step its mistake names is asked again, unless that is
     /// the check itself or a step a flag answered; otherwise the run ends.
     fn failed(&mut self, check: &str, e: CheckError) {
-        let mistake = self
-            .wizard
-            .mistakes
-            .iter()
-            .find(|m| m.check == check && m.kind == e.kind);
-        let (target, fix) = match mistake.and_then(|m| Some((self.wizard.position(m.step)?, m))) {
+        // The first mistake of this kind whose step is on the user's path (a step of the route
+        // taken, or the [`Kind::Run`] that answers a question for it), else the first.
+        let mistakes = || {
+            self.wizard
+                .mistakes
+                .iter()
+                .filter(|m| m.check == check && m.kind == e.kind)
+                .filter_map(|m| Some((self.wizard.position(m.step)?, m)))
+        };
+        let found = mistakes()
+            .find_map(|(i, m)| Some((self.on_route(i)?, m)))
+            .or_else(|| mistakes().next());
+        let (target, fix) = match found {
             Some((target, m)) => (target, format!("{}\n{}", e.detail, m.fix)),
             None => (self.at, e.detail),
         };
         let can_ask_again = self.interactive && target < self.at && !self.given[target];
         if can_ask_again {
             for &s in self.shown.iter().filter(|&&s| s > target) {
-                self.passed[s] = !matches!(self.wizard.steps[s].kind, Kind::Ask(_));
+                self.passed[s] = !matches!(
+                    self.wizard.steps[s].kind,
+                    Kind::Ask(_) | Kind::AskIf(..) | Kind::Run(_)
+                );
             }
             self.shown.retain(|&s| s < target);
-            self.answers[target] = None;
+            // A command's step keeps the answer it gave, to offer again.
+            if !matches!(self.wizard.steps[target].kind, Kind::Run(_)) {
+                self.answers[target] = None;
+            }
             self.at = target;
             self.warning = None;
             self.fix = Some(fix);

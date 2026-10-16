@@ -578,22 +578,23 @@ fn titles_and_next(script: &Script) -> Vec<(String, String, Option<String>)> {
     out
 }
 
-/// The owner's walk of 2026-10-15 (#106): personal and browser. The steps count 1/8 to 8/8
-/// with no gap, each screen names as next the step that comes next, and the client ID is asked
-/// right after Register, while its Overview page is open.
+/// The owner's walk of 2026-10-15 (#106): personal, the browser steps and the browser
+/// sign-in. The steps count 1/9 to 9/9 with no gap, each screen names as next the step that
+/// comes next, and the client ID is asked right after Register, while its Overview page is open.
 #[test]
 fn an_outlook_walk_counts_only_its_steps_and_each_names_the_one_that_follows() {
-    let mut keys = vec![Enter, Enter, Enter, Enter];
+    let mut keys = vec![Enter, Enter, Enter, Enter, Enter, Enter];
     keys.extend(typed("00000000-0000-0000-0000-000000000000"));
-    keys.extend([Enter, Enter]);
+    keys.push(Enter);
     keys.extend(typed("you@example.com"));
     keys.push(Enter);
     let want = [
         "Personal, or work or school?",
         "Get a directory: a free Azure account",
+        "Browser steps or Azure CLI commands?",
+        "How you will sign in",
         "Register the app",
         "Paste the Application (client) ID",
-        "How you will sign in",
         "Add the redirect URI",
         "Your Outlook address",
         "Name the account",
@@ -604,10 +605,10 @@ fn an_outlook_walk_counts_only_its_steps_and_each_names_the_one_that_follows() {
         let seen = titles_and_next(&script);
         let counts: Vec<&str> = seen.iter().map(|(c, _, _)| c.as_str()).collect();
         let titles: Vec<&str> = seen.iter().map(|(_, t, _)| t.as_str()).collect();
-        let numbers: Vec<String> = (1..=8).map(|n| format!("{n}/8")).collect();
+        let numbers: Vec<String> = (1..=9).map(|n| format!("{n}/9")).collect();
         assert_eq!(counts, numbers, "{size:?}");
         assert_eq!(titles, want, "{size:?}");
-        for (i, (_, title, next)) in seen.iter().enumerate().take(7) {
+        for (i, (_, title, next)) in seen.iter().enumerate().take(8) {
             assert_eq!(next.as_deref(), Some(want[i + 1]), "{size:?} at {title}");
         }
     }
@@ -633,23 +634,38 @@ fn moving_the_pointer_shows_the_steps_that_answer_brings() {
     assert_eq!(first.len(), 2, "{first:#?}");
     assert!(first[0].contains("· Get a directory") && !first[0].contains("· Your organisation"));
     assert!(first[1].contains("· Your organisation") && !first[1].contains("· Get a directory"));
-    // At "How you will sign in": browser, then device-code.
-    let mut keys = vec![Enter, Enter, Enter, Enter];
-    keys.extend(typed("00000000-0000-0000-0000-000000000000"));
-    keys.extend([Char('j'), Interrupt]);
-    let script = outlook_screens(&keys, (100, 60));
-    let at_method: Vec<(String, String, Option<String>)> = titles_and_next(&script)
-        .into_iter()
-        .filter(|(_, t, _)| t == "How you will sign in")
-        .collect();
-    let next: Vec<Option<&str>> = at_method.iter().map(|(_, _, n)| n.as_deref()).collect();
-    assert_eq!(
-        next,
-        [
-            Some("Add the redirect URI"),
-            Some("Allow public client flows")
-        ]
+    // At the route: the browser steps, then the commands, each with its own steps and count.
+    let script = outlook_screens(&[Enter, Enter, Enter, Char('j'), Interrupt], (100, 60));
+    let at_route = screens_of(&script, "Browser steps or Azure CLI commands?");
+    assert_eq!(at_route.len(), 2, "{at_route:#?}");
+    assert!(at_route[0].contains("· Register the app") && !at_route[0].contains("· Run the"));
+    assert!(at_route[1].contains("· Run the Azure CLI commands"));
+    assert!(at_route[1].contains("· Your directory") && !at_route[1].contains("· Register"));
+    // At "How you will sign in", on the browser steps: browser, then device-code.
+    let script = outlook_screens(
+        &[Enter, Enter, Enter, Enter, Char('j'), Interrupt],
+        (100, 60),
     );
+    let at_method = screens_of(&script, "How you will sign in");
+    assert_eq!(at_method.len(), 2, "{at_method:#?}");
+    assert!(at_method[0].contains("· Add the redirect URI"));
+    assert!(!at_method[0].contains("· Allow public client flows"));
+    assert!(at_method[1].contains("· Allow public client flows"));
+    assert!(!at_method[1].contains("· Add the redirect URI"));
+}
+
+/// Each distinct screen of the step titled `title`, as plain text.
+fn screens_of(script: &Script, title: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for f in &script.frames {
+        let text: Vec<String> = f.lines.iter().map(|l| screen::plain(l)).collect();
+        let text = text.join("\n");
+        let head = text.lines().next().unwrap_or_default();
+        if head.ends_with(&format!(" · {title}")) && out.last() != Some(&text) {
+            out.push(text);
+        }
+    }
+    out
 }
 
 /// A numbered item that wraps goes on under its text, not under its number, so it does not
@@ -707,4 +723,193 @@ fn pointing_at_a_case_that_stops_the_setup_shows_no_step_to_come() {
             "{size:?}"
         );
     }
+}
+
+/// The Outlook wizard on the commands route (#105), for a work account, up to the app check:
+/// `run` is what happens on the commands step, given the directory its result goes to (`None`
+/// before the step makes it), each time the step waits with no key. Returns the screens, the
+/// client ID the app check got, and the data directory.
+fn commands_walk(
+    lines: &[&'static str],
+    waits: usize,
+    run: impl FnMut(Option<&std::path::Path>) + 'static,
+) -> (Script, Option<String>, tempfile::TempDir) {
+    commands_walk_in("", lines, waits, run)
+}
+
+/// [`commands_walk`] with the data directory at `sub` under a temporary directory.
+fn commands_walk_in(
+    sub: &str,
+    lines: &[&'static str],
+    waits: usize,
+    mut run: impl FnMut(Option<&std::path::Path>) + 'static,
+) -> (Script, Option<String>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join(sub);
+    let runs = data_dir.join("runs");
+    let mut script = Script::terminal(lines, &[]);
+    script.size = (100, 60);
+    script.waits = waits;
+    script.on_wait = Some(Box::new(move || {
+        let dir = std::fs::read_dir(&runs)
+            .ok()
+            .and_then(|mut d| d.next())
+            .map(|e| e.unwrap().path());
+        run(dir.as_deref());
+    }));
+    let got = RefCell::new(None);
+    {
+        let mut ui = Ui::new(&mut script, plain(), &no_opener, false, Memory::none());
+        ui.runs = Some(data_dir.clone());
+        let mut session = Session::new(&crate::oauth::steps::OUTLOOK, true, |_| None).unwrap();
+        let check = |id: &str, answers: &Answers<'_>, _: &mut Ask<'_, '_>| match id {
+            "client-check" => {
+                *got.borrow_mut() = answers.text("client-id").map(str::to_owned);
+                Err(CheckError {
+                    kind: QUIT,
+                    detail: String::new(),
+                })
+            }
+            _ => Ok(String::new()),
+        };
+        let _ = drive(&mut session, &mut ui, check, |_| Ok(Saved::default()));
+    }
+    (script, got.into_inner(), tmp)
+}
+
+/// Account type, route, sign-in method, the directory, the app (Enter keeps neomail): then the
+/// commands step.
+const TO_COMMANDS: [&str; 5] = ["work", "commands", "browser", "contoso.com", ""];
+/// After the commands step: the consent advice, the address and the name.
+const AFTER_COMMANDS: [&str; 3] = ["", "you@example.com", ""];
+const CLIENT_ID: &str = "12345678-90ab-cdef-1234-567890abcdef";
+
+fn write_result(dir: &std::path::Path, text: &str) {
+    std::fs::write(dir.join("part"), text).unwrap();
+    std::fs::rename(dir.join("part"), dir.join("result")).unwrap();
+}
+
+/// The commands' result is picked up while the step waits, with no key pressed: the wizard
+/// goes on with that client ID. The paste on screen runs the script the step wrote into its
+/// directory, which only the user may read, and both are gone afterwards.
+#[test]
+fn the_commands_step_picks_up_the_client_id_without_a_key() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut lines = TO_COMMANDS.to_vec();
+    lines.extend(AFTER_COMMANDS);
+    let seen = std::rc::Rc::new(RefCell::new(None));
+    let saw = seen.clone();
+    let (script, got, data) = commands_walk(&lines, 3, move |dir| {
+        if let Some(dir) = dir {
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode();
+            let file = dir.join("setup.sh");
+            let text = std::fs::read_to_string(&file).unwrap();
+            *saw.borrow_mut() =
+                Some((dir.to_owned(), mode(dir) & 0o777, mode(&file) & 0o777, text));
+            write_result(dir, &format!("ok\n{CLIENT_ID}\n"));
+        }
+    });
+    let (dir, dir_mode, file_mode, text) = seen.borrow_mut().take().expect("no script written");
+    assert_eq!((dir_mode, file_mode), (0o700, 0o600));
+    assert!(text.contains("az login --tenant 'contoso.com'"), "{text}");
+    assert_eq!(got.as_deref(), Some(CLIENT_ID), "{}", script.said);
+    assert!(
+        script.said.contains("Waiting for the result"),
+        "{}",
+        script.said
+    );
+    // The paste on screen, on a line of its own, runs that script, which writes to the
+    // directory the step watched, under the data directory.
+    let line = format!("sh '{}'", dir.join("setup.sh").display());
+    assert!(
+        script.said.lines().any(|l| l == line),
+        "{line}: {}",
+        script.said
+    );
+    assert!(
+        text.contains(&format!("result='{}'", dir.display())),
+        "{text}"
+    );
+    let runs = data.path().join("runs");
+    assert!(dir.starts_with(&runs), "{}", dir.display());
+    assert!(!runs.exists(), "the script's directory was left behind");
+    // What was picked up is shown on the next screen, to correct.
+    let note = format!("Picked up from the commands: {CLIENT_ID}.");
+    assert!(script.said.contains(&note), "{}", script.said);
+}
+
+/// A client ID typed at the step, for commands run on another machine, is taken as well.
+#[test]
+fn the_commands_step_takes_a_typed_client_id() {
+    let mut lines = TO_COMMANDS.to_vec();
+    lines.push(CLIENT_ID);
+    lines.extend(AFTER_COMMANDS);
+    let (script, got, _data) = commands_walk(&lines, 0, |_| {});
+    assert_eq!(got.as_deref(), Some(CLIENT_ID), "{}", script.said);
+    assert!(
+        script.said.contains("no browser here (over SSH)?"),
+        "{}",
+        script.said
+    );
+}
+
+/// A data directory the paste cannot quote (it holds a `'`): the step shows no paste, says so,
+/// and a typed client ID is taken.
+#[test]
+fn a_data_directory_the_paste_cannot_quote_shows_no_paste_and_takes_a_typed_client_id() {
+    let mut lines = TO_COMMANDS.to_vec();
+    lines.push(CLIENT_ID);
+    lines.extend(AFTER_COMMANDS);
+    let (script, got, _tmp) = commands_walk_in("it's data", &lines, 0, |_| {});
+    assert_eq!(got.as_deref(), Some(CLIENT_ID), "{}", script.said);
+    assert!(
+        !script.said.lines().any(|l| l.starts_with("sh '")),
+        "{}",
+        script.said
+    );
+    assert!(
+        script.said.contains("There is no script to paste here"),
+        "{}",
+        script.said
+    );
+    assert!(
+        !script.said.contains("goes on by itself"),
+        "{}",
+        script.said
+    );
+}
+
+/// A failed run reaches the user with what to do next, and the step keeps watching: the next
+/// run's client ID is picked up.
+#[test]
+fn a_failed_run_shows_what_to_do_and_the_next_run_is_picked_up() {
+    let mut lines = TO_COMMANDS.to_vec();
+    lines.extend(AFTER_COMMANDS);
+    let mut runs = 0;
+    let (script, got, _data) = commands_walk(&lines, 4, move |dir| {
+        let Some(dir) = dir else { return };
+        runs += 1;
+        let text = match runs {
+            1 => "failed\napp\nERROR: More than one application have the same display name\n\
+                  neomail\tbbbbbbbb-0000-0000-0000-000000000002\n\
+                  neomail\tcccccccc-0000-0000-0000-000000000003\n"
+                .to_owned(),
+            3 => format!("ok\n{CLIENT_ID}\n"),
+            _ => return,
+        };
+        write_result(dir, &text);
+    });
+    assert!(
+        script
+            .said
+            .contains("More than one app is named exactly neomail"),
+        "{}",
+        script.said
+    );
+    assert!(
+        script.said.contains("bbbbbbbb-0000-0000-0000-000000000002"),
+        "{}",
+        script.said
+    );
+    assert_eq!(got.as_deref(), Some(CLIENT_ID), "{}", script.said);
 }

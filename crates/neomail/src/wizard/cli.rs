@@ -7,10 +7,11 @@
 
 use anyhow::{Result, bail};
 
+use super::capture::{Inbox, Outcome};
 use super::remember::Memory;
 use super::screen::{self, Look};
 use super::term::{Frame, Key, Term, Tty};
-use super::{Answers, CheckError, Event, Kind, Line, Place, Prompt, Session, View};
+use super::{Answers, CheckError, Event, Kind, Line, Place, Prompt, Run, Session, View};
 use crate::style::{self, Paint, Symbols};
 
 /// What the save leaves to the user: shown in the closing summary on a terminal. What was
@@ -50,6 +51,11 @@ pub struct Ui<'a> {
     kept: Vec<(&'static str, String)>,
     /// The header of a list on its own screen ([`choose`]), in place of a step's.
     menu_header: Option<String>,
+    /// Where a [`Kind::Run`] step makes the directory its command writes the result to: the
+    /// data directory. `None` leaves the value to be typed.
+    pub runs: Option<std::path::PathBuf>,
+    /// What a [`Kind::Run`] step picked up, said on the next screen so it can be corrected.
+    picked: Option<String>,
 }
 
 /// Opens nothing: for a [`Ui`] that may not open pages.
@@ -88,6 +94,8 @@ impl<'a> Ui<'a> {
             opened: Vec::new(),
             kept: Vec::new(),
             menu_header: None,
+            runs: None,
+            picked: None,
         }
     }
 
@@ -102,11 +110,14 @@ impl<'a> Ui<'a> {
             hyperlinks: interactive,
         };
         let open = may_open_pages(interactive, no_browser, style::env_var);
-        let memory = match crate::config::data_dir() {
-            Ok(dir) if interactive => Memory::load(&dir, id),
-            _ => Memory::none(),
+        let data_dir = crate::config::data_dir().ok().filter(|_| interactive);
+        let memory = match &data_dir {
+            Some(dir) => Memory::load(dir, id),
+            None => Memory::none(),
         };
-        Self::new(tty, look, &crate::browser::open, open, memory)
+        let mut ui = Self::new(tty, look, &crate::browser::open, open, memory);
+        ui.runs = data_dir;
+        ui
     }
 
     pub fn interactive(&self) -> bool {
@@ -202,6 +213,41 @@ impl Drop for Ui<'_> {
     }
 }
 
+/// How often a [`Kind::Run`] step looks for its command's result while it waits for keys.
+const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A key typed on a line of text: `fill` is what Tab fills in.
+fn edit(text: &mut Vec<char>, cursor: &mut usize, key: Key, fill: Option<&str>) {
+    match key {
+        Key::Char(c) if !c.is_control() => {
+            text.insert(*cursor, c);
+            *cursor += 1;
+        }
+        Key::Tab => {
+            if let Some(k) = fill {
+                *text = k.chars().collect();
+                *cursor = text.len();
+            }
+        }
+        Key::Backspace if *cursor > 0 => {
+            *cursor -= 1;
+            text.remove(*cursor);
+        }
+        Key::Delete if *cursor < text.len() => {
+            text.remove(*cursor);
+        }
+        Key::Left => *cursor = cursor.saturating_sub(1),
+        Key::Right => *cursor = (*cursor + 1).min(text.len()),
+        Key::Home => *cursor = 0,
+        Key::End => *cursor = text.len(),
+        Key::ClearLine => {
+            text.clear();
+            *cursor = 0;
+        }
+        _ => {}
+    }
+}
+
 /// Keeps a role's text as it is: for plain paragraphs.
 fn as_is(_: Paint, text: &str) -> String {
     text.to_owned()
@@ -214,6 +260,15 @@ enum Input<'i> {
     /// A list: the items (label, and what narrowing also matches), the one pointed at (an index
     /// into the narrowed list) and the text typed to narrow it.
     Pick(&'i [(String, String)], usize, &'i str),
+    /// The line that runs the step's script, shown whole on one line so it copies as one, or
+    /// `None` when there is no script to run here; then a line to type the value instead.
+    Run {
+        paste: Option<&'i str>,
+        prompt: &'i str,
+        text: &'i [char],
+        cursor: usize,
+        keeps: Option<&'i str>,
+    },
     /// A line: its prompt, the text so far and the cursor, whether it is hidden, and what Enter
     /// keeps when nothing is typed.
     Line {
@@ -364,6 +419,45 @@ impl Ui<'_> {
         let p = self.paint();
         match input {
             Input::Keys => (Vec::new(), None),
+            Input::Run {
+                paste,
+                prompt,
+                text,
+                cursor,
+                keeps,
+            } => {
+                // What to do with the line, kept with it so a small window still says it.
+                let (mut lines, lead, status) = match paste {
+                    // Unindented and never wrapped by hand: the terminal wraps it, so selecting
+                    // it copies one line.
+                    Some(paste) => (
+                        vec![p.literal(paste), String::new()],
+                        format!("  {} ", p.note(s.running)),
+                        "Paste the line above into a terminal: it runs the script it names, which \
+                         you can open and read first. Waiting for the result: this step goes on \
+                         by itself when it arrives.",
+                    ),
+                    None => (
+                        Vec::new(),
+                        format!("  {} ", s.dot),
+                        "There is no script to paste here: the path of neomail's data folder \
+                         holds a ' or a \\, or the script could not be written there. Type the \
+                         value, or go back and choose the browser steps.",
+                    ),
+                };
+                lines.extend(self.paragraph(&lead, status, cols, |_, l| l.to_owned()));
+                let line = Input::Line {
+                    prompt,
+                    text,
+                    cursor: *cursor,
+                    hidden: false,
+                    keeps: *keeps,
+                };
+                let row = screen::rows(&lines, cols);
+                let (more, at) = self.input(&line, cols, rows);
+                lines.extend(more);
+                (lines, at.map(|(r, c)| (row + r, c)))
+            }
             Input::Line {
                 prompt,
                 text,
@@ -498,11 +592,25 @@ impl Ui<'_> {
         let mut fixed = FRAME_ROWS + self.recent.len() + error.len() + 1;
         let (list, _) = self.input(input, cols, rows);
         let mut layout = None;
-        for (roomy, notes) in [(true, true), (false, true), (false, false)] {
-            let outline = self.outline(view, roomy, cols);
+        // A command to paste may take most of a small window: it goes without the outline
+        // before the header, the command or the prompt go.
+        let run = matches!(input, Input::Run { .. });
+        let layouts = [
+            (true, true, true),
+            (false, true, true),
+            (false, false, true),
+        ];
+        let bare = [(false, false, false)];
+        let tries = layouts.iter().chain(if run { &bare[..] } else { &[] });
+        for &(roomy, notes, with_outline) in tries {
+            let outline = match with_outline {
+                true => self.outline(view, roomy, cols),
+                false => Vec::new(),
+            };
             let body = self.body(view, cols, notes, page_line);
-            let need = fixed + outline.len() + screen::rows(&body, cols) + list.len();
-            let last = !notes;
+            let need =
+                fixed + outline.len() + screen::rows(&body, cols) + screen::rows(&list, cols);
+            let last = !with_outline || (!notes && !run);
             if need <= rows || last {
                 layout = Some((outline, body));
                 break;
@@ -516,7 +624,7 @@ impl Ui<'_> {
             _ => list.len(),
         };
         let (input_lines, cursor) = self.input(input, cols, list_rows);
-        let room = avail.saturating_sub(input_lines.len());
+        let room = avail.saturating_sub(screen::rows(&input_lines, cols));
         if screen::rows(&body, cols) > room {
             let mut keep = body.len();
             while keep > 0 && screen::rows(&body[..keep], cols) + 1 > room {
@@ -524,10 +632,15 @@ impl Ui<'_> {
             }
             let cut = body.len() - keep;
             body.truncate(keep);
-            body.push(self.paint().note(&format!(
-                "  {} {cut} more lines: a taller window shows them",
-                self.sym().down
-            )));
+            // No row for the marker either: the header and the input matter more.
+            if room == 0 {
+                body.clear();
+            } else {
+                body.push(self.paint().note(&format!(
+                    "  {} {cut} more lines: a taller window shows them",
+                    self.sym().down
+                )));
+            }
         }
         let mut lines = vec![header];
         lines.extend(outline);
@@ -629,7 +742,9 @@ impl Ui<'_> {
         if !self.interactive() {
             // Off a terminal only a secret is left to read: Console and Gate steps are skipped.
             return match &view.step.kind {
-                Kind::Ask(q) => Ok(Did::Event(Event::Answer(self.term.secret_line(q.prompt)?))),
+                Kind::Ask(q) | Kind::AskIf(_, q) => {
+                    Ok(Did::Event(Event::Answer(self.term.secret_line(q.prompt)?)))
+                }
                 _ => bail!("step {:?} cannot be shown off a terminal", view.step.id),
             };
         }
@@ -644,7 +759,7 @@ impl Ui<'_> {
         }
         let back = view.can_go_back;
         let did = match &view.step.kind {
-            Kind::Console | Kind::ConsoleIf { .. } => {
+            Kind::Console | Kind::ConsoleIf(_) => {
                 let mut keys = vec![("Enter", "done"), ("s", "skip, already done")];
                 if back {
                     keys.push(("Esc", "back"));
@@ -667,7 +782,8 @@ impl Ui<'_> {
                     None => Did::Quit,
                 }
             }
-            Kind::Ask(q) if !q.choices.is_empty() => {
+            Kind::Run(run) => self.run(view, run, &error, &page, back)?,
+            Kind::Ask(q) | Kind::AskIf(_, q) if !q.choices.is_empty() => {
                 let w = q
                     .choices
                     .iter()
@@ -695,7 +811,7 @@ impl Ui<'_> {
                     None => Did::Quit,
                 }
             }
-            Kind::Ask(q) => {
+            Kind::Ask(q) | Kind::AskIf(_, q) => {
                 let keeps = match self.memory.get(view.step.id) {
                     Some(v) if !q.secret => Some(v.to_owned()),
                     _ => q.default.map(str::to_owned),
@@ -719,6 +835,13 @@ impl Ui<'_> {
             Kind::Check { .. } | Kind::Commit => unreachable!("checks and the write are run"),
         };
         self.recent.clear();
+        if let Some(value) = self.picked.take() {
+            let (cols, _) = self.term.size();
+            let sign = format!("  {} ", self.paint().success(self.sym().check));
+            let text = format!("Picked up from the commands: {value}. Esc goes back to change it.");
+            let lines = self.paragraph(&sign, &text, usize::from(cols), Paint::success);
+            self.recent.extend(lines);
+        }
         Ok(did)
     }
 }
@@ -874,32 +997,80 @@ impl Ui<'_> {
                 }
                 Key::Esc if back => return Ok(Did::Event(Event::Back)),
                 Key::Interrupt => return Ok(Did::Quit),
-                Key::Char(c) if !c.is_control() => {
-                    text.insert(cursor, c);
-                    cursor += 1;
+                key => edit(&mut text, &mut cursor, key, keeps.filter(|_| !hidden)),
+            }
+        }
+    }
+
+    /// A [`Kind::Run`] step: the line that runs its script, written to its own directory, and a
+    /// line to type the value instead. While it waits for keys it polls for the result: a value
+    /// goes on by itself, a failure shows what to do next and keeps watching for the next run.
+    /// The directory, and the script with it, goes when this returns, whichever way.
+    fn run(
+        &mut self,
+        view: &View<'_>,
+        run: &Run,
+        error: &[String],
+        page: &[String],
+        back: bool,
+    ) -> Result<Did> {
+        let inbox = self.runs.as_deref().and_then(|dir| Inbox::new(dir).ok());
+        let script = view.script.as_deref().unwrap_or_default();
+        let paste = inbox.as_ref().and_then(|inbox| inbox.paste(script));
+        let keeps = view.filled.as_deref();
+        let mut error = error.to_vec();
+        let mut text: Vec<char> = Vec::new();
+        let mut cursor = 0;
+        let mut keys = vec![("Enter", "continue")];
+        if keeps.is_some() {
+            keys.push(("Tab", "fill in"));
+        }
+        if back {
+            keys.push(("Esc", "back"));
+        }
+        keys.push(("Ctrl-C", "quit"));
+        let mut drawn: Option<Frame> = None;
+        loop {
+            let input = Input::Run {
+                paste: paste.as_deref(),
+                prompt: run.prompt,
+                text: &text,
+                cursor,
+                keeps,
+            };
+            let frame = self.step_frame(view, &input, &error, page, &keys);
+            if drawn.as_ref() != Some(&frame) {
+                self.term.raw(true)?;
+                self.term.draw(&frame);
+                drawn = Some(frame);
+            }
+            let Some(key) = self.term.key_within(POLL)? else {
+                match inbox.as_ref().and_then(Inbox::take) {
+                    Some(Outcome::Value(value)) => {
+                        self.picked = Some(value.clone());
+                        return Ok(Did::Event(Event::Answer(value)));
+                    }
+                    Some(Outcome::Failed { stage, said }) => {
+                        let (cols, _) = self.term.size();
+                        let fix = (run.failure)(&stage, &said);
+                        error = self.error_lines(Some(&fix), usize::from(cols));
+                    }
+                    None => {}
                 }
-                Key::Tab => {
-                    if let (Some(k), false) = (keeps, hidden) {
-                        text = k.chars().collect();
-                        cursor = text.len();
+                continue;
+            };
+            match key {
+                Key::Enter => {
+                    let typed: String = text.iter().collect();
+                    match (typed.trim(), keeps) {
+                        ("", Some(k)) => return Ok(Did::Event(Event::Answer(k.to_owned()))),
+                        ("", None) => {}
+                        _ => return Ok(Did::Event(Event::Answer(typed))),
                     }
                 }
-                Key::Backspace if cursor > 0 => {
-                    cursor -= 1;
-                    text.remove(cursor);
-                }
-                Key::Delete if cursor < text.len() => {
-                    text.remove(cursor);
-                }
-                Key::Left => cursor = cursor.saturating_sub(1),
-                Key::Right => cursor = (cursor + 1).min(text.len()),
-                Key::Home => cursor = 0,
-                Key::End => cursor = text.len(),
-                Key::ClearLine => {
-                    text.clear();
-                    cursor = 0;
-                }
-                _ => {}
+                Key::Esc if back => return Ok(Did::Event(Event::Back)),
+                Key::Interrupt => return Ok(Did::Quit),
+                key => edit(&mut text, &mut cursor, key, keeps),
             }
         }
     }
@@ -1294,6 +1465,8 @@ pub fn choose(
         seen: 0,
         seen_total: 0,
         outline: Vec::new(),
+        script: None,
+        filled: None,
     };
     let header = ui.paint().heading(&format!("{} {title}", ui.sym().arrow));
     ui.menu_header = Some(header);
