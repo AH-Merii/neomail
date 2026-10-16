@@ -5,7 +5,13 @@
 
 pub mod cli;
 pub mod gmail;
+pub mod imap;
 pub mod proton;
+pub mod remember;
+pub mod screen;
+#[cfg(test)]
+pub mod script;
+pub mod term;
 #[cfg(test)]
 mod tests;
 
@@ -15,6 +21,8 @@ use crate::secret::Password;
 #[derive(Debug)]
 pub struct Wizard {
     pub id: &'static str,
+    /// What it sets up, for the welcome screen: "a Gmail account, with an app password".
+    pub title: &'static str,
     pub steps: &'static [Step],
     /// What a failed check means, and which step to change.
     pub mistakes: &'static [Mistake],
@@ -25,10 +33,15 @@ pub struct Step {
     /// Names the step in [`Kind::Check`] reads and in [`Mistake`]s.
     pub id: &'static str,
     pub title: &'static str,
-    /// Why the step exists, or what to do there.
+    /// Why the step exists, or what to do there: paragraphs, hand-wrapped. A line that starts
+    /// with `- ` is an action the user takes (its own lines after it are indented), one with
+    /// `Why: ` or `Note: ` a side note, and one with `Warning: ` a warning; the lines after it,
+    /// up to the next such line or a blank one, belong to it ([`Step::lines`]).
     pub why: &'static str,
     /// Always printed; a provider's page or the help page a fact comes from.
     pub links: &'static [&'static str],
+    /// The one page of `links` the step sends the user to, opened for them where it can be.
+    pub page: Option<&'static str>,
     pub kind: Kind,
 }
 
@@ -55,6 +68,9 @@ pub enum Kind {
     Commit,
 }
 
+/// What Next names at a [`Case`] the setup stops at.
+pub const STOPS_HERE: &str = "the setup ends here, with what to do instead";
+
 #[derive(Debug)]
 pub struct Case {
     pub label: &'static str,
@@ -70,8 +86,91 @@ pub struct Question {
     /// Read without echo on a terminal, else one line of standard input.
     pub secret: bool,
     pub default: Option<&'static str>,
+    /// The fixed answers, picked from a list on a terminal; empty for free text. `clean` still
+    /// takes each one's value, so the flag accepts the same.
+    pub choices: &'static [Choice],
     /// Tidies an answer, or says what to change.
     pub clean: fn(&str) -> Result<Cleaned, &'static str>,
+}
+
+/// One fixed answer of a [`Question`].
+#[derive(Debug)]
+pub struct Choice {
+    pub value: &'static str,
+    pub label: &'static str,
+}
+
+/// What a line of a step's text is, so each looks different.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Line {
+    /// An instruction or an explanation.
+    Say,
+    /// Something the user does.
+    Action,
+    /// A side note.
+    Note,
+    Warning,
+}
+
+/// `text` with its first letter capitalised, as the start of a line it now is.
+pub(crate) fn capitalised(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// A side note opens with `Note: `, or with `Why` and up to three words before a colon
+/// (`Why: `, `Why External: `).
+fn is_note(line: &str) -> bool {
+    if line.starts_with("Note: ") {
+        return true;
+    }
+    let Some(rest) = line.strip_prefix("Why") else {
+        return false;
+    };
+    rest.split_once(": ")
+        .is_some_and(|(words, _)| words.split_whitespace().count() <= 3 && !words.contains('.'))
+}
+
+impl Step {
+    /// The step's text as paragraphs, each with its kind and its lines joined: the markers of
+    /// [`Step::why`] decide the kind, and `Warning: ` and `- ` are dropped, since the screen
+    /// shows a sign for them.
+    pub fn lines(&self) -> Vec<(Line, String)> {
+        let mut out: Vec<(Line, String)> = Vec::new();
+        let mut open = false;
+        for raw in self.why.lines() {
+            let line = raw.trim();
+            if line.is_empty() {
+                open = false;
+                continue;
+            }
+            let marked = if let Some(rest) = line.strip_prefix("- ") {
+                Some((Line::Action, rest))
+            } else if let Some(rest) = line.strip_prefix("Warning: ") {
+                Some((Line::Warning, rest))
+            } else if is_note(line) {
+                Some((Line::Note, line))
+            } else {
+                None
+            };
+            match (marked, out.last_mut()) {
+                (Some((kind, text)), _) => out.push((kind, capitalised(text))),
+                // An action goes on only on indented lines, as a list item would.
+                (None, Some((kind, text)))
+                    if open && (*kind != Line::Action || raw.starts_with("  ")) =>
+                {
+                    text.push(' ');
+                    text.push_str(line);
+                }
+                (None, _) => out.push((Line::Say, line.to_owned())),
+            }
+            open = true;
+        }
+        out
+    }
 }
 
 /// An answer as it will be used, with a warning that does not stop it.
@@ -157,6 +256,21 @@ pub struct View<'s> {
     /// About the answer just given, which still goes on.
     pub warning: Option<&'static str>,
     pub can_go_back: bool,
+    /// [`Step::page`] with its placeholder filled, as in `links`.
+    pub page: Option<String>,
+    /// Where the step is among those the user sees (1-based), never counting checks.
+    pub seen: usize,
+    pub seen_total: usize,
+    /// The steps the user sees, in order, and how far each is.
+    pub outline: Vec<(&'static str, Place)>,
+}
+
+/// How far a step of the outline is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    Done,
+    Now,
+    Left,
 }
 
 /// An answer, kept as given.
@@ -226,6 +340,11 @@ pub struct Session {
     answers: Vec<Option<Answer>>,
     /// Answered by a flag (or a default when nothing can be asked): never shown.
     given: Vec<bool>,
+    /// The answers offered from the last run, for the path ([`Session::offer`]).
+    offered: Vec<Option<String>>,
+    /// Console steps passed before a failed check asked an earlier step again: not shown again
+    /// on the way back to the check.
+    passed: Vec<bool>,
     fix: Option<String>,
     warning: Option<&'static str>,
     /// Set by a failure that ends the run, or a stop.
@@ -279,6 +398,8 @@ impl Session {
             shown: Vec::new(),
             answers,
             given,
+            offered: vec![None; n],
+            passed: vec![false; n],
             fix: None,
             warning: None,
             end: None,
@@ -297,29 +418,64 @@ impl Session {
         self
     }
 
-    /// Moves past the steps that are not shown: answered (by a flag or earlier), or Console
-    /// and Gate steps when nothing can be asked.
+    /// Moves past the steps that are not shown: answered (by a flag or earlier), Console and
+    /// Gate steps when nothing can be asked, those passed before a failed check asked an earlier
+    /// step again, and a [`Kind::ConsoleIf`] whose answer does not apply.
     fn settle(&mut self) {
         while self.at < self.wizard.steps.len() && self.skipped(self.at) {
             self.at += 1;
         }
     }
 
-    /// Whether step `i` is passed without showing or running it.
+    /// Whether step `i` is passed without showing or running it, on the answers given so far.
     fn skipped(&self, i: usize) -> bool {
         match self.wizard.steps[i].kind {
-            Kind::Console | Kind::Gate(_) => !self.interactive,
-            Kind::ConsoleIf { step, is } => !self.interactive || !self.answered(step, is),
             // An answer kept from earlier: after a failed check asks an earlier step
             // again, the steps between keep theirs. Back still shows them.
             Kind::Ask(_) => self.given[i] || self.answers[i].is_some(),
             Kind::Check { .. } | Kind::Commit => false,
+            _ => !self.shows(i, None) || self.passed[i],
         }
     }
 
-    /// Whether question `id` was answered with one of `values`.
-    fn answered(&self, id: &str, values: &[&str]) -> bool {
-        self.text(id).is_some_and(|t| values.contains(&t))
+    /// Whether step `i` is one the user sees when the current step is answered with `pending`:
+    /// asked or shown, not answered by a flag, and, for a [`Kind::ConsoleIf`], one whose answer
+    /// applies. Checks are never seen.
+    fn shows(&self, i: usize, pending: Option<&str>) -> bool {
+        match self.wizard.steps[i].kind {
+            Kind::Console | Kind::Gate(_) => self.interactive,
+            Kind::ConsoleIf { step, is } => {
+                self.interactive
+                    && self
+                        .expected(step, pending)
+                        .is_some_and(|v| is.contains(&v.as_str()))
+            }
+            Kind::Ask(_) => !self.given[i],
+            Kind::Check { .. } | Kind::Commit => false,
+        }
+    }
+
+    /// The answer question `id` has or is expected to get: `pending` at the current step, else
+    /// the one given, else the one offered from the last run, its default, or a list's first
+    /// item, which is what its screen starts with.
+    fn expected(&self, id: &str, pending: Option<&str>) -> Option<String> {
+        let i = self.wizard.position(id)?;
+        let Kind::Ask(q) = &self.wizard.steps[i].kind else {
+            return None;
+        };
+        if i == self.at
+            && let Some(p) = pending
+        {
+            return Some((q.clean)(p).map_or_else(|_| p.trim().to_owned(), |c| c.value));
+        }
+        if let Some(Answer::Text(t)) = &self.answers[i] {
+            return Some(t.clone());
+        }
+        self.offered[i]
+            .as_deref()
+            .or(q.default)
+            .or(q.choices.first().map(|c| c.value))
+            .map(str::to_owned)
     }
 
     fn text(&self, id: &str) -> Option<&str> {
@@ -352,16 +508,116 @@ impl Session {
         self.settle();
     }
 
-    fn view(&self, at: usize) -> View<'_> {
+    /// The path the user will take from step `at` when it is answered with `pending`: the steps
+    /// they see, in order, and how far each is. A later step that keeps its answer, or that was
+    /// passed before a failed check asked an earlier one again, is done: it is not shown again. The header, the outline, Next and
+    /// the welcome screen all come from it.
+    pub fn path(&self, at: usize, pending: Option<&str>) -> Vec<(usize, Place)> {
+        let stops = self.stops(at, pending);
+        (0..self.wizard.steps.len())
+            .filter(|&i| self.shows(i, pending) && !(stops && i > at))
+            .map(|i| {
+                let place = match i.cmp(&at) {
+                    std::cmp::Ordering::Less => Place::Done,
+                    std::cmp::Ordering::Equal => Place::Now,
+                    // Passed on the way back to a failed check: kept, so not shown again.
+                    _ if self.passed[i] || self.answers[i].is_some() => Place::Done,
+                    std::cmp::Ordering::Greater => Place::Left,
+                };
+                (i, place)
+            })
+            .collect()
+    }
+
+    /// Whether step `at` is a [`Kind::Gate`] and `pending`, the index of a case, is one the setup
+    /// stops at: no step follows it.
+    fn stops(&self, at: usize, pending: Option<&str>) -> bool {
+        let Some(Kind::Gate(cases)) = self.wizard.steps.get(at).map(|s| &s.kind) else {
+            return false;
+        };
+        pending
+            .and_then(|p| p.parse::<usize>().ok())
+            .and_then(|i| cases.get(i))
+            .is_some_and(|c| c.stop.is_some())
+    }
+
+    /// Whether the steps the user sees depend on an answer not given yet: the welcome screen
+    /// then says its count is for the suggested answers.
+    pub fn depends_on_answers(&self) -> bool {
+        self.interactive
+            && self.wizard.steps.iter().any(|s| match s.kind {
+                Kind::ConsoleIf { step, .. } => self.text(step).is_none(),
+                _ => false,
+            })
+    }
+
+    /// Offers `value` as question `id`'s answer, as the screen does (an answer of the last
+    /// run): the path is predicted with it until the question is answered.
+    pub fn offer(&mut self, id: &str, value: &str) {
+        if let Some(i) = self.wizard.position(id) {
+            self.offered[i] = Some(value.to_owned());
+        }
+    }
+
+    /// The answers typed so far that are no secret and came from no flag, by step id: what a
+    /// second run offers again.
+    pub fn typed(&self) -> Vec<(&'static str, &str)> {
+        self.wizard
+            .steps
+            .iter()
+            .zip(&self.answers)
+            .zip(&self.given)
+            .filter_map(|((step, answer), given)| match answer {
+                Some(Answer::Text(t)) if !given => Some((step.id, t.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn wizard(&self) -> &'static Wizard {
+        self.wizard
+    }
+
+    /// The current step's view when it is answered with `pending`, the item pointed at or the
+    /// text typed so far, or at a [`Kind::Gate`] the index of the case pointed at: the outline,
+    /// the count and Next follow that answer.
+    pub fn preview(&self, pending: &str) -> View<'_> {
+        self.view(self.at, Some(pending))
+    }
+
+    fn view(&self, at: usize, pending: Option<&str>) -> View<'_> {
         let steps = self.wizard.steps;
+        let path = self.path(at, pending);
+        let seen_total = path.len();
+        let seen = path.iter().filter(|(i, _)| *i <= at).count().max(1);
+        let stops = self.stops(at, pending);
+        let next = path
+            .iter()
+            .find(|(i, place)| *i > at && *place == Place::Left)
+            .map(|(i, _)| steps[*i].title)
+            .or_else(|| match steps[at].kind {
+                // A case the setup stops at leads to its advice, not to the save.
+                _ if stops => Some(STOPS_HERE),
+                // After the last step the user sees, the save's own screen comes.
+                Kind::Commit => None,
+                _ => steps
+                    .iter()
+                    .find(|s| matches!(s.kind, Kind::Commit))
+                    .map(|s| s.title),
+            });
         View {
+            page: steps[at].page.map(|p| self.link(p)),
+            seen,
+            seen_total,
+            outline: path
+                .into_iter()
+                .map(|(i, place)| (steps[i].title, place))
+                .collect(),
             number: at + 1,
             total: steps.len(),
             step: &steps[at],
             links: steps[at].links.iter().map(|l| self.link(l)).collect(),
-            next: (at + 1..steps.len())
-                .find(|&i| !self.skipped(i))
-                .map(|i| steps[i].title),
+            next,
             fix: self.fix.as_deref(),
             warning: self.warning,
             can_go_back: !self.shown.is_empty(),
@@ -372,7 +628,7 @@ impl Session {
     pub fn prompt(&self) -> Prompt<'_> {
         match &self.end {
             Some(End::Stopped(advice)) => return Prompt::Stopped(advice),
-            Some(End::Failed(at, fix)) => return Prompt::Failed(self.view(*at), fix.clone()),
+            Some(End::Failed(at, fix)) => return Prompt::Failed(self.view(*at, None), fix.clone()),
             Some(End::Done) => return Prompt::Done,
             None => {}
         }
@@ -381,7 +637,7 @@ impl Session {
         };
         match step.kind {
             Kind::Check { reads } => Prompt::Check(
-                self.view(self.at),
+                self.view(self.at, None),
                 Answers {
                     session: self,
                     reads: Some(reads),
@@ -391,7 +647,7 @@ impl Session {
                 session: self,
                 reads: None,
             }),
-            _ => Prompt::Show(self.view(self.at)),
+            _ => Prompt::Show(self.view(self.at, None)),
         }
     }
 
@@ -461,6 +717,9 @@ impl Session {
         };
         let can_ask_again = self.interactive && target < self.at && !self.given[target];
         if can_ask_again {
+            for &s in self.shown.iter().filter(|&&s| s > target) {
+                self.passed[s] = !matches!(self.wizard.steps[s].kind, Kind::Ask(_));
+            }
             self.shown.retain(|&s| s < target);
             self.answers[target] = None;
             self.at = target;

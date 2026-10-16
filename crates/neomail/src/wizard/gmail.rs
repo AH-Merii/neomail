@@ -13,7 +13,8 @@ use anyhow::{Context, Result};
 use nm_imap::smtp::{self, SmtpConfig};
 use nm_imap::{ImapConfig, ImapError, Security};
 
-use super::cli::{self, Term};
+use super::cli::{self, Saved, Ui};
+use super::term::Tty;
 use super::{
     Answers, Case, CheckError, Cleaned, Kind, Mistake, Question, Session, StartError, Step, Wizard,
 };
@@ -27,8 +28,8 @@ const TWO_STEP_PAGE: &str = "https://myaccount.google.com/signinoptions/two-step
 /// What a refused login can mean. Repeated at the password step, since the eligibility step is
 /// skipped when nothing can be asked.
 const REFUSED_FIX: &str = "\
-Gmail refused this address and app password. Paste the app password from step 3, not your Google
-Account password, and check the address (step 6; on a terminal, type < to go back to it). Google
+Gmail refused this address and app password. Paste the app password you created, not your Google
+Account password, and check the address (on a terminal, Esc goes back to it). Google
 revokes app passwords when the Google Account password changes. App passwords need 2-Step
 Verification, and Google may offer none when it is set up only for security keys,
 for a work, school or other organisation account (its administrator may not allow them),
@@ -36,6 +37,7 @@ or with Advanced Protection (https://support.google.com/accounts/answer/185833).
 
 pub static GMAIL_APP_PASSWORD: Wizard = Wizard {
     id: "gmail-app-password",
+    title: "a Gmail account, with an app password",
     steps: &[
         Step {
             id: "eligible",
@@ -44,6 +46,7 @@ pub static GMAIL_APP_PASSWORD: Wizard = Wizard {
 Google has app passwords only for accounts with 2-Step Verification on, and even then may offer
 none in the cases 2 to 4 below. Pick the one that fits.",
             links: &[APP_PASSWORDS_HELP],
+            page: None,
             kind: Kind::Gate(&[
                 Case {
                     label: "None of these: a personal account, with 2-Step Verification on or \
@@ -63,7 +66,7 @@ none in the cases 2 to 4 below. Pick the one that fits.",
                 // Google Workspace users can sign in to legacy apps with an app password, but
                 // not where the administrator requires security keys
                 // (https://knowledge.workspace.google.com/admin/security/how-2-step-verification-works-with-legacy-apps),
-                // so this case goes on and step 3 says what to do if the option is missing.
+                // so this case goes on and the create step says what to do if the option is missing.
                 Case {
                     label: "A work, school or other organisation account: its administrator may \
                             not allow app passwords. If \
@@ -86,27 +89,14 @@ none in the cases 2 to 4 below. Pick the one that fits.",
             id: "two-step",
             title: "Turn on 2-Step Verification",
             why: "\
-Skip this if it is on. Google: \"App passwords can only be used with accounts that have 2-Step
-Verification turned on.\" Use a second step other than security keys alone.",
+- Turn it on, with a second step other than security keys alone.
+Note: skip this if it is on. Google: \"App passwords can only be used with accounts that have
+2-Step Verification turned on.\"",
             links: &[
                 TWO_STEP_PAGE,
                 "https://support.google.com/accounts/answer/185839",
             ],
-            kind: Kind::Console,
-        },
-        Step {
-            id: "create",
-            title: "Create an app password",
-            why: "\
-Name it (\"neomail\", say), create it and copy it. It is what neomail logs in with, so your
-Google Account password never reaches neomail. If the page has no option to add one, Google may
-offer none for this account: with security keys only, add another second step; for a work,
-school or other organisation account, its administrator may not allow app passwords, so ask them or
-use `neomail account add gmail`.",
-            links: &[
-                "https://myaccount.google.com/apppasswords",
-                APP_PASSWORDS_HELP,
-            ],
+            page: Some(TWO_STEP_PAGE),
             kind: Kind::Console,
         },
         Step {
@@ -114,11 +104,13 @@ use `neomail account add gmail`.",
             title: "Name the account",
             why: "What neomail calls it, as in `neomail sync --account NAME`.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--name"),
                 prompt: "Account name in neomail: ",
                 secret: false,
                 default: Some("gmail"),
+                choices: &[],
                 clean: clean_name,
             }),
         },
@@ -127,6 +119,7 @@ use `neomail account add gmail`.",
             title: "Check that the name is free",
             why: "No account in the config has this name yet.",
             links: &[],
+            page: None,
             kind: Kind::Check { reads: &["name"] },
         },
         Step {
@@ -134,11 +127,13 @@ use `neomail account add gmail`.",
             title: "Your Gmail address",
             why: "IMAP and SMTP log in with the address and the app password.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--username"),
                 prompt: "Gmail address: ",
                 secret: false,
                 default: None,
+                choices: &[],
                 clean: clean_address,
             }),
         },
@@ -148,21 +143,41 @@ use `neomail account add gmail`.",
             why: "The config can take the account and the keyring opens, before the password \
                   is asked.",
             links: &[],
+            page: None,
             kind: Kind::Check {
                 reads: &["name", "address"],
             },
         },
         Step {
+            id: "create",
+            title: "Create an app password",
+            why: "\
+- Name it (\"neomail\", say), create it and copy it.
+It is what neomail logs in with, so your Google Account password never reaches neomail.
+Warning: if the page has no option to add one, Google may
+offer none for this account: with security keys only, add another second step; for a work,
+school or other organisation account, its administrator may not allow app passwords, so ask them or
+use `neomail account add gmail`.",
+            links: &[
+                "https://myaccount.google.com/apppasswords",
+                APP_PASSWORDS_HELP,
+            ],
+            page: Some("https://myaccount.google.com/apppasswords"),
+            kind: Kind::Console,
+        },
+        Step {
             id: "password",
             title: "Paste the app password",
-            why: "The app password from step 3, not your Google Account password. Spaces are \
-                  removed.",
+            why: "The app password you just created, not your Google Account password. Spaces \
+                  are removed.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: None,
                 prompt: "App password (not shown): ",
                 secret: true,
                 default: None,
+                choices: &[],
                 clean: clean_app_password,
             }),
         },
@@ -172,6 +187,7 @@ use `neomail account add gmail`.",
             why: "neomail logs in to Gmail's IMAP, reading nothing, and to its SMTP, sending \
                   nothing, before anything is written.",
             links: &[],
+            page: None,
             kind: Kind::Check {
                 reads: &["address", "password"],
             },
@@ -181,6 +197,7 @@ use `neomail account add gmail`.",
             title: "Save the account",
             why: "The app password goes to the keyring and the account to the config.",
             links: &[],
+            page: None,
             kind: Kind::Commit,
         },
     ],
@@ -295,21 +312,29 @@ pub struct Deps<'a> {
     pub servers: Servers,
 }
 
-/// `neomail account add gmail-app-password`.
-pub fn add(config_path: &Path, args: Args, input: Input, out: &mut impl Write) -> Result<()> {
+/// `neomail account add gmail-app-password`, with `paint` for standard error.
+pub fn add(
+    config_path: &Path,
+    args: Args,
+    input: Input,
+    paint: crate::style::Paint,
+    out: &mut impl Write,
+) -> Result<()> {
     let deps = Deps {
         open_keyring: &Keyring::open,
         servers: Servers::gmail(),
     };
-    run(config_path, args, input, &mut cli::Stdio(input), &deps, out)
+    let mut tty = Tty::new(input, "password");
+    let mut ui = Ui::real(&mut tty, paint, false, GMAIL_APP_PASSWORD.id);
+    run(config_path, args, input, &mut ui, &deps, out)
 }
 
-/// The wizard with `term` for the user and `deps` for the outside.
+/// The wizard with `ui` for the user and `deps` for the outside.
 pub fn run(
     config_path: &Path,
     args: Args,
     input: Input,
-    term: &mut dyn Term,
+    ui: &mut Ui<'_>,
     deps: &Deps<'_>,
     out: &mut impl Write,
 ) -> Result<()> {
@@ -318,7 +343,7 @@ pub fn run(
         "--username" => args.username.clone(),
         _ => None,
     };
-    let session = match Session::new(&GMAIL_APP_PASSWORD, term.interactive(), flag) {
+    let session = match Session::new(&GMAIL_APP_PASSWORD, ui.interactive(), flag) {
         Ok(session) => session,
         Err(StartError::Missing(flags)) => {
             return Err(secret::cannot_ask(input, &flags.join(" and ")));
@@ -344,7 +369,10 @@ pub fn run(
             Some(&deps.servers.smtp),
         )
     };
-    let check = |id: &str, answers: &Answers<'_>| -> Result<String, CheckError> {
+    let check = |id: &str,
+                 answers: &Answers<'_>,
+                 _: &mut cli::Ask<'_, '_>|
+     -> Result<String, CheckError> {
         match id {
             "name-free" => {
                 let name = answers.text("name").unwrap_or_default();
@@ -383,10 +411,11 @@ pub fn run(
                     e
                 })
             }
+            "login" => Ok(cli::SKIPPED.to_owned()),
             _ => Ok(String::new()),
         }
     };
-    let write = |answers: &Answers<'_>| -> Result<String> {
+    let write = |answers: &Answers<'_>| -> Result<Saved> {
         let name = answers.text("name").unwrap_or_default();
         let stored = match (keyring.borrow().as_ref(), answers.secret("password")) {
             (Some(keyring), Some(password)) => {
@@ -412,12 +441,16 @@ pub fn run(
             answers.text("address").unwrap_or_default(),
             config_path.display(),
         )?;
-        Ok(format!(
-            "Google revokes app passwords when the Google Account password changes ({APP_PASSWORDS_HELP}): \
-             then create a new one and run `neomail account set-password {name}`."
-        ))
+        out.flush()?;
+        Ok(Saved {
+            said: format!(
+                "Google revokes app passwords when the Google Account password changes ({APP_PASSWORDS_HELP}): \
+                 then create a new one and run `neomail account set-password {name}`."
+            ),
+            todo: Vec::new(),
+        })
     };
-    cli::drive(&mut session, term, check, write)
+    cli::drive(&mut session, ui, check, write)
 }
 
 /// What a refused login adds when the address or the app password came from a flag, which the

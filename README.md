@@ -74,6 +74,17 @@ error. Secrets are never flags: they are prompted for without echo, read as one 
 input, or come from `--password-command`. `--no-check` skips the login. `neomail account add
 --help` lists the flags with examples.
 
+On a terminal each setup is a wizard: a welcome screen, then one step per screen with where you
+are (`▸ Step 2/9 · Name the account`) and the steps done and left. Lists (the provider, the
+security, the account type) are picked with the arrow keys or `j`/`k` and Enter, or by typing
+to narrow them. The footer names the keys: Enter continues, `s` skips a step already done, Esc
+goes back and Ctrl-C quits. A wrong answer shows under it, with what you typed kept to fix.
+Secrets are typed hidden, with nothing shown. Each step's page opens in your browser the first
+time it shows, unless `--no-browser` is given or you are over SSH without a display; the link is
+printed either way. Each check shows as it runs and ends, the save asks first, and the end sums
+up what was saved where and what is left to do. If you quit, the answers you typed (never a
+secret) are kept in the data directory and offered again on the next run.
+
 - **Proton Mail**, through Proton Mail Bridge (paid Proton plans):
 
   ```sh

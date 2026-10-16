@@ -20,6 +20,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 anstyle = "1"
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
+# The setup wizards' terminal (crates/neomail/src/wizard/term.rs): raw mode, keys and the size.
+# ratatui's default backend, so the TUI can share it; no bracketed paste or Windows parts.
+crossterm = { version = "0.29", default-features = false, features = ["events"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 html2text = "0.17"
 # Must match the html5ever that html2text uses: its RcDom is the parse target.

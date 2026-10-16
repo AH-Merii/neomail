@@ -14,7 +14,7 @@ neomail sync --account outlook
 ```
 
 On a terminal, `account add outlook` takes you through the setup one step at a time. Each step
-says what to do, why it exists and which page to open; `<` goes back a step. It first asks
+says what to do, why it exists and which page to open; Esc goes back a step. It first asks
 whether the account is personal (Outlook.com, Hotmail) or work or school (`--account-type`), and
 how you will sign in (`--device-code`), and shows only the steps that apply:
 
@@ -26,6 +26,9 @@ how you will sign in (`--device-code`), and shows only the steps that apply:
 - **Register the app** at <https://entra.microsoft.com> with **Any Entra ID Tenant + Personal
   Microsoft accounts**, not the suggested single tenant: neomail signs in through Microsoft's
   `common` endpoint ([app registration guide](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)).
+- **The Application (client) ID**, asked right after Register, while the app's Overview page
+  shows it: Microsoft opens that page on Register (same guide). It must be a GUID. There is no
+  secret: neomail runs on your machine, so it cannot keep one.
 - **Browser sign-in only: the redirect URI** `http://localhost` under **Mobile and desktop
   applications**. Microsoft ignores the port of a localhost redirect URI, so neomail can listen on
   any free port, on 127.0.0.1 and, where it can, `[::1]`
@@ -40,8 +43,6 @@ how you will sign in (`--device-code`), and shows only the steps that apply:
   If the sign-in asks for an admin's approval, ask your IT admin.
 - **Your address and a name**, then neomail checks that the name is free, that the config file
   can take it and that the keyring opens.
-- **The Application (client) ID** from the app's Overview page. It must be a GUID. There is no
-  secret: neomail runs on your machine, so it cannot keep one.
 
 neomail then asks Microsoft about the client ID before you sign in, with a device code request
 that is never shown or used: an unknown ID sends you back to that step. Then you sign in

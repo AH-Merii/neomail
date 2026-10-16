@@ -1407,3 +1407,65 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
   - The state is the cache's `label_retry` table, keyed by the message's id.
 - **Builds on:** [DEC-2026-10-13-categories](#dec-2026-10-13-categories) and
   [DEC-2026-10-14-labels-junk](#dec-2026-10-14-labels-junk).
+
+### <a id="dec-2026-10-15-wizard-ui"></a>DEC-2026-10-15-wizard-ui: the setup wizards' terminal interface
+
+- **Status:** proposed by Claude on 2026-10-15, for issue #104.
+- **Proposal:**
+  - **One palette of named roles** in `crates/neomail/src/style.rs`, from the 16 ANSI colours plus
+    bold, dim and underline, which help (#102) shares: a heading and where you are, bold yellow;
+    what you type or press (commands, flags, values, keys, the item a list points at), bold
+    green; a placeholder such as `NAME`, magenta; a link, underlined cyan; an action, bold after a
+    bullet; a note, dim; a warning, yellow after ⚠; success, green after ✓; a failure, red after
+    ✗. Symbols and words carry each meaning, so nothing depends on colour, and they fall back to
+    ASCII (`+ x > * ! ->`) when the locale is not UTF-8. The wizards follow `--color`, NO_COLOR
+    and the rest through the standard error decision made in main.rs.
+  - **One dependency, crossterm 0.29 (MIT),** without its default features but `events`: raw
+    mode, keys and the terminal's size. It is ratatui's default backend, so the TUI can share it.
+    No prompt crate: none gives one step per screen with the steps done and left, the footer of
+    keys, an error kept under its answer and remembered answers together, and the wizard model
+    already holds the steps.
+  - **All terminal input and output goes through the `Term` trait** (`wizard/term.rs`): keys in,
+    whole screens out, and plain lines for what is said off a terminal. The tests script keys and
+    read the screens. Raw mode stays on between keys, so typed-ahead keys never echo, goes off for
+    each check, and goes off when the wizard's `Ui` drops, so it is left on success, an error, a
+    quit and an unwinding panic; a panic hook leaves it too.
+  - **The screens:** a welcome screen (what is set up, how many steps, that Ctrl-C quits and what
+    is kept, then "Ready to start?"); then one step per screen, with a header such as `▸ Step
+    2/9 · Name the account` counting only the steps the user sees, never the checks, and the
+    steps done, current and left, one per line where they fit, else on one line. A step's text
+    marks its actions (`- `), notes (`Why: `, `Note: `) and warnings (`Warning: `), each shown
+    differently. A footer names the keys: Enter, `s` to skip a step that may be done already, Esc
+    to go back, `q` or Ctrl-C to quit. Lists (the provider, every gate, every question with fixed
+    answers) take the arrows, `j`/`k` before anything is typed, a digit, and typing to narrow.
+    A wrong answer shows under it with the text kept to edit. Secrets show nothing. Each check
+    shows while it runs and as ✓ or ✗ on the next screen; the save asks yes or no first, and so
+    does replacing a leftover sign-in; the end lists the checks passed, what was saved where and
+    what is left to do. Paragraphs wrap to the terminal, at most 100 columns wide; at 80x24 the
+    outline goes on one line, then notes go, then the text is cut, so the header, the action, the
+    prompt and the footer stay on screen.
+  - **The steps follow the answer about to be given** (#106): the count, the outline, Next and the
+    welcome screen come from one prediction (`Session::path`), made with the item pointed at or
+    the text typed, else the answer given, the one offered from the last run, or the default. A
+    value is asked right after the step whose page shows it. The end lists the checks passed and
+    those `--no-check` skipped, and what is left to do; what was saved where, the save says once.
+  - **Pages open for you.** The first time a step with a page shows, neomail opens it through
+    `browser.rs` and says `↗ opening URL`, except with `--no-browser`, over SSH without a display
+    or off a terminal, where it says `Open it yourself:` with the URL. Links are always printed,
+    as OSC 8 hyperlinks on a terminal. This changes "A browser opens only when the user asks" in
+    [DEC-2026-10-13-wizard-steps](#dec-2026-10-13-wizard-steps), as the owner asked in #104.
+  - **A second run remembers.** The answers typed in an unfinished run that are no secret and
+    came from no flag are kept in `wizard-ID.json` in the data directory (mode 0600), offered
+    again (Enter keeps each), and deleted once the account is saved. With `--no-input` or off a
+    terminal the file is neither read nor written.
+  - **imap is on the wizard model on a terminal** (`wizard/imap.rs`), with a security question it
+    did not ask before; off a terminal and with `--no-input` it runs from the flags as before.
+  - Off a terminal and with `--no-input` nothing changes: the flags answer, checks print as they
+    did and secrets are read from standard input.
+- **Rejected:** a prompt crate (dialoguer, inquire): each draws its own prompt line and none
+  shows a whole step per screen with the outline and footer; the alternate screen: a Ctrl-C during
+  a check would leave the user on it, and the summary would vanish with it; numbering steps by
+  their place in the model: checks would count, and the count would not match what the user
+  sees.
+- **Builds on:** [DEC-2026-10-13-wizard-steps](#dec-2026-10-13-wizard-steps) and
+  [DEC-2026-10-14-help-logo](#dec-2026-10-14-help-logo).

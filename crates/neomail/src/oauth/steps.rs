@@ -4,7 +4,7 @@
 //!
 //! Console labels drift, so each step quotes its provider briefly and links the page.
 
-use crate::wizard::{Cleaned, Kind, Mistake, Question, Step, Wizard};
+use crate::wizard::{Choice, Cleaned, Kind, Mistake, Question, Step, Wizard};
 
 // What a failed check can mean: the `kind` of a `CheckError`, matched in the tables' mistakes.
 pub const NAME_TAKEN: &str = "name-taken";
@@ -21,6 +21,8 @@ pub const REDIRECT_MISMATCH: &str = "redirect-mismatch";
 pub const CONFIDENTIAL_DEVICE: &str = "confidential-device";
 pub const CONFIDENTIAL_BROWSER: &str = "confidential-browser";
 /// Anything else: no step to send the user back to.
+/// The user kept a leftover sign-in rather than have it revoked and deleted.
+pub const KEPT_LEFTOVER: &str = "kept-leftover";
 pub const OTHER: &str = "other";
 
 /// The answers of the Outlook choices, as the steps that depend on them read them.
@@ -46,30 +48,34 @@ const WRITE_WHY: &str = "The sign-in goes to the keyring and the account to the 
 /// (<https://support.google.com/cloud/answer/15549257>).
 pub static GMAIL: Wizard = Wizard {
     id: "gmail",
+    title: "a Gmail account, through your own Google OAuth app",
     steps: &[
         Step {
             id: "project",
             title: "Create a Google Cloud project",
             why: "\
 neomail ships no OAuth client, so you create your own, and every client belongs to a project.
-Create one (\"neomail\", say) on its own, apart from anything else you run. No billing is
-needed. Its project ID can be changed only while you create it.",
+- Create one (\"neomail\", say) on its own, apart from anything else you run.
+Note: no billing is needed. Its project ID can be changed only while you create it.",
             links: &["https://console.cloud.google.com/projectcreate"],
+            page: Some("https://console.cloud.google.com/projectcreate"),
             kind: Kind::Console,
         },
         Step {
             id: "project-id",
             title: "The project's ID",
             why: "\
-The Project ID from the project's dashboard, not its name or number. With it, the links in the
-next steps open this project; press Enter to skip, then pick the project at the top of each
-page.",
+- Copy the Project ID from the project's dashboard, not its name or number.
+With it, the links in the next steps open this project. Press Enter to skip, then pick the
+project at the top of each page.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--project"),
                 prompt: "Project ID (Enter to skip): ",
                 secret: false,
                 default: Some(""),
+                choices: &[],
                 clean: clean_project,
             }),
         },
@@ -77,22 +83,27 @@ page.",
             id: "gmail-api",
             title: "Enable the Gmail API",
             why: "\
-Click Enable. Google lists only the scopes of enabled APIs when you add scopes under Data
-Access, and Gmail's scope is the one neomail reads your mail with.",
+- Click Enable.
+Why: Google lists only the scopes of enabled APIs when you add scopes under Data Access, and
+Gmail's scope is the one neomail reads your mail with.",
             links: &[
                 "https://console.cloud.google.com/apis/library/gmail.googleapis.com?project={project-id}",
             ],
+            page: Some(
+                "https://console.cloud.google.com/apis/library/gmail.googleapis.com?project={project-id}",
+            ),
             kind: Kind::Console,
         },
         Step {
             id: "branding",
             title: "Set up the Google Auth Platform",
             why: "\
-Branding > Get started: an app name only you will see, your address as the support email,
-Audience External, your address as the contact, agree to the policy, then Create.
+- Branding > Get started: an app name only you will see, your address as the support email,
+  Audience External, your address as the contact, agree to the policy, then Create.
 Why External: it lets a personal @gmail.com account sign in; Internal admits only a Google
 Workspace organisation's own users.",
             links: &["https://console.developers.google.com/auth/branding?project={project-id}"],
+            page: Some("https://console.developers.google.com/auth/branding?project={project-id}"),
             kind: Kind::Console,
         },
         Step {
@@ -100,11 +111,13 @@ Workspace organisation's own users.",
             title: "Your Gmail address",
             why: "The account neomail reads. You add it as a test user next, and sign in with it.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--email"),
                 prompt: "Gmail address: ",
                 secret: false,
                 default: None,
+                choices: &[],
                 clean: clean_address,
             }),
         },
@@ -112,22 +125,24 @@ Workspace organisation's own users.",
             id: "test-user",
             title: "Add yourself as a test user",
             why: "\
-Audience > Test users > Add users: add the address you just gave, then Save.
+- Audience > Test users > Add users: add the address you just gave, then Save.
 Why: while the app's publishing status is Testing, only its test users can sign in.",
             links: &["https://console.developers.google.com/auth/audience?project={project-id}"],
+            page: Some("https://console.developers.google.com/auth/audience?project={project-id}"),
             kind: Kind::Console,
         },
         Step {
             id: "scope",
             title: "Data Access: add the mail scope",
             why: "\
-Data Access > Add or Remove Scopes: tick https://mail.google.com/ (or paste it under Manually
-add scopes), click Update, then Save.
+- Data Access > Add or Remove Scopes: tick https://mail.google.com/ (or paste it under Manually
+  add scopes), click Update, then Save.
 Why: Gmail's IMAP and SMTP accept OAuth only with this scope.",
             links: &[
                 "https://console.developers.google.com/auth/scopes?project={project-id}",
                 "https://developers.google.com/workspace/gmail/imap/xoauth2-protocol",
             ],
+            page: Some("https://console.developers.google.com/auth/scopes?project={project-id}"),
             kind: Kind::Console,
         },
         Step {
@@ -140,13 +155,15 @@ Audience shows the publishing status, Testing for a new app. It decides how long
 - Published (Audience > Publish app): sign-ins last. Your app is unverified, so Google warns at
   sign-in (Advanced, then Go to the app's name) and caps it at 100 users; an app for your own
   use needs no verification.
-Neither works with Advanced Protection: it lets only verified apps reach the account's data.",
+Warning: neither works with Advanced Protection: it lets only verified apps reach the
+account's data.",
             links: &[
                 "https://console.developers.google.com/auth/audience?project={project-id}",
                 "https://developers.google.com/identity/protocols/oauth2#expiration",
                 "https://support.google.com/cloud/answer/13464323",
                 "https://support.google.com/accounts/answer/7539956",
             ],
+            page: None,
             kind: Kind::Console,
         },
         Step {
@@ -154,11 +171,13 @@ Neither works with Advanced Protection: it lets only verified apps reach the acc
             title: "Name the account",
             why: NAME_STEP_WHY,
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--name"),
                 prompt: "Account name in neomail: ",
                 secret: false,
                 default: Some("gmail"),
+                choices: &[],
                 clean: clean_name,
             }),
         },
@@ -167,6 +186,7 @@ Neither works with Advanced Protection: it lets only verified apps reach the acc
             title: "Check that the account can be saved",
             why: READY_WHY,
             links: &[],
+            page: None,
             kind: Kind::Check {
                 reads: &["name", "email"],
             },
@@ -175,15 +195,16 @@ Neither works with Advanced Protection: it lets only verified apps reach the acc
             id: "client",
             title: "Create a Desktop app client",
             why: "\
-Clients > Create client > Application type: Desktop app, any name, Create. Copy the client ID
-and the client secret now: Google shows the secret in full only this once. Lost it? Open the
-client and click Add secret.
+- Clients > Create client > Application type: Desktop app, any name, Create.
+- Copy the client ID and the client secret now: Google shows the secret in full only this once.
+Lost it? Open the client and click Add secret.
 Why Desktop app: it may send the sign-in back to http://127.0.0.1 on any port, where neomail
 waits for it.",
             links: &[
                 "https://console.developers.google.com/auth/clients?project={project-id}",
                 "https://support.google.com/cloud/answer/15549257",
             ],
+            page: Some("https://console.developers.google.com/auth/clients?project={project-id}"),
             kind: Kind::Console,
         },
         Step {
@@ -191,11 +212,13 @@ waits for it.",
             title: "Paste the client ID",
             why: "It ends in .apps.googleusercontent.com.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--client-id"),
                 prompt: "Client ID: ",
                 secret: false,
                 default: None,
+                choices: &[],
                 clean: clean_google_client_id,
             }),
         },
@@ -204,11 +227,13 @@ waits for it.",
             title: "Paste the client secret",
             why: "The secret of the same client. It goes to the keyring with the sign-in.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: None,
                 prompt: "Client secret (not shown): ",
                 secret: true,
                 default: None,
+                choices: &[],
                 clean: clean_secret,
             }),
         },
@@ -217,6 +242,7 @@ waits for it.",
             title: "Check the client with Google",
             why: "Google is asked whether it knows this client ID and secret; no one signs in.",
             links: &[],
+            page: None,
             kind: Kind::Check {
                 reads: &["client-id", "secret"],
             },
@@ -226,6 +252,7 @@ waits for it.",
             title: "Sign in",
             why: SIGN_IN_WHY,
             links: &[],
+            page: None,
             kind: Kind::Check {
                 reads: &["email", "client-id", "secret"],
             },
@@ -236,6 +263,7 @@ waits for it.",
             why: "neomail logs in to Gmail's IMAP, reading nothing, and to its SMTP, sending \
                   nothing, with the new sign-in.",
             links: &[],
+            page: None,
             kind: Kind::Check { reads: &["email"] },
         },
         Step {
@@ -243,10 +271,17 @@ waits for it.",
             title: "Save the account",
             why: WRITE_WHY,
             links: &[],
+            page: None,
             kind: Kind::Commit,
         },
     ],
     mistakes: &[
+        Mistake {
+            check: "sign-in",
+            kind: KEPT_LEFTOVER,
+            step: "name",
+            fix: "Choose another name, or keep this one and let neomail replace the old sign-in.",
+        },
         Mistake {
             check: "ready",
             kind: NAME_TAKEN,
@@ -326,6 +361,7 @@ waits for it.",
 /// <https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/configure-user-consent>).
 pub static OUTLOOK: Wizard = Wizard {
     id: "outlook",
+    title: "an Outlook or Hotmail account, through your own Microsoft Entra app",
     steps: &[
         Step {
             id: "account-type",
@@ -334,11 +370,22 @@ pub static OUTLOOK: Wizard = Wizard {
 personal: Outlook.com, Hotmail or Live. work: an address your organisation gave you. Each sees
 only the steps that apply to it.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--account-type"),
                 prompt: "personal or work? ",
                 secret: false,
                 default: Some(PERSONAL),
+                choices: &[
+                    Choice {
+                        value: PERSONAL,
+                        label: "Outlook.com, Hotmail or Live",
+                    },
+                    Choice {
+                        value: WORK,
+                        label: "an address your organisation gave you",
+                    },
+                ],
                 clean: clean_account_type,
             }),
         },
@@ -347,13 +394,16 @@ only the steps that apply to it.",
             title: "Get a directory: a free Azure account",
             why: "\
 An app registration lives in a directory (tenant), and a personal account has none: Microsoft
-says you can't register apps until you have one. Sign up for the free Azure account with this
-account; Microsoft asks for a phone number and a card. Then sign in at entra.microsoft.com:
-a directory name under your name, not a bare GUID, means it worked.",
+says you can't register apps until you have one.
+- Sign up for the free Azure account with this
+  account; Microsoft asks for a phone number and a card.
+- Then sign in at entra.microsoft.com: a directory name under your name, not a bare GUID, means
+  it worked.",
             links: &[
                 "https://azure.microsoft.com/pricing/purchase-options/azure-account",
                 "https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-create-new-tenant",
             ],
+            page: Some("https://azure.microsoft.com/pricing/purchase-options/azure-account"),
             kind: Kind::ConsoleIf {
                 step: "account-type",
                 is: &[PERSONAL],
@@ -363,15 +413,34 @@ a directory name under your name, not a bare GUID, means it worked.",
             id: "register",
             title: "Register the app",
             why: "\
-At entra.microsoft.com: Entra ID > App registrations > New registration, any name. Under
-Supported account types choose Any Entra ID Tenant + Personal Microsoft accounts (not the
-suggested Single tenant), then Register.
+- At entra.microsoft.com: Entra ID > App registrations > New registration, any name. Under
+  Supported account types choose Any Entra ID Tenant + Personal Microsoft accounts (not the
+  suggested Single tenant), then Register.
 Why: neomail signs in through Microsoft's common endpoint, which needs that type.",
             links: &[
                 "https://entra.microsoft.com",
                 "https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app",
             ],
+            page: Some("https://entra.microsoft.com"),
             kind: Kind::Console,
+        },
+        Step {
+            id: "client-id",
+            title: "Paste the Application (client) ID",
+            why: "\
+Register opens the app's Overview page: copy its Application (client) ID, not the Directory
+(tenant) ID or the Object ID. There is no secret: neomail runs on your machine, so it cannot
+keep one.",
+            links: &[],
+            page: None,
+            kind: Kind::Ask(Question {
+                flag: Some("--client-id"),
+                prompt: "Application (client) ID: ",
+                secret: false,
+                default: None,
+                choices: &[],
+                clean: clean_guid,
+            }),
         },
         Step {
             id: "sign-in-method",
@@ -380,11 +449,22 @@ Why: neomail signs in through Microsoft's common endpoint, which needs that type
 browser: in a browser on this machine. device-code: with a code, on another device (chosen
 for you over SSH without a display). It decides the next step.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--device-code"),
                 prompt: "browser or device-code? ",
                 secret: false,
                 default: Some(BROWSER),
+                choices: &[
+                    Choice {
+                        value: BROWSER,
+                        label: "in a browser on this machine",
+                    },
+                    Choice {
+                        value: DEVICE_CODE,
+                        label: "with a code, on another device",
+                    },
+                ],
                 clean: clean_sign_in_method,
             }),
         },
@@ -392,13 +472,14 @@ for you over SSH without a display). It decides the next step.",
             id: "redirect",
             title: "Add the redirect URI",
             why: "\
-In the app: Authentication > Add Redirect URI > Mobile and desktop applications. Under Custom
-redirect URIs enter http://localhost, then Configure.
+- In the app: Authentication > Add Redirect URI > Mobile and desktop applications. Under Custom
+  redirect URIs enter http://localhost, then Configure.
 Why: Microsoft sends the browser back to http://localhost on any port, where neomail waits.
-Under Web instead, Microsoft would take the app for a confidential client and refuse it.",
+Note: under Web instead, Microsoft would take the app for a confidential client and refuse it.",
             links: &[
                 "https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-redirect-uri",
             ],
+            page: None,
             kind: Kind::ConsoleIf {
                 step: "sign-in-method",
                 is: &[BROWSER],
@@ -408,12 +489,13 @@ Under Web instead, Microsoft would take the app for a confidential client and re
             id: "public-client",
             title: "Allow public client flows",
             why: "\
-In the app: Authentication > Advanced settings: set Allow public client flows to Yes, then Save.
+- In the app: Authentication > Advanced settings: set Allow public client flows to Yes, then Save.
 Why: the device code sign-in sends no redirect URI, so this setting alone tells Microsoft the
 app is a public client, which has no secret.",
             links: &[
                 "https://learn.microsoft.com/en-us/troubleshoot/entra/entra-id/app-integration/confidential-client-application-authentication-error-aadsts7000218",
             ],
+            page: None,
             kind: Kind::ConsoleIf {
                 step: "sign-in-method",
                 is: &[DEVICE_CODE],
@@ -425,12 +507,14 @@ app is a public client, which has no secret.",
             why: "\
 neomail asks to read, change and send your mail. Microsoft's pages disagree on whether you can
 allow that yourself: one says users can by default, another that the default for new tenants
-keeps users from allowing Mail.Read and Mail.ReadWrite. If the sign-in asks for an admin's
-approval, ask your IT admin to approve the app, then sign in again.",
+keeps users from allowing Mail.Read and Mail.ReadWrite.
+Warning: if the sign-in asks for an admin's approval, ask your IT admin to approve the app, then
+sign in again.",
             links: &[
                 "https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/configure-user-consent",
                 "https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/manage-app-consent-policies",
             ],
+            page: None,
             kind: Kind::ConsoleIf {
                 step: "account-type",
                 is: &[WORK],
@@ -441,11 +525,13 @@ approval, ask your IT admin to approve the app, then sign in again.",
             title: "Your Outlook address",
             why: "The account neomail reads, and the one you sign in with.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--email"),
                 prompt: "Outlook address: ",
                 secret: false,
                 default: None,
+                choices: &[],
                 clean: clean_address,
             }),
         },
@@ -454,11 +540,13 @@ approval, ask your IT admin to approve the app, then sign in again.",
             title: "Name the account",
             why: NAME_STEP_WHY,
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--name"),
                 prompt: "Account name in neomail: ",
                 secret: false,
                 default: Some("outlook"),
+                choices: &[],
                 clean: clean_name,
             }),
         },
@@ -467,30 +555,17 @@ approval, ask your IT admin to approve the app, then sign in again.",
             title: "Check that the account can be saved",
             why: READY_WHY,
             links: &[],
+            page: None,
             kind: Kind::Check {
                 reads: &["name", "email"],
             },
-        },
-        Step {
-            id: "client-id",
-            title: "Paste the Application (client) ID",
-            why: "\
-From the app's Overview page: the Application (client) ID, not the Directory (tenant) ID or
-the Object ID. There is no secret: neomail runs on your machine, so it cannot keep one.",
-            links: &[],
-            kind: Kind::Ask(Question {
-                flag: Some("--client-id"),
-                prompt: "Application (client) ID: ",
-                secret: false,
-                default: None,
-                clean: clean_guid,
-            }),
         },
         Step {
             id: "client-check",
             title: "Check the app with Microsoft",
             why: "Microsoft is asked whether it knows this app; no one signs in.",
             links: &[],
+            page: None,
             kind: Kind::Check {
                 reads: &["client-id"],
             },
@@ -500,6 +575,7 @@ the Object ID. There is no secret: neomail runs on your machine, so it cannot ke
             title: "Sign in",
             why: SIGN_IN_WHY,
             links: &[],
+            page: None,
             kind: Kind::Check {
                 reads: &["account-type", "sign-in-method", "email", "client-id"],
             },
@@ -509,6 +585,7 @@ the Object ID. There is no secret: neomail runs on your machine, so it cannot ke
             title: "Check the mailbox",
             why: "neomail reads the INBOX's message count through Microsoft Graph, once.",
             links: &[],
+            page: None,
             kind: Kind::Check { reads: &["email"] },
         },
         Step {
@@ -516,10 +593,17 @@ the Object ID. There is no secret: neomail runs on your machine, so it cannot ke
             title: "Save the account",
             why: WRITE_WHY,
             links: &[],
+            page: None,
             kind: Kind::Commit,
         },
     ],
     mistakes: &[
+        Mistake {
+            check: "sign-in",
+            kind: KEPT_LEFTOVER,
+            step: "name",
+            fix: "Choose another name, or keep this one and let neomail replace the old sign-in.",
+        },
         Mistake {
             check: "ready",
             kind: NAME_TAKEN,

@@ -248,8 +248,8 @@ Secrets are never flags: they are prompted for without echo, read as one line of
 or come from --password-command.
 
 gmail-app-password goes one step at a time on a terminal: whether the account can have an app
-password, 2-Step Verification, creating the app password, then the name and address (type < to
-go back). The keyring and the config are checked before the app password is asked, spaces in a
+password, 2-Step Verification, creating the app password, then the name and address (Esc goes
+back). The keyring and the config are checked before the app password is asked, spaces in a
 pasted one are removed, and the IMAP login and an SMTP login that sends nothing are checked
 before anything is written. Off a terminal or with --no-input it skips the advice steps and needs
 --username:
@@ -1213,7 +1213,7 @@ fn run(cli: Cli, colors: Colors) -> Result<ExitCode> {
             command: AccountCommand::Add(add),
         } => {
             let path = config::config_path(cli.config)?;
-            add_account(*add, &path, input, &mut out)?;
+            add_account(*add, &path, input, colors.stderr, &mut out)?;
             ExitCode::SUCCESS
         }
         Command::Account {
@@ -1603,10 +1603,16 @@ fn check_config(path: &Path) -> Result<std::result::Result<usize, String>> {
 
 /// `neomail account add`: picks the provider (a menu on a terminal), refuses flags that do not
 /// apply to it, then runs its flow.
-fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write) -> Result<()> {
+fn add_account(
+    add: AddCommand,
+    path: &Path,
+    input: Input,
+    paint: style::Paint,
+    out: &mut impl Write,
+) -> Result<()> {
     let provider = match add.provider {
         Some(p) => p,
-        None if input.can_prompt() => choose_provider()?,
+        None if input.can_prompt() => choose_provider(input, paint)?,
         None => {
             return Err(usage(format!(
                 "{}: name the provider, one of {} (`neomail account add PROVIDER`)",
@@ -1707,7 +1713,7 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
                 AddProvider::Outlook => &oauth::MICROSOFT,
                 _ => &oauth::GOOGLE,
             };
-            return account::add(oauth_provider, path, args, input, out);
+            return account::add(oauth_provider, path, args, input, paint, out);
         }
         AddProvider::GmailAppPassword => {
             let args = wizard::gmail::Args {
@@ -1716,7 +1722,7 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
                 password_command: add.password_command,
                 no_check: add.no_check,
             };
-            return wizard::gmail::add(path, args, input, out);
+            return wizard::gmail::add(path, args, input, paint, out);
         }
         AddProvider::Proton => {
             let args = wizard::proton::Args {
@@ -1731,7 +1737,7 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
                 password_command: add.password_command,
                 no_check: add.no_check,
             };
-            return wizard::proton::add(path, args, input, out);
+            return wizard::proton::add(path, args, input, paint, out);
         }
         AddProvider::Imap => &setup::IMAP,
     };
@@ -1748,30 +1754,18 @@ fn add_account(add: AddCommand, path: &Path, input: Input, out: &mut impl Write)
         smtp_port: add.smtp_port,
         smtp_security: add.smtp_security.map(SecurityArg::security),
     };
-    setup::add(preset, path, args, input, out)
+    setup::add(preset, path, args, input, paint, out)
 }
 
-/// The provider menu, on standard error.
-fn choose_provider() -> Result<AddProvider> {
-    eprintln!("Which kind of account?");
-    for (i, p) in AddProvider::ALL.iter().enumerate() {
-        eprintln!("  {}. {:<20} {}", i + 1, p.id(), p.label());
+/// The provider menu, a list on standard error picked with the keys.
+fn choose_provider(input: Input, paint: style::Paint) -> Result<AddProvider> {
+    let items = AddProvider::ALL.map(|p| (p.id(), p.label()));
+    let mut tty = wizard::term::Tty::new(input, "password");
+    let mut ui = wizard::cli::Ui::real(&mut tty, paint, true, "menu");
+    match wizard::cli::choose(&mut ui, "Which kind of account?", &items, 0)? {
+        Some(i) => Ok(AddProvider::ALL[i]),
+        None => anyhow::bail!("stopped; nothing was written."),
     }
-    loop {
-        let typed = secret::prompt_line(&format!("Number [1-{}]: ", AddProvider::ALL.len()))?;
-        if let Some(p) = parse_choice(&typed) {
-            return Ok(p);
-        }
-        eprintln!("neomail: {typed:?} is not one of the numbers or names above");
-    }
-}
-
-/// A menu answer: its number or the provider's name.
-fn parse_choice(typed: &str) -> Option<AddProvider> {
-    let typed = typed.trim();
-    AddProvider::ALL.into_iter().enumerate().find_map(|(i, p)| {
-        (typed == (i + 1).to_string() || typed.eq_ignore_ascii_case(p.id())).then_some(p)
-    })
 }
 
 /// Opens the cache. With `create` unset, a missing cache is `None` rather than a new empty file.
@@ -1890,25 +1884,6 @@ mod tests {
         };
         let sending: Result<()> = Err(smtp).context(send::Sending("sending from work".into()));
         assert!(!is_broken_pipe(&sending.unwrap_err().context("outer")));
-    }
-
-    #[test]
-    fn menu_answers_are_a_number_or_a_name() {
-        assert!(matches!(parse_choice("1"), Some(AddProvider::Gmail)));
-        assert!(matches!(parse_choice("2"), Some(AddProvider::Outlook)));
-        assert!(matches!(parse_choice(" 4 "), Some(AddProvider::Proton)));
-        assert!(matches!(
-            parse_choice("outlook"),
-            Some(AddProvider::Outlook)
-        ));
-        assert!(matches!(parse_choice("IMAP"), Some(AddProvider::Imap)));
-        assert!(matches!(
-            parse_choice("gmail-app-password"),
-            Some(AddProvider::GmailAppPassword)
-        ));
-        for bad in ["", "0", "6", "hotmail"] {
-            assert!(parse_choice(bad).is_none(), "{bad}");
-        }
     }
 
     #[test]

@@ -15,10 +15,12 @@ use base64::Engine;
 use nm_imap::{CertPin, ImapConfig, Security};
 
 use self::probe::{ProbeError, Protocol};
-use super::cli::{self, Term};
+use super::cli::{self, Saved, Ui};
 use super::gmail::{NAME_TAKEN, REFUSED, check_login, clean_name, name_taken, other};
+use super::term::Tty;
 use super::{
-    Answers, CheckError, Cleaned, Kind, Mistake, Question, Session, StartError, Step, Wizard,
+    Answers, CheckError, Choice, Cleaned, Kind, Mistake, Question, Session, StartError, Step,
+    Wizard,
 };
 use crate::config::{self, SmtpSettings};
 use crate::keyring::{self, Keyring};
@@ -29,38 +31,60 @@ const SETTINGS_GUIDE: &str = "https://proton.me/support/comprehensive-guide-to-b
 
 pub static PROTON: Wizard = Wizard {
     id: "proton",
+    title: "a Proton Mail account, through Proton Mail Bridge",
     steps: &[
         Step {
             id: "plan",
             title: "A paid Proton plan",
             why: "\
 Proton Mail Bridge, which neomail reads Proton Mail through, comes only with a paid plan that
-includes Mail. On a free plan Bridge refuses the sign-in in step 3.",
+includes Mail.
+Warning: on a free plan Bridge refuses the sign-in in step 3.",
             links: &[BRIDGE_PAGE, "https://proton.me/mail/pricing"],
+            page: Some("https://proton.me/mail/pricing"),
             kind: Kind::Console,
         },
         Step {
             id: "install",
             title: "Install Proton Mail Bridge and a keyring",
             why: "\
-Bridge decrypts your mail on this computer and serves it to apps such as neomail. Install it from
-Proton's page or your distribution (Arch: protonmail-bridge, or protonmail-bridge-core without
-the window). Bridge keeps its keys in a keyring: GNOME Keyring, KWallet, KeePassXC or pass.",
+Bridge decrypts your mail on this computer and serves it to apps such as neomail.
+- Install it from Proton's page or your distribution (Arch: protonmail-bridge, or
+  protonmail-bridge-core without the window).
+Note: Bridge keeps its keys in a keyring: GNOME Keyring, KWallet, KeePassXC or pass.",
             links: &[
                 "https://proton.me/support/bridge-for-linux",
                 "https://proton.me/support/bridge-cli-guide",
             ],
+            page: Some("https://proton.me/support/bridge-for-linux"),
             kind: Kind::Console,
         },
         Step {
             id: "sign-in",
             title: "Sign in to Bridge, and keep it running",
             why: "\
-Open Bridge and sign in with your Proton address and password, or run `protonmail-bridge --cli`
-and `login`. Your Proton password goes only into Bridge, never into neomail. Keep Bridge running
-(its window in the tray, or `protonmail-bridge --noninteractive`, say from its systemd --user
-unit): neomail syncs and sends through it.",
+- Open Bridge and sign in with your Proton address and password, or run
+  `protonmail-bridge --cli` and `login`.
+Your Proton password goes only into Bridge, never into neomail.
+- Keep Bridge running (its window in the tray, or `protonmail-bridge --noninteractive`, say from
+  its systemd --user unit): neomail syncs and sends through it.",
             links: &["https://proton.me/support/bridge-cli-guide"],
+            page: None,
+            kind: Kind::Console,
+        },
+        Step {
+            id: "export",
+            title: "Export Bridge's certificate",
+            why: "\
+Bridge secures the connection with a certificate it made itself, which no authority vouches for.
+neomail pins it, and checks it against a copy you export from Bridge now, before the mailbox
+details are open.
+- In Bridge, open Settings > Advanced settings > Export TLS certificates and pick a folder, or run
+  `cert export` in `protonmail-bridge --cli`.
+Warning: the export also writes key.pem, Bridge's private key, next to cert.pem: delete it once
+the certificate is pinned.",
+            links: &[SETTINGS_GUIDE, "https://proton.me/support/bridge-cli-guide"],
+            page: None,
             kind: Kind::Console,
         },
         Step {
@@ -68,11 +92,13 @@ unit): neomail syncs and sends through it.",
             title: "Name the account",
             why: "What neomail calls it, as in `neomail sync --account NAME`.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--name"),
                 prompt: "Account name in neomail: ",
                 secret: false,
                 default: Some("proton"),
+                choices: &[],
                 clean: clean_name,
             }),
         },
@@ -81,23 +107,27 @@ unit): neomail syncs and sends through it.",
             title: "Check that the name is free",
             why: "No account in the config has this name yet.",
             links: &[],
+            page: None,
             kind: Kind::Check { reads: &["name"] },
         },
         Step {
             id: "username",
             title: "Mailbox details: the username",
             why: "\
-In Bridge, pick the account and open its mailbox details (in `protonmail-bridge --cli`: `info`).
-The next questions copy them. The username is usually your Proton address. With split addresses
-mode each address has its own details: add one neomail account per address.",
+- In Bridge, pick the account and open its mailbox details (in `protonmail-bridge --cli`: `info`).
+The next questions copy them. The username is usually your Proton address.
+Note: with split addresses mode each address has its own details: add one neomail account per
+address.",
             links: &[
                 "https://proton.me/support/difference-combined-addresses-mode-split-addresses-mode",
             ],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--username"),
                 prompt: "Username: ",
                 secret: false,
                 default: None,
+                choices: &[],
                 clean: clean_username,
             }),
         },
@@ -106,11 +136,13 @@ mode each address has its own details: add one neomail account per address.",
             title: "Mailbox details: the IMAP port",
             why: "Bridge serves IMAP on 127.0.0.1, by default on port 1143.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--port"),
                 prompt: "IMAP port: ",
                 secret: false,
                 default: Some("1143"),
+                choices: &[],
                 clean: clean_port,
             }),
         },
@@ -121,11 +153,22 @@ mode each address has its own details: add one neomail account per address.",
 STARTTLS (the default), or SSL, which neomail calls tls: TLS from the first byte. Bridge sets it
 under Settings > Advanced settings > Connection mode.",
             links: &[SETTINGS_GUIDE],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--security"),
                 prompt: "IMAP security (starttls or tls): ",
                 secret: false,
                 default: Some("starttls"),
+                choices: &[
+                    Choice {
+                        value: "starttls",
+                        label: "STARTTLS, Bridge's default",
+                    },
+                    Choice {
+                        value: "tls",
+                        label: "SSL: TLS from the first byte",
+                    },
+                ],
                 clean: clean_security,
             }),
         },
@@ -134,11 +177,13 @@ under Settings > Advanced settings > Connection mode.",
             title: "Mailbox details: the SMTP port",
             why: "neomail sends through Bridge's SMTP on 127.0.0.1, by default on port 1025.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--smtp-port"),
                 prompt: "SMTP port: ",
                 secret: false,
                 default: Some("1025"),
+                choices: &[],
                 clean: clean_port,
             }),
         },
@@ -147,11 +192,22 @@ under Settings > Advanced settings > Connection mode.",
             title: "Mailbox details: the SMTP security",
             why: "STARTTLS (the default), or SSL, which neomail calls tls.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--smtp-security"),
                 prompt: "SMTP security (starttls or tls): ",
                 secret: false,
                 default: Some("starttls"),
+                choices: &[
+                    Choice {
+                        value: "starttls",
+                        label: "STARTTLS, Bridge's default",
+                    },
+                    Choice {
+                        value: "tls",
+                        label: "SSL: TLS from the first byte",
+                    },
+                ],
                 clean: clean_security,
             }),
         },
@@ -160,6 +216,7 @@ under Settings > Advanced settings > Connection mode.",
             title: "Is Bridge ready?",
             why: "neomail connects to both ports as you answered and reads Bridge's certificate.",
             links: &[],
+            page: None,
             kind: Kind::Check {
                 reads: &["imap-port", "imap-security", "smtp-port", "smtp-security"],
             },
@@ -168,18 +225,19 @@ under Settings > Advanced settings > Connection mode.",
             id: "certificate",
             title: "Pin Bridge's certificate",
             why: "\
-Bridge secures the connection with a certificate it made itself, which no authority vouches for.
-neomail pins its SHA-256, shown above: it then talks only to the server holding that
-certificate. To check that it is Bridge's own, rather than read over the same connection, export
-it from Bridge (Settings > Advanced settings > Export TLS certificates, or `cert export` in
-`protonmail-bridge --cli`) and give the path of its cert.pem here: neomail compares the two.
-The export also writes key.pem, Bridge's private key, next to it: delete that afterwards.",
+neomail pins the SHA-256 of the certificate Bridge presented, shown above: it then talks only to
+the server holding that certificate. Give the path of the cert.pem you exported and neomail
+compares the two, so the pin is Bridge's own certificate rather than one read over the same
+connection.
+Note: then delete the key.pem the export wrote next to it.",
             links: &[SETTINGS_GUIDE],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: Some("--cert-sha256"),
                 prompt: "Pin it? y, the path to the exported cert.pem, or its SHA-256 [y/path/N] ",
                 secret: false,
                 default: None,
+                choices: &[],
                 clean: clean_certificate,
             }),
         },
@@ -188,6 +246,7 @@ The export also writes key.pem, Bridge's private key, next to it: delete that af
             title: "Compare and pin the certificate",
             why: "The cert.pem or SHA-256 given must be the certificate Bridge presented.",
             links: &[],
+            page: None,
             kind: Kind::Check {
                 reads: &["certificate"],
             },
@@ -198,6 +257,7 @@ The export also writes key.pem, Bridge's private key, next to it: delete that af
             why: "The config can take the account and the keyring opens, before the password \
                   is asked.",
             links: &[],
+            page: None,
             kind: Kind::Check {
                 reads: &[
                     "name",
@@ -215,11 +275,13 @@ The export also writes key.pem, Bridge's private key, next to it: delete that af
             why: "\
 The password Bridge's mailbox details show, not your Proton password. It goes to the keyring.",
             links: &[],
+            page: None,
             kind: Kind::Ask(Question {
                 flag: None,
                 prompt: "Bridge password (not shown): ",
                 secret: true,
                 default: None,
+                choices: &[],
                 clean: clean_password,
             }),
         },
@@ -229,6 +291,7 @@ The password Bridge's mailbox details show, not your Proton password. It goes to
             why: "neomail logs in to Bridge's IMAP, reading nothing, and to its SMTP, sending \
                   nothing, with the pinned certificate, before anything is written.",
             links: &[],
+            page: None,
             kind: Kind::Check {
                 reads: &[
                     "username",
@@ -245,6 +308,7 @@ The password Bridge's mailbox details show, not your Proton password. It goes to
             title: "Save the account",
             why: "The Bridge password goes to the keyring and the account to the config.",
             links: &[],
+            page: None,
             kind: Kind::Commit,
         },
     ],
@@ -335,8 +399,8 @@ Advanced settings > Connection mode.";
 
 const REFUSED_FIX: &str = "\
 Bridge refused this username and password. Paste the password Bridge's mailbox details show, not
-your Proton password, and check the username (step 6). If Bridge lists no account, sign in to
-Bridge first (step 3).";
+your Proton password, and check the username (on a terminal, Esc goes back to it). If Bridge
+lists no account, sign in to Bridge first.";
 
 /// The username Bridge shows: usually an address. Bridge checks it; here it only has to be one
 /// word.
@@ -432,12 +496,20 @@ fn find_bridge() -> Option<PathBuf> {
 }
 
 /// `neomail account add proton`.
-pub fn add(config_path: &Path, args: Args, input: Input, out: &mut impl Write) -> Result<()> {
+pub fn add(
+    config_path: &Path,
+    args: Args,
+    input: Input,
+    paint: crate::style::Paint,
+    out: &mut impl Write,
+) -> Result<()> {
     let deps = Deps {
         open_keyring: &Keyring::open,
         find_bridge: &find_bridge,
     };
-    run(config_path, args, input, &mut cli::Stdio(input), &deps, out)
+    let mut tty = Tty::new(input, "password");
+    let mut ui = Ui::real(&mut tty, paint, false, PROTON.id);
+    run(config_path, args, input, &mut ui, &deps, out)
 }
 
 /// The certificates Bridge presented, or the ones pinned: Bridge has one for both ports, but a
@@ -448,12 +520,12 @@ struct Certs {
     smtp: CertPin,
 }
 
-/// The wizard with `term` for the user and `deps` for the outside.
+/// The wizard with `ui` for the user and `deps` for the outside.
 pub fn run(
     config_path: &Path,
     args: Args,
     input: Input,
-    term: &mut dyn Term,
+    ui: &mut Ui<'_>,
     deps: &Deps<'_>,
     out: &mut impl Write,
 ) -> Result<()> {
@@ -477,7 +549,7 @@ pub fn run(
         }),
         _ => None,
     };
-    let session = match Session::new(&PROTON, term.interactive(), flag) {
+    let session = match Session::new(&PROTON, ui.interactive(), flag) {
         Ok(session) => session,
         Err(StartError::Missing(flags)) => {
             let flags: Vec<&str> = flags
@@ -532,62 +604,64 @@ pub fn run(
             Some(&smtp(answers)),
         )
     };
-    let check = |id: &str, answers: &Answers<'_>| -> Result<String, CheckError> {
-        match id {
-            "name-free" => {
-                let name = answers.text("name").unwrap_or_default();
-                if name_taken(config_path, name) {
-                    return Err(CheckError {
-                        kind: NAME_TAKEN,
-                        detail: format!(
-                            "{} already has an account named {name:?}.",
-                            config_path.display()
-                        ),
-                    });
-                }
-                Ok(String::new())
-            }
-            "bridge" if !args.no_check => {
-                let (certs, said) = bridge_ready(answers, deps)?;
-                presented.set(Some(certs));
-                Ok(said)
-            }
-            "pin" => {
-                let answer = answers.text("certificate").unwrap_or("no");
-                let (certs, said) = pin(answer, presented.get())?;
-                pinned.set(Some(certs));
-                Ok(said)
-            }
-            "ready" => {
-                let name = answers.text("name").unwrap_or_default();
-                config::check_append(config_path, name, &block(answers)).map_err(other)?;
-                if command.is_none() {
-                    *keyring.borrow_mut() = Some((deps.open_keyring)().map_err(other)?);
-                }
-                Ok(String::new())
-            }
-            "login" if !args.no_check => {
-                let password = match &command {
-                    Some(c) => secret::run_password_command(c).map_err(other)?,
-                    None => match answers.secret("password") {
-                        Some(p) => Password::new(p.expose().to_owned()),
-                        None => return Err(other(anyhow::anyhow!("no password was given"))),
-                    },
-                };
-                check_login(&imap(answers), &smtp(answers), &password).map_err(|mut e| {
-                    if e.kind == REFUSED && command.is_some() {
-                        e.detail.push_str(
-                            "\nThe password came from --password-command: it must print the \
-                             password Bridge shows.",
-                        );
+    let check =
+        |id: &str, answers: &Answers<'_>, _: &mut cli::Ask<'_, '_>| -> Result<String, CheckError> {
+            match id {
+                "name-free" => {
+                    let name = answers.text("name").unwrap_or_default();
+                    if name_taken(config_path, name) {
+                        return Err(CheckError {
+                            kind: NAME_TAKEN,
+                            detail: format!(
+                                "{} already has an account named {name:?}.",
+                                config_path.display()
+                            ),
+                        });
                     }
-                    e
-                })
+                    Ok(String::new())
+                }
+                "bridge" if !args.no_check => {
+                    let (certs, said) = bridge_ready(answers, deps)?;
+                    presented.set(Some(certs));
+                    Ok(said)
+                }
+                "pin" => {
+                    let answer = answers.text("certificate").unwrap_or("no");
+                    let (certs, said) = pin(answer, presented.get())?;
+                    pinned.set(Some(certs));
+                    Ok(said)
+                }
+                "ready" => {
+                    let name = answers.text("name").unwrap_or_default();
+                    config::check_append(config_path, name, &block(answers)).map_err(other)?;
+                    if command.is_none() {
+                        *keyring.borrow_mut() = Some((deps.open_keyring)().map_err(other)?);
+                    }
+                    Ok(String::new())
+                }
+                "login" if !args.no_check => {
+                    let password = match &command {
+                        Some(c) => secret::run_password_command(c).map_err(other)?,
+                        None => match answers.secret("password") {
+                            Some(p) => Password::new(p.expose().to_owned()),
+                            None => return Err(other(anyhow::anyhow!("no password was given"))),
+                        },
+                    };
+                    check_login(&imap(answers), &smtp(answers), &password).map_err(|mut e| {
+                        if e.kind == REFUSED && command.is_some() {
+                            e.detail.push_str(
+                                "\nThe password came from --password-command: it must print the \
+                             password Bridge shows.",
+                            );
+                        }
+                        e
+                    })
+                }
+                "bridge" | "login" => Ok(cli::SKIPPED.to_owned()),
+                _ => Ok(String::new()),
             }
-            _ => Ok(String::new()),
-        }
-    };
-    let write = |answers: &Answers<'_>| -> Result<String> {
+        };
+    let write = |answers: &Answers<'_>| -> Result<Saved> {
         let name = answers.text("name").unwrap_or_default();
         let stored = match (keyring.borrow().as_ref(), answers.secret("password")) {
             (Some(keyring), Some(password)) => {
@@ -614,9 +688,13 @@ pub fn run(
             answers.text("username").unwrap_or_default(),
             config_path.display(),
         )?;
-        Ok(String::new())
+        out.flush()?;
+        Ok(Saved {
+            said: String::new(),
+            todo: vec!["Keep Bridge running: neomail syncs and sends through it.".to_owned()],
+        })
     };
-    cli::drive(&mut session, term, check, write)
+    cli::drive(&mut session, ui, check, write)
 }
 
 fn security_name(security: Security) -> &'static str {
