@@ -1491,17 +1491,19 @@ Never edit an entry's text. To change a ruling, add an entry that supersedes it.
     waits at its subscription selector for Enter (azure-cli's profile `login`), and
     `AZURE_CORE_COLLECT_TELEMETRY=no`, or az's detached telemetry uploader makes the removed
     directory again (azure-cli's `telemetry.py`); knack reads any option from
-    `AZURE_<SECTION>_<OPTION>` ([Azure CLI configuration](https://learn.microsoft.com/en-us/cli/azure/azure-cli-configuration)).
-    The live check of #105 found both. The user's own az setup is never read or changed. The commands route asks the directory on both account types and passes it to
-    `az login --tenant`: without it az signs in to every tenant the account reaches and acts on
-    the first with a subscription.
+    `AZURE_<SECTION>_<OPTION>`
+    ([Azure CLI configuration](https://learn.microsoft.com/en-us/cli/azure/azure-cli-configuration)).
+    The live check of #105 found both. The user's own az setup is never read or changed. The
+    commands route asks the directory on both account types and passes it to `az login --tenant`:
+    without it az signs in to every tenant the account reaches and acts on the first with a
+    subscription.
   - **The result is picked up, not copied.** A step of the new kind `Kind::Run` names the
     question it answers (`fills`); its script holds `{result}`, which the driver replaces with a
     directory it makes for the step under the data directory (`runs/PID`, mode 0700,
     `wizard/capture.rs`), quoted for sh, and removes with the script when the step ends. The
-    script writes `ok` and the value, or
-    `failed`, the stage and what the command said, to a temporary name and renames it to
-    `result`. The screen polls for it every 250 ms while it waits for keys
+    script writes `ok` and the value, or `failed`, the stage and what the command said, to a
+    temporary name and renames it to `result`. The screen polls for it every 250 ms while it waits
+    for keys
     (`Term::key_within`): a value goes on by itself and is shown on the next screen to correct
     (Esc goes back), a failure shows the step's own advice and keeps watching. A value can be
     typed instead, for a script run on another machine, which prints it; `Run::wrong` says what
